@@ -9,9 +9,16 @@ A **systems performance + coverage benchmark** for interpretability workloads on
 swept across serving backends, model types/architectures, and parallelism/optimization configs.
 
 It answers, for each (workload × model × backend × config) cell:
-1. **Does it run?** → coverage matrix (= the OSDI "still in active design" gap map, generated).
+1. **Is it applicable, and if not, HOW does it fail?** → the **applicability map** (primary
+   user-facing deliverable; see §8.1). Multi-valued, not binary — the point is a *guideline* for
+   users ("for this access pattern, vLLM+nnsight is/ isn't usable, and here's the failure mode").
 2. **Is it correct?** → numerical equivalence vs an HF-eager reference oracle, within tolerance.
 3. **Is it fast?** → latency, throughput, peak memory, overhead vs baselines, transfer volume.
+
+**Philosophy (decided):** the corpus is *not* scoped to the runnable-everywhere intersection. It
+**deliberately includes non-portable workloads as frontier markers** — the boundary IS the
+result. This systematizes scattered tribal knowledge (session-gap, in-place-write failures, PP
+tuple-read returning wrong values) into one generated, verified artifact.
 
 We are layer **(3b)** in the field map (see `references.md`): the *systems* benchmark. The field
 has frameworks (nnsight/pyvene) and *faithfulness* benchmarks (causalab/CausalGym/InterpBench),
@@ -84,7 +91,7 @@ L2 exercises the **engine axis** + concurrency — where vLLM should win and HF 
 
 ## 6. L3 — Sweep matrix (system under test = the OSDI three axes as config)
 
-- **Backend (engine axis)**: HF Transformers · vLLM sync · vLLM async · NDIF remote
+- **Backend (engine axis)**: **v1 = HF Transformers · vLLM-async** (vLLM-sync + NDIF remote deferred)
 - **Parallelism (distribution axis)**: single-GPU · TP=2/4/8 · PP · multi-node
 - **Engine config (optimization axis)**: enforce_eager vs CUDA graphs · prefix-cache on/off
 - **Model type**: causal-LM · diffusion · vision-language  *(first-class axis — "types")*
@@ -124,13 +131,20 @@ Reporter  (parquet/json → tables, plots, coverage matrix, regression diff)
 - **Two levels:** `type → family`. *Type* fixes which vocabulary exists (causal-LM:
   layers/attn/mlp/residual/heads/unembed; diffusion: down/mid/up blocks + timestep; VLM:
   vision tower / connector / LM). *Family* fixes the concrete binding.
-- **Resolution tiers** (a binding is `(module_ref, slice|None, access_kind)`):
-  - block-level (`residual_{pre,post}`, `attn_out`, `mlp_out`) — mechanical from tree + config.
-  - sub-block (`head[h]`, `neuron[j]`) — needs `config.{num_attention_heads, head_dim,
-    intermediate_size}` + a tensor slice.
-  - intermediate-op (`attn_weights` pre-softmax, residual add) — needs `.source`; fragile,
-    family-specific.
-  - runtime/engine (`logits`, `sampled_token`) — backend-specific, not family-specific.
+- **Resolution tiers** (a binding is `(module_ref, slice|None, access_kind)`). Vocabulary spans
+  all tiers; v1 build/expectation differs per tier (see F3):
+  - **(a) block-level** (`residual_{pre,post}`, `attn_out`, `mlp_out`) — `module.output` directly;
+    mechanical from tree + config. *Portable, perf workhorse.*
+  - **(b) sub-block** (`head[h]`, `neuron[j]`) — config-driven reshape/slice of a module
+    output/input (`attn.output[0].view(B,S,n_heads,head_dim)`; `mlp.act.output[...,j]`); needs
+    `config.{num_attention_heads, head_dim, num_key_value_heads (GQA), intermediate_size}`. **No
+    `.source`.** *Portable, perf workhorse.* nnsight idiom: `docs/patterns/per-head-attention.md`.
+  - **(c) intermediate-op** (`attn_weights`, pre-softmax scores) — needs `.source.<op>` (op name
+    differs per family, e.g. `attention_interface_0`) **+ `attn_implementation="eager"`**.
+    Attention weights do **not** materialize under SDPA/FlashAttention → **cannot exist on vLLM**.
+    v1: implemented **HF-only as frontier markers**. nnsight idiom:
+    `docs/patterns/attention-patterns.md`.
+  - **runtime/engine** (`logits`, `sampled_token`) — backend-specific, not family-specific.
 - **Capability declaration → coverage matrix for free.** Each adapter (and backend) declares which
   logical selectors it can realize; unrealizable = structured `unsupported`. That declaration *is*
   the OSDI gap map.
@@ -146,14 +160,37 @@ analysis-DAG with artifact deps" — for *faithfulness*. Adopt its proven shape 
 `task/model/analysis/runners`, agent/skill-driven runner) and **swap the metric layer from
 faithfulness → systems**. Our config groups ≈ `workload / model / backend / metric`.
 
-## 8. Metrics
+## 8. Metrics & deliverables
 
-- **Performance:** end-to-end latency · throughput (tok/s, traces/s, prompts/s) · peak GPU memory ·
-  **overhead vs no-intervention baseline** (per backend) · **overhead vs raw-PyTorch-hooks
-  baseline** (HF only — the existing micro-benchmark is the L0 floor) · **transfer volume** (NDIF) ·
-  time-to-first-save.
-- **Correctness:** (1) coverage (runs?) · (2) cross-backend numerical equivalence (HF-eager oracle
-  + tolerance — the "same trace, same answer" claim) · (3) regression vs golden values.
+### 8.1 Applicability map (PRIMARY deliverable)
+
+For each (workload × backend × config), a multi-valued state — the user guideline:
+
+| State | Meaning | Detected by |
+|---|---|---|
+| `SUPPORTED` | runs, matches HF reference within tolerance | oracle pass |
+| `SUPPORTED_DEGRADED` | correct, but forced a de-opt (disables CUDA graphs / prefix cache) | runs + perf delta |
+| `ERROR` | raises a clear, catchable error (user gets a signal) | exception captured |
+| `SILENTLY_WRONG` | runs, no error, but fails the oracle — **the dangerous cell** | oracle mismatch |
+| `HANG` | deadlocks | timeout |
+| `UNSUPPORTED_BY_CONSTRUCTION` | value can't exist (flash-attn attention patterns) | declared + confirmed |
+
+`SILENTLY_WRONG` is **only detectable with the equivalence oracle** → this makes F4 load-bearing,
+not optional. Each non-portable workload carries an *expected* state; the runner verifies the
+actual state matches (and flags when vLLM returns `SILENTLY_WRONG` where `ERROR` was expected).
+
+### 8.2 Performance
+
+End-to-end latency · throughput (tok/s, traces/s, prompts/s) · peak GPU memory · **overhead vs
+no-intervention baseline** (per backend) · **overhead vs raw-PyTorch-hooks baseline** (HF only —
+the existing micro-benchmark is the L0 floor) · **transfer volume** (remote, later) ·
+time-to-first-save.
+
+### 8.3 Correctness
+
+(1) the applicability state above · (2) cross-backend numerical equivalence (HF-eager oracle +
+tolerance — the "same trace, same answer" claim, and the `SILENTLY_WRONG` detector) ·
+(3) regression vs golden values.
 
 ## 9. Cross-cutting concerns
 
@@ -168,8 +205,8 @@ faithfulness → systems**. Our config groups ≈ `workload / model / backend / 
 | # | Decision | Options | Lean | Status |
 |---|---|---|---|---|
 | F1 | Spec form | data / code / **hybrid** | hybrid (declarative spec compiled by small builders) | proposed |
-| F2 | v1 scope | causal-LM observe/steer/patch vs +training +diffusion/VLM | causal-LM, Method+some Macro, full backend sweep; training & diffusion/VLM additive later | **awaiting confirm** |
-| F3 | Resolver vocab resolution | (a) block-level / (b) +sub-block / (c) +source | (b) | **awaiting confirm** |
-| F4 | Correctness goal | coverage-only vs +numerical equivalence | +equivalence (HF oracle + tolerance) — it's the OSDI claim | proposed |
+| F2 | v1 scope | — | causal-LM, Method+some Macro; **backends = HF + vLLM-async only**; training & diffusion/VLM & vLLM-sync/NDIF additive later | **DECIDED** |
+| F3 | Resolver vocab resolution | (a)/(b)/(c) | **vocabulary spans all of (a/b/c)**; v1 *portable+perf* addressing = (a)+(b); (c) implemented **HF-eager-only as frontier markers** (run on vLLM expecting ERROR/UNSUPPORTED, verified) | **DECIDED** |
+| F4 | Correctness goal | coverage-only vs +equivalence | **+equivalence — LOAD-BEARING**: it's the only `SILENTLY_WRONG` detector (§8.1), not just the OSDI claim | **DECIDED** |
 | F5 | Adopt pyvene vocab + causalab harness shape | yes / build fresh | adopt/align both | proposed |
 | F6 | Repo name | provisional `interp-serve-bench` | finalize later (avoid "InterpBench") | open |
