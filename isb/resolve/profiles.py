@@ -71,7 +71,10 @@ GPT2 = FamilyProfile(
         "unembed": "lm_head",
     },
     output_index={"block": 0, "attn": 0, "mlp": None},
-    dims={"n_heads": "n_head", "head_dim": None, "n_kv_heads": "n_head", "ffn": "n_inner"},
+    dims={
+        "n_heads": "n_head", "head_dim": None, "n_kv_heads": "n_head",
+        "ffn": "n_inner", "hidden": "n_embd",   # n_inner may be None -> derive 4*hidden
+    },
     caps=set(_CAUSAL_LM_CAPS),
     n_layers_attr="n_layer",
 )
@@ -94,6 +97,7 @@ LLAMA = FamilyProfile(
         "head_dim": "head_dim",
         "n_kv_heads": "num_key_value_heads",  # GQA-aware
         "ffn": "intermediate_size",
+        "hidden": "hidden_size",
     },
     caps=set(_CAUSAL_LM_CAPS),
     n_layers_attr="num_hidden_layers",

@@ -102,6 +102,26 @@ def test_weird_family_is_profile_only_no_hardcoding():
     assert R.resolve_one("final_norm").module is model.trunk.final_ln
 
 
+def test_head_value_binds_oproj_input_side():
+    """Per-head value taps the o_proj/c_proj INPUT, not its output (§11.3)."""
+    model = _fake_gpt2()
+    R = Resolver(GPT2, model)
+    b = R.resolve(Selector("attn.head_value", scope=[0], head=3))[0]
+    assert b.module is model.transformer.h[0].attn.c_proj   # the o_proj/c_proj module
+    assert b.side == "input"                                  # read its INPUT, not output
+    assert b.index == ("head", 3, None)                      # head_dim derived at runtime
+    assert b.site_id == "L0.attn.head_value.h3"
+
+
+def test_ffn_dim_derives_for_gpt2():
+    """GPT-2 n_inner defaults to None -> ffn derives 4*hidden from the profile."""
+    model = _fake_gpt2()
+    model.config.n_inner = None
+    model.config.n_embd = 768
+    R = Resolver(GPT2, model)
+    assert R._dim("ffn") == 4 * 768
+
+
 def test_predict_supported_and_unsupported():
     wl_lens = Workload(
         id="x", motif="logit_lens",

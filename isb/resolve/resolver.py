@@ -22,9 +22,10 @@ class Binding:
     site_id: str
     module: Any                       # resolved nnsight Envoy (or any obj with .output)
     output_index: Optional[int]       # tuple-output index hint (None => not a tuple)
-    reshape: Optional[tuple]          # e.g. (B, S, n_heads, head_dim) for per-head
-    index: Optional[tuple]            # slice into the reshaped tensor (head/neuron/pos)
+    reshape: Optional[tuple]          # reserved for future explicit reshape
+    index: Optional[tuple]            # tier-(b) slice tag: ("head",h,head_dim) | ("neuron",j)
     access: str
+    side: str = "output"             # "output" (.output) or "input" (.input); §11.3 head_value
 
 
 class Unsupported(Exception):
@@ -35,7 +36,7 @@ class Resolver:
     def __init__(self, profile: FamilyProfile, model: Any):
         self.p = profile
         self.model = model
-        self.config = getattr(model, "config", None)
+        self.config = model.config   # a model always has .config; fail loudly if not
 
     def capabilities(self) -> set:
         return self.p.caps
@@ -45,9 +46,13 @@ class Resolver:
 
     def _dim(self, name: str) -> Optional[int]:
         attr = self.p.dims.get(name)
-        if attr is None:
-            return None
-        return int(getattr(self.config, attr))
+        val = getattr(self.config, attr) if attr is not None else None
+        if val is None and name == "ffn":
+            # GPT-2's n_inner defaults to None; derive 4*hidden from the profile's hidden attr.
+            hidden_attr = self.p.dims.get("hidden")
+            hidden = getattr(self.config, hidden_attr) if hidden_attr is not None else None
+            return 4 * int(hidden) if hidden is not None else None
+        return None if val is None else int(val)
 
     # --- path walking -----------------------------------------------------------
 
@@ -87,10 +92,12 @@ class Resolver:
         out_idx = self.p.output_index.get(
             "block" if sel.target.startswith("block") else role
         )
+        # §11.3: per-head value = o_proj/c_proj INPUT; residual-pre = block .input.
+        side = "input" if sel.target in ("block.input", "attn.head_value") else "output"
         bindings = []
         for i in self._scope_to_layers(sel.scope):
             module = self._walk(self.p.paths[role], i)
-            reshape, index = self._subblock(sel)
+            index = self._subblock(sel)
             bindings.append(
                 Binding(
                     site_id=f"L{i}.{sel.target}"
@@ -98,29 +105,25 @@ class Resolver:
                     + (f".n{sel.neuron}" if sel.neuron is not None else ""),
                     module=module,
                     output_index=out_idx,
-                    reshape=reshape,
+                    reshape=None,
                     index=index,
                     access=sel.access,
+                    side=side,
                 )
             )
         return bindings
 
     def _subblock(self, sel: Selector):
-        """Compute (reshape, static-index) for tier-(b) head/neuron selectors.
+        """Static slice tag for tier-(b) head/neuron selectors; None for tier (a).
 
-        reshape is a partial shape with -1 placeholders for runtime (batch, seq);
-        read_value fills those from the live tensor. Tier (a) returns (None, None).
+        head_dim may be None (e.g. GPT-2 has no explicit head_dim) -> read_value
+        derives it from the live tensor's last dim. Tier (a) returns None.
         """
         if sel.target == "attn.head_value" and sel.head not in (None, "all"):
-            head_dim = self._dim("head_dim")
-            if head_dim is None:
-                # derive from hidden size if not explicit
-                n_heads = self._dim("n_heads")
-                head_dim = None if n_heads is None else None  # filled at runtime
-            return ("per_head", ("head", sel.head, head_dim))
+            return ("head", sel.head, self._dim("head_dim"))
         if sel.target == "mlp.neuron" and sel.neuron not in (None, "all"):
-            return (None, ("neuron", sel.neuron))
-        return (None, None)
+            return ("neuron", sel.neuron)
+        return None
 
     def resolve_one(self, role: str) -> Binding:
         """Resolve a singleton module (final_norm, unembed) — no layer index."""
@@ -138,7 +141,12 @@ class Resolver:
 def predict(
     workload, family: FamilyProfile, backend: BackendProfile, motif_requires=frozenset()
 ) -> str:
-    """A-priori applicability cell (design.md §11.6): need ⊆ (family ∩ backend)?"""
+    """A-priori applicability cell (design.md §11.6): need ⊆ (family ∩ backend)?
+
+    `motif_requires` is the motif's capability requirement set. Per the layering in
+    §11.10 (motifs depend on resolve, not vice-versa), the RUNNER looks it up from the
+    motif registry and passes it here — this function stays registry-agnostic.
+    """
     need = set(motif_requires)
     for s in workload.selectors:
         need.add(s.target)
@@ -148,18 +156,22 @@ def predict(
 
 
 def read_value(b: Binding):
-    """Translate a Binding into an nnsight read: .output, untuple, reshape, slice."""
-    out = b.module.output
-    if isinstance(out, tuple):
-        out = out[b.output_index if b.output_index is not None else 0]
-    if b.reshape == "per_head" and b.index is not None:
+    """Translate a Binding into an nnsight read: pick .input/.output, untuple, slice.
+
+    Dispatch for tier-(b) is unified on the index tag (`("head",…)` / `("neuron",…)`).
+    For `attn.head_value` the source is the o_proj/c_proj INPUT (§11.3), not its output.
+    """
+    src = b.module.input if b.side == "input" else b.module.output
+    if isinstance(src, tuple):
+        src = src[b.output_index if b.output_index is not None else 0]
+    if b.index is None:
+        return src
+    tag = b.index[0]
+    if tag == "head":
         _, head, head_dim = b.index
-        shp = out.shape
-        if head_dim is None:
-            # infer head_dim from a known n_heads if available; else leave as-is
-            head_dim = shp[-1]
-        view = out.view(shp[0], shp[1], shp[-1] // head_dim, head_dim)
-        return view[:, :, head]
-    if b.index is not None and b.index[0] == "neuron":
-        return out[..., b.index[1]]
-    return out
+        shp = src.shape
+        hd = head_dim if head_dim is not None else shp[-1]   # derive when not explicit
+        return src.view(shp[0], shp[1], shp[-1] // hd, hd)[:, :, head]
+    if tag == "neuron":
+        return src[..., b.index[1]]
+    return src
