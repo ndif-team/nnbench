@@ -1,0 +1,21 @@
+# Logit lens, portable variant: unembed via weight matmul (bypasses vLLM's
+# ParallelLMHead.forward guard). Expected SUPPORTED on both backends -> exercises
+# the equivalence oracle (SUPPORTED vs SILENTLY_WRONG).
+id: logit_lens.all_layers.weight
+motif: logit_lens
+tier: method
+profile: interactive
+selectors:
+  - target: block.output
+    scope: all
+    position: last
+    access: read
+aux:
+  - kind: unembed
+inputs:
+  kind: single
+  prompts: ["The Eiffel Tower is in the city of"]
+generation:
+  new_tokens: 0
+params:
+  unembed: weight        # vs "module" (idiomatic; ERRORs on vLLM)

@@ -45,7 +45,11 @@ class VLLMAsyncBackend(Backend):
             ) as tracer:
                 proxy = program.build_proxy(model, ctx)
                 saved = proxy.save()  # noqa: F841  (named for the async .saves key)
-            return await tracer.backend()
+            # with-exit auto-submits; stream to the finished output (saves attached there)
+            last = None
+            async for output in tracer.backend:
+                last = output
+            return last
 
         t0 = time.time()
         out = asyncio.run(_go())
@@ -57,7 +61,25 @@ class VLLMAsyncBackend(Backend):
         }
 
     def _collect(self, out):
+        # async returns {base_id: {var_name: value}} (per-request namespacing); descend
+        # the single-key wrapper layers until we reach the var->value dict.
         saves = out.saves
+        while (
+            isinstance(saves, dict)
+            and len(saves) == 1
+            and isinstance(next(iter(saves.values())), dict)
+        ):
+            saves = next(iter(saves.values()))
+        # nnsight's deferred-exception payload: an intervention raised in the worker.
+        if isinstance(saves, dict) and {"type_name", "message", "traceback"} <= set(saves):
+            import sys
+
+            print("--- vLLM worker intervention traceback ---", file=sys.stderr)
+            print(saves.get("traceback", ""), file=sys.stderr)
+            # the message embeds the inner traceback; surface just its final line
+            msg = (saves.get("message") or "").strip().splitlines()
+            reason = msg[-1] if msg else saves["type_name"]
+            raise RuntimeError(f"worker intervention: {reason}")
         if "saved" in saves:
             v = saves["saved"]
         elif len(saves) == 1:

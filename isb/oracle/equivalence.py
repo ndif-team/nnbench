@@ -17,6 +17,11 @@ def compare(ref, got) -> dict:
         return {"shape_match": False, "top1_agree": 0.0, "max_abs": float("inf")}
     r = ref.float()
     g = got.float()
+    # vLLM's ParallelLMHead pads the vocab (e.g. 50257 -> 50304); align the last dim to
+    # the real vocab before comparing so padding positions don't skew argmax/max-abs.
+    if r.shape[-1] != g.shape[-1]:
+        m = min(r.shape[-1], g.shape[-1])
+        r, g = r[..., :m], g[..., :m]
     shape_match = tuple(r.shape) == tuple(g.shape)
     if not shape_match:
         r2, g2 = r.squeeze(), g.squeeze()

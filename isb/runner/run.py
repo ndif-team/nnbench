@@ -72,6 +72,63 @@ def run_cell(
             backend_impl.teardown(model)
 
 
+def run_workloads_on_backend(
+    workloads,
+    repo: str,
+    family,
+    backend_profile,
+    backend_impl,
+    *,
+    run_negatives: bool = True,
+):
+    """Load a backend ONCE, run each workload, tear down once.
+
+    Returns {workload.id: CellResult}. Running multiple workloads on one engine also
+    exercises nnsight's deferred-exception recovery (a worker intervention that raises
+    must not kill the engine for the next workload).
+    """
+    results = {}
+    pending = []
+    for wl in workloads:
+        predicted = predict(wl, family, backend_profile, requires_for(wl.motif))
+        if predicted == AppState.UNSUPPORTED_BY_CONSTRUCTION and not run_negatives:
+            results[wl.id] = CellResult(backend_profile.name, predicted, predicted)
+        else:
+            pending.append((wl, predicted))
+    if not pending:
+        return results
+
+    model = None
+    try:
+        model = backend_impl.load(repo)
+        for wl, predicted in pending:
+            try:
+                resolver = Resolver(family, model)
+                program = build_motif(wl.motif, wl, resolver)
+                out = backend_impl.run(
+                    model, program, wl.inputs.prompts[0], wl.generation
+                )
+                results[wl.id] = CellResult(
+                    backend_profile.name, predicted, "RAN",
+                    latency_s=out["latency_s"], value=out["value"],
+                )
+            except Exception as e:
+                traceback.print_exc()
+                results[wl.id] = CellResult(
+                    backend_profile.name, predicted, AppState.ERROR, error=repr(e)[:300]
+                )
+    except Exception as e:  # load failed -> every pending cell is ERROR
+        for wl, predicted in pending:
+            results[wl.id] = CellResult(
+                backend_profile.name, predicted, AppState.ERROR,
+                error=f"backend load failed: {repr(e)[:200]}",
+            )
+    finally:
+        if model is not None:
+            backend_impl.teardown(model)
+    return results
+
+
 def evaluate(cells, reference: str = "hf", top1_thresh: float = 0.8):
     """Assign applicability states by comparing each cell to the reference cell."""
     ref = next((c for c in cells if c.backend == reference), None)

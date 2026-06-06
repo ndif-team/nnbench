@@ -31,13 +31,28 @@ def logit_lens(workload, resolver):
     norm = resolver.resolve_one("final_norm").module
     unembed = resolver.resolve_one("unembed").module
     site_ids = [b.site_id for b in sites]
+    # unembed via the module's forward ("module", idiomatic) or a weight matmul
+    # ("weight", portable). vLLM's ParallelLMHead.forward() guards against direct
+    # calls ("LMHead's weights should be used in the sampler"), so "weight" is the
+    # portable path; "module" stays as the canonical-form frontier marker.
+    unembed_mode = workload.params.get("unembed", "module")
 
     def build_proxy(model, ctx):
+        import torch
+
         rows = []
-        for b in sites:
-            hs = read_value(b)                    # residual stream at this layer
-            logits = unembed(norm(hs))            # model's own head (forward dispatch)
-            rows.append(ctx.select_last(logits))  # [1, vocab]
-        return ctx.stack(rows)                    # [n_layers, 1, vocab]
+        # Logit lens is forward-only. no_grad keeps the aux head (grad-enabled params)
+        # from tracking vLLM's inference-mode intermediates for backward — required on
+        # vLLM, harmless on HF (one motif, both backends).
+        with torch.no_grad():
+            for b in sites:
+                hs = read_value(b)                    # residual stream at this layer
+                normed = norm(hs)
+                if unembed_mode == "weight":
+                    logits = torch.nn.functional.linear(normed, unembed.weight)
+                else:
+                    logits = unembed(normed)          # model's own head (forward dispatch)
+                rows.append(ctx.select_last(logits))  # [1, vocab]
+            return ctx.stack(rows)                    # [n_layers, 1, vocab]
 
     return Program(build_proxy, site_ids, {"cache", "aux"})
