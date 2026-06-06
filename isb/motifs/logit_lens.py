@@ -31,6 +31,11 @@ def logit_lens(workload, resolver):
     norm = resolver.resolve_one("final_norm").module
     unembed = resolver.resolve_one("unembed").module
     site_ids = [b.site_id for b in sites]
+    position = sel.position
+    if position != "last":
+        # only last-token logit lens is wired today; fail loud rather than silently
+        # ignoring the spec's position field.
+        raise NotImplementedError(f"logit_lens position={position!r} not supported yet")
     # unembed via the module's forward ("module", idiomatic) or a weight matmul
     # ("weight", portable). vLLM's ParallelLMHead.forward() guards against direct
     # calls ("LMHead's weights should be used in the sampler"), so "weight" is the

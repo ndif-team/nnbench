@@ -12,7 +12,11 @@ class HFBackend(Backend):
     def load(self, repo: str, device: str = "cuda:0"):
         from nnsight import LanguageModel
 
-        return LanguageModel(repo, device_map=device, dispatch=True)
+        # eager attention so this stays a faithful "HF-eager reference" (§11.8) — matters
+        # once tier-(c) attn.weights workloads run; harmless for logit lens.
+        return LanguageModel(
+            repo, device_map=device, dispatch=True, attn_implementation="eager"
+        )
 
     def run(self, model, program, prompt: str, generation) -> dict:
         import torch

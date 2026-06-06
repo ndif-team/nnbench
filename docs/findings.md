@@ -10,7 +10,7 @@ Result (`results/smoke_gpt2.txt`):
 | workload | hf | vllm_async | note |
 |---|---|---|---|
 | `logit_lens` (idiomatic: `lm_head(ln_f(h))`) | SUPPORTED | **ERROR** | vLLM `ParallelLMHead.forward()` guards: *"LMHead's weights should be used in the sampler."* |
-| `logit_lens.weight` (unembed via weight matmul) | SUPPORTED | **SUPPORTED** | top1=1.00 across 12 layers, maxabs=0.89 (kernel/dtype drift) |
+| `logit_lens.weight` (unembed via weight matmul) | SUPPORTED | **SUPPORTED** | top1=1.00 / TV=0.021 across 12 layers (maxabs=0.89 is kernel/dtype drift, diagnostic only) |
 
 ### F-1 — vLLM intermediates are inference-mode tensors
 Applying a grad-enabled sub-module (e.g. `ln_f`) to a vLLM activation raises

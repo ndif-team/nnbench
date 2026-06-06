@@ -38,6 +38,7 @@ class AppState:
     SILENTLY_WRONG = "SILENTLY_WRONG"
     HANG = "HANG"
     UNSUPPORTED_BY_CONSTRUCTION = "UNSUPPORTED_BY_CONSTRUCTION"
+    NO_REFERENCE = "NO_REFERENCE"  # ran, but the reference cell failed -> can't judge
 
 
 # Logical target vocabulary (design.md §11.3). Tier annotations in comments.

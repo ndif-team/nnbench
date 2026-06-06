@@ -83,9 +83,10 @@ def run_workloads_on_backend(
 ):
     """Load a backend ONCE, run each workload, tear down once.
 
-    Returns {workload.id: CellResult}. Running multiple workloads on one engine also
-    exercises nnsight's deferred-exception recovery (a worker intervention that raises
-    must not kill the engine for the next workload).
+    Returns {workload.id: CellResult}. Use ONLY for backends whose engine survives a
+    failed intervention. F-3 (docs/findings.md) showed a vLLM worker error can kill the
+    EngineCore, poisoning later workloads — so the sweep isolates vLLM cells with
+    per-cell `run_cell` instead. This load-once path is for engine-stable backends (HF).
     """
     results = {}
     pending = []
@@ -129,20 +130,27 @@ def run_workloads_on_backend(
     return results
 
 
-def evaluate(cells, reference: str = "hf", top1_thresh: float = 0.8):
-    """Assign applicability states by comparing each cell to the reference cell."""
+def evaluate(cells, reference: str = "hf", top1_thresh: float = 0.9, tv_tol: float = 0.05):
+    """Assign applicability states by comparing each cell to the reference cell.
+
+    If the reference cell itself failed (no value), a successfully-running non-reference
+    cell is `NO_REFERENCE` — it ran, but there is no ground truth to judge it against
+    (NOT SILENTLY_WRONG, which would falsely condemn a correct result).
+    """
     ref = next((c for c in cells if c.backend == reference), None)
     refval = ref.value if ref is not None else None
     for c in cells:
         if c.state in (AppState.ERROR, AppState.UNSUPPORTED_BY_CONSTRUCTION):
             continue
         if c.backend == reference:
-            c.state = AppState.SUPPORTED            # reference is ground truth
+            c.state = AppState.SUPPORTED if refval is not None else AppState.NO_REFERENCE
+        elif refval is None:
+            c.state = AppState.NO_REFERENCE
         else:
             c.metrics = compare(refval, c.value)
             c.state = (
                 AppState.SUPPORTED
-                if is_equivalent(c.metrics, top1_thresh)
+                if is_equivalent(c.metrics, top1_thresh, tv_tol)
                 else AppState.SILENTLY_WRONG
             )
     for c in cells:                                  # drop tensors after comparison
