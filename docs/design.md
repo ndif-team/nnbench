@@ -215,6 +215,13 @@ tolerance — the "same trace, same answer" claim, and the `SILENTLY_WRONG` dete
 
 ## 11. Detailed design — Workload spec + Resolver interface
 
+> **SUPERSEDED by §12 (2026-06-06).** The Resolver / FamilyProfile / Binding / predict /
+> BackendCtx abstraction below was built and shown to be the wrong tool for a *benchmark*:
+> it bakes in nnsight's "one trace runs everywhere" thesis, which is the very thing the
+> benchmark must *measure*, not assume — and it leaked at every backend quirk (no_grad,
+> lm_head guard, flat buffer, vocab padding) in a single motif. Kept for history; the live
+> design is §12. Original text follows.
+
 This is the load-bearing interface. It resolves **F1 (hybrid)** and **F5 (adopt pyvene vocab +
 causalab harness)** concretely.
 
@@ -420,3 +427,90 @@ isb/
 **F1 → hybrid (resolved):** spec=data, builder=code, profile=data.
 **F5 → adopt (resolved):** vocabulary aligned to pyvene component names + `type_to_module_mapping`
 (`FamilyProfile`); harness uses causalab's Hydra config-group shape (`workload/model/backend`).
+
+---
+
+## 12. Architecture (LIVE) — fixed per-cell methodologies
+
+Supersedes §11. The benchmark serves **benchmark maintainers**, not arbitrary users, so the
+model/family set is **curated and finite** — we never face an unknown architecture and therefore
+do not need a general addressing abstraction (no `Resolver`, no `FamilyProfile`, no
+`StandardizedTransformer`, no `predict`/caps). A cell is honestly specific, by design.
+
+### 12.1 The matrix
+
+The benchmark is a matrix of **cells**, one per `(methodology, family, backend [, variant])`. The
+cell IS the workload AND the unit of failure. A cell is a small, explicit function — readable
+top-to-bottom — that writes the real intervention code for that exact combination.
+
+```python
+@cell("logit_lens", family="gpt2", backend="hf")
+def _(be, model, prompt):
+    with be.trace(model, prompt) as t:
+        rows = [model.lm_head(model.transformer.ln_f(blk.output[0]))
+                for blk in model.transformer.h]
+        saved = be.save(be.stack([be.last(r) for r in rows]))
+    return be.collect(t, saved)
+```
+
+- **Family** is a real row dimension, but handled by *writing the cell*, not by abstraction. The
+  Llama cell says `model.model.layers`; the GPT-2 cell says `model.transformer.h`. That is correct
+  explicit code, not the hidden-hardcoding the project rule forbids (which is *general* code that
+  secretly works for one convention). Cells still read real runtime state.
+- **Backend** is the real divergence axis (vLLM ≠ HF). It shows up as separate cells
+  (`backend="hf"` vs `backend="vllm_async"`) — explicit, where you can read the `no_grad` /
+  weight-matmul / flat-buffer specifics.
+- **Variants** (layers touched, overhead, idiomatic-vs-portable unembed) = params or sibling cells.
+- **Reuse emerges bottom-up:** when two cells are structurally identical except module names,
+  extract a `lens_core(be, blocks, norm, head, ...)` helper they both call with their *own*
+  explicit modules. The helper never tries to be universal; the maintainer wires it per cell.
+  Do not pre-build it.
+
+### 12.2 Failure model & the per-family control
+
+HF-of-the-same-family is the **control / oracle**. The interesting signal is the **backend-vs-HF
+delta within a family**:
+
+| HF (control) | vLLM | meaning |
+|---|---|---|
+| ✅ | ✅ | portable |
+| ✅ | ✗ | **backend bug in vLLM's <family> path** (e.g. vLLM-Llama impl bug) |
+| ✗ (HF-other-family ✅) | — | **family-specific architecture quirk** |
+| ✗ across families | — | methodology-level issue |
+
+**Consequence:** the oracle reference is per-`(methodology, family)` — the vLLM-Llama cell is
+compared against **HF-Llama**, never against GPT-2. `family` is a *grouping key* in the runner,
+not an abstraction in the code.
+
+### 12.3 What is kept vs dropped from §11
+
+- **Dropped:** `isb/resolve/` (Resolver, FamilyProfile, Binding, read_value, predict), the heavy
+  `Workload`/`Selector` spec, `BackendCtx`.
+- **Kept:** the applicability-map output + states (§8.1), the **oracle** (§8.3, now grouped by
+  family), the **runner** verify→score→report flow, and the genuinely backend-specific *infra*
+  (`be`: open trace, save, collect, last/stack, teardown — HF handle vs vLLM async `output.saves`).
+
+### 12.4 Layout
+
+```
+isb/
+  states.py             # AppState
+  methodologies/
+    registry.py         # @cell(methodology, family, backend, variant=...) -> fn ; lookup
+    logit_lens.py       # the cells (+ a local helper if/when reuse appears)
+  backends/
+    hf.py vllm_async.py # `be` infra: trace/save/collect/last/stack/teardown + load
+  oracle/equivalence.py # per-family reference comparison (unchanged)
+  runner/run.py         # enumerate cells, group by (methodology,family), HF=control, score
+  report/applicability.py
+scripts/smoke.py        # enumerate the cells to run; print the map
+```
+
+### 12.5 Extension points
+
+| Add a… | What you write |
+|---|---|
+| methodology | new file of `@cell` functions |
+| (family,backend) cell | one explicit function for that combination |
+| backend | a `be` infra impl (trace/collect/teardown) + its cells per methodology |
+| variant | a param or a sibling `@cell` |
