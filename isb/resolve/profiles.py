@@ -14,6 +14,10 @@ _ALL_TARGETS = {
     "attn.head_value", "mlp.neuron", "attn.weights", "logits", "sampled_token",
 }
 _ALL_ACCESS = {"read", "write_replace", "write_inplace", "cache", "grad"}
+# Motif primitives that are universally available wherever reads are (so they do NOT
+# gate at predict-time). Gating primitives (grad, source, attn.weights) live in caps
+# and CAN be absent on a backend. "aux" = run a side module/computation on a value.
+_PRIMITIVES = {"cache", "aux"}
 
 
 @dataclass
@@ -56,7 +60,7 @@ class FamilyProfile:
 
 
 # Architectural caps shared by standard decoder-only causal LMs.
-_CAUSAL_LM_CAPS = _ALL_TARGETS | _ALL_ACCESS
+_CAUSAL_LM_CAPS = _ALL_TARGETS | _ALL_ACCESS | _PRIMITIVES
 
 GPT2 = FamilyProfile(
     type="causal_lm",
@@ -128,7 +132,8 @@ def family_for(model_type: str) -> FamilyProfile:
 
 HF = BackendProfile(
     name="hf",
-    caps=_ALL_TARGETS | _ALL_ACCESS | {"source"},  # eager HF realizes everything, incl. attn.weights
+    # eager HF realizes everything, incl. attn.weights + grad + source
+    caps=_ALL_TARGETS | _ALL_ACCESS | _PRIMITIVES | {"source"},
 )
 
 VLLM_ASYNC = BackendProfile(
@@ -136,7 +141,7 @@ VLLM_ASYNC = BackendProfile(
     caps={
         "block.output", "block.input", "attn.output", "mlp.output",
         "attn.head_value", "mlp.neuron", "logits", "sampled_token",
-        "read", "write_replace", "write_inplace", "cache",
+        "read", "write_replace", "write_inplace", "cache", "aux",
     },  # NO attn.weights (flash-attn), NO grad (inference engine), NO source
 )
 

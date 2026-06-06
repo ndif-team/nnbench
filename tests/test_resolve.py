@@ -129,6 +129,11 @@ def test_predict_supported_and_unsupported():
     )
     assert predict(wl_lens, GPT2, HF) == AppState.SUPPORTED
     assert predict(wl_lens, GPT2, VLLM_ASYNC) == AppState.SUPPORTED
+    # with the motif's universal primitives, prediction stays SUPPORTED (not gated)
+    assert (
+        predict(wl_lens, GPT2, VLLM_ASYNC, motif_requires={"cache", "aux"})
+        == AppState.SUPPORTED
+    )
 
     wl_attn = Workload(
         id="y", motif="attention_pattern",

@@ -1,0 +1,18 @@
+# Logit lens — tier (a), read, forward-only. Expected SUPPORTED on both backends.
+id: logit_lens.all_layers
+motif: logit_lens
+tier: method
+profile: interactive
+selectors:
+  - target: block.output
+    scope: all
+    position: last
+    access: read
+aux:
+  - kind: unembed          # model's own final_norm + lm_head
+inputs:
+  kind: single
+  prompts: ["The Eiffel Tower is in the city of"]
+generation:
+  new_tokens: 0            # single forward
+# expect omitted -> predicted from caps (SUPPORTED on hf and vllm_async)
