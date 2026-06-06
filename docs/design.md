@@ -204,9 +204,219 @@ tolerance — the "same trace, same answer" claim, and the `SILENTLY_WRONG` dete
 
 | # | Decision | Options | Lean | Status |
 |---|---|---|---|---|
-| F1 | Spec form | data / code / **hybrid** | hybrid (declarative spec compiled by small builders) | proposed |
+| F1 | Spec form | data / code / **hybrid** | hybrid: spec=data, builder=code, profile=data (see §11.1) | **DECIDED** |
 | F2 | v1 scope | — | causal-LM, Method+some Macro; **backends = HF + vLLM-async only**; training & diffusion/VLM & vLLM-sync/NDIF additive later | **DECIDED** |
 | F3 | Resolver vocab resolution | (a)/(b)/(c) | **vocabulary spans all of (a/b/c)**; v1 *portable+perf* addressing = (a)+(b); (c) implemented **HF-eager-only as frontier markers** (run on vLLM expecting ERROR/UNSUPPORTED, verified) | **DECIDED** |
 | F4 | Correctness goal | coverage-only vs +equivalence | **+equivalence — LOAD-BEARING**: it's the only `SILENTLY_WRONG` detector (§8.1), not just the OSDI claim | **DECIDED** |
-| F5 | Adopt pyvene vocab + causalab harness shape | yes / build fresh | adopt/align both | proposed |
+| F5 | Adopt pyvene vocab + causalab harness shape | yes / build fresh | adopt: pyvene names→`FamilyProfile`; causalab Hydra config groups (§11.10) | **DECIDED** |
 | F6 | Repo name | provisional `interp-serve-bench` | finalize later (avoid "InterpBench") | open |
+
+---
+
+## 11. Detailed design — Workload spec + Resolver interface
+
+This is the load-bearing interface. It resolves **F1 (hybrid)** and **F5 (adopt pyvene vocab +
+causalab harness)** concretely.
+
+### 11.1 Three artifacts — the data/code split (F1 = hybrid)
+
+| Artifact | Form | Who owns family knowledge | Analogy |
+|---|---|---|---|
+| **Workload spec** | DATA (YAML → validated dataclass) | none (logical only) | pyvene `IntervenableConfig`; causalab task/analysis YAML |
+| **Motif builder** | CODE (registered fn) | none (consumes resolved bindings) | pyvene intervention type; causalab analysis |
+| **Family / Backend profile** | DATA (declarative map) | **all of it** | pyvene `type_to_module_mapping` |
+
+Invariant restated structurally: only **profiles** name concrete paths. Specs and builders speak
+the logical vocabulary; a builder that types `transformer.h` cannot pass review *because it has no
+way to obtain that string* — it only ever receives `Binding`s.
+
+### 11.2 Workload spec schema (the "dataset" unit)
+
+```python
+# isb/spec/schema.py  — pydantic for validation; serialized as YAML on disk
+class Selector(BaseModel):
+    target: TargetKind                       # logical target (see 11.3)
+    scope:  Scope = "all"                    # "all" | [int,…] | {start,stop,step} | {fraction}
+    head:   int | Literal["all"] | list[int] | None = None     # tier (b)
+    neuron: int | Literal["all"] | list[int] | None = None     # tier (b)
+    position: int | Literal["last","all"] | list[int] = "all"
+    access: AccessKind = "read"              # read|write_replace|write_inplace|cache|grad
+
+class Workload(BaseModel):
+    id: str
+    motif: str                               # registered builder id
+    tier: Literal["micro","method","macro"]
+    profile: WorkloadProfile                 # interactive|batched|generation|harvesting|concurrent
+    selectors: list[Selector]
+    aux: list[AuxSpec] = []                  # unembed | sae | probe  (frozen|trainable)
+    inputs: Inputs                           # single|list|dataset; pairs(counterfactual); chat
+    generation: Generation = Generation()    # new_tokens (0=forward); per_step
+    params: dict = {}                        # motif-specific knobs
+    expect: dict[str, AppState] = {}         # per-backend expected state; missing ⇒ predicted (11.6)
+```
+
+### 11.3 Logical target vocabulary (causal-LM; pyvene-aligned, F5)
+
+| Logical target | Tier | pyvene name | nnsight access (resolved) |
+|---|---|---|---|
+| `block.output` / `block.input` | a | `block_output/input` | `block.output[0]` (residual stream) |
+| `attn.output` | a | `attention_output` | `attn.output[0]` |
+| `mlp.output` | a | `mlp_output` | `mlp.output` |
+| `attn.head_value[h]` | b | `head_attention_value_output` | reshape `o_proj/c_proj` **input** → slice head |
+| `mlp.neuron[j]` | b | `mlp_activation` | slice `mlp.act.output` / `down_proj.input` |
+| `attn.weights` | c | — | `attn.source.<op>.output[1]` (**eager only**) |
+| `logits` / `sampled_token` | runtime | — | backend hookable property |
+
+### 11.4 FamilyProfile (DATA) — same spec, different binding
+
+```python
+GPT2 = FamilyProfile(type="causal_lm", family="gpt2",
+  paths={"block":"transformer.h.{i}", "attn":"transformer.h.{i}.attn",
+         "attn_oproj":"transformer.h.{i}.attn.c_proj", "mlp":"transformer.h.{i}.mlp",
+         "mlp_act":"transformer.h.{i}.mlp.act",
+         "final_norm":"transformer.ln_f", "unembed":"lm_head"},
+  output_index={"block":0, "attn":0, "mlp":None},          # tuple-output handling
+  dims={"n_heads":"n_head","head_dim":None,"n_kv_heads":"n_head","ffn":"n_inner"},
+  caps={"block.output","attn.output","attn.head_value","mlp.output","mlp.neuron",
+        "attn.weights","logits"})
+
+LLAMA = FamilyProfile(type="causal_lm", family="llama",
+  paths={"block":"model.layers.{i}", "attn":"model.layers.{i}.self_attn",
+         "attn_oproj":"model.layers.{i}.self_attn.o_proj", "mlp":"model.layers.{i}.mlp",
+         "mlp_down":"model.layers.{i}.mlp.down_proj",
+         "final_norm":"model.norm", "unembed":"lm_head"},
+  output_index={"block":0, "attn":0, "mlp":None},
+  dims={"n_heads":"num_attention_heads","head_dim":"head_dim",
+        "n_kv_heads":"num_key_value_heads","ffn":"intermediate_size"},   # GQA-aware
+  caps={…})
+
+# Non-standard names MUST be a profile-only change (proves no hardcoding):
+WEIRD = FamilyProfile(family="myllm",
+  paths={"block":"decoder_blocks.{i}", …, "unembed":"output_projection"}, …)
+```
+
+### 11.5 Resolver interface (the ONLY model-aware code; shared, profile-parameterized)
+
+```python
+@dataclass
+class Binding:
+    site_id: str                 # stable label, e.g. "L9.attn.head_value[4]"
+    module: Envoy                # resolved nnsight envoy
+    output_index: int | None     # tuple index (0 for block/attn; None for mlp)
+    reshape: tuple | None        # e.g. (B,S,n_heads,head_dim) for per-head
+    index: tuple | None          # slice into reshaped tensor (head/neuron/position)
+    access: AccessKind
+
+class Resolver:
+    def __init__(self, profile: FamilyProfile, model): ...
+    def capabilities(self) -> set[str]: return self.profile.caps
+    def resolve(self, sel: Selector) -> list[Binding]:
+        if sel.target not in self.profile.caps:
+            raise Unsupported(sel.target)                 # → predicted UNSUPPORTED state
+        layers = self._scope_to_layers(sel.scope)         # all|list|range|fraction → [i,…]
+        return [self._bind(sel, i) for i in layers]       # reshape/slice math from profile.dims
+```
+
+The slice/reshape math (per-head, per-neuron, GQA) lives **once** in `_bind`, reading head/ffn
+dims by name from `profile.dims`. Adding a family = a new profile entry, never new code.
+
+### 11.6 BackendProfile + applicability prediction (the map, computed a priori)
+
+```python
+HF         = BackendProfile("hf", caps=ALL | {"grad","write_inplace","source","attn.weights"})
+VLLM_ASYNC = BackendProfile("vllm_async",
+    caps={"block.output","attn.output","attn.head_value","mlp.output","mlp.neuron",
+          "logits","sampled_token","write_replace","write_inplace"})   # no source/grad/weights
+
+def predict(wl: Workload, fam: FamilyProfile, be: BackendProfile) -> AppState:
+    need = motif_requires(wl.motif) | {s.target for s in wl.selectors} \
+                                    | {s.access for s in wl.selectors}
+    have = fam.caps & be.caps
+    return SUPPORTED if need <= have else UNSUPPORTED_BY_CONSTRUCTION
+```
+
+`predict` gives the *a priori* cell; the runner then **empirically verifies** it (11.8) and flags
+any disagreement (esp. predicted-SUPPORTED but oracle says `SILENTLY_WRONG`, or predicted-ERROR but
+actually `SILENTLY_WRONG`).
+
+### 11.7 Motif builder interface (family-independent)
+
+```python
+@motif("logit_lens", requires={"cache","aux"})
+def logit_lens(wl, R: Resolver, model):
+    sites = R.resolve(wl.selectors[0])                    # block.output across scope
+    norm  = R.resolve_one("final_norm"); W = R.resolve_one("unembed")
+    def program(tracer):
+        out = {}
+        for s in sites:
+            h = read(s)                                   # helper: module.output[idx][…,pos]
+            out[s.site_id] = save(apply(W, apply(norm, h)).softmax(-1))   # aux: family-independent
+        return out
+    return program
+```
+
+`read(binding)` / `write(binding, val)` are shared helpers translating a `Binding` into nnsight
+access (`.output[idx]`, `.view(reshape)`, slice). Builders never see a path.
+
+### 11.8 Verification flow (per workload × model × backend cell)
+
+```
+predicted = predict(wl, fam, be)
+if predicted == UNSUPPORTED_BY_CONSTRUCTION and not run_negatives:   record predicted; next
+try:      result = run(build(wl, Resolver(fam, model)), timeout)
+except CleanError as e:   actual = ERROR(type(e))
+except Timeout:           actual = HANG
+else:
+    ref    = oracle.reference(wl, model)          # HF-eager, matched dtype
+    actual = SUPPORTED if equiv(result, ref, tol) else SILENTLY_WRONG
+    if forced_deopt(be, wl):  actual = SUPPORTED_DEGRADED
+record(cell, predicted, expected=wl.expect.get(be.name, predicted), actual, perf)
+```
+
+### 11.9 Worked examples (across tiers, with expected applicability)
+
+```yaml
+# logit_lens — tier a, read, forward-only → SUPPORTED on both
+id: logit_lens.all_layers
+motif: logit_lens
+tier: method ; profile: interactive
+selectors: [{target: block.output, scope: all, position: last, access: read}]
+aux: [{kind: unembed}]
+inputs: {kind: single, prompts: ["The Eiffel Tower is in"]}
+generation: {new_tokens: 0}
+---
+# per-head patching (IOI) — tier b, write_replace, cross-prompt → SUPPORTED on both
+id: head_patch.ioi
+motif: head_patching
+tier: method ; profile: batched
+selectors: [{target: attn.head_value, scope: [9,10,11], head: all, access: write_replace}]
+inputs: {kind: list, pairs: true, prompts: [...clean/corrupted...]}
+params: {metric: logit_diff}
+---
+# attention-pattern read — tier c FRONTIER MARKER
+id: attn_pattern.read
+motif: attention_pattern
+tier: method ; profile: interactive
+selectors: [{target: attn.weights, scope: all, access: read}]
+inputs: {kind: single, prompts: ["The cat sat on the"]}
+expect: {hf: SUPPORTED, vllm_async: UNSUPPORTED_BY_CONSTRUCTION}   # flash-attn: no weights tensor
+```
+
+### 11.10 Package + config-group layout (causalab-aligned, F5)
+
+```
+isb/
+  spec/       # Workload/Selector dataclasses + YAML loader            (data schema)
+  resolve/    # FamilyProfile, BackendProfile, Resolver, Binding, predict()
+  motifs/     # registered builders (logit_lens, head_patching, …)     (family-independent)
+  backends/   # SUT instantiation: hf, vllm_async
+  runner/     # sweep dispatch, warmup, timed trials, failure-tolerant exec (11.8)
+  oracle/     # HF-eager reference + tolerance equivalence
+  report/     # applicability map + perf tables + plots
+  configs/
+    workload/ model/ backend/ family/ runners/    # Hydra config groups; runner = a sweep preset
+```
+
+**F1 → hybrid (resolved):** spec=data, builder=code, profile=data.
+**F5 → adopt (resolved):** vocabulary aligned to pyvene component names + `type_to_module_mapping`
+(`FamilyProfile`); harness uses causalab's Hydra config-group shape (`workload/model/backend`).
