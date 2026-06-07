@@ -1,16 +1,18 @@
-"""vLLM async backend (design.md F2 = HF + vLLM-async).
+"""vLLM async backend infra (design.md F2; §12.3).
 
-Async save-collection differs from HF: saves come back on the finished RequestOutput's
-`.saves` dict (keyed by the inferred var name of the `.save()` assignment), not via the
-handle. We name the assignment `saved` so the key is stable; we also fall back to the
-sole save value if there is exactly one.
+`run` owns the `with model.trace(...)` and the async stream in one coroutine; the cell's
+`build()` closure runs inside the trace. After the with-exit submits the request, we
+stream to the finished output and pull the saved value from its nested `.saves`,
+surfacing nnsight's deferred-exception payload as a clean error.
+
+NOTE: multi-prompt under vLLM (continuous batching) is a future step — this handles one
+prompt; the cell interface already accepts a list.
 """
 from __future__ import annotations
 
 import contextlib
-import time
 
-from .base import Backend, BackendCtx
+from .base import Backend
 
 
 class VLLMAsyncBackend(Backend):
@@ -19,50 +21,31 @@ class VLLMAsyncBackend(Backend):
     def load(self, repo: str, gpu_memory_utilization: float = 0.2):
         from nnsight.modeling.vllm import VLLM
 
-        # enforce_eager is forced True internally (CUDA graphs ⊥ hooks); device via
-        # CUDA_VISIBLE_DEVICES set by the caller.
         return VLLM(
-            repo,
-            mode="async",
-            dispatch=True,
+            repo, mode="async", dispatch=True,
             gpu_memory_utilization=gpu_memory_utilization,
         )
 
-    def run(self, model, program, prompt: str, generation) -> dict:
+    def run(self, model, prompts, build):
         import asyncio
 
-        import torch
-
-        ctx = BackendCtx(
-            select_last=lambda t: t[-1:, :],              # flat [tokens, H] -> [1, vocab]
-            stack=lambda rows: torch.stack(rows, dim=0),  # -> [n_sites, 1, vocab]
-        )
-        gen_tokens = max(1, generation.new_tokens)
+        prompt = prompts[0] if isinstance(prompts, (list, tuple)) else prompts
 
         async def _go():
-            with model.trace(
-                prompt, temperature=0.0, top_p=1, max_tokens=gen_tokens
-            ) as tracer:
-                proxy = program.build_proxy(model, ctx)
-                saved = proxy.save()  # noqa: F841  (named for the async .saves key)
-            # with-exit auto-submits; stream to the finished output (saves attached there)
+            with model.trace(prompt, temperature=0.0, top_p=1, max_tokens=1) as tracer:
+                proxy = build()
+                saved = proxy.save()  # noqa: F841  — the var name IS the async .saves key
             last = None
-            async for output in tracer.backend:
+            async for output in tracer.backend:   # with-exit already submitted
                 last = output
-            return last
+            return self._extract(last)
 
-        t0 = time.time()
-        out = asyncio.run(_go())
-        latency = time.time() - t0
-        return {
-            "value": self._collect(out),
-            "site_ids": program.site_ids,
-            "latency_s": latency,
-        }
+        return asyncio.run(_go())
 
-    def _collect(self, out):
-        # async returns {base_id: {var_name: value}} (per-request namespacing); descend
-        # the single-key wrapper layers until we reach the var->value dict.
+    def last(self, t):
+        return t[-1:, :]                          # flat [tokens, vocab] -> [1, vocab]
+
+    def _extract(self, out):
         saves = out.saves
         while (
             isinstance(saves, dict)
@@ -70,22 +53,12 @@ class VLLMAsyncBackend(Backend):
             and isinstance(next(iter(saves.values())), dict)
         ):
             saves = next(iter(saves.values()))
-        # nnsight's deferred-exception payload: an intervention raised in the worker.
         if isinstance(saves, dict) and {"type_name", "message", "traceback"} <= set(saves):
-            import sys
-
-            print("--- vLLM worker intervention traceback ---", file=sys.stderr)
-            print(saves.get("traceback", ""), file=sys.stderr)
-            # the message embeds the inner traceback; surface just its final line
             msg = (saves.get("message") or "").strip().splitlines()
-            reason = msg[-1] if msg else saves["type_name"]
-            raise RuntimeError(f"worker intervention: {reason}")
-        if "saved" in saves:
-            v = saves["saved"]
-        elif len(saves) == 1:
-            v = next(iter(saves.values()))
-        else:
-            raise RuntimeError(f"unexpected async save keys: {list(saves)}")
+            raise RuntimeError(
+                f"worker intervention: {msg[-1] if msg else saves['type_name']}"
+            )
+        v = saves["saved"] if "saved" in saves else next(iter(saves.values()))
         return v.detach().float().cpu()
 
     def teardown(self, model) -> None:
