@@ -17,6 +17,14 @@ def test_cells_registered_by_method_family_backend():
     assert "gpt2" in families_for("logit_lens", "hf")
 
 
+def test_llama_logit_lens_registered_as_own_family():
+    # second family, same methodology -> separate cells, grouped under family="llama"
+    assert ("logit_lens", "llama", "hf") in CELLS
+    assert ("logit_lens", "llama", "vllm_async") in CELLS
+    fams = families_for("logit_lens", "hf")
+    assert {"gpt2", "llama"} <= set(fams)
+
+
 def test_cell_accepts_variances():
     fn = get_cell("logit_lens", "gpt2", "hf")
     params = inspect.signature(fn).parameters

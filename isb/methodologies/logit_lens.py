@@ -23,13 +23,29 @@ def _untuple(x):
     return x[0] if isinstance(x, tuple) else x
 
 
-def _lens_proxy(blocks, norm, head, *, layers, unembed, last_fn):
+def _resid(out, how):
+    """The residual stream at a block's output boundary.
+
+    `plain`: the block output (or `[0]` of its tuple) — correct for GPT-2 and for any HF block,
+    which already carries the full residual stream.
+    `fused`: `hidden + residual`. vLLM's Llama/RMSNorm decoder layers return `(hidden, residual)`
+    (fused-residual RMSNorm) and the true residual stream is their SUM — vLLM computes exactly
+    `hidden + residual` for its own aux hidden states (vllm .../models/llama.py:425). Reading only
+    `[0]` (as `plain` does) drops the accumulated residual -> silently wrong logits. Falls back to
+    `plain` when the output is not a 2-tuple, so it is safe on HF.
+    """
+    if how == "fused" and isinstance(out, tuple) and len(out) >= 2:
+        return out[0] + out[1]
+    return _untuple(out)
+
+
+def _lens_proxy(blocks, norm, head, *, layers, unembed, last_fn, residual="plain"):
     """Build the stacked logit-lens proxy. Runs INSIDE a trace (no trace-open here)."""
     idx = range(len(blocks)) if layers == "all" else layers
     rows = []
-    with torch.no_grad():                              # forward-only; required on vLLM, harmless on HF
+    with torch.no_grad():                                   # forward-only; required on vLLM, harmless on HF
         for i in idx:
-            normed = norm(_untuple(blocks[i].output))  # residual -> final norm
+            normed = norm(_resid(blocks[i].output, residual))  # residual stream -> final norm
             logits = (
                 F.linear(normed, head.weight)           # portable: bypass lm_head.forward guard
                 if unembed == "weight"
@@ -52,4 +68,25 @@ def logit_lens_gpt2_vllm(be, model, prompts, *, layers="all", unembed="weight"):
     return be.run(model, prompts, lambda: _lens_proxy(
         model.transformer.h, model.transformer.ln_f, model.lm_head,
         layers=layers, unembed=unembed, last_fn=be.last,
+    ))
+
+
+# --- Llama family: same methodology, the model's OWN module names (§12.1 explicit-per-family).
+# `transformer.h`/`ln_f` (GPT-2) become `model.layers`/`model.norm` (Llama); the final norm is
+# RMSNorm not LayerNorm. _lens_proxy is reused verbatim — the reuse the design calls "bottom-up".
+@cell("logit_lens", family="llama", backend="hf")
+def logit_lens_llama_hf(be, model, prompts, *, layers="all", unembed="module", residual="plain"):
+    return be.run(model, prompts, lambda: _lens_proxy(
+        model.model.layers, model.model.norm, model.lm_head,
+        layers=layers, unembed=unembed, last_fn=be.last, residual=residual,
+    ))
+
+
+@cell("logit_lens", family="llama", backend="vllm_async")
+def logit_lens_llama_vllm(be, model, prompts, *, layers="all", unembed="weight", residual="fused"):
+    # residual="fused" is the backend-aware default: vLLM Llama uses fused-residual RMSNorm, so the
+    # residual stream is hidden+residual. residual="plain" (naively ported from GPT-2) is SILENTLY_WRONG.
+    return be.run(model, prompts, lambda: _lens_proxy(
+        model.model.layers, model.model.norm, model.lm_head,
+        layers=layers, unembed=unembed, last_fn=be.last, residual=residual,
     ))

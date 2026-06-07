@@ -35,3 +35,68 @@ per-cell `run_cell` for the sweep.
 real vocab before comparing, or padding positions skew argmax/max-abs and a correct
 result is mislabeled `SILENTLY_WRONG`. This near-miss is why the equivalence oracle +
 honest verification is load-bearing (§8.1). → `isb/oracle/equivalence.py`.
+
+## Smoke tier — steering (ActAdd), GPT-2, HF vs vLLM-async (2026-06)
+
+First *write* methodology — adds `α·‖resid‖·unit(W[" Rome"])` into block 8's residual,
+reads the final-layer portable-unembed next-token distribution. `α=0` is the unsteered
+baseline; the effect-size guard measured **HF unsteered vs steered top1=0.00 / TV=0.994**,
+so the write genuinely moves the control and the verdicts below are not vacuous. Result
+(`results/smoke_steering.txt`):
+
+| workload | hf | vllm_async | note |
+|---|---|---|---|
+| `steering` (`mode=inplace`, `hidden[:] += vec`) | SUPPORTED | **ERROR** | vLLM: *"Inplace update to inference tensor outside InferenceMode is not allowed."* |
+| `steering` (`mode=replace`, whole-tuple new tensor) | SUPPORTED | **SUPPORTED** | top1=1.00 / TV=0.000 / maxabs=0.32 — steered logits match HF exactly |
+
+### F-5 — vLLM residual writes: in-place RAISES, replacement WORKS (no silent no-op)
+The idiomatic in-place steering form (`blk.output[0][:] += vec`) raises on vLLM because
+the residual is an inference-mode tensor — a **loud, actionable ERROR** (the message even
+prescribes the fix: clone first), not the dangerous silent no-op `SILENTLY_WRONG` cell we
+were hunting. The whole-tuple replacement form (`blk.output = (resid + vec, *rest)`) builds
+a *new* tensor and is applied faithfully (TV=0.000 vs HF). **Guidance:** on vLLM, do
+activation steering/patching by replacement, never in-place. This is the write analogue of
+the logit-lens `module`-vs-`weight` split (F-2): idiomatic = frontier, portable = supported.
+→ `isb/methodologies/steering.py`.
+
+### F-6 (methodology) — a write cell's verdict needs an effect-size guard
+A backend that silently no-ops a write would score `SUPPORTED` against a control whose own
+output barely moved — a false pass. So a write methodology must first prove the write moves
+the control (here TV=0.994 unsteered-vs-steered) before any `SUPPORTED`/`SILENTLY_WRONG`
+label is trustworthy. The self-calibrating `α·‖resid‖` strength makes this robust across
+layers/models without a hard-coded magnitude. → `scripts/smoke_steering.py` `_effect_size`.
+
+## Smoke tier — logit lens, LLAMA architecture, HF vs vLLM-async (2026-06)
+
+Second family (`HuggingFaceTB/SmolLM2-135M-Instruct`, a `LlamaForCausalLM`; meta-llama is
+gated + tokenizer not in local cache). The per-family control is HF-llama, never GPT-2.
+Result (`results/smoke_llama.txt`):
+
+| workload | hf | vllm_async | note |
+|---|---|---|---|
+| `logit_lens` (idiomatic `lm_head(...)`) | SUPPORTED | **ERROR** | `ParallelLMHead.forward` guarded — same frontier as GPT-2 (F-2) |
+| `logit_lens.weight` + `residual=fused` (backend-aware) | SUPPORTED | **SUPPORTED** | top1=0.97 / TV=0.017 — matches HF |
+| `logit_lens.weight` + `residual=plain` (naive GPT-2 port) | SUPPORTED | **SILENTLY_WRONG** | top1=0.13 / TV=0.897 / maxabs=78.55 |
+
+### F-7 — vLLM-Llama logit lens is SILENTLY_WRONG unless you reconstruct the fused residual ⭐
+**The first `SILENTLY_WRONG` cell — the one only the numerical oracle can catch.** The exact
+portable logit-lens that is correct on GPT-2 (read `block.output[0]`, final-norm, weight-matmul;
+F-2 form) returns numerically wrong logits on vLLM-Llama: **top1 agreement 0.13, TV 0.897**, no
+error, no crash. A coverage-only (crash-or-not) benchmark would mislabel this `SUPPORTED`.
+
+Root cause (read from `vllm/model_executor/models/llama.py`): vLLM's Llama uses **fused-residual
+RMSNorm**. Each `LlamaDecoderLayer.forward(...)` returns `(hidden_states, residual)` (`:332`), and
+the actual residual stream at the layer boundary is their **sum** — vLLM itself computes
+`hidden_states + residual` for its aux hidden states (`:425`). The naive readout takes only
+`output[0]` (= `hidden_states`), dropping the accumulated `residual`, so it normalizes half the
+state. HF's Llama adds the residual inside the layer, so `output[0]` already carries the full
+stream → HF is correct; the divergence is purely vLLM's representation.
+
+Fix = the backend-aware `residual="fused"` form (`out[0] + out[1]`), which restores TV=0.017
+(same quality as GPT-2). This is the residual-stream analogue of the `unembed` split (F-2):
+**idiomatic ports → frontier; backend-aware form → supported.** Guidance for the nnsight team
+and users: *on vLLM, reading a fused-residual model's mid-stack residual requires summing
+`(hidden, residual)`; the single-tensor idiom is silently wrong.* This generalizes to any vLLM
+model whose decoder layers use fused-residual RMSNorm (Llama, Mistral, Qwen2, Gemma, …) — a broad
+frontier the GPT-2-only smoke could never have surfaced. → `isb/methodologies/logit_lens.py`
+`_resid`.
