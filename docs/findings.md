@@ -25,12 +25,16 @@ vLLM's `ParallelLMHead.forward()` deliberately raises; its weights are consumed 
 sampler. So the *idiomatic* logit lens (`model.lm_head(...)`) is a genuine frontier
 marker on vLLM. The portable form does `F.linear(normed, lm_head.weight)`, which works.
 
-### F-3 — a worker intervention error can kill the EngineCore
-When the idiomatic workload raised in the worker, a *subsequent* workload on the same
-async engine got `EngineDeadError`. nnsight's deferred-exception mechanism did **not**
-contain this error class. Consequence for the harness: **isolate vLLM cells** (fresh
-engine per workload) so an engine-killer can't poison later cells. → runner uses
-per-cell `run_cell` for the sweep.
+### F-3 — intervention errors are isolated; the engine survives (corrects an earlier claim)
+A worker intervention error (e.g. the guarded `lm_head` call) surfaces as a clean per-cell
+`ERROR` via nnsight's deferred-exception mechanism and does **not** kill the EngineCore. With
+one engine amortized across all cells, an `lm_head`-guard ERROR is immediately followed by a
+`SUPPORTED` cell on the *same* engine (verified by the bench run). An earlier version of this
+note claimed the opposite, generalizing from a single observed `EngineDeadError`; that was a
+misattribution — ordinary intervention errors are contained, so the benchmark amortizes one
+model load across all cells rather than reloading per cell. (Separately: driving one async
+engine with repeated `asyncio.run` calls *does* kill it by closing the loop its background task
+runs on — the benchmark avoids that with a persistent event loop. → `isb/backends/vllm_async.py`.)
 
 ### F-4 (harness, not nnsight) — vLLM pads the vocab
 `ParallelLMHead` pads vocab (50257→50304). The oracle must align the last dim to the

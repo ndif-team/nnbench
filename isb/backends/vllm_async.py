@@ -23,6 +23,32 @@ class VLLMAsyncBackend(Backend):
         # (bf16 for GPT-2). Forcing "float32" matches HF's precision, which is how we separate a
         # precision-degradation (SUPPORTED_DEGRADED) from a true mechanism bug (SILENTLY_WRONG).
         self.dtype = dtype
+        self._loop = None
+
+    def __getstate__(self):
+        # The build closure captures `self.last` (a bound method), so this backend is serialized into
+        # the mediator sent to the worker. The persistent event loop is not picklable (it holds a
+        # `_contextvars.Context`) and the worker never needs it — drop it from the pickle.
+        state = self.__dict__.copy()
+        state["_loop"] = None
+        return state
+
+    def _run_coro(self, coro):
+        """Drive an async trace on ONE persistent event loop, reused across calls. `asyncio.run`
+        creates AND closes a fresh loop each call, which kills the AsyncLLM engine's background loop
+        and makes the next call raise EngineDeadError — fatal once the engine is amortized across
+        warmup + timed trials (the perf path). So we keep one loop alive for the backend's lifetime.
+
+        We still run each call inside a FRESH copied contextvars Context — exactly what `asyncio.run`
+        does (`copy_context().run(...)`). Without this, `run_until_complete` executes in the live
+        current context and nnsight's mediator serialization captures a `_contextvars.Context`
+        (`TypeError: cannot pickle '_contextvars.Context'`). The copy isolates each call's context."""
+        import asyncio
+        import contextvars
+
+        if self._loop is None or self._loop.is_closed():
+            self._loop = asyncio.new_event_loop()
+        return contextvars.copy_context().run(self._loop.run_until_complete, coro)
 
     def load(self, repo: str, gpu_memory_utilization: float = 0.2):
         from nnsight.modeling.vllm import VLLM
@@ -37,10 +63,7 @@ class VLLMAsyncBackend(Backend):
         import asyncio
 
         if isinstance(prompts, (list, tuple)) and len(prompts) > 1:
-            # fail loud rather than silently scoring 1 prompt vs HF's N (-> false mislabel)
-            raise NotImplementedError(
-                "vllm_async multi-prompt (continuous batching) not wired yet"
-            )
+            return self.run_batched(model, prompts, build)        # N prompts -> continuous batching
         prompt = prompts[0] if isinstance(prompts, (list, tuple)) else prompts
 
         async def _go():
@@ -52,7 +75,46 @@ class VLLMAsyncBackend(Backend):
                 last = output
             return self._extract(last)
 
-        return asyncio.run(_go())
+        return self._run_coro(_go())
+
+    def run_batched(self, model, prompts, build):
+        """Batched throughput path: N prompts in ONE async trace via per-prompt `tracer.invoke`
+        (the documented multi-invoke pattern). Each invoke runs `build()` on its own prompt's
+        activations and stores it in a shared parent-scope list; after draining, the per-prompt
+        outputs are concatenated along the batch dim so they match HF's `[..., N, vocab]` and the
+        oracle can compare per prompt (throughput = N / batch-latency).
+
+        Depends on the upstream async multi-prompt submission. Until that lands the engine submits
+        only the first invoke, so this returns fewer than N per-prompt outputs and the cell is
+        flagged by the oracle — surfaced, not silently passed.
+        """
+        import asyncio
+
+        import torch
+
+        n = len(prompts)
+
+        async def _go():
+            with model.trace(temperature=0.0, top_p=1, max_tokens=1) as tracer:
+                rows = [None] * n
+                rows = rows.save()  # noqa: F841 — parent-scope list; "rows" is the saves key
+                for i, p in enumerate(prompts):
+                    with tracer.invoke(p):
+                        rows[i] = build()
+            last = None
+            async for output in tracer.backend:
+                last = output
+            collected = self._extract_list(last)                  # ordered, len n (None where not produced)
+            mats = [r.detach().float().cpu() for r in collected if r is not None]
+            if not mats:
+                raise RuntimeError(
+                    "vllm_async batched produced no per-prompt outputs "
+                    "(awaiting the upstream async multi-prompt submission fix)"
+                )
+            # each per-prompt output is [..., 1, vocab]; concat on the batch dim -> [..., N, vocab]
+            return torch.cat(mats, dim=-2) if mats[0].dim() >= 2 else torch.stack(mats)
+
+        return self._run_coro(_go())
 
     def patch(self, model, clean_prompt, corrupted_prompt, capture, patch):
         import asyncio
@@ -76,7 +138,7 @@ class VLLMAsyncBackend(Backend):
                 last2 = output
             return self._extract(last2)
 
-        return asyncio.run(_go())
+        return self._run_coro(_go())
 
     def last(self, t):
         return t[-1:, :]                          # flat [tokens, vocab] -> [1, vocab]
@@ -97,6 +159,35 @@ class VLLMAsyncBackend(Backend):
         v = saves["saved"] if "saved" in saves else next(iter(saves.values()))
         return v.detach().float().cpu()
 
+    def _extract_list(self, out):
+        """Like `_extract` but the saved value is the batched per-prompt list (`rows`); return it as
+        a Python list (one entry per invoke; entries may be None if not produced)."""
+        if not hasattr(out, "saves"):
+            # nnsight attaches `.saves` only on a finished output whose saves were collected. A
+            # multi-invoke batched trace currently submits fewer requests than invokes upstream, so
+            # the list is never collected — surface that clearly rather than as a raw AttributeError.
+            raise RuntimeError(
+                "vllm_async batched: finished output carried no saves — the engine submitted fewer "
+                "requests than invokes (awaiting the upstream async multi-prompt submission fix)"
+            )
+        saves = out.saves
+        while (
+            isinstance(saves, dict)
+            and len(saves) == 1
+            and isinstance(next(iter(saves.values())), dict)
+            and not {"type_name", "message", "traceback"} <= set(saves)
+        ):
+            saves = next(iter(saves.values()))
+        if isinstance(saves, dict) and {"type_name", "message", "traceback"} <= set(saves):
+            msg = (saves.get("message") or "").strip().splitlines()
+            raise RuntimeError(
+                f"worker intervention: {msg[-1] if msg else saves['type_name']}"
+            )
+        v = saves.get("rows") if isinstance(saves, dict) and "rows" in saves else (
+            next(iter(saves.values())) if isinstance(saves, dict) else saves
+        )
+        return list(v) if isinstance(v, (list, tuple)) else [v]
+
     def teardown(self, model) -> None:
         import gc
 
@@ -104,6 +195,10 @@ class VLLMAsyncBackend(Backend):
 
         with contextlib.suppress(Exception):
             model.vllm_entrypoint.shutdown()
+        if self._loop is not None and not self._loop.is_closed():   # close the loop AFTER engine shutdown
+            with contextlib.suppress(Exception):
+                self._loop.close()
+            self._loop = None
         with contextlib.suppress(Exception):
             del model
         gc.collect()

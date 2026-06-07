@@ -24,3 +24,30 @@ def print_map(methodology: str, family: str, label: str, repo: str, cells) -> No
             note = c.error or ""
         print(f"{c.backend:<14}{c.state:<22}{lat:<9}{note}")
     print("-" * 86)
+
+
+def print_perf(methodology: str, family: str, label: str, repo: str, cells) -> None:
+    """Performance table (design.md §8.2): latency median±std, peak GPU mem, overhead vs the
+    no-intervention baseline, and throughput where the workload generates it. Only cells that were
+    timed (perf populated) appear."""
+    timed = [c for c in cells if c.perf is not None]
+    if not timed:
+        return
+    print("\n=== Performance ===")
+    title = f"{methodology}  family={family}"
+    if label:
+        title += f"  [{label}]"
+    print(f"task  : {title}")
+    print(f"model : {repo}")
+    print("-" * 86)
+    print(f"{'backend':<14}{'latency (ms)':<20}{'peak GB':<9}{'overhead×':<11}{'throughput':<14}")
+    print("-" * 86)
+    for c in timed:
+        p = c.perf
+        lat = f"{p.median_latency_ms:.1f} ± {p.std_latency_ms:.1f}"
+        gb = f"{p.peak_mem_mb / 1024:.2f}" if p.peak_mem_mb else "-"
+        ov = f"{p.overhead_vs_baseline:.2f}" if p.overhead_vs_baseline is not None else "-"
+        tp = f"{p.throughput:.1f} pr/s" if p.throughput is not None else "-"
+        eager = "  (eager)" if p.enforce_eager else ""
+        print(f"{c.backend:<14}{lat:<20}{gb:<9}{ov:<11}{tp:<14}{eager}")
+    print("-" * 86)

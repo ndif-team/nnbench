@@ -35,6 +35,13 @@ def _capture(blocks, layer, residual):
         return _resid(blocks[layer].output, residual).clone()  # clone -> an independent snapshot
 
 
+def _read_final(blocks, norm, head, residual, last_fn):
+    """The corrupted run's natural final logits — the un-patched baseline (no transplant)."""
+    with torch.no_grad():
+        normed = norm(_resid(blocks[-1].output, residual))
+        return last_fn(F.linear(normed, head.weight))
+
+
 def _patch_and_read(blocks, norm, head, *, layer, clean_act, residual, last_fn):
     """Trace-2 build: replace `layer`'s residual with the clean snapshot, read final logits."""
     with torch.no_grad():
@@ -54,25 +61,24 @@ def _patch_and_read(blocks, norm, head, *, layer, clean_act, residual, last_fn):
     return last_fn(logits)
 
 
-@cell("activation_patching", family="gpt2", backend="hf")
-def patch_gpt2_hf(be, model, prompts, *, layer=6, residual="plain"):
+def _patch_cell(be, model, prompts, *, layer, residual, patch):
     clean, corrupted = prompts
     h, ln_f, head = model.transformer.h, model.transformer.ln_f, model.lm_head
+    if not patch:                                        # baseline: corrupted run, no transplant
+        return be.run(model, [corrupted], lambda: _read_final(h, ln_f, head, residual, be.last))
     return be.patch(
         model, clean, corrupted,
         capture=lambda: _capture(h, layer, residual),
         patch=lambda clean_act: _patch_and_read(
             h, ln_f, head, layer=layer, clean_act=clean_act, residual=residual, last_fn=be.last),
     )
+
+
+@cell("activation_patching", family="gpt2", backend="hf")
+def patch_gpt2_hf(be, model, prompts, *, layer=6, residual="plain", patch=True):
+    return _patch_cell(be, model, prompts, layer=layer, residual=residual, patch=patch)
 
 
 @cell("activation_patching", family="gpt2", backend="vllm_async")
-def patch_gpt2_vllm(be, model, prompts, *, layer=6, residual="plain"):
-    clean, corrupted = prompts
-    h, ln_f, head = model.transformer.h, model.transformer.ln_f, model.lm_head
-    return be.patch(
-        model, clean, corrupted,
-        capture=lambda: _capture(h, layer, residual),
-        patch=lambda clean_act: _patch_and_read(
-            h, ln_f, head, layer=layer, clean_act=clean_act, residual=residual, last_fn=be.last),
-    )
+def patch_gpt2_vllm(be, model, prompts, *, layer=6, residual="plain", patch=True):
+    return _patch_cell(be, model, prompts, layer=layer, residual=residual, patch=patch)

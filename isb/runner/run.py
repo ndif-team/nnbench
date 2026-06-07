@@ -18,6 +18,22 @@ from ..states import AppState
 
 
 @dataclass
+class PerfResult:
+    """Performance measurement for one warm cell run (design.md §8.2). Filled by the perf path
+    (warmup + N trials), never by the cheap single-shot correctness path."""
+    median_latency_ms: float
+    std_latency_ms: float
+    min_latency_ms: float
+    n_trials: int
+    warmup: int
+    peak_mem_mb: float
+    throughput: Optional[float] = None            # prompts/s (batched); None for interactive single
+    overhead_vs_baseline: Optional[float] = None  # median / no-intervention-baseline median (ratio)
+    enforce_eager: Optional[bool] = None          # vLLM: True (CUDA graphs forced off) — fairness note
+    notes: str = ""
+
+
+@dataclass
 class CellResult:
     methodology: str
     family: str
@@ -28,6 +44,8 @@ class CellResult:
     error: Optional[str] = None
     metrics: dict = field(default_factory=dict)
     value: Any = None                # cpu tensor; cleared by evaluate() after comparison
+    workload: str = "interactive"    # "interactive" | "batched" — a coverage axis (oracle-checked per regime)
+    perf: Optional["PerfResult"] = None  # filled only by the perf path, only for SUPPORTED*/cells
 
 
 def run_cell(
@@ -72,7 +90,9 @@ def evaluate(cells, control: str = "hf", top1_thresh: float = 0.9, tv_tol: float
 
     groups = defaultdict(list)
     for c in cells:
-        groups[(c.methodology, c.family)].append(c)
+        # group by workload too: batching is a regime that can change correctness, so HF-batched is
+        # the control for vLLM-batched, never HF-interactive.
+        groups[(c.methodology, c.family, c.workload)].append(c)
 
     for group in groups.values():
         ctrl = next((c for c in group if c.backend == control), None)
