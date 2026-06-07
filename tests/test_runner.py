@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch  # noqa: E402
 
-from isb.runner.run import CellResult, evaluate  # noqa: E402
+from isb.runner.run import CellResult, disambiguate_precision, evaluate  # noqa: E402
 from isb.states import AppState  # noqa: E402
 
 
@@ -51,6 +51,34 @@ def test_error_cells_are_not_overwritten():
     evaluate([hf, err])
     assert err.state == AppState.ERROR           # preserved, not rescored
     assert hf.state == AppState.SUPPORTED
+
+
+def test_dtype_control_reclassifies_precision_not_bug():
+    """A near-tie SILENTLY_WRONG that matches the control at the control's dtype -> SUPPORTED_DEGRADED;
+    one that still diverges at the control's dtype stays SILENTLY_WRONG."""
+    ref = torch.zeros(1, 8); ref[0, 3] = 5.0           # control argmax = index 3
+    near = ref.clone(); near[0, 3] = 4.9; near[0, 2] = 4.95   # bf16-ish near-tie: argmax flipped to 2
+    far = torch.zeros(1, 8); far[0, 7] = 9.0            # genuinely different distribution
+
+    degraded = _cell("gpt2", "vllm_async", None); degraded.state = AppState.SILENTLY_WRONG
+    realbug = _cell("gpt2", "vllm_async", None); realbug.state = AppState.SILENTLY_WRONG
+    control = _cell("gpt2", "hf", ref); control.state = AppState.SUPPORTED
+
+    # rerun-at-control-dtype: the degraded cell becomes ref-equal at fp32; the real bug stays `far`
+    fp32 = {id(degraded): ref.clone(), id(realbug): far}
+    disambiguate_precision([control, degraded, realbug], ref, lambda c: fp32[id(c)])
+
+    assert degraded.state == AppState.SUPPORTED_DEGRADED
+    assert realbug.state == AppState.SILENTLY_WRONG
+    assert control.state == AppState.SUPPORTED          # control untouched
+
+
+def test_dtype_control_noop_without_control_value():
+    cell = _cell("gpt2", "vllm_async", None); cell.state = AppState.SILENTLY_WRONG
+    called = []
+    disambiguate_precision([cell], None, lambda c: called.append(c) or None)
+    assert cell.state == AppState.SILENTLY_WRONG        # unchanged
+    assert called == []                                 # rerun never invoked
 
 
 def _run_all():

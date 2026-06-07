@@ -94,3 +94,31 @@ def evaluate(cells, control: str = "hf", top1_thresh: float = 0.9, tv_tol: float
     for c in cells:
         c.value = None
     return cells
+
+
+def disambiguate_precision(
+    cells, control_value, rerun_at_control_dtype,
+    control: str = "hf", top1_thresh: float = 0.9, tv_tol: float = 0.05,
+):
+    """Separate a precision degradation from a real bug for `SILENTLY_WRONG` non-control cells.
+
+    The strict oracle flags ANY top1/TV gate failure as `SILENTLY_WRONG`, but a near-tie that only
+    diverges because the backend ran a lower precision than the control is a DEGRADATION, not a bug
+    (e.g. vLLM bf16 vs HF fp32 flipping a near-tie top-1). For each `SILENTLY_WRONG` non-control
+    cell, re-run it at the control's precision via `rerun_at_control_dtype(cell) -> cpu tensor |
+    None`; if that matches `control_value`, relabel the cell `SUPPORTED_DEGRADED`. Mutates
+    `cell.state` / `cell.metrics`. Call AFTER `evaluate`. Returns `cells`.
+    """
+    if control_value is None:
+        return cells
+    for c in cells:
+        if c.backend == control or c.state != AppState.SILENTLY_WRONG:
+            continue
+        ctrl_dtype_value = rerun_at_control_dtype(c)
+        if ctrl_dtype_value is None:
+            continue
+        m = compare(control_value, ctrl_dtype_value)
+        c.metrics["control_dtype_tv"] = round(m["tv"], 4)
+        if is_equivalent(m, top1_thresh, tv_tol):
+            c.state = AppState.SUPPORTED_DEGRADED  # matched at the control's precision -> precision, not a bug
+    return cells

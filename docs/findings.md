@@ -101,4 +101,23 @@ The two-trace patch matches HF at fp32 (top1=1.00, TV=0.0006); at vLLM's default
 top-1 flips (top1=0.00) with TV=0.083 — a near-tie precision effect, so `SUPPORTED_DEGRADED`, not
 `SILENTLY_WRONG`. The strict gate alone can't tell these apart, so the smoke re-runs the failing
 backend at the control's dtype: matches → `SUPPORTED_DEGRADED`, persists → `SILENTLY_WRONG`.
-→ `scripts/smoke_patching.py` (dtype control), vLLM `dtype` knob.
+→ `scripts/smoke_patching.py` (dtype control), vLLM `dtype` knob. Shared helper:
+`isb/runner/disambiguate_precision`.
+
+## Smoke tier — ablation (zero-knockout), GPT-2, HF vs vLLM-async (2026-06)
+
+Zero a submodule's output at block 6 (whole-tuple replacement) and read the next-token distribution.
+Effect-size guard (HF un-ablated vs ablated): `mlp` top1=1.00/TV=0.115 (WEAK — knocking out one mid
+MLP barely moves the top-1, so this cell mostly measures baseline backend precision), `attn`
+top1=0.00/TV=0.100 (flips the top-1 — a substantive ablation). Result (`results/smoke_ablation.txt`):
+
+| workload | hf | vllm_async | note |
+|---|---|---|---|
+| ablation `target=mlp` | SUPPORTED | **SUPPORTED_DEGRADED** | bf16 top1=1.00/TV=0.081; fp32 matches HF |
+| ablation `target=attn` | SUPPORTED | **SUPPORTED_DEGRADED** | bf16 top1=1.00/TV=0.061; fp32 matches HF |
+
+### F-9 — ablation ports to vLLM; default bf16 is a near-tie precision divergence
+The replacement-form knockout is applied faithfully on vLLM (matches HF at fp32, top-1 agrees). At
+default bf16 the ablated distribution diverges from HF-fp32 by TV≈0.06–0.08 — the same precision
+near-tie as patching (F-8), resolved to `SUPPORTED_DEGRADED` by the dtype control. In-place zeroing
+would raise on vLLM (F-5); the cell uses replacement. → `isb/methodologies/ablation.py`.

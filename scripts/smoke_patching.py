@@ -25,10 +25,9 @@ sys.path.insert(0, str(ROOT))
 import isb.methodologies  # noqa: F401,E402  (registers the cells)
 from isb.backends import HFBackend, VLLMAsyncBackend  # noqa: E402
 from isb.methodologies.logit_lens import _resid  # noqa: E402
-from isb.oracle.equivalence import compare, is_equivalent  # noqa: E402
+from isb.oracle.equivalence import compare  # noqa: E402
 from isb.report import print_map  # noqa: E402
-from isb.runner import evaluate, run_cell  # noqa: E402
-from isb.states import AppState  # noqa: E402
+from isb.runner import disambiguate_precision, evaluate, run_cell  # noqa: E402
 
 METHOD = "activation_patching"
 FAMILY = "gpt2"
@@ -75,7 +74,6 @@ def main():
                 run_cell(METHOD, FAMILY, name, impl, REPO, PROMPTS, params=params, label=label)
             )
         hf_cell = next((c for c in cells if c.backend == "hf"), None)
-        vllm_cell = next((c for c in cells if c.backend == "vllm_async"), None)
         hf_val = hf_cell.value if hf_cell is not None else None  # keep: evaluate() clears .value
 
         if unpatched is not None and hf_val is not None:
@@ -86,26 +84,11 @@ def main():
                   f"top1={eff['top1_agree']:.2f} tv={eff['tv']:.3f} -> {verdict}")
 
         evaluate(cells, control="hf")  # strict oracle: SUPPORTED or SILENTLY_WRONG
-
-        # Dtype control: a strict gate-failure may be PRECISION (vLLM default bf16 vs HF fp32), not a
-        # mechanism bug. Re-run vLLM at fp32; if it then matches HF, the bf16 divergence is precision
-        # -> SUPPORTED_DEGRADED, not SILENTLY_WRONG. This is the disambiguation a fair cross-backend
-        # oracle needs (F-8); without it, precision is mislabeled as a correctness bug.
-        if vllm_cell is not None and vllm_cell.state == AppState.SILENTLY_WRONG and hf_val is not None:
-            print(f"[dtype control | {label}] vLLM failed strict gate; re-checking at fp32 ...")
-            fp32 = run_cell(METHOD, FAMILY, "vllm_async", VLLMAsyncBackend(dtype="float32"),
-                            REPO, PROMPTS, params=params, label=label)
-            if fp32.value is not None:
-                m = compare(hf_val, fp32.value)
-                if is_equivalent(m):
-                    vllm_cell.state = AppState.SUPPORTED_DEGRADED
-                    vllm_cell.metrics["fp32_tv"] = round(m["tv"], 4)
-                    print(f"   vLLM-fp32 vs HF: top1={m['top1_agree']:.2f} tv={m['tv']:.4f} "
-                          f"-> bf16 divergence is PRECISION -> SUPPORTED_DEGRADED")
-                else:
-                    print(f"   vLLM-fp32 vs HF: top1={m['top1_agree']:.2f} tv={m['tv']:.4f} "
-                          f"-> persists in fp32 -> stays SILENTLY_WRONG")
-
+        # dtype control: a strict gate-failure may be bf16-vs-fp32 precision, not a bug (F-8)
+        disambiguate_precision(
+            cells, hf_val,
+            lambda c: run_cell(METHOD, FAMILY, c.backend, VLLMAsyncBackend(dtype="float32"),
+                               REPO, PROMPTS, params=params, label=label).value)
         print_map(METHOD, FAMILY, label, REPO, cells)
 
 
