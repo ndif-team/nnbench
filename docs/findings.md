@@ -100,3 +100,32 @@ and users: *on vLLM, reading a fused-residual model's mid-stack residual require
 model whose decoder layers use fused-residual RMSNorm (Llama, Mistral, Qwen2, Gemma, …) — a broad
 frontier the GPT-2-only smoke could never have surfaced. → `isb/methodologies/logit_lens.py`
 `_resid`.
+
+## Smoke tier — activation patching (causal tracing), GPT-2, HF vs vLLM-async (2026-06)
+
+Cross-prompt write: capture block-L residual from a CLEAN run ("...France...") and transplant it
+into a CORRUPTED run ("...Russia...", a length-matched minimal pair) via **two single-prompt
+traces** (`be.patch`), then read the corrupted run's next-token logits. The two-trace form needs no
+multi-invoke/barrier, which is why it runs on vLLM at all. Result (`results/smoke_patching.txt`,
+layers 3 & 9 identical):
+
+| backend | state | note |
+|---|---|---|
+| hf | SUPPORTED | per-family control; non-vacuity guard TV(unpatched, patched)=0.753 |
+| vllm_async (default bf16) | **SUPPORTED_DEGRADED** | top1=0.00 TV=0.083 vs HF, but vLLM-**fp32** vs HF = top1=1.00 TV=0.0006 |
+
+### F-8 — vLLM activation patching is correct, but default bf16 flips a near-tie top-1 ⭐
+The two-trace patch mechanism **ports faithfully to vLLM**: forced to `dtype="float32"` it matches
+HF to TV=0.0006 / top1=1.00 (essentially bit-identical). But at vLLM's **default bf16** the patched
+next-token's top-1 flips vs HF-fp32 (top1=0.00) while the distribution stays close (TV=0.083) —
+because each backend transplants a residual computed at its *own* precision and the final prediction
+is a near-tie. The honest label is **SUPPORTED_DEGRADED**, not `SILENTLY_WRONG`.
+
+**Methodology lesson (load-bearing):** a strict cross-backend oracle *conflates precision-
+degradation with correctness-bugs* — the bf16 run fails the same gate (top1<0.9) that caught the
+real F-7 bug. The disambiguator is a **dtype control**: re-run the failing backend at the control's
+precision; if it then matches, the divergence was precision (`SUPPORTED_DEGRADED`); if it persists,
+it is a genuine `SILENTLY_WRONG`. Without this control, a benchmark would cry "silent bug" at every
+bf16 near-tie and lose the signal. Contrast the two ⭐ findings: F-7 is FAR (TV=0.897, persists at
+any dtype) = real bug; F-8 is CLOSE (TV=0.083, vanishes at fp32) = precision. → `be.patch` (two
+single-prompt traces), `scripts/smoke_patching.py` (dtype-control disambiguation), vLLM `dtype` knob.

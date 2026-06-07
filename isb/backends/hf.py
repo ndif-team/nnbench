@@ -19,6 +19,14 @@ class HFBackend(Backend):
             saved = build().save()
         return saved.detach().float().cpu()
 
+    def patch(self, model, clean_prompt, corrupted_prompt, capture, patch):
+        with model.trace(clean_prompt):     # trace 1: snapshot the clean activation
+            ca = capture().save()
+        clean_act = ca.detach().float().cpu()
+        with model.trace(corrupted_prompt):  # trace 2: inject it, observe the corrupted run
+            res = patch(clean_act).save()
+        return res.detach().float().cpu()
+
     def last(self, t):
         return t[:, -1, :]                  # [B, S, vocab] -> [B, vocab]
 

@@ -19,6 +19,17 @@ class Backend:
         """Open the trace, call `build()` (-> a proxy) inside it, save, return CPU tensor."""
         raise NotImplementedError
 
+    def patch(self, model, clean_prompt, corrupted_prompt, capture, patch):
+        """Two-trace activation patching: capture a value from a CLEAN single-prompt trace, then
+        inject it in a CORRUPTED single-prompt trace and return the corrupted run's CPU result.
+
+        `capture()` runs inside trace 1 and returns the proxy to snapshot. `patch(clean_cpu_tensor)`
+        runs inside trace 2 (the captured value is a materialized CPU tensor by then) and returns the
+        observed proxy. Both prompts are SINGLE prompts, so this never needs multi-invoke/barrier —
+        which is exactly why it can run on vLLM, where continuous-batch multi-invoke is unsupported.
+        """
+        raise NotImplementedError
+
     def last(self, t):
         """Last-token row of a logits tensor (backend-shape-specific)."""
         raise NotImplementedError

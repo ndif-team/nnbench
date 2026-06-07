@@ -18,12 +18,19 @@ from .base import Backend
 class VLLMAsyncBackend(Backend):
     name = "vllm_async"
 
+    def __init__(self, dtype: str | None = None):
+        # dtype is a real engine-config axis (design L3). Default None -> vLLM's own default
+        # (bf16 for GPT-2). Forcing "float32" matches HF's precision, which is how we separate a
+        # precision-degradation (SUPPORTED_DEGRADED) from a true mechanism bug (SILENTLY_WRONG).
+        self.dtype = dtype
+
     def load(self, repo: str, gpu_memory_utilization: float = 0.2):
         from nnsight.modeling.vllm import VLLM
 
+        kw = {} if self.dtype is None else {"dtype": self.dtype}
         return VLLM(
             repo, mode="async", dispatch=True,
-            gpu_memory_utilization=gpu_memory_utilization,
+            gpu_memory_utilization=gpu_memory_utilization, **kw,
         )
 
     def run(self, model, prompts, build):
@@ -44,6 +51,29 @@ class VLLMAsyncBackend(Backend):
             async for output in tracer.backend:   # with-exit already submitted
                 last = output
             return self._extract(last)
+
+        return asyncio.run(_go())
+
+    def patch(self, model, clean_prompt, corrupted_prompt, capture, patch):
+        import asyncio
+
+        async def _go():
+            # both traces in ONE event loop / coroutine: two sequential single-prompt requests on
+            # the same async engine. Avoids the two-`asyncio.run` two-loop hazard and never needs
+            # multi-invoke (continuous-batch multi-prompt is unsupported here).
+            with model.trace(clean_prompt, temperature=0.0, top_p=1, max_tokens=1) as t1:
+                ca = capture().save()  # noqa: F841 — var name IS the async .saves key
+            last1 = None
+            async for output in t1.backend:
+                last1 = output
+            clean_act = self._extract(last1)        # materialized CPU tensor
+
+            with model.trace(corrupted_prompt, temperature=0.0, top_p=1, max_tokens=1) as t2:
+                res = patch(clean_act).save()  # noqa: F841
+            last2 = None
+            async for output in t2.backend:
+                last2 = output
+            return self._extract(last2)
 
         return asyncio.run(_go())
 
