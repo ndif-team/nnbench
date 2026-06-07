@@ -61,27 +61,36 @@ def run_cell(
 
 
 def evaluate(cells, control: str = "hf", top1_thresh: float = 0.9, tv_tol: float = 0.05):
-    """Score cells of one (methodology, family, params) task across backends.
+    """Score cells against the per-(methodology, family) control (§12.2).
 
-    `control` (HF, same family) is ground truth. A non-control cell that ran is SUPPORTED
-    iff equivalent to the control, else SILENTLY_WRONG; NO_REFERENCE if the control failed.
+    Cells are grouped by (methodology, family) and each group is scored against ITS OWN
+    control cell — so vLLM-Llama is compared to HF-Llama, never to HF-GPT2. A non-control
+    cell that ran is SUPPORTED iff equivalent to its control, else SILENTLY_WRONG;
+    NO_REFERENCE if its control failed.
     """
-    ctrl = next((c for c in cells if c.backend == control), None)
-    refval = ctrl.value if ctrl is not None else None
+    from collections import defaultdict
+
+    groups = defaultdict(list)
     for c in cells:
-        if c.state in (AppState.ERROR, AppState.UNSUPPORTED):
-            continue
-        if c.backend == control:
-            c.state = AppState.SUPPORTED if refval is not None else AppState.NO_REFERENCE
-        elif refval is None:
-            c.state = AppState.NO_REFERENCE
-        else:
-            c.metrics = compare(refval, c.value)
-            c.state = (
-                AppState.SUPPORTED
-                if is_equivalent(c.metrics, top1_thresh, tv_tol)
-                else AppState.SILENTLY_WRONG
-            )
+        groups[(c.methodology, c.family)].append(c)
+
+    for group in groups.values():
+        ctrl = next((c for c in group if c.backend == control), None)
+        refval = ctrl.value if ctrl is not None else None
+        for c in group:
+            if c.state in (AppState.ERROR, AppState.UNSUPPORTED):
+                continue
+            if c.backend == control:
+                c.state = AppState.SUPPORTED if refval is not None else AppState.NO_REFERENCE
+            elif refval is None:
+                c.state = AppState.NO_REFERENCE
+            else:
+                c.metrics = compare(refval, c.value)
+                c.state = (
+                    AppState.SUPPORTED
+                    if is_equivalent(c.metrics, top1_thresh, tv_tol)
+                    else AppState.SILENTLY_WRONG
+                )
     for c in cells:
         c.value = None
     return cells

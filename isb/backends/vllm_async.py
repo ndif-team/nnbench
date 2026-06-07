@@ -29,6 +29,11 @@ class VLLMAsyncBackend(Backend):
     def run(self, model, prompts, build):
         import asyncio
 
+        if isinstance(prompts, (list, tuple)) and len(prompts) > 1:
+            # fail loud rather than silently scoring 1 prompt vs HF's N (-> false mislabel)
+            raise NotImplementedError(
+                "vllm_async multi-prompt (continuous batching) not wired yet"
+            )
         prompt = prompts[0] if isinstance(prompts, (list, tuple)) else prompts
 
         async def _go():
