@@ -2,11 +2,14 @@
 "activation patching / causal tracing").
 
 Cross-prompt write methodology: capture a layer's residual from a CLEAN run, inject it into a
-CORRUPTED run at the same layer, observe the corrupted run's next-token distribution. We use a
-**two-trace** formulation (capture in trace 1, inject in trace 2 via `be.patch`) rather than the
-single-trace two-invoke form, because the two-invoke form needs continuous-batch multi-invoke +
-cross-invoke barriers, which vLLM-async does not support. Two single-prompt traces sidestep that
-entirely, so the methodology is the same shape on both backends and the map is honest.
+CORRUPTED run at the same layer, observe the corrupted run's next-token distribution. We use the
+**two-trace** formulation (capture in trace 1, inject in trace 2 via `be.patch`). This is the
+DOCUMENTED vLLM recipe, not an invention: the canonical single-trace form uses `tracer.barrier(2)`
+to hand the clean value from invoke 1 to invoke 2, but on vLLM the barrier is not shared across
+invokes (cross-invoke dependencies are unsupported — see nnsight VLLM_GUIDE "Activation Patching"
+and docs/developing/barrier-vllm-not-shared.md). Multi-invoke itself IS supported for *independent*
+prompts; it's the cross-invoke value hand-off that isn't. Two separate single-prompt traces
+guarantee ordering and need no barrier, so the methodology is the same shape on both backends.
 
 `clean` and `corrupted` are a length-matched minimal pair (differ at one token), so (a) the residual
 shapes align for replacement and (b) the patch actually changes the corrupted output — without that

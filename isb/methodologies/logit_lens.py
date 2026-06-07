@@ -28,11 +28,12 @@ def _resid(out, how):
 
     `plain`: the block output (or `[0]` of its tuple) — correct for GPT-2 and for any HF block,
     which already carries the full residual stream.
-    `fused`: `hidden + residual`. vLLM's Llama/RMSNorm decoder layers return `(hidden, residual)`
-    (fused-residual RMSNorm) and the true residual stream is their SUM — vLLM computes exactly
-    `hidden + residual` for its own aux hidden states (vllm .../models/llama.py:425). Reading only
-    `[0]` (as `plain` does) drops the accumulated residual -> silently wrong logits. Falls back to
-    `plain` when the output is not a 2-tuple, so it is safe on HF.
+    `fused`: `hidden + residual`. This is **documented intervention-gaps Gap 1.2** (the vLLM dual
+    residual stream): vLLM's Llama/RMSNorm decoder layers return `(hidden, residual)` and the true
+    residual stream is their SUM — vLLM computes exactly `hidden + residual` for its own aux hidden
+    states (vllm .../models/llama.py:425; VLLM_GUIDE "Logit Lens" prescribes `out[0] + out[1]`).
+    Reading only `[0]` (as `plain` does) drops the accumulated residual -> silently wrong logits.
+    Falls back to `plain` when the output is not a 2-tuple, so it is safe on HF.
     """
     if how == "fused" and isinstance(out, tuple) and len(out) >= 2:
         return out[0] + out[1]

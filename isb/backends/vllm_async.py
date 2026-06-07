@@ -59,8 +59,9 @@ class VLLMAsyncBackend(Backend):
 
         async def _go():
             # both traces in ONE event loop / coroutine: two sequential single-prompt requests on
-            # the same async engine. Avoids the two-`asyncio.run` two-loop hazard and never needs
-            # multi-invoke (continuous-batch multi-prompt is unsupported here).
+            # the same async engine. Avoids the two-`asyncio.run` two-loop hazard, and uses two
+            # separate traces (not two invokes) because vLLM does not share a barrier / cross-invoke
+            # value across invokes — the documented patching recipe (VLLM_GUIDE "Activation Patching").
             with model.trace(clean_prompt, temperature=0.0, top_p=1, max_tokens=1) as t1:
                 ca = capture().save()  # noqa: F841 — var name IS the async .saves key
             last1 = None

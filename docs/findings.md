@@ -1,7 +1,18 @@
 # Findings (living)
 
-Real observations the benchmark has surfaced. Each is a candidate row in the
-applicability map and/or a note for the nnsight team.
+Each entry is a row in the applicability map and/or a note for the nnsight team.
+
+> **Source of truth — these are mostly VERIFICATIONS, not discoveries.** The architectural
+> HF↔vLLM intervention gaps are already documented in
+> `nnsight/src/nnsight/modeling/vllm/intervention-gaps/{REPORT.md,VLLM_GUIDE.md}` (13 numbered
+> gaps; PR ndif-team/nnsight#662 further cleaned the docs up). This benchmark's job is to
+> *systematically re-verify* those gaps across a methodology×family×backend matrix with a
+> **numerical-equivalence oracle**, quantify their severity, and flag where the documented
+> patterns themselves are **stale** on the current `dev` branch. Where a finding restates a
+> documented gap, it cites the gap number. The non-redundant contributions are: (1) the
+> oracle-quantified severity per cell, (2) the **dtype-control** protocol that separates a
+> precision degradation from a real correctness bug (F-8), (3) the **effect-size guard** for
+> write methodologies (F-6), and (4) the doc-staleness discrepancies in §"Doc discrepancies".
 
 ## Smoke tier — logit lens, GPT-2, HF vs vLLM-async (2026-06)
 
@@ -49,15 +60,19 @@ so the write genuinely moves the control and the verdicts below are not vacuous.
 | `steering` (`mode=inplace`, `hidden[:] += vec`) | SUPPORTED | **ERROR** | vLLM: *"Inplace update to inference tensor outside InferenceMode is not allowed."* |
 | `steering` (`mode=replace`, whole-tuple new tensor) | SUPPORTED | **SUPPORTED** | top1=1.00 / TV=0.000 / maxabs=0.32 — steered logits match HF exactly |
 
-### F-5 — vLLM residual writes: in-place RAISES, replacement WORKS (no silent no-op)
-The idiomatic in-place steering form (`blk.output[0][:] += vec`) raises on vLLM because
-the residual is an inference-mode tensor — a **loud, actionable ERROR** (the message even
-prescribes the fix: clone first), not the dangerous silent no-op `SILENTLY_WRONG` cell we
-were hunting. The whole-tuple replacement form (`blk.output = (resid + vec, *rest)`) builds
-a *new* tensor and is applied faithfully (TV=0.000 vs HF). **Guidance:** on vLLM, do
-activation steering/patching by replacement, never in-place. This is the write analogue of
-the logit-lens `module`-vs-`weight` split (F-2): idiomatic = frontier, portable = supported.
-→ `isb/methodologies/steering.py`.
+### F-5 — vLLM in-place residual writes raise on `dev` → the documented in-place steer form is STALE
+*(Verifies + corrects intervention-gaps Gap 1.1 / VLLM_GUIDE "Steering".)* The in-place steering
+form raises on vLLM because the residual is an inference-mode tensor:
+*"Inplace update to inference tensor outside InferenceMode is not allowed."* The whole-tuple
+**replacement** form builds a new tensor and is applied faithfully (oracle TV=0.000 vs HF).
+
+This is a **doc-staleness flag, not a new gap**: `VLLM_GUIDE.md` ("Modifying Activations —
+Steering", line ~200) still prescribes the in-place form `model.model.layers[L].output[0][-1,:] +=
+v`, and Gap 1.1 ("in-place mutation corrupts `.save()`") was marked FIXED via clone-on-save — but
+on this `dev` branch / vLLM 0.15.1 the in-place *write* still raises (clone-on-save protects the
+saved copy, not the live inference tensor you write to). My prior memory already noted that doc's
+"wrong in-place form"; PR #662 began cleaning it. **Confirmed guidance:** on vLLM steer/patch by
+*replacement*, never in-place. → `isb/methodologies/steering.py` (smoke `results/smoke_steering.txt`).
 
 ### F-6 (methodology) — a write cell's verdict needs an effect-size guard
 A backend that silently no-ops a write would score `SUPPORTED` against a control whose own
@@ -78,54 +93,66 @@ Result (`results/smoke_llama.txt`):
 | `logit_lens.weight` + `residual=fused` (backend-aware) | SUPPORTED | **SUPPORTED** | top1=0.97 / TV=0.017 — matches HF |
 | `logit_lens.weight` + `residual=plain` (naive GPT-2 port) | SUPPORTED | **SILENTLY_WRONG** | top1=0.13 / TV=0.897 / maxabs=78.55 |
 
-### F-7 — vLLM-Llama logit lens is SILENTLY_WRONG unless you reconstruct the fused residual ⭐
-**The first `SILENTLY_WRONG` cell — the one only the numerical oracle can catch.** The exact
-portable logit-lens that is correct on GPT-2 (read `block.output[0]`, final-norm, weight-matmul;
-F-2 form) returns numerically wrong logits on vLLM-Llama: **top1 agreement 0.13, TV 0.897**, no
-error, no crash. A coverage-only (crash-or-not) benchmark would mislabel this `SUPPORTED`.
+### F-7 — quantifying documented Gap 1.2 (dual residual stream) as a `SILENTLY_WRONG` logit-lens cell ⭐
+**This is documented gap 1.2, not a new finding — the contribution is the oracle severity number.**
+The intervention-gaps REPORT (Gap 1.2) and VLLM_GUIDE ("Logit Lens") already state: vLLM keeps a
+**dual residual stream**, decoder layers return `(hidden_states, residual)`, and *"logit lens,
+steering vectors, activation patching all need to account for the dual-stream format"* — the
+prescribed form is `hs = layers[i].output[0] + layers[i].output[1]`. (Confirmed in source:
+`vllm/model_executor/models/llama.py` layer returns `(hidden, residual)` `:332`; vLLM computes the
+sum for its own aux hidden states `:425`.)
 
-Root cause (read from `vllm/model_executor/models/llama.py`): vLLM's Llama uses **fused-residual
-RMSNorm**. Each `LlamaDecoderLayer.forward(...)` returns `(hidden_states, residual)` (`:332`), and
-the actual residual stream at the layer boundary is their **sum** — vLLM itself computes
-`hidden_states + residual` for its aux hidden states (`:425`). The naive readout takes only
-`output[0]` (= `hidden_states`), dropping the accumulated `residual`, so it normalizes half the
-state. HF's Llama adds the residual inside the layer, so `output[0]` already carries the full
-stream → HF is correct; the divergence is purely vLLM's representation.
-
-Fix = the backend-aware `residual="fused"` form (`out[0] + out[1]`), which restores TV=0.017
-(same quality as GPT-2). This is the residual-stream analogue of the `unembed` split (F-2):
-**idiomatic ports → frontier; backend-aware form → supported.** Guidance for the nnsight team
-and users: *on vLLM, reading a fused-residual model's mid-stack residual requires summing
-`(hidden, residual)`; the single-tensor idiom is silently wrong.* This generalizes to any vLLM
-model whose decoder layers use fused-residual RMSNorm (Llama, Mistral, Qwen2, Gemma, …) — a broad
-frontier the GPT-2-only smoke could never have surfaced. → `isb/methodologies/logit_lens.py`
-`_resid`.
+What the benchmark adds: the **oracle quantifies the severity** a user incurs if they ignore Gap 1.2
+and naively port the single-tensor GPT-2 idiom (`output[0]` only). On vLLM-llama (SmolLM2-135M) that
+naive form is **`SILENTLY_WRONG`: top1=0.13, TV=0.897, maxabs=78.55** — no error, no crash; a
+coverage-only check would mislabel it `SUPPORTED`. The documented fix (`residual="fused"` =
+`out[0]+out[1]`) restores **top1=0.97, TV=0.017** (same quality as GPT-2). The gap is general to any
+fused-residual-RMSNorm vLLM model (Llama/Mistral/Qwen2/Gemma). → `isb/methodologies/logit_lens.py`
+`_resid` (smoke `results/smoke_llama.txt`).
 
 ## Smoke tier — activation patching (causal tracing), GPT-2, HF vs vLLM-async (2026-06)
 
 Cross-prompt write: capture block-L residual from a CLEAN run ("...France...") and transplant it
 into a CORRUPTED run ("...Russia...", a length-matched minimal pair) via **two single-prompt
-traces** (`be.patch`), then read the corrupted run's next-token logits. The two-trace form needs no
-multi-invoke/barrier, which is why it runs on vLLM at all. Result (`results/smoke_patching.txt`,
-layers 3 & 9 identical):
+traces** (`be.patch`), then read the corrupted run's next-token logits. The two-trace form is the
+**documented** vLLM patching recipe — VLLM_GUIDE "Activation Patching" says *"barriers and
+cross-invoke dependencies are not supported... use two separate traces for dependencies"* (the
+canonical single-trace form uses `tracer.barrier(2)`, which is not shared across invokes on vLLM;
+see `docs/developing/barrier-vllm-not-shared.md`). `be.patch` just packages that recipe. Result
+(`results/smoke_patching.txt`, layers 3 & 9 identical):
 
 | backend | state | note |
 |---|---|---|
 | hf | SUPPORTED | per-family control; non-vacuity guard TV(unpatched, patched)=0.753 |
 | vllm_async (default bf16) | **SUPPORTED_DEGRADED** | top1=0.00 TV=0.083 vs HF, but vLLM-**fp32** vs HF = top1=1.00 TV=0.0006 |
 
-### F-8 — vLLM activation patching is correct, but default bf16 flips a near-tie top-1 ⭐
-The two-trace patch mechanism **ports faithfully to vLLM**: forced to `dtype="float32"` it matches
-HF to TV=0.0006 / top1=1.00 (essentially bit-identical). But at vLLM's **default bf16** the patched
-next-token's top-1 flips vs HF-fp32 (top1=0.00) while the distribution stays close (TV=0.083) —
-because each backend transplants a residual computed at its *own* precision and the final prediction
-is a near-tie. The honest label is **SUPPORTED_DEGRADED**, not `SILENTLY_WRONG`.
+### F-8 — a dtype-control protocol that separates precision degradation from a real bug ⭐
+*(The "numbers differ across backends" caveat is documented — REPORT "Key differences", item 5:
+"vLLM and HF use different kernels... Compare intervention effects, not absolute values." The
+contribution here is a concrete protocol to act on it.)* The two-trace patch mechanism **ports
+faithfully to vLLM**: forced to `dtype="float32"` it matches HF to TV=0.0006 / top1=1.00. But at
+vLLM's **default bf16** the patched top-1 flips vs HF-fp32 (top1=0.00) while the distribution stays
+close (TV=0.083) — each backend transplants a residual at its own precision and the prediction is a
+near-tie. Honest label: **SUPPORTED_DEGRADED**, not `SILENTLY_WRONG`.
 
-**Methodology lesson (load-bearing):** a strict cross-backend oracle *conflates precision-
-degradation with correctness-bugs* — the bf16 run fails the same gate (top1<0.9) that caught the
-real F-7 bug. The disambiguator is a **dtype control**: re-run the failing backend at the control's
-precision; if it then matches, the divergence was precision (`SUPPORTED_DEGRADED`); if it persists,
-it is a genuine `SILENTLY_WRONG`. Without this control, a benchmark would cry "silent bug" at every
-bf16 near-tie and lose the signal. Contrast the two ⭐ findings: F-7 is FAR (TV=0.897, persists at
-any dtype) = real bug; F-8 is CLOSE (TV=0.083, vanishes at fp32) = precision. → `be.patch` (two
-single-prompt traces), `scripts/smoke_patching.py` (dtype-control disambiguation), vLLM `dtype` knob.
+**The protocol (the actual contribution):** a strict cross-backend oracle conflates precision with
+correctness — the bf16 run fails the same top1<0.9 gate that caught the real Gap-1.2 bug (F-7). The
+**dtype control** disambiguates: re-run the failing backend at the control's precision; matches →
+`SUPPORTED_DEGRADED` (precision); persists → `SILENTLY_WRONG` (bug). Contrast: F-7 is FAR (TV=0.897,
+dtype-invariant) = real; F-8 is CLOSE (TV=0.083, vanishes at fp32) = precision. This operationalizes
+the REPORT's "compare effects not absolutes" caveat into a verdict rule. → `be.patch`,
+`scripts/smoke_patching.py` (dtype-control), vLLM `dtype` knob.
+
+## Doc discrepancies — VLLM_GUIDE examples that are STALE on `dev` / vLLM 0.15.1
+
+Empirically run against the current `dev` branch; candidates for the PR #662 doc cleanup. Each is a
+case where a documented example would *not run as written*. (Verify before filing — version-sensitive.)
+
+| Doc location | What it shows | What actually happens on `dev` |
+|---|---|---|
+| `VLLM_GUIDE.md` "Logit Lens" (~line 263) | `logits = model.lm_head(normed)` inside the trace | **Raises** `RuntimeError: LMHead's weights should be used in the sampler.` — `ParallelLMHead.forward` is guarded. Use `F.linear(normed, lm_head.weight)` for a per-layer lens, or `model.logits.output` for the final-token logits. |
+| `VLLM_GUIDE.md` "Steering" (~line 200) | `model.model.layers[L].output[0][-1,:] += v` (in-place) | **Raises** `Inplace update to inference tensor outside InferenceMode`. Use whole-tuple replacement (F-5). |
+
+Both reduce to: on `dev`/0.15.1, vLLM activations are inference tensors and `ParallelLMHead.forward`
+is guarded, so the GUIDE's in-place-write and `lm_head(...)`-call examples need updating to the
+replacement / `model.logits` forms. Tested with GPT-2 and SmolLM2-135M (a `LlamaForCausalLM`).
