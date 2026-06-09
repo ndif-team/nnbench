@@ -30,6 +30,20 @@ class Backend:
         """
         raise NotImplementedError
 
+    def attribute(self, model, clean_prompt, corrupt_prompt, acts_of, metric_of, n):
+        """Attribution patching: a first-order linear approximation of activation patching over a
+        clean/corrupt pair. `acts_of(model)` returns the `n` per-layer activation proxies to attribute
+        (called fresh inside each trace, in forward order); `metric_of(model)` returns the scalar
+        metric proxy; `n` is the layer count (passed in so the result lists can be created outside the
+        trace). Returns a CPU `[n]` tensor of `((act_clean - act_corrupt) * grad).sum()` per layer,
+        where `grad = d(metric)/d(act)` on the corrupt run.
+
+        This needs autograd — a clean forward plus a corrupt forward+backward. It is the backend's
+        gradient primitive: HF supports it; vLLM runs in inference mode (its activations are inference
+        tensors with no autograd), so it cannot, and surfaces that as a per-cell ERROR.
+        """
+        raise NotImplementedError
+
     def last(self, t):
         """Last-token row of a logits tensor (backend-shape-specific)."""
         raise NotImplementedError

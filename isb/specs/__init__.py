@@ -3,6 +3,7 @@ replaces a former `scripts/smoke_*.py`."""
 from .ablation import ablation_gpt2
 from .activation_patching import activation_patching_gpt2
 from .attention_pattern import attention_pattern_gpt2
+from .attribution_patching import attribution_patching_gpt2
 from .logit_lens import logit_lens_gpt2, logit_lens_llama
 from .steering import steering_gpt2
 
@@ -15,6 +16,7 @@ SPECS = {
         activation_patching_gpt2,
         ablation_gpt2,
         attention_pattern_gpt2,
+        attribution_patching_gpt2,
     )
 }
 

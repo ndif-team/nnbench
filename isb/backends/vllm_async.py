@@ -140,6 +140,24 @@ class VLLMAsyncBackend(Backend):
 
         return self._run_coro(_go())
 
+    def attribute(self, model, clean_prompt, corrupt_prompt, acts_of, metric_of, n=None):
+        """vLLM activations are inference-mode tensors with no autograd, so attribution patching
+        cannot run. We attempt `requires_grad_(True)` on the corrupt run's residuals: it raises in the
+        worker (`Setting requires_grad=True on inference tensor ...`) and surfaces as a clean per-cell
+        ERROR. Deliberately FORWARD-ONLY — no `.backward()` over the async path — so it fails fast
+        with no hang risk; the point is to record that the `grad` primitive is unavailable on vLLM."""
+        async def _go():
+            with model.trace(corrupt_prompt, temperature=0.0, top_p=1, max_tokens=1) as tracer:
+                acts = acts_of(model)
+                for a in acts:
+                    a.requires_grad_(True)            # raises: inference tensor, no autograd
+                probe = acts[0].save()  # noqa: F841 — never meaningfully reached; the above raises
+            last = None
+            async for output in tracer.backend:
+                last = output
+            return self._extract(last)                # surfaces the worker's requires_grad error
+        return self._run_coro(_go())
+
     def last(self, t):
         return t[-1:, :]                          # flat [tokens, vocab] -> [1, vocab]
 

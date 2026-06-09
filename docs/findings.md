@@ -145,3 +145,26 @@ attention) that computes attention implicitly and never materializes the probabi
 no `attention_interface` op — so the `.source` read raises (`AttributeError`, surfaced as a clean
 per-cell `ERROR`). This is an architectural limit of the serving backend, not a missing nnsight
 feature: there is no probability matrix to read on the vLLM path. → `isb/methodologies/attention_pattern.py`.
+
+## Smoke tier — attribution patching, GPT-2, HF vs vLLM-async (2026-06)
+
+Gradient-based linear approximation of activation patching: one clean forward, one corrupt
+forward+backward, attribution per layer = `((resid_clean - resid_corrupt) * grad_corrupt).sum()`,
+metric = `logit[" Paris"] - logit[" Moscow"]` on the corrupt run (length-matched France/Russia pair,
+portable unembed). New backend primitive `be.attribute` (clean trace + corrupt trace with
+`metric.sum().backward()`). Result (`isb/specs/attribution_patching.py`):
+
+| workload | hf | vllm_async | note |
+|---|---|---|---|
+| attribution `residual=plain` | SUPPORTED (overhead 3.4× fwd) | **ERROR** | `Inference tensors cannot be saved for backward … created in inference mode` |
+
+### F-11 — gradient-based attribution is HF-only; vLLM is inference-mode (no autograd)
+This is the `grad` frontier — a whole class of methods (attribution patching, edge attribution
+patching, any gradient saliency) is HF-only. HF runs the forward with autograd, so
+`requires_grad_` + `with metric.sum().backward(): act.grad` works and the per-layer attribution is
+produced (overhead ≈3.4× a single forward: clean fwd + corrupt fwd + backward). vLLM creates
+activations under `torch.inference_mode()`, so any attempt to track them for backward raises
+(`Inference tensors cannot be saved for backward`), surfaced as a clean per-cell `ERROR`. The cell's
+`grad=False` baseline (forward-only metric) runs on both backends — it's specifically the backward
+that vLLM cannot do. → `isb/methodologies/attribution_patching.py`, `isb/backends/{hf,vllm_async}.py`
+(`be.attribute`).
