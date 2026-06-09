@@ -125,3 +125,23 @@ The replacement-form knockout is applied faithfully on vLLM (matches HF at fp32,
 default bf16 the ablated distribution diverges from HF-fp32 by TV≈0.06–0.08 — the same precision
 near-tie as patching (F-8), resolved to `SUPPORTED_DEGRADED` by the dtype control. In-place zeroing
 would raise on vLLM (F-5); the cell uses replacement. → `isb/methodologies/ablation.py`.
+
+## Smoke tier — attention-pattern read, GPT-2, HF vs vLLM-async (2026-06)
+
+Read the post-softmax attention probability matrix for the last query token across all heads of every
+layer, via `.source` (a block's `.output` is the value-weighted result, not the probabilities). HF
+eager exposes the weights as `attn.source.attention_interface_0.output[1]` (`[B, heads, q, k]`); the
+cell emits `log(A)` for the last-query row so the oracle's softmax recovers the true attention
+distribution. Result (`isb/specs/attention_pattern.py`):
+
+| workload | hf | vllm_async | note |
+|---|---|---|---|
+| attention-pattern `layers=all` | SUPPORTED | **ERROR** | `AttributeError: 'SourceEnvoy' has no attribute 'attention_interface_0'` |
+
+### F-10 — reading attention weights is HF-only; vLLM's paged attention exposes no probability matrix
+This is the `attn-weights` frontier. HF eager computes `attn_output, attn_weights = attention_interface(...)`,
+so `.source.attention_interface_0` returns the matrix. vLLM runs a different forward (paged/flash
+attention) that computes attention implicitly and never materializes the probability matrix, and has
+no `attention_interface` op — so the `.source` read raises (`AttributeError`, surfaced as a clean
+per-cell `ERROR`). This is an architectural limit of the serving backend, not a missing nnsight
+feature: there is no probability matrix to read on the vLLM path. → `isb/methodologies/attention_pattern.py`.
