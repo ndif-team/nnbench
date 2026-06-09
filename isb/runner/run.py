@@ -78,32 +78,45 @@ def run_cell(
             backend_impl.teardown(model)
 
 
-def evaluate(cells, control: str = "hf", top1_thresh: float = 0.9, tv_tol: float = 0.05):
+def evaluate(cells, control: str = "hf", top1_thresh: float = 0.9, tv_tol: float = 0.05,
+             ref_override=None):
     """Score cells against the per-(methodology, family) control (§12.2).
 
     Cells are grouped by (methodology, family) and each group is scored against ITS OWN
     control cell — so vLLM-Llama is compared to HF-Llama, never to HF-GPT2. A non-control
     cell that ran is SUPPORTED iff equivalent to its control, else SILENTLY_WRONG;
     NO_REFERENCE if its control failed.
+
+    When `ref_override` is given (a cpu tensor) it is THE reference for every group, and EVERY
+    cell — the control backend included — is scored against it rather than the control being
+    auto-passed. The batched workload needs this: its ground truth is each prompt's own
+    single-prompt forward, not a same-backend padded batch. A single padded forward shifts a
+    model's learned absolute position embeddings (GPT-2) on the padded rows, so HF-batched is not
+    self-consistent and is an invalid per-prompt control — scoring it against the per-prompt
+    reference correctly flags that (and confirms vLLM, which runs each prompt as its own unpadded
+    request, is right). The reference itself is built per-prompt on HF in `driver._batched_reference`.
     """
     from collections import defaultdict
 
     groups = defaultdict(list)
     for c in cells:
-        # group by workload too: batching is a regime that can change correctness, so HF-batched is
-        # the control for vLLM-batched, never HF-interactive.
+        # group by workload too: batching can change correctness, so a batched cell is scored only
+        # against its own batched workload group, never mixed with interactive.
         groups[(c.methodology, c.family, c.workload)].append(c)
 
     for group in groups.values():
-        ctrl = next((c for c in group if c.backend == control), None)
-        refval = ctrl.value if ctrl is not None else None
+        if ref_override is not None:
+            refval, external = ref_override, True
+        else:
+            ctrl = next((c for c in group if c.backend == control), None)
+            refval, external = (ctrl.value if ctrl is not None else None), False
         for c in group:
             if c.state in (AppState.ERROR, AppState.UNSUPPORTED):
                 continue
-            if c.backend == control:
-                c.state = AppState.SUPPORTED if refval is not None else AppState.NO_REFERENCE
-            elif refval is None:
+            if refval is None:
                 c.state = AppState.NO_REFERENCE
+            elif c.backend == control and not external:
+                c.state = AppState.SUPPORTED   # same-backend control IS the reference by definition
             else:
                 c.metrics = compare(refval, c.value)
                 c.state = (

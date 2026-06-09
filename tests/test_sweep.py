@@ -107,15 +107,27 @@ def test_oracle_scores_per_task_on_warm_output():
     assert by[("vllm_async", "b")].state == AppState.SUPPORTED  # vLLM "b" == HF "b" -> equivalent
 
 
-def test_batched_oracle_catches_per_prompt_divergence():
-    """Batching is a coverage axis: the oracle must compare per-prompt under batching and flag a
-    single diverging prompt as SILENTLY_WRONG (not measure throughput blind to correctness)."""
-    hf_batch = torch.cat([_onehot(1), _onehot(2), _onehot(3)], dim=0)    # [3, V]
-    vllm_batch = hf_batch.clone(); vllm_batch[1] = _onehot(7)[0]          # prompt 1 diverges
+def test_batched_oracle_scores_against_per_prompt_reference_not_padded_batch():
+    """Batching is a coverage axis, and a single padded batch is NOT a valid per-prompt reference
+    for absolute-position models: left-padding shifts the position embeddings on the padded rows, so
+    a backend's own batched output can disagree with its per-prompt-interactive result. The oracle
+    must therefore score EVERY batched cell — the HF control included — against the per-prompt
+    reference (the cell run on each prompt alone), not auto-pass HF-batched.
+
+    Fixture: each cell returns a per-prompt row for a 1-element prompt list (the reference is the
+    concat of those), and a *different* output for the full batch. HF-batched diverges from its own
+    per-prompt truth on one prompt (the position-shift effect) and must be flagged; vLLM runs each
+    prompt as its own unpadded request, so its batched output matches the per-prompt truth and is
+    SUPPORTED. The old oracle, which trusted HF-batched as the control, could catch neither."""
+    per_prompt = {"p1": _onehot(1), "p2": _onehot(2), "p3": _onehot(3)}    # the per-prompt ground truth
+    hf_batched = torch.cat([_onehot(1), _onehot(6), _onehot(3)], dim=0)    # HF padded batch: p2 corrupted
+    vllm_batched = torch.cat([_onehot(1), _onehot(2), _onehot(3)], dim=0)  # vLLM per-request: all correct
 
     def fake_get_cell(methodology, family, backend):
         def fn(impl, model, prompts, **params):
-            return (vllm_batch if backend == "vllm_async" else hf_batch).clone()
+            if len(prompts) == 1:                                  # per-prompt (reference + interactive)
+                return per_prompt[prompts[0]].clone()
+            return (vllm_batched if backend == "vllm_async" else hf_batched).clone()   # padded batch
         return fn
 
     spec = CellConfig(
@@ -135,8 +147,10 @@ def test_batched_oracle_catches_per_prompt_divergence():
         driver.get_cell, driver.run_cell = orig_gc, orig_rc
 
     by = {(c.backend, c.workload): c for c in results}
-    assert by[("hf", "batched")].state == AppState.SUPPORTED
-    assert by[("vllm_async", "batched")].state == AppState.SILENTLY_WRONG   # one prompt diverged
+    # HF-batched is NOT auto-passed: its padded batch diverges from the per-prompt truth -> flagged.
+    assert by[("hf", "batched")].state == AppState.SILENTLY_WRONG
+    # vLLM-batched matches the per-prompt truth -> SUPPORTED even though it differs from HF-batched.
+    assert by[("vllm_async", "batched")].state == AppState.SUPPORTED
     assert by[("vllm_async", "batched")].perf.throughput is not None        # prompts/s reported
     assert by[("hf", "batched")].perf.throughput is not None
 

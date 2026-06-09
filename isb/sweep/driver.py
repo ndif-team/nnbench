@@ -42,6 +42,25 @@ def _call_cell(name, impl, model, prompts, methodology, family, params):
     return fn(impl, model, prompts, **params)
 
 
+def _batched_reference(name, impl, model, workload, methodology, family, params):
+    """Per-prompt-interactive ground truth for a batched workload: run the cell on each prompt
+    ALONE (a 1-element list -> no padding) and concatenate along the batch dim, with the SAME
+    concat rule the batched cells use. A single padded batch is NOT a valid per-prompt reference
+    for absolute-position models (GPT-2): left-padding shifts the learned position embeddings on
+    the padded rows, so HF-batched disagrees with HF-interactive on the padded prompts. Built on
+    HF (the per-family control) while its model is loaded; consumed by `evaluate(ref_override=)`."""
+    import torch
+
+    mats = [
+        _call_cell(name, impl, model, [p], methodology, family, params)
+        for p in workload.prompts
+    ]
+    mats = [m for m in mats if m is not None]
+    if not mats:
+        return None
+    return torch.cat(mats, dim=-2) if mats[0].dim() >= 2 else torch.stack(mats)
+
+
 def _throughput(workload, timing):
     if workload.kind == "batched" and timing.median_ms:
         return len(workload.prompts) / (timing.median_ms / 1000.0)   # prompts/s
@@ -63,7 +82,8 @@ def _fp32_rerun(spec, params, workload):
 def run_sweep(spec, backends=("hf", "vllm_async"), backend_factory=None):
     backend_factory = backend_factory or _default_backend
     results = []
-    effect = {}   # spec-level effect-size verdict, computed on the HF control (interactive)
+    effect = {}        # spec-level effect-size verdict, computed on the HF control (interactive)
+    batched_refs = {}  # label -> per-prompt-interactive HF reference for the batched oracle
 
     for name in backends:
         impl = backend_factory(name, spec)
@@ -116,6 +136,16 @@ def run_sweep(spec, backends=("hf", "vllm_async"), backend_factory=None):
                             b, p, tv_floor=spec.effect.tv_floor, top1_ceiling=spec.effect.top1_ceiling)
                     except Exception:
                         traceback.print_exc()
+
+                # per-prompt-interactive reference for the batched oracle, built on HF (the control)
+                # while its model is loaded — the same padded HF batch cannot be its own reference.
+                if name == "hf" and workload.kind == "batched":
+                    for params, label in spec.tasks:
+                        try:
+                            batched_refs[label] = _batched_reference(
+                                name, impl, model, workload, spec.methodology, spec.family, params)
+                        except Exception:
+                            traceback.print_exc()
         finally:
             if model is not None:
                 impl.teardown(model)
@@ -126,8 +156,11 @@ def run_sweep(spec, backends=("hf", "vllm_async"), backend_factory=None):
             cells = [c for c in results if c.workload == workload.kind and c.label == label]
             if not cells:
                 continue
-            hf_val = next((c.value for c in cells if c.backend == "hf"), None)
-            evaluate(cells, control="hf")
+            # batched is scored against the per-prompt-interactive reference, not HF-batched (which
+            # is not self-consistent for absolute-position models); interactive keeps HF as control.
+            ref = batched_refs.get(label) if workload.kind == "batched" else None
+            hf_val = ref if ref is not None else next((c.value for c in cells if c.backend == "hf"), None)
+            evaluate(cells, control="hf", ref_override=ref)
             disambiguate_precision(cells, hf_val, _fp32_rerun(spec, params, workload))
             if workload.kind in effect:
                 e = effect[workload.kind]
