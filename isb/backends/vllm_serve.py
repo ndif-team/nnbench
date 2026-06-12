@@ -131,6 +131,14 @@ class VLLMServeBackend(Backend):
             probe = acts[0].save()  # noqa: F841 — never meaningfully reached; the above raises
         return probe.detach().float().cpu()
 
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
+        # Whether a tracer.iter loop survives the serve transport (compiled client-side, iterated
+        # server-side) is its own venue question — surface it honestly rather than guessing.
+        raise NotImplementedError(
+            "generation over serve is a follow-up; the per-step iteration loop is not yet wired "
+            "through the serve transport"
+        )
+
     def last(self, t):
         return t[-1:, :]  # server returns flat [tokens, vocab] (vLLM shape), like vllm_async
 

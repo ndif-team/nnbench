@@ -110,6 +110,7 @@ Status: ✓ = already an nnbench cell. **frontier** = exercises a primitive wher
 | **Activation patching / causal tracing** | copy an activation from a clean run into a corrupted run; measure restoration | `read` `write` `xprompt` | any transformer | ✓ |
 | **Ablation / knockout** | zero- or mean-out a component, measure the damage | `read` `write` | any transformer | ✓ |
 | **Steering / ActAdd** | add a direction into the residual at run time to push behavior | `read` `write` | any decoder-only LM | ✓ |
+| **Generation-time steering** | the steering write applied at EVERY decode step of a greedy generation, per-step logits read | `write` × iteration | any decoder-only LM; vLLM needs the bounded `iter[0:N]` realization | ✓ — **composition confirmed** (write × bounded-iter SUPPORTED on vLLM, top1=1.00 tv=0.000; unbounded = the F-13 frontier marker; F-17) |
 | **Attribution patching** | gradient linear-approx of patching for *every* component in one fwd+bwd | `read` `grad` | any differentiable model | ✓ — **frontier confirmed** (`grad`: vLLM ERROR, F-11) |
 | **Path patching** | patch specific component→component *edges* (not whole activations) | `read` `write` `xprompt` `.source` | any transformer; more plumbing | TODO (composite) |
 
@@ -145,16 +146,19 @@ SUPPORTED/ERROR — F-12..F-16). Attention-pattern read and attribution patching
 The queue is now method-tier breadth over the measured base:
 
 **Tier 1 — cheap deterministic cells, no trained artifact:**
-1. **Generation-time steering** — the serving-shaped workload, now VIABLE on both backends via
-   the bounded-iteration realization (`iter[0:N]`, measured SUPPORTED — F-13); the unbounded
-   form rides along as the frontier marker / flip-detector for the upstream saves-drop fix.
+1. ~~**Generation-time steering**~~ — ✓ **DONE** (2026-06-12, F-17): the write × bounded-iteration
+   composition is SUPPORTED on vLLM exactly (top1=1.00 tv=0.000); the unbounded form rides along
+   as the frontier marker / flip-detector for the upstream saves-drop fix.
 2. **Multi-layer `tracer.cache`** — the fused bulk-cache primitive (READ × breadth + SAVE);
    throughput-bound, the harvesting regime; the one Level-2 fused primitive still unprobed.
-3. **Per-head ablation** — turns the measured derived-site READ into a WRITE methodology
+3. **Generation-time cross-prompt patching** — the OTHER unmeasured composition the causalab
+   audit surfaced (locate's footprint: cross-prompt transplant × iteration); with F-17 in hand,
+   this completes the audit's two flagged predictions.
+4. **Per-head ablation** — turns the measured derived-site READ into a WRITE methodology
    (head-sliced write is still unexercised).
-4. **Direct logit attribution** — `read` (+ `.source` for per-head); exact read-only decomposition
+5. **Direct logit attribution** — `read` (+ `.source` for per-head); exact read-only decomposition
    over the now-measured non-attention `.source` site.
-5. **Family axis for the micro tier** — the Level-0/1 map is (GPT-2)-only; rerun on a
+6. **Family axis for the micro tier** — the Level-0/1 map is (GPT-2)-only; rerun on a
    fused-residual family (SmolLM2/Llama) where boundary denotation differs (F-7).
 
 **Tier 2 — need a (cheap/available) trained artifact:**
@@ -166,4 +170,5 @@ The queue is now method-tier breadth over the measured base:
 **Selection criterion recap:** an ideal new cell is (a) deterministic, (b) needs no trained artifact,
 (c) exercises a Level-2 combination not yet covered by any cell — ideally one where vLLM and HF
 *diverge* — so it adds a real coverage frontier, not just a row. By that test the next cells to build
-are **generation-time steering** and **multi-layer `tracer.cache`**.
+are **multi-layer `tracer.cache`** and **generation-time cross-prompt patching** (generation-time
+steering is done, F-17).

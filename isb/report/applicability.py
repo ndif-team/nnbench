@@ -54,7 +54,8 @@ def print_perf(methodology: str, family: str, label: str, repo: str, cells) -> N
         lat = f"{p.median_latency_ms:.1f} ± {p.std_latency_ms:.1f}"
         gb = f"{p.peak_mem_mb / 1024:.2f}" if p.peak_mem_mb else "-"
         ov = f"{p.overhead_vs_baseline:.2f}" if p.overhead_vs_baseline is not None else "-"
-        tp = f"{p.throughput:.1f} pr/s" if p.throughput is not None else "-"
+        unit = "tok/s" if c.workload == "generation" else "pr/s"
+        tp = f"{p.throughput:.1f} {unit}" if p.throughput is not None else "-"
         eager = "  (eager)" if p.enforce_eager else ""
         print(f"{c.backend:<14}{lat:<20}{gb:<9}{ov:<11}{tp:<14}{eager}")
     print("-" * 86)

@@ -47,6 +47,15 @@ def _call_cell(name, impl, model, prompts, methodology, family, params):
     return fn(impl, model, prompts, **params)
 
 
+def _task_params(workload, params):
+    """A generation workload carries its decode-step count on the Workload (it is the regime axis,
+    same value for every task), so the driver injects it into the cell's params here instead of
+    every task dict duplicating it (and risking divergence from the workload)."""
+    if workload.kind == "generation":
+        return {**params, "new_tokens": workload.new_tokens}
+    return params
+
+
 def _per_prompt_stack(name, impl, model, prompts, methodology, family, params):
     """Run the cell on each prompt ALONE (a 1-element list -> its own trace, no padding) and stack
     the per-prompt outputs along the sample dim. Two uses:
@@ -70,8 +79,13 @@ def _per_prompt_stack(name, impl, model, prompts, methodology, family, params):
 
 
 def _throughput(workload, timing):
-    if workload.kind == "batched" and timing.median_ms:
-        return len(workload.prompts) / (timing.median_ms / 1000.0)   # prompts/s
+    if not timing.median_ms:
+        return None
+    s = timing.median_ms / 1000.0
+    if workload.kind == "batched":
+        return len(workload.prompts) / s     # prompts/s
+    if workload.kind == "generation":
+        return workload.new_tokens / s       # tokens/s (single-prompt greedy decode)
     return None
 
 
@@ -86,11 +100,12 @@ def _fp32_rerun(spec, params, workload):
         model = None
         try:
             model = impl.load(spec.repo)
+            p = _task_params(workload, params)
             if workload.aggregate:
                 return _per_prompt_stack(c.backend, impl, model, workload.prompts,
-                                         spec.methodology, spec.family, params)
+                                         spec.methodology, spec.family, p)
             return _call_cell(c.backend, impl, model, workload.prompts,
-                              spec.methodology, spec.family, params)
+                              spec.methodology, spec.family, p)
         except Exception:
             traceback.print_exc()
             return None
@@ -147,12 +162,13 @@ def dump_control_refs(spec, dirpath):
             for params, label in spec.tasks:
                 try:
                     # match the serve verdict's shape: aggregate-interactive is per-prompt-stacked
+                    p = _task_params(workload, params)
                     if workload.aggregate:
                         val = _per_prompt_stack("vllm_async", impl, model, workload.prompts,
-                                                spec.methodology, spec.family, params)
+                                                spec.methodology, spec.family, p)
                     else:
                         val = _call_cell("vllm_async", impl, model, workload.prompts,
-                                         spec.methodology, spec.family, params)
+                                         spec.methodology, spec.family, p)
                     dump[(workload.kind, label)] = val
                 except Exception:
                     traceback.print_exc()
@@ -212,8 +228,9 @@ def run_sweep(spec, backends=("hf", "vllm_async"), backend_factory=None,
                 base_timing = None
                 try:
                     base_timing, _ = time_cell(
-                        lambda tp=timed_prompts: _call_cell(name, impl, model, tp,
-                                                            spec.methodology, spec.family, spec.baseline.params),
+                        lambda tp=timed_prompts: _call_cell(
+                            name, impl, model, tp, spec.methodology, spec.family,
+                            _task_params(workload, spec.baseline.params)),
                         warmup=spec.warmup, n_trials=spec.n_trials)
                 except Exception:
                     traceback.print_exc()
@@ -221,15 +238,16 @@ def run_sweep(spec, backends=("hf", "vllm_async"), backend_factory=None,
                 for params, label in spec.tasks:
                     try:
                         timing, warm = time_cell(
-                            lambda tp=timed_prompts, p=params: _call_cell(name, impl, model, tp,
-                                                                          spec.methodology, spec.family, p),
+                            lambda tp=timed_prompts, p=_task_params(workload, params): _call_cell(
+                                name, impl, model, tp, spec.methodology, spec.family, p),
                             warmup=spec.warmup, n_trials=spec.n_trials)
                         # aggregate-interactive verdict: re-run the cell per-prompt over the full set so
                         # the oracle scores top-1 agreement as a fraction over N (the timed warm output
                         # above is a single prompt — fine for perf, too thin for a verdict).
                         if workload.aggregate:
                             warm = _per_prompt_stack(name, impl, model, workload.prompts,
-                                                     spec.methodology, spec.family, params)
+                                                     spec.methodology, spec.family,
+                                                     _task_params(workload, params))
                         perf = PerfResult(
                             median_latency_ms=timing.median_ms, std_latency_ms=timing.std_ms,
                             min_latency_ms=timing.min_ms, n_trials=timing.n_trials, warmup=timing.warmup,
@@ -251,14 +269,16 @@ def run_sweep(spec, backends=("hf", "vllm_async"), backend_factory=None,
                             spec.methodology, spec.family, name, label, AppState.ERROR,
                             error=repr(e)[:300], workload=workload.kind))
 
-                # effect-size guard on the control (HF, interactive), reusing the loaded model
-                if name == "hf" and spec.effect is not None and workload.kind == "interactive":
+                # effect-size guard on the control (HF, interactive/generation — the per-trace
+                # regimes a write cell runs in), reusing the loaded model
+                if name == "hf" and spec.effect is not None \
+                        and workload.kind in ("interactive", "generation"):
                     try:
                         b = _call_cell(name, impl, model, workload.prompts, spec.methodology,
-                                       spec.family, spec.effect.baseline_params)
+                                       spec.family, _task_params(workload, spec.effect.baseline_params))
                         p = _call_cell(name, impl, model, workload.prompts, spec.methodology,
-                                       spec.family, spec.effect.perturbed_params)
-                        effect["interactive"] = compute_effect_size(
+                                       spec.family, _task_params(workload, spec.effect.perturbed_params))
+                        effect[workload.kind] = compute_effect_size(
                             b, p, tv_floor=spec.effect.tv_floor, top1_ceiling=spec.effect.top1_ceiling)
                     except Exception:
                         traceback.print_exc()

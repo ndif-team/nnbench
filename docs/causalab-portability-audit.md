@@ -133,6 +133,14 @@ No new Level-0 op was needed — the closed-core claim survived contact with a r
 
 ## 7. What to do with this
 
+> **Addendum (2026-06-12, same day):** the first flagged composition is now MEASURED. The
+> generation-time steering cell (`isb/methodologies/gen_steering.py`, finding F-17) runs the
+> replacement write inside `iter[0:N]` at every decode step: **SUPPORTED on vLLM, exactly**
+> (top1=1.00, tv=0.000 vs the HF control over 8 prompts × 8 steps, at default bf16); the
+> unbounded realization errors as predicted (F-13). The path_steering row in §4 is no longer a
+> prediction — and it is the first method-tier confirmation of §3.6's composes-upward claim.
+> The locate row's composition (cross-prompt transplant × iteration) remains the open one.
+
 - **Macro-tier candidates, in order:** path_steering (= the generation-time steering cell the
   roadmap already ranks first; now doubly motivated), then locate-via-interchange (generation-time
   cross-prompt patching). Together they validate the two unmeasured compositions and turn the §4

@@ -59,6 +59,21 @@ class HFBackend(Backend):
             for L in range(n)
         ])
 
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
+        import torch
+
+        prompt = prompts[0] if isinstance(prompts, (list, tuple)) else prompts
+        it = slice(0, new_tokens) if bounded else slice(None)   # unbounded: stop bound comes from
+        with model.generate(prompt, max_new_tokens=new_tokens,  # max_new_tokens via default_all
+                            do_sample=False) as tracer:
+            rows = list().save()
+            for _step in tracer.iter[it]:
+                rows.append(build_step())
+        if len(rows) != new_tokens:
+            raise RuntimeError(
+                f"hf generation collected {len(rows)} per-step rows, expected {new_tokens}")
+        return torch.cat([r.detach().float().cpu() for r in rows], dim=0)   # [steps, vocab]
+
     def last(self, t):
         return t[:, -1, :]                  # [B, S, vocab] -> [B, vocab]
 

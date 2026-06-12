@@ -44,6 +44,19 @@ class Backend:
         """
         raise NotImplementedError
 
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
+        """Greedy multi-token decode with a per-step intervention: open the generation trace,
+        iterate the decode steps, call `build_step()` once per step inside the loop (it intervenes
+        and returns that step's per-step proxy, e.g. last-token logits), and return the stacked
+        per-step CPU tensor `[new_tokens, ...]`.
+
+        `bounded` selects the iteration REALIZATION (Level 1.5): True = `tracer.iter[0:N]`
+        (carries its own stop bound — the working idiom on vLLM); False = `tracer.iter[:]`
+        (relies on the engine-supplied stop bound — works on HF, drops ALL saves on vLLM, F-13).
+        Single prompt: generation is the per-trace decode regime, not a batching axis.
+        """
+        raise NotImplementedError
+
     def last(self, t):
         """Last-token row of a logits tensor (backend-shape-specific)."""
         raise NotImplementedError

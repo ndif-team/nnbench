@@ -243,3 +243,31 @@ On vLLM the row splits (nnsight `docs/developing/vllm-construct-gaps.md` §3):
 passes a `hook=` kwarg the vLLM execution path rejects. Both are per-cell ERRORs (clear signal, no
 silent wrongness), matching `docs/models/vllm.md`'s "not validated on the vLLM path" caveat — now
 measured rather than presumed.
+
+## Method tier — generation-time steering, GPT-2, HF vs vLLM-async (2026-06-12)
+
+Result (`results/gen_steering_gpt2.txt`), the first **generation-regime** methodology: the
+steering write applied at EVERY decode step of an 8-token greedy generation, per-step logits
+oracle-checked row-per-step over 8 probe prompts (64 rows):
+
+| realization | hf | vllm_async | note |
+|---|---|---|---|
+| bounded `iter[0:N]` | SUPPORTED | **SUPPORTED** | top1=1.00 / TV=0.000 at default bf16 (maxabs=1.18 diagnostic only) |
+| unbounded `iter[:]` | SUPPORTED | **ERROR** | all per-step saves dropped (F-13) — the frontier marker for the upstream fix |
+
+Effect-size on the control: the per-step steer flips EVERY step's top-1 (top1=0.00, TV=0.999) —
+the verdict is maximally non-vacuous. Perf: vLLM 176 ms / 45.4 tok/s vs HF 197 ms / 40.6 tok/s;
+the per-step write costs ≈1.05× over the no-intervention generation baseline.
+
+### F-17 — the WRITE × bounded-iteration composition holds on vLLM, exactly
+First method-tier cell measuring a COMPOSITION of two separately measured inventory rows:
+replacement WRITE (F-5) inside the bounded iteration construct (F-13). The composed statuses
+predict SUPPORTED, and the measurement agrees — *exactly*: per-step logits match HF with
+top1=1.00 / TV=0.000 across the full greedy trajectory, i.e. the steered decode follows the
+identical token path on both backends, with no precision degradation even at vLLM's default
+bf16. This is the first method-tier confirmation of the "statuses compose upward" claim
+(design.md §3.6) — and it converts the causalab portability audit's "composition unmeasured"
+flag on the path_steering footprint into a measured cell
+(`docs/causalab-portability-audit.md` §4). The unbounded realization rides along as predicted
+ERROR (F-13), so the spec doubles as the flip-detector for the upstream saves fix.
+→ `isb/methodologies/gen_steering.py`, `isb/specs/gen_steering.py`.

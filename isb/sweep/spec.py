@@ -15,18 +15,21 @@ from typing import Optional
 class Workload:
     """An input regime. Batching is a coverage axis (it can change correctness), so each workload is
     oracle-checked in its own regime, not just timed."""
-    kind: str                 # "interactive" (N independent prompts) | "batched" (N prompts) | "generation" (stub)
+    kind: str                 # "interactive" (N independent prompts) | "batched" (N prompts) |
+                              # "generation" (greedy multi-token decode; cells read/intervene per step)
     prompts: list
-    new_tokens: int = 0       # generation stub; asserted == 0 in v1
-    aggregate: bool = True    # interactive: run each prompt as its OWN trace and score the verdict
-                              # aggregated over all of them (top-1 fraction + mean TV) — robust, not a
-                              # single-token anecdote. Set False for cells that consume their prompt
-                              # list as ONE unit (clean/corrupt pairs) or can't stack (attention maps).
+    new_tokens: int = 0       # generation: decode steps per prompt; injected into cell params by the
+                              # driver (the regime axis lives on the Workload, not in every task dict)
+    aggregate: bool = True    # interactive/generation: run each prompt as its OWN trace and score the
+                              # verdict aggregated over all of them (top-1 fraction + mean TV) — robust,
+                              # not a single-token anecdote. Set False for cells that consume their
+                              # prompt list as ONE unit (clean/corrupt pairs) or can't stack (attention
+                              # maps).
 
     def __post_init__(self):
-        if self.kind == "generation" and self.new_tokens == 0:
-            raise ValueError("generation workload needs new_tokens>0 (v1 stub: not implemented)")
-        if self.kind not in ("interactive", "batched"):
+        if self.kind == "generation" and self.new_tokens <= 0:
+            raise ValueError("generation workload needs new_tokens>0")
+        if self.kind not in ("interactive", "batched", "generation"):
             raise ValueError(f"workload kind {self.kind!r} not implemented in v1")
         if self.aggregate and self.kind == "batched":
             self.aggregate = False    # batched runs ONE padded trace by definition; never per-prompt
