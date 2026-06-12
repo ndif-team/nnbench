@@ -50,17 +50,26 @@ crash-or-not check would mislabel that `SUPPORTED`.
 
 ## Running it
 
-Environment: `nnsight-serve-test` (local nnsight dev source + vLLM 0.15.1).
+Environment: `nnsight-serve-test` (nnsight editable from `/disk/u/zikai/nnsight/src`, the `dev`
+branch, + vLLM **0.15.1**). Note the skew: the nnsight `dev` branch targets vLLM **0.19.1** —
+running the benchmark in this env is correct, but nnsight-side vLLM behavior must be verified
+under `ndif-dev` (vLLM 0.19.1) with `PYTHONPATH=/disk/u/zikai/nnsight/src`, not characterized
+from 0.15.1 alone.
+
+GPU runs use the env's python directly (`conda run` mishandles signals on long vLLM runs — false
+timeouts, swallowed SIGABRT) and always go under `timeout`:
 
 ```bash
+PY=/disk/u/zikai/anaconda3/envs/nnsight-serve-test/bin/python
+
 # one methodology (HF vs vLLM-async)
-CUDA_VISIBLE_DEVICES=0 conda run -n nnsight-serve-test python scripts/bench.py --spec steering_gpt2
+CUDA_VISIBLE_DEVICES=0 timeout 1800 $PY scripts/bench.py --spec steering_gpt2
 
 # all methodologies / families
-CUDA_VISIBLE_DEVICES=0 conda run -n nnsight-serve-test python scripts/bench.py --spec all
+CUDA_VISIBLE_DEVICES=0 timeout 1800 $PY scripts/bench.py --spec all
 
 # HF only (no GPU contention with vLLM)
-CUDA_VISIBLE_DEVICES=0 conda run -n nnsight-serve-test python scripts/bench.py --spec ablation_gpt2 --backends hf
+CUDA_VISIBLE_DEVICES=0 timeout 1800 $PY scripts/bench.py --spec ablation_gpt2 --backends hf
 ```
 
 Specs: `logit_lens_gpt2`, `logit_lens_llama`, `steering_gpt2`, `activation_patching_gpt2`,
