@@ -46,6 +46,8 @@ class CellResult:
     value: Any = None                # cpu tensor; cleared by evaluate() after comparison
     workload: str = "interactive"    # "interactive" | "batched" — a coverage axis (oracle-checked per regime)
     perf: Optional["PerfResult"] = None  # filled only by the perf path, only for SUPPORTED*/cells
+    expected: Optional[str] = None   # the spec's declared expectation for this cell (default SUPPORTED)
+    surprise: bool = False           # actual state != expected -> the only thing a run should headline
 
 
 def run_cell(

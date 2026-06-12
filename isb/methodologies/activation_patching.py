@@ -1,5 +1,5 @@
-"""Activation patching (causal tracing) — fixed per-cell methodology (design.md §12; L1 motif
-"activation patching / causal tracing").
+"""Activation patching (causal tracing) — fixed per-cell methodology (design.md §12; registry
+entry "activation patching / causal tracing").
 
 Cross-prompt write methodology: capture a layer's residual from a CLEAN run, inject it into a
 CORRUPTED run at the same layer, observe the corrupted run's next-token distribution. We use the

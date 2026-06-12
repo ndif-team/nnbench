@@ -11,8 +11,13 @@ from ._prompts import ONE
 attention_pattern_gpt2 = CellConfig(
     name="attention_pattern_gpt2",
     methodology="attention_pattern", family="gpt2", repo="openai-community/gpt2",
-    workloads=[Workload("interactive", ONE)],
+    # output is [layers, heads, k_len] — variable k_len across prompts can't be stacked, so no
+    # per-prompt aggregation (the verdict already spans layers×heads).
+    workloads=[Workload("interactive", ONE, aggregate=False)],
     tasks=[({"layers": "all"}, "layers=all")],
     baseline=BaselineSpec(params={"layers": [0]}),
     effect=None,
+    # vLLM has no probability matrix to read (paged attention, no `.source` attention_interface op) —
+    # a genuine architectural frontier, not a missing feature (findings F-10). No working version exists.
+    expected={("vllm_async", "interactive", "layers=all"): "ERROR"},
 )

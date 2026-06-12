@@ -1,4 +1,4 @@
-"""Ablation (zero-knockout) — fixed per-cell methodology (design.md §12; L1 motif "ablation").
+"""Ablation (zero-knockout) — fixed per-cell methodology (design.md §12; registry entry "ablation").
 
 Zero a component's output at one layer to measure its causal contribution, then read the model's
 next-token distribution. Like steering this is a *write* methodology, but the write is a knockout

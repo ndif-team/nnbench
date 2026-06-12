@@ -1,0 +1,93 @@
+# VM-style nnbench split: a fully-equipped GPU SERVER (nnsight-vllm-serve) + a GPU-less CLIENT that
+# runs the benchmark cells against it over HTTP. This makes nnbench measure the real over-the-wire
+# deployment (serialize -> HTTP -> save-transmission), not the in-process `vllm_async` proxy.
+#
+# The server hosts ONE model, so run one compose-up per family (see run_vm.sh). Parametrize with env:
+#   MODEL  (default openai-community/gpt2)   — HF repo the server loads and the client mirrors as meta
+#   SPEC   (default logit_lens_gpt2)         — nnbench spec the client runs (must match MODEL's family)
+#   GPU    (default 0)                       — host GPU id given to the server
+#   HF_CACHE   (default /disk/u/models)      — HuggingFace cache (read-only) mounted into both
+#   NNSIGHT_SRC(default /disk/u/zikai/nnsight) — local nnsight `dev` checkout (serve module + meta build)
+#
+# Usage:
+#   MODEL=openai-community/gpt2 SPEC=logit_lens_gpt2 docker compose up --abort-on-container-exit
+#   docker compose down
+
+x-common: &common
+  image: nnbench-serve:v0.15.1
+  build:
+    context: .
+    dockerfile: Dockerfile
+  volumes:
+    - ${NNSIGHT_SRC:-/disk/u/zikai/nnsight}:/nnsight:ro   # nnsight dev (serve module + meta VLLM)
+    - ..:/nnbench:ro                                       # this benchmark repo (isb + scripts)
+    - ${HF_CACHE:-/disk/u/models}:/models:ro              # HuggingFace cache (weights + tokenizers)
+  environment:
+    HF_HUB_CACHE: /models
+    PYTHONPATH: /nnsight/src:/nnbench                      # dev nnsight first, then isb
+
+services:
+  server:
+    <<: *common
+    container_name: nnbench-serve-server
+    # Fully equipped: one GPU, real vLLM async engine behind FastAPI. --host 0.0.0.0 is REQUIRED for
+    # cross-container reach (the cli defaults to localhost-only).
+    entrypoint: ["python3", "-m", "nnsight.modeling.vllm.serve.cli"]
+    command:
+      - ${MODEL:-openai-community/gpt2}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "6677"
+      - --gpu-memory-utilization
+      - "0.3"
+      - --dtype
+      - ${DTYPE:-auto}                                      # auto=bf16 for gpt2; DTYPE=float32 matches HF
+    # NB: nnsight's serve VLLM hardcodes enforce_eager=True in _load, so do NOT forward --enforce-eager
+    # here (it duplicates the kwarg and AsyncEngineArgs raises "got multiple values for enforce_eager").
+    shm_size: "1g"
+    ports:
+      - "6677:6677"                                        # publish for host-side curl/debug (optional)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU:-0}"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:6677/health')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+
+  client:
+    <<: *common
+    container_name: nnbench-serve-client
+    # GPU-less: NVIDIA_VISIBLE_DEVICES=void -> no GPU/driver -> the backend forces vLLM's CPU platform
+    # so the meta VLLM build is CUDA-free. The cells run over HTTP and score against cached refs.
+    environment:
+      HF_HUB_CACHE: /models
+      PYTHONPATH: /nnsight/src:/nnbench
+      NVIDIA_VISIBLE_DEVICES: void
+    volumes:
+      - ${NNSIGHT_SRC:-/disk/u/zikai/nnsight}:/nnsight:ro
+      - ..:/nnbench:ro
+      - ${HF_CACHE:-/disk/u/models}:/models:ro
+      - ../results/refs:/refs:ro                           # cached integrated references for the oracle
+    entrypoint: ["python3", "/nnbench/scripts/bench.py"]
+    command:
+      - --spec
+      - ${SPEC:-logit_lens_gpt2}
+      - --backends
+      - vllm_serve
+      - --serve
+      - http://server:6677
+      - --refs
+      - /refs
+      - --ctl-refs
+      - /refs
+    depends_on:
+      server:
+        condition: service_healthy

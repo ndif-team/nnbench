@@ -21,7 +21,15 @@ def cell(methodology: str, family: str, backend: str):
 
 
 def get_cell(methodology: str, family: str, backend: str):
-    return CELLS.get((methodology, family, backend))
+    fn = CELLS.get((methodology, family, backend))
+    if fn is None and backend == "vllm_serve":
+        # The serve-client backend runs the SAME vLLM model via the SAME intervention code as the
+        # in-process async backend — the only difference (in-process vs over-HTTP) is fully contained
+        # in the backend object passed as `be`. So a `vllm_serve` cell is, by construction, the
+        # `vllm_async` cell; reuse it rather than duplicating every methodology×family. An explicit
+        # `vllm_serve` registration still takes precedence if a cell ever needs to differ.
+        fn = CELLS.get((methodology, family, "vllm_async"))
+    return fn
 
 
 def families_for(methodology: str, backend: str = "hf") -> list:

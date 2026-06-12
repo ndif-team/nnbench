@@ -11,8 +11,11 @@ from ._prompts import CLEAN, CORRUPTED
 attribution_patching_gpt2 = CellConfig(
     name="attribution_patching_gpt2",
     methodology="attribution_patching", family="gpt2", repo="openai-community/gpt2",
-    workloads=[Workload("interactive", [CLEAN, CORRUPTED])],
+    workloads=[Workload("interactive", [CLEAN, CORRUPTED], aggregate=False)],  # clean/corrupt pair
     tasks=[({"residual": "plain"}, "residual=plain")],
     baseline=BaselineSpec(params={"residual": "plain", "grad": False}),
     effect=None,
+    # vLLM runs inference-mode (no autograd), so the backward an attribution needs raises — the whole
+    # `grad` frontier is HF-only (findings F-11). No working version exists on vLLM.
+    expected={("vllm_async", "interactive", "residual=plain"): "ERROR"},
 )

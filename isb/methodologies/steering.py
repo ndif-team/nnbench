@@ -1,5 +1,5 @@
 """Steering (activation addition / ActAdd) — fixed per-cell methodology (design.md §12;
-L1 motif "steering / ActAdd").
+registry entry "steering / ActAdd").
 
 This is the first *write* methodology, so it tests the backend's **write fidelity** — the open
 question for vLLM. We add a steering vector into a block's residual-stream output and then read the

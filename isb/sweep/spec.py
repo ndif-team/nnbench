@@ -15,15 +15,21 @@ from typing import Optional
 class Workload:
     """An input regime. Batching is a coverage axis (it can change correctness), so each workload is
     oracle-checked in its own regime, not just timed."""
-    kind: str                 # "interactive" (1 prompt) | "batched" (N prompts) | "generation" (stub)
+    kind: str                 # "interactive" (N independent prompts) | "batched" (N prompts) | "generation" (stub)
     prompts: list
     new_tokens: int = 0       # generation stub; asserted == 0 in v1
+    aggregate: bool = True    # interactive: run each prompt as its OWN trace and score the verdict
+                              # aggregated over all of them (top-1 fraction + mean TV) — robust, not a
+                              # single-token anecdote. Set False for cells that consume their prompt
+                              # list as ONE unit (clean/corrupt pairs) or can't stack (attention maps).
 
     def __post_init__(self):
         if self.kind == "generation" and self.new_tokens == 0:
             raise ValueError("generation workload needs new_tokens>0 (v1 stub: not implemented)")
         if self.kind not in ("interactive", "batched"):
             raise ValueError(f"workload kind {self.kind!r} not implemented in v1")
+        if self.aggregate and self.kind == "batched":
+            self.aggregate = False    # batched runs ONE padded trace by definition; never per-prompt
 
 
 @dataclass
@@ -61,3 +67,9 @@ class CellConfig:
     n_trials: int = 7
     hf_kwargs: dict = field(default_factory=dict)
     vllm_kwargs: dict = field(default_factory=dict)
+    # The benchmark's encoded knowledge: what each cell is EXPECTED to do, so a run reports the DELTA
+    # ("cell X flipped") instead of restating the map. Keyed by (backend, workload_kind, label); only
+    # the non-SUPPORTED cells need listing — anything unlisted defaults to SUPPORTED. A vllm_serve cell
+    # with no entry inherits the vllm_async expectation (serve should match in-process vLLM; a mismatch
+    # is a genuine transport surprise). See `expected_state` in the driver.
+    expected: dict = field(default_factory=dict)

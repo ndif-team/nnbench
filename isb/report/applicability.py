@@ -10,7 +10,7 @@ def print_map(methodology: str, family: str, label: str, repo: str, cells) -> No
     print(f"task  : {title}")
     print(f"model : {repo}")
     print("-" * 86)
-    print(f"{'backend':<14}{'actual':<22}{'latency':<9}{'metrics / note'}")
+    print(f"{'backend':<14}{'actual':<22}{'vs expected':<24}{'latency':<9}{'metrics / note'}")
     print("-" * 86)
     for c in cells:
         lat = f"{c.latency_s:.2f}s" if c.latency_s is not None else "-"
@@ -22,7 +22,14 @@ def print_map(methodology: str, family: str, label: str, repo: str, cells) -> No
             )
         else:
             note = c.error or ""
-        print(f"{c.backend:<14}{c.state:<22}{lat:<9}{note}")
+        # the delta column: ✓ when actual matches the declared expectation, ⚠ when it doesn't
+        if getattr(c, "surprise", False):
+            vs = f"⚠ SURPRISE (exp {c.expected})"
+        elif c.expected is not None and c.expected != "SUPPORTED":
+            vs = f"✓ expected {c.expected}"          # a known frontier/degraded cell, as documented
+        else:
+            vs = "✓"
+        print(f"{c.backend:<14}{c.state:<22}{vs:<24}{lat:<9}{note}")
     print("-" * 86)
 
 

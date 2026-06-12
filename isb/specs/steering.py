@@ -4,14 +4,14 @@ Baseline = alpha=0 (no write -> pure forward + readout); effect-size = TV(alpha=
 control (the per-mode non-vacuity guard, now declarative).
 """
 from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload
-from ._prompts import BATCHED, ONE
+from ._prompts import BATCHED, PROBE
 
 _S = {"layer": 8, "target": " Rome", "alpha": 6.0}
 
 steering_gpt2 = CellConfig(
     name="steering_gpt2",
     methodology="steering", family="gpt2", repo="openai-community/gpt2",
-    workloads=[Workload("interactive", ONE), Workload("batched", BATCHED)],
+    workloads=[Workload("interactive", PROBE), Workload("batched", BATCHED)],
     tasks=[
         ({**_S, "mode": "inplace"}, "mode=inplace"),
         ({**_S, "mode": "replace"}, "mode=replace"),
@@ -21,4 +21,12 @@ steering_gpt2 = CellConfig(
         baseline_params={**_S, "alpha": 0.0, "mode": "replace"},
         perturbed_params={**_S, "alpha": 6.0, "mode": "replace"},
     ),
+    # in-place residual write raises on vLLM inference tensors (F-5); whole-tuple `replace` is the
+    # working form (matches HF exactly, tv=0.000). Batched HF is SUPPORTED here (verified — the steer
+    # dominates, so it is robust to the GPT-2 position artifact, unlike logit_lens/ablation batched).
+    expected={
+        ("vllm_async", "interactive", "mode=inplace"): "ERROR",
+        ("vllm_async", "batched", "mode=inplace"): "ERROR",     # batched gated (+ in-place)
+        ("vllm_async", "batched", "mode=replace"): "ERROR",     # batched gated (awaiting upstream fix)
+    },
 )

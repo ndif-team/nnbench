@@ -155,6 +155,166 @@ def test_batched_oracle_scores_against_per_prompt_reference_not_padded_batch():
     assert by[("hf", "batched")].perf.throughput is not None
 
 
+def test_vm_serve_scores_against_cached_integrated_refs():
+    """VM mode: the GPU-less serve client has no in-run HF control, so it scores serve cells against
+    references cached by a prior integrated run. Round-trip: (1) an integrated run dumps the HF
+    interactive control output per task; (2) a serve-only run loads those refs and scores its cells
+    against them — SUPPORTED when the serve output matches the cached HF reference, SILENTLY_WRONG when
+    it diverges. Uses fakes (no GPU, no server)."""
+    import tempfile
+
+    # the serve backend's fake cell: matches the cached HF ref for task "b", diverges for task "a"
+    def fake_get_cell(methodology, family, backend):
+        def fn(impl, model, prompts, **params):
+            k = params.get("k")
+            if backend == "vllm_serve":
+                return (OUT["b"].clone() if k == "b" else _onehot(7))  # "a" -> wrong vs HF ref OUT["a"]
+            return OUT[k].clone()                                       # hf / vllm_async truth
+        return fn
+
+    with tempfile.TemporaryDirectory() as d:
+        orig = driver.get_cell
+        driver.get_cell = fake_get_cell
+        try:
+            # 1) integrated run dumps the HF reference for each task
+            driver.run_sweep(
+                _spec(), backends=("hf",), dump_refs=d,
+                backend_factory=lambda name, s: _FakeBackend(name))
+            # 2) serve-only run scores against the cached refs (no HF control present this run)
+            results = driver.run_sweep(
+                _spec(), backends=("vllm_serve",), serve_host="http://x:6677", refs=d,
+                backend_factory=lambda name, s: _FakeBackend(name))
+        finally:
+            driver.get_cell = orig
+
+    by = {(c.backend, c.label): c for c in results}
+    assert by[("vllm_serve", "b")].state == AppState.SUPPORTED        # matches cached HF reference
+    assert by[("vllm_serve", "a")].state == AppState.SILENTLY_WRONG   # diverges from cached HF reference
+
+
+def test_vm_serve_precision_disambiguation_via_ctl_refs():
+    """A bf16 serve cell that diverges from the HF control is SILENTLY_WRONG, but the GPU-less client
+    disambiguates with the cached fp32-vLLM (control-dtype) output: if THAT matches the HF control the
+    divergence is a precision near-tie -> SUPPORTED_DEGRADED; if the fp32-vLLM output also diverges it's
+    a real mechanism bug -> stays SILENTLY_WRONG. (The GPU-less analog of disambiguate_precision's live
+    fp32 rerun — this is what separates ablation/patching bf16 from the llama dual-residual bug.)"""
+    import tempfile
+
+    import torch
+
+    def fake_get_cell(methodology, family, backend):
+        def fn(impl, model, prompts, **params):
+            k = params.get("k")
+            return _onehot(5) if k == "a" else _onehot(6)   # both diverge from HF -> both SILENTLY_WRONG
+        return fn
+
+    with tempfile.TemporaryDirectory() as d:
+        # HF control (fp32 truth)
+        torch.save({("interactive", "a"): _onehot(3), ("interactive", "b"): _onehot(2)},
+                   driver._ref_file(d, "fake"))
+        # fp32-vLLM control-dtype output: matches HF for "a" (precision), diverges for "b" (real bug)
+        torch.save({("interactive", "a"): _onehot(3), ("interactive", "b"): _onehot(6)},
+                   driver._ctl_ref_file(d, "fake"))
+        orig = driver.get_cell
+        driver.get_cell = fake_get_cell
+        try:
+            results = driver.run_sweep(
+                _spec(), backends=("vllm_serve",), serve_host="http://x:6677",
+                refs=d, ctl_refs=d, backend_factory=lambda name, s: _FakeBackend(name))
+        finally:
+            driver.get_cell = orig
+
+    by = {(c.backend, c.label): c for c in results}
+    assert by[("vllm_serve", "a")].state == AppState.SUPPORTED_DEGRADED  # fp32-vLLM == HF -> precision
+    assert by[("vllm_serve", "b")].state == AppState.SILENTLY_WRONG      # fp32-vLLM != HF -> real bug
+
+
+def test_expected_state_reports_only_the_delta():
+    """A run's headline is the DELTA vs declared expectation: a cell that matches its expected state is
+    NOT a surprise; one that diverges IS. (This is the structural antidote to restating documented
+    gaps as findings.)"""
+    spec = CellConfig(
+        name="exp", methodology="m", family="fam", repo="r",
+        workloads=[Workload("interactive", ["p"])],
+        tasks=[({"k": "a"}, "a"), ({"k": "b"}, "b")],
+        baseline=BaselineSpec(params={"k": "base"}), effect=None, warmup=0, n_trials=1,
+        expected={("vllm_async", "interactive", "a"): "ERROR"})   # "a" is a declared frontier
+
+    created = {}
+    orig = driver.get_cell
+    driver.get_cell = _fake_get_cell                              # vllm_async "a" raises -> ERROR
+    try:
+        results = driver.run_sweep(spec, backends=("hf", "vllm_async"),
+                                   backend_factory=lambda n, s: created.setdefault(n, _FakeBackend(n)))
+    finally:
+        driver.get_cell = orig
+
+    by = {(c.backend, c.label): c for c in results}
+    assert by[("vllm_async", "a")].state == AppState.ERROR
+    assert by[("vllm_async", "a")].surprise is False             # ERROR == declared ERROR -> no news
+    assert by[("vllm_async", "b")].surprise is False             # SUPPORTED == default -> no news
+    # drop the declaration: the same ERROR now IS a surprise
+    spec.expected = {}
+    driver.get_cell = _fake_get_cell
+    try:
+        results2 = driver.run_sweep(spec, backends=("hf", "vllm_async"),
+                                    backend_factory=lambda n, s: _FakeBackend(n))
+    finally:
+        driver.get_cell = orig
+    assert {(c.backend, c.label): c.surprise for c in results2}[("vllm_async", "a")] is True
+
+
+def test_expected_state_serve_inherits_vllm_async():
+    """A vllm_serve cell with no own expectation inherits the vllm_async one — serve should match
+    in-process vLLM, so a divergence over the wire is a genuine transport surprise."""
+    from isb.sweep.driver import expected_state
+
+    spec = CellConfig(
+        name="x", methodology="m", family="f", repo="r",
+        workloads=[Workload("interactive", ["p"])], tasks=[({}, "a")],
+        baseline=BaselineSpec(params={}), effect=None,
+        expected={("vllm_async", "interactive", "a"): "ERROR"})
+    assert expected_state(spec, "vllm_serve", "interactive", "a") == "ERROR"     # inherits async
+    assert expected_state(spec, "vllm_serve", "interactive", "z") == "SUPPORTED"  # unlisted -> default
+    assert expected_state(spec, "hf", "interactive", "a") == "SUPPORTED"          # hf != async
+
+
+def test_aggregate_interactive_scores_over_all_prompts():
+    """An aggregate-interactive workload runs each prompt as its OWN trace and scores the verdict over
+    ALL of them — so a backend that is right on 1 prompt but wrong on another is caught, where a
+    single-prompt (n=1) verdict would pass it. vLLM here matches HF on 3 of 4 prompts -> top-1
+    agreement 0.75 < 0.9 -> SILENTLY_WRONG (a single-prompt check on the first prompt would say
+    SUPPORTED)."""
+    refs = {"p0": _onehot(0), "p1": _onehot(1), "p2": _onehot(2), "p3": _onehot(3)}
+
+    def fake(methodology, family, backend):
+        def fn(impl, model, prompts, **params):
+            p = prompts[0]                                    # per-prompt: always a 1-element list
+            if backend == "vllm_async" and p == "p3":
+                return _onehot(7)                             # wrong on the 4th prompt only
+            return refs[p].clone()
+        return fn
+
+    spec = CellConfig(
+        name="agg", methodology="m", family="f", repo="r",
+        workloads=[Workload("interactive", ["p0", "p1", "p2", "p3"])],   # aggregate=True (default)
+        tasks=[({}, "t")], baseline=BaselineSpec(params={}), effect=None, warmup=0, n_trials=1)
+
+    orig_gc, orig_fp = driver.get_cell, driver._fp32_rerun
+    driver.get_cell = fake
+    driver._fp32_rerun = lambda *a, **k: (lambda c: None)   # disambiguation rerun -> None: no GPU, no reclassify
+    try:
+        results = driver.run_sweep(spec, backends=("hf", "vllm_async"),
+                                   backend_factory=lambda n, s: _FakeBackend(n))
+    finally:
+        driver.get_cell, driver._fp32_rerun = orig_gc, orig_fp
+
+    by = {(c.backend, c.workload): c for c in results}
+    assert by[("hf", "interactive")].state == AppState.SUPPORTED            # control
+    assert by[("vllm_async", "interactive")].state == AppState.SILENTLY_WRONG  # 3/4 agreement, caught
+    assert by[("vllm_async", "interactive")].metrics["top1_agree"] == 0.75    # aggregated over 4 prompts
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
