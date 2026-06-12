@@ -66,7 +66,7 @@ not their metric.
 
 ## C. Method corpora / tutorials — runnable recipes ("what technique")
 
-The seed for our **L1 motif registry** (seed, not ceiling).
+The seed for our **methodology registry** (design.md §4; seed, not ceiling).
 
 - **nnsight-website tutorials** (`ndif-team/nnsight-website`, branch `docs`, `docs/tutorials/`):
   - `tutorials/`: `probing/{logit_lens, diffusion_lens}`,

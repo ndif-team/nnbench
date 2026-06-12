@@ -1,7 +1,7 @@
 # Design — interp-serve-bench (living document)
 
 > Status: evolving. Captures decisions as they're made in the design conversation.
-> Last structural update: positioning + taxonomy + resolver decouple + reference synthesis.
+> Last structural update: leveled primitive model (§3 rewritten; §§4–6 retitled — levels vs context).
 
 ## 1. Purpose & positioning
 
@@ -26,42 +26,159 @@ but no systems-performance-and-coverage benchmark for interp workloads on produc
 
 Strategic backdrop: the nnsight OSDI '26 abstracts frame NNsight×vLLM along three axes —
 **engine** (request lifecycle vs one forward call), **distribution** (TP/PP/EP sharding),
-**optimization** (continuous batching, CUDA graphs, prefix caching). Our **L3 sweep matrix
+**optimization** (continuous batching, CUDA graphs, prefix caching). Our **sweep matrix (§6)
 instantiates those axes**, so the benchmark is the empirical backbone of the systems story.
 
 ## 2. Organizing spine — granularity tiers (map 1:1 onto existing artifacts)
 
 | Tier | = | Seeded from | Role |
 |---|---|---|---|
-| **Micro** | L0 primitives | `nnsight/tests/performance/benchmark_interventions.py` | overhead floor |
-| **Method** | single motif | nnsight-website `tutorials/` | canonical units |
+| **Micro** | Levels 0–2 of the primitive model (§3), measured per context | `nnsight/tests/performance/benchmark_interventions.py` | support/denotation map + overhead floor |
+| **Method** | one Level-3 program (§3.5) | nnsight-website `tutorials/` | canonical units |
 | **Macro** | end-to-end paper repro | nnsight-website `mini-papers/` | "real research runs on this" |
 
 Adding work = adding rows/registry entries, never a harness redesign.
 
-## 3. L0 — Primitives (the interpretability "ISA")
+## 3. The primitive model — leveled (rewritten 2026-06-11)
 
-Atomic trace-level ops. Each scales along independent axes: **breadth** (#sites), **tensor size**
-(hidden×seq×batch), **depth** (#tokens), **payload** (bytes saved/transferred), **side-compute**
-(aux FLOPs).
+> **Supersedes the flat "L0 primitives" table.** That table mixed levels — implementation variants
+> (WRITE-inplace), addresses (LOGITS), control flow (ITERATIVE), compositions (CROSS-PROMPT) and
+> whole programs (TRAIN-INTERVENTION) sat as siblings — which made "what primitives do we have /
+> what do workloads need / what does each backend support" unanswerable. The replacement is a
+> leveled model, PL-style: a small closed core, an address space, idioms, compositions, programs —
+> and an orthogonal execution **context**. Where each old row now lives:
+>
+> | old flat row | new home |
+> |---|---|
+> | READ one site | Level 0 READ × Level 1 boundary site |
+> | CACHE many | Level 2 fused primitive (READ × breadth + SAVE) |
+> | WRITE-replace / WRITE-inplace | Level 0 WRITE; the replace/in-place split is a Level 1.5 realization |
+> | CROSS-PROMPT | Level 2 composition (READ in trace A → WRITE in trace B) |
+> | ITERATIVE | Level 0 control construct (iteration) |
+> | BACKWARD-attribution | Level 0 BACKWARD |
+> | TRAIN-INTERVENTION | Level 3 program |
+> | AUX-MODULE | Level 0 COMPUTE |
+> | EDIT | Level 0 control construct |
+> | LOGITS / SAMPLING | Level 1 engine-tier sites |
+> | SOURCE | Level 1 internal-tier sites |
+> | SAVE / transmit | Level 0 SAVE |
 
-| Primitive | nnsight surface | Notes |
+**This model is a vocabulary for declaring footprints and indexing measurements** — metadata and
+micro-cells. It is NOT a construction layer: cells stay flat and explicit (§12); nothing generates
+intervention code from these declarations. That distinction is the §11 lesson — the Resolver died
+because it *constructed* the experiments; the levels only *explain and index* them.
+
+Normative definitions live here; the maintained per-context **status inventory** lives in
+`interp-methods-catalog.md` (one copy, so the lists can't diverge again).
+
+### 3.1 Level 0 — core operations (closed set; should essentially never grow)
+
+| op | semantics | nnsight surface |
 |---|---|---|
-| READ one site | `.output`/`.input`/`.inputs` | |
-| CACHE many | `tracer.cache(modules=…)` | breadth |
-| WRITE-replace | `x = new` | |
-| WRITE-inplace | `x[:] = …` | distinct semantics |
-| CROSS-PROMPT | invoke A → invoke B + `barrier` | patching |
-| ITERATIVE | `tracer.iter[...]`, `.all()`, `.next()` | decode steps |
-| BACKWARD-attribution | `with t.backward(): …grad` | single bwd |
-| TRAIN-INTERVENTION | bwd → params → optimizer loop | DAS / dict-learning / probe-train / LoRA (heavy) |
-| AUX-MODULE | run SAE/probe/rotation in trace | frozen *or* trainable |
-| EDIT | `model.edit()` | persistent weight/module edit |
-| LOGITS / SAMPLING | logits & sampled-token props | backend-specific |
-| SOURCE | `.source.<op>` | intermediate ops; fragile/family-specific |
-| SAVE / transmit | `.save()` | payload, esp. remote |
+| **READ** | observe the value at a site | `site.output` / `.input` (real tensor inside the trace) |
+| **WRITE** | set the value at a site | `site.output = …` / `x[:] = …` (realizations differ, §3.3) |
+| **COMPUTE** | run arbitrary torch/Python on live values inside the trace — incl. applying external `nn.Module`s (probes/SAEs) and the model's own modules as functions | plain code in the trace body |
+| **SAVE** | move a value across the trace boundary (to the user; over the wire on serve/remote) | `.save()` |
+| **BACKWARD** | reverse-mode flow; equivalently READ in gradient space | `with t.backward(): … x.grad` |
 
-## 4. L1 — Motif registry (seed, not ceiling)
+**Control / structure constructs** — same level, different kind: they don't touch values, they
+shape *when and in what scope* the ops run:
+
+| construct | shapes | nnsight surface |
+|---|---|---|
+| trace | the base scope: one forward / one generate | `model.trace(...)` |
+| invoke | multi-prompt scoping within one trace (the batched regime) | `tracer.invoke(...)` |
+| iteration | the decode-time axis: ops per generation step | `tracer.iter[...]` / `.all()` / `.next()` |
+| barrier | cross-invoke synchronization (value sharing) | `tracer.barrier(n)` |
+| session | multi-trace scoping (variables flow across traces) | `model.session()` |
+| edit | persistent model modification outside any trace | `model.edit()` |
+| scan | shape-only execution mode | `model.scan(...)` |
+
+### 3.2 Level 1 — the address space (sites)
+
+A *site* is a **name** for a value READ/WRITE can target. Tiers, by depth:
+
+| tier | sites | note |
+|---|---|---|
+| **engine** | `logits`, sampled tokens | runtime properties; backend-specific, not family-specific |
+| **module boundary** | `.output` / `.input` at any tree depth: model root → block → submodule (attn/mlp/norm) → leaf (linear/embedding) | the workhorse |
+| **module internal** | `.source.<op>` — intermediate ops inside a forward | op names are family-specific; existence is backend-specific |
+| **derived (value-level)** | head *h*, neuron *j*, position *p* | NOT new reads — READ ∘ COMPUTE(view/slice); derived *names* in the address space, not Level-0 ops |
+| **gradient space** | `.grad` of any of the above | exists only under BACKWARD |
+
+A site name's **denotation is context-dependent** — the central Level-1 fact. Per context a site
+has three properties: **exists?** (attention weights have no denotation under paged attention),
+**denotes what?** (vLLM fused-residual blocks: "block output" exists but denotes
+`(hidden, residual)` whose SUM is the residual stream — same name, different meaning, F-7),
+**writable?**.
+
+### 3.3 Level 1.5 — realizations (idioms)
+
+One abstract op, several concrete spellings; contexts differ in WHICH spelling works. The
+"documented working recipe per backend" deliverable = the realization of each abstract op that
+works in that context. Cell params like `mode=` / `unembed=` are realization selectors, not
+arbitrary knobs.
+
+| abstract op | realizations |
+|---|---|
+| WRITE | in-place `x[:] = …` vs replacement (new tensor / whole tuple) |
+| COMPUTE (unembed) | call the module `lm_head(h)` vs use its weights `F.linear(h, W)` |
+| COMPUTE (aux) | bare vs under `torch.no_grad()` |
+| cross-prompt transfer | two single-prompt traces vs barrier within one trace |
+
+### 3.4 Level 2 — derived primitives (compositions)
+
+The finite catalog of **op × site-tier × time × realization** combinations, plus compositions
+across ops — what the methods-catalog tags (`read`, `write`, `xprompt`, `grad`, `attn-weights`, …)
+were groping at. Examples: boundary read; internal read (attention-weights = READ × internal ×
+attention); head-sliced write (WRITE × derived site); cross-prompt transplant (READ in trace A →
+WRITE in trace B); per-step steering (WRITE × iteration); bulk cache (`tracer.cache` = READ ×
+breadth + SAVE, a fused Level-2 primitive); gradient attribution read (BACKWARD + READ × grad
+space).
+
+Scaling parameters — **breadth** (#sites), **tensor size** (hidden×seq×batch), **depth**
+(#tokens), **payload** (bytes saved/transferred), **side-compute** (aux FLOPs) — are *measures on*
+Level-2 entries, never new entries.
+
+### 3.5 Level 3 — methodologies (programs) and footprints
+
+A methodology is a small program over Level-2 primitives plus a readout metric and semantic
+intent. Each program has a **footprint**: the set of Level-2 entries (with realizations) it needs.
+The catalog's per-method tag rows are footprints. This gives coverage a definition: the method
+tier is complete when its programs' footprints jointly cover every Level-2 entry any cataloged
+method needs — the gap between "needed by the catalog" and "exercised by a cell" IS the roadmap,
+mechanically.
+
+### 3.6 Context — orthogonal to all levels — and the failure-kind taxonomy
+
+`family × backend × engine-config × parallelism × workload-regime` is the environment a program
+runs in, not a level. Every level has a *status in a context*; statuses compose upward, and
+failures classify into five kinds (which flat per-cell expected entries cannot distinguish):
+
+| failure kind | level | measured example |
+|---|---|---|
+| operation unsupported | L0 × context | BACKWARD on vLLM (inference mode) — F-11 |
+| site absent | L1 × context | attention weights under paged/flash attention — F-10 |
+| denotation mismatch | L1 × context | vLLM fused residual: name exists, means something else — F-7 |
+| realization unsupported | L1.5 × context | in-place WRITE raises (F-5); `lm_head.forward` guarded (F-2) |
+| regime effect | context alone | batched GPT-2 absolute positions: no primitive involved — the model's own semantics change under the regime |
+
+The regime-effect row is why per-cell expected-state overrides exist: it is the class that does
+NOT decompose through the levels, and the model makes it an explicit, interesting category instead
+of an exception that embarrasses the abstraction.
+
+### 3.7 How the tiers (§2) use the model
+
+- **Micro tier** = measure Levels 0–2 per context: op support, site existence + denotation,
+  realization viability. Small (~a dozen rows per backend), and the right surface to
+  version-stamp — the primitive-status map is the version-sensitive artifact, not every cell.
+- **Method tier** = verify Level-3 programs per context. Expected states become *derivable*
+  (footprint ∧ measured support) except the explicitly-marked regime effects; the runner's
+  existing surprise mechanism catches wrong derivations.
+- When an upstream fix lands, the micro-tier row flips first and every dependent method cell flips
+  with it — one cause, reported once.
+
+## 4. Methodology registry — Level-3 programs (seed, not ceiling)
 
 A **living registry with a fixed schema**: seeded from the nnsight tutorials, extended from the
 literature; adding a motif = one registry entry, never a harness change.
@@ -75,11 +192,11 @@ Backlog (literature, additive later): path/edge patching · attention knockout �
 patchscopes · future lens · SAE family (gated/JumpReLU/top-k/transcoders/crosscoders) · steering
 family (CAA/ITI/RepE) · sparse probing / CCS · integrated gradients.
 
-**Borrow:** align motif → primitive recipes with **pyvene's intervention-type enum** (Vanilla /
+**Borrow:** align methodology footprints (§3.5) with **pyvene's intervention-type enum** (Vanilla /
 Addition / Subtraction / Zero / Collect / RotatedSpace=DAS / LoRA) where they map, for shared
 vocabulary and cross-framework portability.
 
-## 5. L2 — Workload profiles (how motifs get run; the "dataset" distribution)
+## 5. Context — workload regimes (how methodologies get run; the "dataset" distribution)
 
 - **Interactive probe** — 1 trace, 1 prompt (notebook shape)
 - **Batched analysis** — 1 motif × N prompts (patching/probing over a dataset)
@@ -87,9 +204,12 @@ vocabulary and cross-framework portability.
 - **Bulk harvesting** — CACHE-many × large corpus, throughput-bound (SAE data collection)
 - **Multi-tenant / concurrent** — many independent traces vs one engine (nnsight-serve / NDIF)
 
-L2 exercises the **engine axis** + concurrency — where vLLM should win and HF should struggle.
+Regimes are context (§3.6), not levels — a regime can change *verdicts* (the batched
+absolute-position regime effect), which is why each workload is oracle-checked in its own regime.
+The regime axis exercises the **engine axis** + concurrency — where vLLM should win and HF should
+struggle.
 
-## 6. L3 — Sweep matrix (system under test = the OSDI three axes as config)
+## 6. Context — sweep matrix (system under test = the OSDI three axes as config)
 
 - **Backend (engine axis)**: **v1 = HF Transformers · vLLM-async** (vLLM-sync + NDIF remote deferred)
 - **Parallelism (distribution axis)**: single-GPU · TP=2/4/8 · PP · multi-node
@@ -99,6 +219,9 @@ L2 exercises the **engine axis** + concurrency — where vLLM should win and HF 
   deliberately include **non-standard module names** to prove the Resolver isn't hardcoded.
 
 ## 7. Harness — the spec → resolver → builder → runner → oracle → reporter pipeline
+
+> **SUPERSEDED by §12** (same supersession as §11 — the Resolver/builder stages were dropped; the
+> runner → oracle → reporter tail survives in §12.3). Kept for history.
 
 ```
 Workload spec  (family-INDEPENDENT — the portable, citable "dataset")
@@ -183,7 +306,7 @@ actual state matches (and flags when vLLM returns `SILENTLY_WRONG` where `ERROR`
 
 End-to-end latency · throughput (tok/s, traces/s, prompts/s) · peak GPU memory · **overhead vs
 no-intervention baseline** (per backend) · **overhead vs raw-PyTorch-hooks baseline** (HF only —
-the existing micro-benchmark is the L0 floor) · **transfer volume** (remote, later) ·
+the existing micro-benchmark is the Micro-tier floor) · **transfer volume** (remote, later) ·
 time-to-first-save.
 
 ### 8.3 Correctness
@@ -514,3 +637,23 @@ scripts/smoke.py        # enumerate the cells to run; print the map
 | (family,backend) cell | one explicit function for that combination |
 | backend | a `be` infra impl (trace/collect/teardown) + its cells per methodology |
 | variant | a param or a sibling `@cell` |
+
+### 12.6 The primitive model as index (2026-06-11)
+
+§3's leveled model is the benchmark's *vocabulary*, not an abstraction layer. Concretely:
+
+- Cells stay flat and explicit; the model never constructs them.
+- A cell/task may DECLARE its footprint (the Level-2 entries + realizations it needs) as metadata
+  next to the registration — pure data, consumed only by reporting/derivation.
+- The **micro tier** (§2, §3.7) is one minimal cell per (Level-0/1/1.5 entry × backend) — most
+  extractable from existing cell code — producing the measured primitive-status map that
+  (a) explains method-level expected states, (b) carries the version stamp (provenance attaches to
+  ~a dozen primitive rows, not to every cell), and (c) flips first when an upstream fix lands —
+  one cause, reported once, with every dependent method cell flipping alongside it.
+  **Built 2026-06-11**: `isb/micro/probes.py` (one probe per row, self-contained denotation
+  checks, watchdog HANG detection, vLLM probes ordered safest-first), `scripts/micro.py`;
+  measured maps in `results/micro_{hf,vllm_async}.txt`, findings F-12..F-16.
+- Per-cell `expected` entries remain for **regime effects** (§3.6) — the non-decomposable residue,
+  now an explicit category rather than entries indistinguishable from derivable consequences.
+- The maintained Level-0/1 status inventory (measured vs UNTESTED per backend) lives in
+  `interp-methods-catalog.md`; the UNTESTED rows there are the coverage queue.

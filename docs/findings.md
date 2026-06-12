@@ -16,9 +16,9 @@ Result (`results/smoke_gpt2.txt`):
 
 ### F-1 — vLLM intermediates are inference-mode tensors
 Applying a grad-enabled sub-module (e.g. `ln_f`) to a vLLM activation raises
-*"Inference tensors cannot be saved for backward."* Fix that keeps one motif for both
+*"Inference tensors cannot be saved for backward."* Fix that keeps one methodology for both
 backends: wrap forward-only aux compute in `torch.no_grad()` (harmless on HF, required
-on vLLM). → `isb/motifs/logit_lens.py`.
+on vLLM). → `isb/methodologies/logit_lens.py`.
 
 ### F-2 — `lm_head` cannot be called directly on vLLM
 vLLM's `ParallelLMHead.forward()` deliberately raises; its weights are consumed by the
@@ -168,3 +168,78 @@ activations under `torch.inference_mode()`, so any attempt to track them for bac
 `grad=False` baseline (forward-only metric) runs on both backends — it's specifically the backward
 that vLLM cannot do. → `isb/methodologies/attribution_patching.py`, `isb/backends/{hf,vllm_async}.py`
 (`be.attribute`).
+
+## Micro tier — Level 0/1 primitive probes, GPT-2, HF vs vLLM-async (2026-06-11)
+
+One minimal probe per previously-UNTESTED inventory row (design.md §3.7; `isb/micro/`,
+`scripts/micro.py`), each with a self-contained denotation check. Full maps in
+`results/micro_{hf,vllm_async}.txt`. **Refined 2026-06-11** after the per-construct root-cause
+diagnosis (nnsight `docs/developing/vllm-construct-gaps.md`; all construct failures verified
+identical on vllm 0.19.1 and 0.15.1): iteration split by realization (bounded/unbounded) and
+session split by flow (saved/un-saved). **HF: 13/13 SUPPORTED** (all checks exact or ≤1e-3
+rel-dev). **vLLM-async: 7 SUPPORTED / 6 ERROR**:
+
+| probe | hf | vllm_async |
+|---|---|---|
+| boundary `.input` | SUPPORTED | SUPPORTED (exact) |
+| engine `logits` | SUPPORTED | SUPPORTED (== portable unembed) |
+| engine `samples` | SUPPORTED | SUPPORTED (== greedy argmax) |
+| derived head | SUPPORTED | SUPPORTED (recon in-trace) |
+| derived neuron | SUPPORTED | SUPPORTED (rel-dev 3e-3, bf16) |
+| `.source` non-attention | SUPPORTED | SUPPORTED (exact) |
+| iteration — bounded `iter[0:3]` | SUPPORTED | SUPPORTED (3 steps; step-0 == single-step trace) |
+| iteration — unbounded `iter[:]` | SUPPORTED | **ERROR** (all saves dropped) |
+| scan | SUPPORTED | **ERROR** (`hook` kwarg) |
+| edit | SUPPORTED | **ERROR** (mediator pickling) |
+| barrier | SUPPORTED | **ERROR** async; **SILENTLY_WRONG on the sync engine** (clean exit, saved dict empty — construct-gaps repros; sync is not yet a bench backend) |
+| session — saved flow | SUPPORTED | **ERROR** async (no drain point); works on the sync engine (construct-gaps repros) |
+| session — un-saved cross-trace flow | SUPPORTED | **ERROR** (both engines) |
+
+### F-12 — Level-1 sites are portable on vLLM; weight-using checks must run in the worker
+Boundary `.input`, engine `logits`/`samples`, derived head/neuron views, and non-attention
+`.source` all hold on vLLM with exact (or bf16-roundoff) denotation checks — the vLLM MLP forward
+is plain Python, so `.source` rewriting works there; the attention-weights case (F-10) stays the
+only absent internal site. Gotcha: the client-side envoy is the META model — a reconstruction that
+touches `.weight` must run INSIDE the trace (in the worker), else `Cannot copy out of meta tensor`.
+→ `isb/micro/probes.py` (`derived_head_vllm`).
+
+### F-13 — UNBOUNDED `tracer.iter[:]` drops all saves on vLLM; bounded slices work
+The documented multi-token idiom (`for step in tracer.iter[:]: rows.append(model.logits)` —
+nnsight `docs/models/vllm.md`) yields a finished output that carries **no saves at all**, while
+the identical trace without `iter` collects fine. The split is a realization (Level 1.5)
+distinction: **bounded `iter[0:3]` is SUPPORTED on both engines** (measured); only the unbounded
+forms (`iter[:]`, `.all()`) fail, on sync (UnboundLocalError) and async (no `.saves`) alike.
+Root cause (diagnosed upstream, nnsight `docs/developing/vllm-construct-gaps.md` §1): the vLLM
+path never sets a stop bound, so the loop overruns the last step, blocks, and is unwound by
+`Cancelation` before the body's single final `push()` — the only thing that publishes saves.
+Blocks the generation-time workload class on vLLM until fixed; the bounded realization is the
+working recipe meanwhile. → `isb/micro/probes.py` (`_iter_vllm`).
+
+### F-14 — barrier on vLLM: loud on async, SILENT on the sync engine
+The cross-invoke barrier patch (HF: matches the two-trace patch exactly) fails on vLLM with a
+per-engine split. **Async**: no saves at all — two documented causes stack (the async
+multi-prompt submission gate and the Barrier object not being shared across invokes, nnsight
+`docs/developing/barrier-vllm-not-shared.md`) — a clean ERROR. **Sync engine** (measured via the
+construct-gaps repros; a plain two-invoke trace works there): the trace **exits cleanly with the
+saved dict EMPTY** — silent post-barrier data loss, the SILENTLY_WRONG state, with no error
+signal of any kind. The two-trace `be.patch` recipe remains the working cross-prompt form (F-8).
+Note: the sync engine is not yet a bench backend — engine mode is a context axis the inventory
+currently under-represents.
+
+### F-15 — session on vLLM: only the UN-SAVED cross-trace flow is broken (plus async entirely)
+On HF both flows work (saved read-after-exit, and un-saved trace-1 → trace-2 reuse, |Δ|=0).
+On vLLM the row splits (nnsight `docs/developing/vllm-construct-gaps.md` §3):
+- **saved flow** (`.save()` in a session trace, read after exit): **works on the sync engine**
+  (measured); ERROR on async — there is no drain point inside a captured session body (`async
+  for` cannot compile there, and tracer handles don't survive to the caller frame).
+- **un-saved cross-trace flow** (the session contract): ERROR on BOTH engines — only values in
+  `Globals.saves` ship back from the worker, so the un-saved trace-1 variable never materializes
+  client-side; trace 2 dies and the surfaced `UnboundLocalError` misleadingly names the
+  *downstream* saved variable.
+
+### F-16 — edit and scan error cleanly on the vLLM path
+`model.edit()` stores its mediator, but replaying it into a vLLM worker trace fails to serialize
+(`PicklingError: ... source code unavailable`). `model.scan()` fails earlier — the scan machinery
+passes a `hook=` kwarg the vLLM execution path rejects. Both are per-cell ERRORs (clear signal, no
+silent wrongness), matching `docs/models/vllm.md`'s "not validated on the vLLM path" caveat — now
+measured rather than presumed.
