@@ -1,7 +1,7 @@
 # Design — interp-serve-bench (living document)
 
 > Status: evolving. Captures decisions as they're made in the design conversation.
-> Last structural update: leveled primitive model (§3 rewritten; §§4–6 retitled — levels vs context).
+> Last structural update: data-flow / control-flow split + cross-edge movement class (§3.1, §3.4).
 
 ## 1. Purpose & positioning
 
@@ -39,7 +39,7 @@ instantiates those axes**, so the benchmark is the empirical backbone of the sys
 
 Adding work = adding rows/registry entries, never a harness redesign.
 
-## 3. The primitive model — leveled (rewritten 2026-06-11)
+## 3. The primitive model — leveled (rewritten 2026-06-11; revised 2026-06-12 to the language-level model: boundary-crossing data primitives, control quantifiers, source→destination edges, law-checking)
 
 > **Supersedes the flat "L0 primitives" table.** That table mixed levels — implementation variants
 > (WRITE-inplace), addresses (LOGITS), control flow (ITERATIVE), compositions (CROSS-PROMPT) and
@@ -50,18 +50,18 @@ Adding work = adding rows/registry entries, never a harness redesign.
 >
 > | old flat row | new home |
 > |---|---|
-> | READ one site | Level 0 READ × Level 1 boundary site |
-> | CACHE many | Level 2 fused primitive (READ × breadth + SAVE) |
-> | WRITE-replace / WRITE-inplace | Level 0 WRITE; the replace/in-place split is a Level 1.5 realization |
-> | CROSS-PROMPT | Level 2 composition (READ in trace A → WRITE in trace B) |
-> | ITERATIVE | Level 0 control construct (iteration) |
-> | BACKWARD-attribution | Level 0 BACKWARD |
+> | READ one site | data op READ × Level 1 boundary site |
+> | CACHE many | Level 2 fused primitive (READ × breadth + live-out) |
+> | WRITE-replace / WRITE-inplace | data op WRITE; the replace/in-place split is a Level 1.5 realization |
+> | CROSS-PROMPT | Level 2 cross-edge movement (inter-region communication via the host) |
+> | ITERATIVE | control op: the loop (mirrors the decode loop) |
+> | BACKWARD-attribution | data op grad (a read on the derivative graph) |
 > | TRAIN-INTERVENTION | Level 3 program |
-> | AUX-MODULE | Level 0 COMPUTE |
-> | EDIT | Level 0 control construct |
+> | AUX-MODULE | meta-compute (demoted from Level 0, §3.1; its measured rows live as realization rows) |
+> | EDIT | staging (the named residue — neither data nor control flow) |
 > | LOGITS / SAMPLING | Level 1 engine-tier sites |
 > | SOURCE | Level 1 internal-tier sites |
-> | SAVE / transmit | Level 0 SAVE |
+> | SAVE / transmit | Level 2 cross-edge movement (live-out of a region) |
 
 **This model is a vocabulary for declaring footprints and indexing measurements** — metadata and
 micro-cells. It is NOT a construction layer: cells stay flat and explicit (§12); nothing generates
@@ -71,112 +71,377 @@ because it *constructed* the experiments; the levels only *explain and index* th
 Normative definitions live here; the maintained per-context **status inventory** lives in
 `interp-methods-catalog.md` (one copy, so the lists can't diverge again).
 
-### 3.1 Level 0 — core operations (closed set; should essentially never grow)
+### 3.1 Level 0 — data primitives and control quantifiers (revised 2026-06-12)
 
-| op | semantics | nnsight surface |
+Two orthogonal kinds of operation. **Data primitives** move values across the object/meta
+boundary between a model run and the experiment program; **control quantifiers** determine which
+runs exist and where in their coordinates the boundary crossings attach. A data-op instance is
+located at **(op × site × scope position)** — the site (§3.2) is its SPACE coordinate, the scope
+position its TIME/EXTENT coordinate.
+
+**Data primitives — membership criterion (replacing the enumerated framing):** *an operation is
+a data primitive iff it crosses the object/meta boundary.* Implementation ground truth: every
+data primitive lowers to a Mediator boundary event (nnsight
+`src/nnsight/intervention/interleaver.py:349-357` — VALUE / SWAP / SKIP / BARRIER / END /
+EXCEPTION); the engine's own event protocol independently confirms the criterion — every user
+surface lowers to read(VALUE) / write(SWAP) / skip / sync / end / error.
+
+| op | semantics | nnsight surfaces |
 |---|---|---|
-| **READ** | observe the value at a site | `site.output` / `.input` (real tensor inside the trace) |
-| **WRITE** | set the value at a site | `site.output = …` / `x[:] = …` (realizations differ, §3.3) |
-| **COMPUTE** | run arbitrary torch/Python on live values inside the trace — incl. applying external `nn.Module`s (probes/SAEs) and the model's own modules as functions | plain code in the trace body |
-| **SAVE** | move a value across the trace boundary (to the user; over the wire on serve/remote) | `.save()` |
-| **BACKWARD** | reverse-mode flow; equivalently READ in gradient space | `with t.backward(): … x.grad` |
+| **read**(r, addr) | observe the value at an address of run r (VALUE event) | `.output`, `.input`, `.inputs`, `.source.<op>`, `logits`, `samples`, `tracer.result`; `t.grad` is a read on the derivative graph |
+| **write**(r, addr, v) | the **counterfactual run**: r continues as if addr had value v (SWAP event; plus the in-place and skip realizations) | `.output = …`, `.input = …`, `x[:] = …`, `.skip(v)`, `samples = …`, `t.grad = …` |
+| **grad**(r, addr; metric) | observe the derivative graph of run r at addr | `with metric.backward(): … x.grad` |
 
-**Control / structure constructs** — same level, different kind: they don't touch values, they
-shape *when and in what scope* the ops run:
+`grad` is kept a primitive (rather than folded into read-on-the-derivative-graph) because
+methodologies treat it as one, and because the derivative graph may not exist at all in a
+context (F-11) — exactly the kind of status the inventory must carry.
 
-| construct | shapes | nnsight surface |
-|---|---|---|
-| trace | the base scope: one forward / one generate | `model.trace(...)` |
-| invoke | multi-prompt scoping within one trace (the batched regime) | `tracer.invoke(...)` |
-| iteration | the decode-time axis: ops per generation step | `tracer.iter[...]` / `.all()` / `.next()` |
-| barrier | cross-invoke synchronization (value sharing) | `tracer.barrier(n)` |
-| session | multi-trace scoping (variables flow across traces) | `model.session()` |
-| edit | persistent model modification outside any trace | `model.edit()` |
-| scan | shape-only execution mode | `model.scan(...)` |
+**What the criterion demotes.** COMPUTE leaves Level 0: the trace body is real Python and the
+model's parameters are readable constants, so arbitrary computation — including applying
+external `nn.Module`s (probes/SAEs) and the model's own modules as functions — is *meta-level
+code*, not a boundary crossing. The measured COMPUTE rows are NOT discarded: they become
+realization rows of **meta-compute** in a context ("aux compute needs `no_grad` on vLLM", F-1;
+"module-call unembed is guarded, weight-matmul works", F-2). `.save()` also stays out: it does
+not act on a value at a site — it moves a value OUT of a region. It is a data **edge** (the
+live-out), and lives with the other cross-edge movement in §3.4.
+
+**Control quantifiers — membership criterion:** *a control construct is named iff it quantifies
+boundary crossings over runs, steps, addresses, inputs, or run order.* Engine coupling is no
+longer the membership test — it is a per-quantifier **property** (some quantifiers are
+engine-coupled; some are host-side and free). This admits **sweep** — the host-side loop over
+addresses, the control construct most methodologies use most — which the old engine-coupling
+criterion wrongly excluded. Plain Python `if`/`for` over real tensors inside a trace remains
+ordinary control flow, free since v0.5, and deliberately NOT in the inventory.
+
+| quantifier | over | engine-coupled? | nnsight surface |
+|---|---|---|---|
+| **run** (region) | one run's existence/extent | yes (request lifecycle; steps=N; mode=fake; `tracer.stop()` truncation) | `model.trace(...)` / `generate` / `scan`; the backward region `with metric.backward():` |
+| **step** | the run's unrolled time | yes (the decode loop) | `tracer.iter[0:N]` / `iter[:]` / `.all()` / `tracer.next()` (realizations, §3.3) |
+| **sweep** | addresses | **no — host-side, free** | a plain Python loop; breadth (§3.4) is its measure |
+| **dataset** | inputs (independent runs) | only in the batched realization | prompt lists; `tracer.invoke(...)` incl. the empty invoke |
+| **adaptive** | future runs chosen from past results | no | host `while` / `if` over past results |
+| **run DAG** | run ordering with data dependence | yes (multi-request grouping) | `model.session()`; two traces |
+| (sync) | fork branches | yes | `tracer.barrier(n)` — a coordination construct whose only observable is its sharing edge (§3.4) |
+
+`generate` and `scan` remain region PARAMETERS, not separate constructs: steps=N
+(`max_tokens` / `max_new_tokens`) and mode=fake (`model.scan(...)`). **Staging** (`model.edit()`)
+remains the named residue — neither a data primitive nor a quantifier: code defined once,
+replayed into every future region; its observable is the replay edge (§3.4).
+
+**Scope position, defined.** A data-op instance's scope position is its path in the engine-side
+scope tree — exactly the coordinates the engine knows:
+
+```
+session  >  trace  >  invoke  >  step
+(multi-      (one        (which      (which decode
+ request      request     batch       iteration)
+ grouping)    lifecycle)  member)
+```
+
+Host-side quantifiers (sweep, dataset-as-sequential-runs, adaptive) do **not** occupy scope
+positions; they multiply *instances*, each of which has its own scope position. A footprint
+writes scope position as the innermost engine scope the crossing fires in (e.g. `write@step`,
+`read@invoke[1]`, `read@trace` default).
+
+**Fork: program or context — resolved.** The dataset quantifier is a *program* element. Whether
+it is realized as one batched trace (`invoke`) or N sequential traces is a *realization* (§3.3)
+of the dataset quantifier. The *workload regime* (§5) stays context: it describes the input
+distribution and concurrency the cell is run under. The dataset-lift law (§3.7) is what connects
+the two realizations, and the batched-GPT-2 positions effect is a model-side failure of that law
+(§3.6) — not a definitional ambiguity.
+
+Why the engine-coupled quantifiers "feel complex" while the data primitives don't: their
+complexity is **inherited from the serving engine**, not invented by nnsight. On HF — one
+in-process forward loop — they are all trivial (the micro tier measures 13/13 SUPPORTED). On
+vLLM they map onto real scheduler and request-lifecycle machinery, which is exactly where the
+measured frontier sits (§3.4).
+
+Orthogonality leak (note it, don't engineer around it): some quantifier parameters alter data
+semantics rather than just routing — mode=fake makes read return fake values; steps=N makes a
+site's denotation step-indexed.
 
 ### 3.2 Level 1 — the address space (sites)
 
-A *site* is a **name** for a value READ/WRITE can target. Tiers, by depth:
+A *site* is a **name** for a coordinate `(module-path × token-position × generation-step
+[× batch-member])` of the run's dataflow graph (and its derivative extension). **Membership
+criterion:** *a name belongs to the address space iff read/write/grad can target it and its
+denotation is checkable per context* (exists? / denotes what? / writable?). Tiers, by depth:
 
 | tier | sites | note |
 |---|---|---|
-| **engine** | `logits`, sampled tokens | runtime properties; backend-specific, not family-specific |
-| **module boundary** | `.output` / `.input` at any tree depth: model root → block → submodule (attn/mlp/norm) → leaf (linear/embedding) | the workhorse |
-| **module internal** | `.source.<op>` — intermediate ops inside a forward | op names are family-specific; existence is backend-specific |
-| **derived (value-level)** | head *h*, neuron *j*, position *p* | NOT new reads — READ ∘ COMPUTE(view/slice); derived *names* in the address space, not Level-0 ops |
-| **gradient space** | `.grad` of any of the above | exists only under BACKWARD |
+| **engine** | `logits`, `samples` (sampled tokens), `tracer.result`, `generator.output`, `streamer.output` | runtime properties; backend-specific, not family-specific |
+| **module boundary** | `.output` / `.input` / `.inputs` (the args+kwargs view) at any tree depth: model root → block → submodule (attn/mlp/norm) → leaf (linear/embedding) | the workhorse |
+| **module internal** | `.source.<op>` — intermediate ops inside a forward (incl. nested `.source`) | op names are family-specific; existence is backend-specific |
+| **derived (value-level)** | head *h*, neuron *j*, position *p* — **and subspace / direction-valued addresses** (DAS rotations, steering directions): a projection `(site, R)` is a derived NAME, realized as read∘project / project-write; the sweep quantifier ranges over them like any address | derived *names* in the address space, not Level-0 ops |
+| **gradient space** | `.grad` of any of the above | exists only under the backward region (grad) |
+
+Derived addresses are **names whose access path is a realization** (§3.3): a head-sliced write
+is write × derived address, where the derived address's *realization* is
+reshape-slice-reassemble at the boundary site. How a name is reached is its realization — this
+dissolves the old site/op blur for derived sites.
 
 A site name's **denotation is context-dependent** — the central Level-1 fact. Per context a site
 has three properties: **exists?** (attention weights have no denotation under paged attention),
 **denotes what?** (vLLM fused-residual blocks: "block output" exists but denotes
 `(hidden, residual)` whose SUM is the residual stream — same name, different meaning, F-7),
-**writable?**.
+**writable?**. The inventory (`interp-methods-catalog.md`) is required to carry the per-site
+**writable?** property, not just existence/denotation.
 
-### 3.3 Level 1.5 — realizations (idioms)
+### 3.3 Level 1.5 — realizations (idioms) — generalized 2026-06-12
 
-One abstract op, several concrete spellings; contexts differ in WHICH spelling works. The
-"documented working recipe per backend" deliverable = the realization of each abstract op that
-works in that context. Cell params like `mode=` / `unembed=` are realization selectors, not
-arbitrary knobs.
+**Definition (generalized):** *a realization is a concrete spelling of ANY language element —
+data op, quantifier, edge, or address — such that all spellings have the same language-level
+meaning.* Contexts differ in WHICH spelling works; the "documented working recipe per backend"
+deliverable = a realization choice per element. Cell params like `mode=` / `unembed=` are
+realization selectors, not arbitrary knobs.
 
-| abstract op | realizations |
+**Membership criterion:** two surfaces are realizations of one element iff a language-level
+semantics-preserving rewrite connects them (replacement ↔ in-place; bounded ↔ unbounded ↔
+`next`; batched invoke ↔ sequential traces; barriered ↔ two-trace transfer; `out[0]` ↔
+`out[0]+out[1]` for the same denotation).
+
+| element | realizations |
 |---|---|
-| WRITE | in-place `x[:] = …` vs replacement (new tensor / whole tuple) |
-| COMPUTE (unembed) | call the module `lm_head(h)` vs use its weights `F.linear(h, W)` |
-| COMPUTE (aux) | bare vs under `torch.no_grad()` |
-| cross-prompt transfer | two single-prompt traces vs barrier within one trace |
+| write | in-place `x[:] = …` / replacement (new tensor / whole tuple) / skip-with-value `.skip(v)` |
+| meta-compute (unembed) | call the module `lm_head(h)` / use its weights `F.linear(h, W)` |
+| meta-compute (aux) | bare / under `torch.no_grad()` |
+| step quantifier | bounded `iter[0:N]` / unbounded `iter[:]` / `.all()` / `tracer.next()` |
+| dataset quantifier | batched invoke (incl. the empty invoke) / sequential traces |
+| run↔run transfer edge | barriered / un-barriered cross-invoke (CROSS_INVOKER push/pull) / two traces via the host / session variable |
+| residual read (fused-residual families) | plain `out[0]` / fused sum `out[0] + out[1]` |
+| read / live-out **value semantics** | alias (reference into the run's storage) / snapshot (clone-at-crossing) — correct value selected by the **engine memory model** (§3.6); under in-place buffer reuse the alias decays silently, so the snapshot realization is required. Runtime-checkable selector (`tensor.is_inference()`), not a backend branch; nnsight applies it automatically (clone-on-save, vLLM intervention-gaps Gap 1.1) |
+| read-before-write (user's own downstream write) | alias / clone-first (`before = x.clone().save()`) — distinct from the value-semantics row above: this guards against *your* later write to the same site, not the engine's buffer reuse |
+| live-out edge (transport) | in-process / async streaming drain / over-the-wire (serve) |
 
-### 3.4 Level 2 — derived primitives (compositions)
+Note the re-homing: "loop step-selector" and "cross-prompt transfer" were never Level-0 ops —
+they are realizations of the **step quantifier** and of the **run↔run transfer edge**
+respectively. With realization defined element-generically, the table no longer violates its own
+definition.
 
-The finite catalog of **op × site-tier × time × realization** combinations, plus compositions
-across ops — what the methods-catalog tags (`read`, `write`, `xprompt`, `grad`, `attn-weights`, …)
-were groping at. Examples: boundary read; internal read (attention-weights = READ × internal ×
-attention); head-sliced write (WRITE × derived site); cross-prompt transplant (READ in trace A →
-WRITE in trace B); per-step steering (WRITE × iteration); bulk cache (`tracer.cache` = READ ×
-breadth + SAVE, a fused Level-2 primitive); gradient attribution read (BACKWARD + READ × grad
-space).
+### 3.4 Level 2 — entries; cross-edge data movement is the frontier class
 
-Scaling parameters — **breadth** (#sites), **tensor size** (hidden×seq×batch), **depth**
-(#tokens), **payload** (bytes saved/transferred), **side-compute** (aux FLOPs) — are *measures on*
-Level-2 entries, never new entries.
+**Definition.** The finite catalog of tuples **(data-op | edge) × address-tier × scope-position**,
+each carrying a **realization coordinate** — what the methods-catalog tags (`read`, `write`,
+`xprompt`, `grad`, `attn-weights`, …) were groping at. Examples: boundary read; internal read
+(attention-weights = read × internal × attention); head-sliced write (write × derived address);
+per-step steering (write × boundary × step); bulk cache (`tracer.cache` = read × breadth +
+live-out, a fused Level-2 primitive); gradient attribution read (grad × boundary).
+
+**The membership rule (resolving the 1.5/2 double-classification):** *realizations are
+coordinates ON entries, never entries.* An inventory row is an L2 entry; where statuses differ
+by spelling, the row splits by its realization coordinate. So bounded-vs-unbounded iteration is
+ONE L2 entry (the loop-carried accumulation edge, step → run) with two realization values, of
+which one is ERROR on vLLM; barrier-vs-two-trace is ONE entry (the run↔run transfer edge) with
+realization values {barriered, two-trace, un-barriered, session-var}. A failure's *kind* (§3.6)
+is then read off the coordinate that varies.
+
+**Edge derivation (source → destination).** Every value crossing the boundary has a provenance
+`(run, address, step)` and a destination; classifying meta-level dataflow edges by
+source → destination scope gives a complete, small set:
+
+| edge class | shape | canonical methodology |
+|---|---|---|
+| **observation** | read → emit | logit lens, probing data collection |
+| **rewiring** | read → compute → write, same run, downstream | path patching; SAE/transcoder splice |
+| **transplant** | read in run A → write in run B | activation patching / causal tracing |
+| **injection** | meta-constant → write | steering, zero/mean ablation |
+| **accumulation** | reads → meta-state → later write or analysis | mean ablation's mean; probe/SAE/DAS training (makes the `trained` tag structural) |
+| **derivative** | grad → emit/compute | attribution patching, saliency |
+
+The concrete movement table below is these edges viewed from below — the classic
+compiler/parallel-systems notions, and naming them that way is not decoration: it predicts where
+things break. **Rewiring and accumulation are the two edge classes with no measuring cell**
+(roadmap).
+
+| movement | edge | compiler name |
+|---|---|---|
+| `.save()` | region → caller (incl. streaming drain and over-the-wire on serve) | live-out |
+| iter accumulation (`rows.append` per step) | step → region | loop-carried dependency |
+| invoke value sharing (barriered or un-barriered) | fork branch ↔ fork branch | communication at fork/join |
+| session variable flow | region → region | live across regions |
+| cross-prompt transplant (two traces) | region → region via the host | inter-region communication |
+| edit replay (and export/import persistence) | definition → every future region | staging |
+
+**Enumerated membership** (making §3.5's completeness criterion computable): the L2 catalog is
+**generated, not curated** — the cross product of the traverse's data ops and edges (§3.8) ×
+address tiers (§3.2) × scope positions (§3.1), filtered to combinations any cataloged method's
+footprint names. The inventory in `interp-methods-catalog.md` carries this enumeration; coverage
+= footprint-needed entries minus probe-or-cell-exercised entries, mechanically computable.
+
+**Measured concentration (micro tier + the construct-gaps diagnosis): cross-edge movement
+carries most of the vLLM frontier** — loop-carried saves dropped (unbounded iter), fork/join
+sharing broken (barrier), cross-region flow absent (session), staging replay unserializable
+(edit) — plus one region mode (scan). Of the micro tier's data-op × site probes, 6/6 pass on
+vLLM (bounded iteration, the seventh SUPPORTED probe, is an edge realization, not a site probe).
+The non-edge failures are exactly the taxonomy's other kinds (§3.6): grad (op-level, F-11),
+attention-weights (site-level, F-10), in-place write and module-call compute (realization-level,
+F-5/F-2), fused residual (denotation, F-7). Mechanism for the edge concentration: data ops
+execute inside one worker scope; edges must cross nnsight's process/serialization boundaries,
+and on a production engine those boundaries are real.
+
+Scaling parameters — **breadth** (#sites — explicitly the sweep quantifier's measure), **tensor
+size** (hidden×seq×batch), **depth** (#tokens), **payload** (bytes saved/transferred),
+**side-compute** (aux FLOPs) — are *measures on* Level-2 entries, never new entries.
 
 ### 3.5 Level 3 — methodologies (programs) and footprints
 
-A methodology is a small program over Level-2 primitives plus a readout metric and semantic
-intent. Each program has a **footprint**: the set of Level-2 entries (with realizations) it needs.
-The catalog's per-method tag rows are footprints. This gives coverage a definition: the method
-tier is complete when its programs' footprints jointly cover every Level-2 entry any cataloged
-method needs — the gap between "needed by the catalog" and "exercised by a cell" IS the roadmap,
-mechanically.
+A methodology is a **meta-program over the language**: boundary crossings + quantifiers + edges,
+plus a readout metric and semantic intent. The space is structured as **base programs ×
+transformations** — step-lift (steering → generation-time steering), dataset-lift (single-input
+→ batched/statistical form), aggregation (ablation → mean ablation), linearization (patching →
+attribution patching; a *scientific approximation*, flagged as such, not an equivalence), and
+amortization (logit lens → tuned lens; fixed direction → trained probe/SAE). Each registry entry
+(§4) names its base program and the transformations applied. Membership criterion for a bench
+cell: deterministic (greedy/argmax), oracle-checkable, and its footprint is derivable from its
+program text.
 
-### 3.6 Context — orthogonal to all levels — and the failure-kind taxonomy
+**Footprint derivation is syntactic.** A cell's footprint is computed from its program text (or
+declared and checked against it — the declaration is the contract, the text is the truth):
+
+1. Every boundary crossing in the text contributes an L2 entry reference
+   `(op, address-tier, scope-position, realization)`. E.g. `blk.output = (h + v, out[1])` inside
+   `for step in tracer.iter[0:N]` contributes `write × boundary.block × step × replacement`.
+2. Every quantifier contributes its name + realization (`step/bounded`, `dataset/batched-invoke`,
+   `sweep` with its breadth).
+3. Every meta-level dataflow edge contributes its source→destination class (observation /
+   rewiring / transplant / injection / accumulation / derivative), plus the live-out for whatever
+   is saved.
+4. Modes (fake, steps=N) and semantics-relevant CONFIG values are recorded as entry parameters.
+
+**Machine-readable form** — `footprint=[...]` metadata on `@cell` registrations: pure data,
+consumed only by reporting/derivation; cells stay flat and explicit (§12/§12.6 untouched).
+Footprint vocabulary is the **catalog's tag table** (the single registry; realizations attach
+as `/`-suffixes); the site segment may refine to tier-level IDs (`boundary.block.output`,
+`internal.attn-weights`) — stable metadata names; cells keep explicit per-family paths:
+
+```python
+@cell("gen_steering", family="gpt2", backend="vllm_async",
+      footprint=[
+        "write/boundary/step/replacement",
+        "step/bounded",
+        "injection",                 # meta-constant direction → write
+        "loop-carried",              # per-step rows.append (a distinct edge from accumulation)
+        "live-out",
+      ])
+```
+
+**Completeness, restated:** the method tier is complete when (a) its programs' footprints
+jointly cover every L2 entry any cataloged method needs — the gap between "needed by the
+catalog" and "exercised by a cell" IS the roadmap, mechanically — AND (b) every edge type and
+every transformation is exercised by at least one cell. (b) is the language-level requirement:
+it is what makes the gen-steering cell "the step-lift transformation, verified" rather than just
+another method.
+
+### 3.6 Context — orthogonal to all levels — composition (∧), the failure-kind taxonomy, attribution
 
 `family × backend × engine-config × parallelism × workload-regime` is the environment a program
-runs in, not a level. Every level has a *status in a context*; statuses compose upward, and
-failures classify into five kinds (which flat per-cell expected entries cannot distinguish):
+runs in, not a level. **Engine mode (sync/async) is an explicit context coordinate** (barrier and
+session statuses differ by it). **The engine memory model is a second explicit context
+coordinate**: HF allocates fresh storage per forward (crossed values are de-facto snapshots);
+vLLM reuses activation/KV buffers in place (crossed values alias live storage). This one
+coordinate selects two realizations and produces a notable failure asymmetry — its **write face**
+is the in-place-vs-replacement split (in-place *raises* on vLLM, loud, F-5) and its **read face**
+is the alias-vs-snapshot split (an un-cloned read *silently decays* — measured ref-vs-clone
+divergence 64.6 / 1013.8, intervention-gaps Gap 1.1 — so the snapshot realization, §3.3, is
+required and nnsight applies it automatically). The engine protects writes loudly and reads not at
+all, which is why the read face needed an automatic fix. Every level has a *status in a context*;
+statuses compose upward — and the composition operator is now defined:
 
-| failure kind | level | measured example |
+- **Status order (worse = more severe):**
+  `SUPPORTED < SUPPORTED_DEGRADED < UNSUPPORTED_BY_CONSTRUCTION < ERROR < HANG < SILENTLY_WRONG`.
+- **∧ = max-severity:** the predicted status of a method in a context is the *worst* measured
+  status among its footprint's L2 entries in that context
+  (`SUPPORTED ∧ SUPPORTED_DEGRADED = SUPPORTED_DEGRADED`).
+- **Per-realization:** a footprint names the realization the cell actually uses, so the lookup
+  is per-realization — `write/.../replacement` composes against the replacement row (SUPPORTED
+  on vLLM), never against "write in general". "Some realization exists" is a *recipe* statement,
+  not a composition input.
+- **Per-context:** engine mode is a context coordinate, so there is no merging problem — a
+  barrier-using method inherits ERROR in `vllm_async` and SILENTLY_WRONG in `vllm_sync`, as two
+  cells.
+- **UNTESTED inputs:** any footprint entry with no measured row makes the prediction
+  `UNDERIVABLE(missing: <entry>)` — never a guess. The UNDERIVABLE set is the probe queue
+  generator (§3.7).
+
+Failures classify into seven kinds. The taxonomy is now a **decision procedure** over the L2
+coordinates (§3.4's membership rule): vary one coordinate of the failing entry and see what
+changes — same entry, one realization red → realization-unsupported; all realizations red →
+op/edge-unsupported; name missing → site-absent; name exists but red denotation →
+denotation-mismatch.
+
+| failure kind | level (varying coordinate) | measured example |
 |---|---|---|
-| operation unsupported | L0 × context | BACKWARD on vLLM (inference mode) — F-11 |
+| operation unsupported | L0 × context | grad on vLLM (inference mode) — F-11 |
 | site absent | L1 × context | attention weights under paged/flash attention — F-10 |
 | denotation mismatch | L1 × context | vLLM fused residual: name exists, means something else — F-7 |
-| realization unsupported | L1.5 × context | in-place WRITE raises (F-5); `lm_head.forward` guarded (F-2) |
-| regime effect | context alone | batched GPT-2 absolute positions: no primitive involved — the model's own semantics change under the regime |
+| realization unsupported | L1.5 coordinate × context | in-place write raises (F-5); `lm_head.forward` guarded (F-2) |
+| edge unsupported | L2 edge × context | the vLLM frontier: loop-carried saves dropped (F-13), fork/join sharing (F-14), cross-region flow (F-15), staging replay (F-16) |
+| mode unsupported | region parameter × context | scan (mode=fake) dies in input prep on vLLM — F-16 |
+| model-side law failure (formerly "regime effect") | context alone — a lifting law fails for the model itself | batched GPT-2 absolute positions: no primitive involved — the dataset-lift law (§3.7) is invalid for absolute-position families |
 
-The regime-effect row is why per-cell expected-state overrides exist: it is the class that does
-NOT decompose through the levels, and the model makes it an explicit, interesting category instead
-of an exception that embarrasses the abstraction.
+When a method cell's measured status disagrees with its ∧-prediction, attribute three ways:
 
-### 3.7 How the tiers (§2) use the model
+- **model-side law failure** — the scientist's lift was invalid for this model
+  (absolute positions under dataset-lift). Recorded as a per-cell expected override with
+  `attribution: model`; it does NOT impeach the entry statuses or ∧.
+- **implementation-side composition failure** — footprint entries interact through shared engine
+  state (the upstream saves-clobbering class). Recorded `attribution: implementation`; generates
+  a composition cell (the pair becomes a permanent regression row).
+- **numerics** — bf16 near-ties; the dtype control decides (F-8's `disambiguate_precision`
+  already implements this) → `SUPPORTED_DEGRADED`, `attribution: numerics`.
 
-- **Micro tier** = measure Levels 0–2 per context: op support, site existence + denotation,
-  realization viability. Small (~a dozen rows per backend), and the right surface to
-  version-stamp — the primitive-status map is the version-sensitive artifact, not every cell.
-- **Method tier** = verify Level-3 programs per context. Expected states become *derivable*
-  (footprint ∧ measured support) except the explicitly-marked regime effects; the runner's
-  existing surprise mechanism catches wrong derivations.
+The model-side-law-failure row is why per-cell expected-state overrides exist: it is the class
+that does NOT decompose through the levels, and the model makes it an explicit, interesting
+category — with a definition (a named law failing, attributed to the model) instead of a vibe.
+
+### 3.7 How the tiers (§2) use the model — micro checks entries, methods check laws
+
+- **Micro tier = entry-checking:** measure Levels 0–2 per context — data-op support, site
+  existence + denotation + writability, realization viability, **edge viability** (the
+  cross-edge movements of §3.4 — empirically the rows that carry the frontier). Small (~a dozen
+  rows per backend), and the right surface to version-stamp — the primitive-status map is the
+  version-sensitive artifact, not every cell. **The UNDERIVABLE set (§3.6) is the probe queue:**
+  the footprint entries blocking ∧-derivations are exactly what the micro tier probes next.
+- **Method tier = law-checking.** ∧-derivation is only an *a priori* prediction; it silently
+  assumes footprint entries compose independently. The transformations' **laws** are that
+  assumption made explicit — method cells test laws; micro probes test entries:
+
+  | law | claim | tested by | measured so far |
+  |---|---|---|---|
+  | step-lift | a per-forward intervention stays valid per step | base cell vs step-lifted cell, SAME backend | no direct test yet (base-vs-lifted comparison queued); F-17 supports it only indirectly — it measured the lifted cell's cross-backend agreement, which is the composition row's confirmation |
+  | dataset-lift | batched ≡ sequential per-prompt | batched-invoke cell vs sequential-traces cell | FAILS model-side for absolute-position families (batched GPT-2 positions) |
+  | sweep-exchange | sweeping addresses inside one run ≡ one run per address (non-interacting reads) | multi-layer cell vs per-layer cells | untested as a named law (logit-lens cells implicitly assume it) |
+  | composition | independent footprint entries compose (∧ is sound) | any method cell vs its ∧-prediction | one confirmation (F-17); known counterexamples upstream where entries share implementation state (nnsight batched-multitoken saves clobbering; PP iteration hang) |
+
+  A method cell's verdict protocol: `predicted = ∧(footprint, measured map)`; run; compare.
+  Agreement confirms both the entry statuses and the law instance ("statuses compose upward",
+  confirmed at method tier by F-17). Disagreement is a finding in itself and triggers the
+  three-way attribution (§3.6); the runner's existing surprise mechanism catches it.
 - When an upstream fix lands, the micro-tier row flips first and every dependent method cell flips
   with it — one cause, reported once.
+
+### 3.8 The complete component list per level (traverse summary, 2026-06-12)
+
+The full 75-row primitive traverse of nnsight's user-facing surface — with `file:line` evidence,
+per-row inventory status, and the disposition of every row not yet measured — lives in
+`drafts/design-revision-2026-06-12.md` Part 1. The compact normative answer to "what is the
+complete component list per level":
+
+| level | complete component list |
+|---|---|
+| **L0 data primitives** | read · write · grad (closed by the boundary-crossing criterion, §3.1) |
+| **L0 control quantifiers** | run (region; params steps=N, mode=fake; truncation `stop()`) · step · sweep · dataset · adaptive · run DAG · (sync/barrier) |
+| **residue** | staging (`edit`; replay + export/import persistence) |
+| **L1 address tiers** | engine (`logits`, `samples`, `tracer.result`, `generator.output`, `streamer.output`) · boundary (`.output`/`.input`/`.inputs`) · internal (`.source.<op>`, incl. nested) · derived (head/neuron/position + subspace/direction) · gradient (`.grad`) |
+| **L1.5 realizations** | per element, the §3.3 table (write ×3 · meta-compute ×2 · step ×3 · dataset ×2 · run↔run transfer ×4 · residual read ×2 · read/live-out value semantics: alias/snapshot · read-before-write clone-first · live-out transport ×3) |
+| **L2 entries** | generated: (data ops + edges) × address tiers × scope positions, filtered to footprint-named combinations (§3.4); edges classified observation / rewiring / transplant / injection / accumulation / derivative |
+| **L3 methodologies** | the registry (§4), each = base program × transformations (step-lift, dataset-lift, aggregation, linearization, amortization) |
+| **meta-level (not in the language)** | COMPUTE (trace body is real Python; measured realization rows F-1/F-2) · plain `if`/`for` · `save` (= the live-out edge) · harness/address-space machinery (`rename=`, enumeration, device mgmt) |
+| **out-of-scope v1** | NDIF plane (remote/session-bundling/non-blocking/`tracer.local`/code shipping — decision F2) · deprecated iteration forms · non-greedy sampling (breaks the determinism criterion) · non-LM model classes (F2; the §6 model-type axis reserves the slot) |
+
+Maintained per-context statuses for every inventoried component live ONLY in
+`interp-methods-catalog.md` (single copy); rows added 2026-06-12 from the traverse are all
+**UNTESTED** — no measured status is ever invented.
 
 ## 4. Methodology registry — Level-3 programs (seed, not ceiling)
 
@@ -194,7 +459,10 @@ family (CAA/ITI/RepE) · sparse probing / CCS · integrated gradients.
 
 **Borrow:** align methodology footprints (§3.5) with **pyvene's intervention-type enum** (Vanilla /
 Addition / Subtraction / Zero / Collect / RotatedSpace=DAS / LoRA) where they map, for shared
-vocabulary and cross-framework portability.
+vocabulary and cross-framework portability. Made concrete 2026-06-12: the catalog's tag table
+carries the edge-class ↔ pyvene-enum mapping (Collect=observation, Addition/Subtraction=injection,
+Vanilla interchange=transplant, RotatedSpace=subspace rewiring, LoRA=staging); subspace addresses
+are derived-tier Level-1 citizens (§3.2).
 
 ## 5. Context — workload regimes (how methodologies get run; the "dataset" distribution)
 
@@ -205,7 +473,8 @@ vocabulary and cross-framework portability.
 - **Multi-tenant / concurrent** — many independent traces vs one engine (nnsight-serve / NDIF)
 
 Regimes are context (§3.6), not levels — a regime can change *verdicts* (the batched
-absolute-position regime effect), which is why each workload is oracle-checked in its own regime.
+absolute-position model-side law failure, formerly "regime effect"), which is why each workload
+is oracle-checked in its own regime.
 The regime axis exercises the **engine axis** + concurrency — where vLLM should win and HF should
 struggle.
 
@@ -653,7 +922,8 @@ scripts/smoke.py        # enumerate the cells to run; print the map
   **Built 2026-06-11**: `isb/micro/probes.py` (one probe per row, self-contained denotation
   checks, watchdog HANG detection, vLLM probes ordered safest-first), `scripts/micro.py`;
   measured maps in `results/micro_{hf,vllm_async}.txt`, findings F-12..F-16.
-- Per-cell `expected` entries remain for **regime effects** (§3.6) — the non-decomposable residue,
-  now an explicit category rather than entries indistinguishable from derivable consequences.
+- Per-cell `expected` entries remain for **model-side law failures** (§3.6; formerly "regime
+  effects") — the non-decomposable residue, now an explicit category rather than entries
+  indistinguishable from derivable consequences.
 - The maintained Level-0/1 status inventory (measured vs UNTESTED per backend) lives in
   `interp-methods-catalog.md`; the UNTESTED rows there are the coverage queue.

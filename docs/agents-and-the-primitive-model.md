@@ -12,7 +12,9 @@
 
 The benchmark's decomposition of interp workloads —
 
-1. **primitives** (Level 0: READ/WRITE/COMPUTE/SAVE/BACKWARD + control constructs)
+1. **primitives** (Level 0: data primitives read/write/grad — the boundary-crossing criterion;
+   COMPUTE is meta-level — plus control quantifiers; cross-edge data movement —
+   live-out/loop-carried/fork-join/cross-region/staging — is the named frontier class at Level 2)
 2. **address & range** (Level 1: site tiers; a site is a NAME whose denotation is
    context-dependent)
 3. **idioms** (Level 1.5: the working realization per backend)
@@ -28,7 +30,7 @@ path_steering → pullback; pyvene + nnsight ≥ 0.5.9).
 
 | benchmark level | agent concept |
 |---|---|
-| primitives + control constructs | atomic tools |
+| data ops + engine-coupled control ops | atomic tools |
 | address space (name vs denotation) | tool arguments, with environment-dependent meaning |
 | idioms / realizations | per-environment tool VARIANTS |
 | methodology footprint | plan / skill signature |

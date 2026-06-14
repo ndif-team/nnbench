@@ -1,11 +1,12 @@
 """Micro tier — Level 0/1 primitive probes (design.md §3.7, §12.6).
 
-One minimal probe per UNTESTED row of the primitive inventory
+One minimal probe per row of the primitive inventory
 (`docs/interp-methods-catalog.md`), per backend. A probe measures ONE primitive —
-a Level-0 control construct (iteration / barrier / session / edit / scan) or a
-Level-1 site (boundary `.input`, engine `logits`/`samples`, derived head/neuron,
-non-attention `.source`) — with a self-contained denotation check, so its verdict
-uses the same applicability states as method cells:
+a control op or its cross-edge data movement (iteration loop-carried saves /
+barrier fork-join sharing / session cross-region flow / edit staging replay /
+scan region mode) or a Level-1 site (boundary `.input`, engine `logits`/`samples`,
+derived head/neuron, non-attention `.source`) — with a self-contained denotation
+check, so its verdict uses the same applicability states as method cells:
 
   SUPPORTED       ran AND the denotation check passed
   SILENTLY_WRONG  ran, no error, denotation check failed (the dangerous cell)
