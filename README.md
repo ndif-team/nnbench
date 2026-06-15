@@ -37,11 +37,15 @@ and reports latency, peak GPU memory, overhead vs a no-intervention baseline, an
 ## Current coverage
 
 - **Methodologies:** logit-lens · steering (activation addition) · activation patching (causal
-  tracing) · ablation (zero-knockout).
+  tracing) · ablation (zero-knockout) · attention-pattern read · attribution patching ·
+  generation-time steering.
 - **Families:** GPT-2 · Llama (SmolLM2-135M, a `LlamaForCausalLM`, as the Llama-arch stand-in).
-- **Backends:** HuggingFace `LanguageModel` (per-family control) vs vLLM-async (system under test).
-- **Workloads:** `interactive` (single prompt) and `batched` (N prompts; throughput + per-prompt
-  oracle). Batching is a coverage axis — it is oracle-checked, not timed blind.
+- **Backends:** HuggingFace `LanguageModel` (the per-family control) vs vLLM in both engine modes —
+  `vllm_async` (continuous-batching server) and `vllm_sync` (in-process) — plus a `vllm_serve` client
+  for a remote nnsight-vllm-serve server. Selectable with `--backend(s)` on `scripts/{bench,micro}.py`.
+- **Workloads:** `interactive` (single prompt), `batched` (N prompts; throughput + per-prompt
+  oracle), and `generation` (greedy multi-token decode; per-step read/intervention). Batching is a
+  coverage axis — it is oracle-checked, not timed blind.
 
 Representative finding: the exact portable logit-lens that is correct on GPT-2 is `SILENTLY_WRONG`
 on vLLM-Llama (top-1 agreement 0.13 vs HF, no error) because vLLM keeps a dual residual stream and
@@ -62,18 +66,21 @@ timeouts, swallowed SIGABRT) and always go under `timeout`:
 ```bash
 PY=/disk/u/zikai/anaconda3/envs/nnsight-serve-test/bin/python
 
-# one methodology (HF vs vLLM-async)
+# one methodology (default backends: HF + vLLM-async)
 CUDA_VISIBLE_DEVICES=0 timeout 1800 $PY scripts/bench.py --spec steering_gpt2
 
 # all methodologies / families
 CUDA_VISIBLE_DEVICES=0 timeout 1800 $PY scripts/bench.py --spec all
 
-# HF only (no GPU contention with vLLM)
+# pick backends explicitly: HF only, or the vLLM sync engine instead of async
 CUDA_VISIBLE_DEVICES=0 timeout 1800 $PY scripts/bench.py --spec ablation_gpt2 --backends hf
+CUDA_VISIBLE_DEVICES=0 timeout 1800 $PY scripts/bench.py --spec steering_gpt2 --backends hf vllm_sync
 ```
 
-Specs: `logit_lens_gpt2`, `logit_lens_llama`, `steering_gpt2`, `activation_patching_gpt2`,
-`ablation_gpt2`. The llama spec needs `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`.
+Specs: `logit_lens_gpt2`, `logit_lens_llama`, `steering_gpt2`, `gen_steering_gpt2`,
+`activation_patching_gpt2`, `ablation_gpt2`, `attention_pattern_gpt2`, `attribution_patching_gpt2`.
+The llama spec needs `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`. The Level-0/1 primitive probes run
+via `scripts/micro.py --backend {hf,vllm_async,vllm_sync}`.
 
 No-GPU unit tests (cell logic, oracle, timing, driver) run without a model:
 
@@ -86,24 +93,24 @@ conda run -n nnsight-serve-test python tests/test_sweep.py   # etc.
 ```
 isb/
   methodologies/   @cell(methodology, family, backend) -> explicit per-cell intervention code
-  backends/        `be` infra: HF (control) + vLLM-async (run / patch / batched / timing-safe loop)
+  backends/        `be` infra: HF (control) + vLLM async / sync / serve (run / patch / batched / teardown)
   oracle/          numerical-equivalence comparison (top-1 + total-variation)
   runner/          run_cell, evaluate (per-family control), dtype-control disambiguation
   perf/            time_cell (warmup + N trials, CUDA-synced, median±std, peak mem)
   sweep/           CellConfig/Workload/EffectSpec + the one-pass run_sweep driver
   specs/           one CellConfig per methodology (what bench.py --spec runs)
   report/          applicability map + performance table
-scripts/bench.py   single entrypoint
+scripts/           bench.py (method specs) · micro.py (Level-0/1 primitive probes)
 docs/              design.md (living design) · references.md · findings.md (measured results)
 ```
 
 ## Status
 
 Harness built and validated: the one-pass driver (amortized model load, correctness verified in the
-same warm/batched regime perf is measured), the numerical oracle, the performance layer, and the 4
-methodologies above. Batched throughput on vLLM is wired to the documented multi-invoke pattern but
-gated on an upstream nnsight async multi-prompt fix (HF batched works today). Next: more
-methodologies/families, larger models, a generation-time workload, and real prompt datasets.
+same warm/batched regime perf is measured), the numerical oracle, the performance layer, and the 7
+methodologies above. Batched runs the per-prompt multi-invoke pattern: it works on HF and on
+`vllm_sync` (each prompt is its own request); on `vllm_async` it is gated on an upstream multi-prompt
+submission fix. Next: more families, larger models, and real prompt datasets.
 
 See [`docs/design.md`](docs/design.md) for the living design and [`docs/findings.md`](docs/findings.md)
 for the measured results.

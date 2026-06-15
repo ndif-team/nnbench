@@ -28,6 +28,13 @@ logit_lens_gpt2 = CellConfig(
         # A future flip to SUPPORTED would surface as a surprise = "the async multi-prompt fix landed".
         ("vllm_async", "batched", "unembed=module"): "ERROR",
         ("vllm_async", "batched", "unembed=weight"): "ERROR",
+        # sync: idiomatic unembed still calls the guarded head.forward (engine-wide) -> ERROR. Batched
+        # runs each prompt as its own vLLM request (no left-padding), so the portable-weight lens is
+        # SUPPORTED (top1=0.92) where HF's padded batch is SILENTLY_WRONG — vLLM avoids the GPT-2
+        # absolute-position artifact.
+        ("vllm_sync", "interactive", "unembed=module"): "ERROR",
+        ("vllm_sync", "batched", "unembed=module"): "ERROR",
+        ("vllm_sync", "batched", "unembed=weight"): "SUPPORTED",
     },
 )
 
@@ -53,5 +60,14 @@ logit_lens_llama = CellConfig(
         ("vllm_async", "batched", "unembed=module"): "ERROR",                       # gated (+ guard)
         ("vllm_async", "batched", "unembed=weight (backend-aware)"): "ERROR",       # batched gated
         ("vllm_async", "batched", "unembed=weight, residual=plain (naive port)"): "ERROR",
+        # sync: same engine-wide guards/denotation. Batched runs each prompt as its own vLLM request;
+        # llama is RoPE (no position artifact), so the fused-residual lens is SUPPORTED and the
+        # naive-plain port stays SILENTLY_WRONG (dual-residual denotation) — the denotation is engine-wide,
+        # not engine-mode-specific; idiomatic unembed ERRORs (head guard).
+        ("vllm_sync", "interactive", "unembed=module"): "ERROR",
+        ("vllm_sync", "interactive", "unembed=weight, residual=plain (naive port)"): "SILENTLY_WRONG",
+        ("vllm_sync", "batched", "unembed=module"): "ERROR",
+        ("vllm_sync", "batched", "unembed=weight (backend-aware)"): "SUPPORTED",
+        ("vllm_sync", "batched", "unembed=weight, residual=plain (naive port)"): "SILENTLY_WRONG",
     },
 )

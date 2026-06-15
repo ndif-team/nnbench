@@ -33,5 +33,9 @@ gen_steering_gpt2 = CellConfig(
     # (SUPPORTED via working idioms) — the composition this spec exists to measure.
     expected={
         ("vllm_async", "generation", "bound=iter[:]"): "ERROR",
+        # sync pre-fix: unbounded iter[:] dropped all per-step saves (UnboundLocalError) too. The
+        # construct-gap fix sets a per-request stop bound + publishes saves on the unwind, so this
+        # flips to SUPPORTED on the fix branch — the write × unbounded-iter composition, now measurable.
+        ("vllm_sync", "generation", "bound=iter[:]"): "ERROR",
     },
 )

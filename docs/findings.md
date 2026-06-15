@@ -225,8 +225,9 @@ multi-prompt submission gate and the Barrier object not being shared across invo
 construct-gaps repros; a plain two-invoke trace works there): the trace **exits cleanly with the
 saved dict EMPTY** — silent post-barrier data loss, the SILENTLY_WRONG state, with no error
 signal of any kind. The two-trace `be.patch` recipe remains the working cross-prompt form (the
-activation-patching recipe). Note: the sync engine is not yet a bench backend — engine mode is a
-context axis the inventory currently under-represents.
+activation-patching recipe). Note: the sync engine is **now a bench backend**
+(`isb/backends/vllm_sync.py`); on the construct-bugs fix branch this barrier cell flips
+SILENTLY_WRONG→SUPPORTED, bench-measured (see the sync-backend section below).
 
 ### Session on vLLM: only the UN-SAVED cross-trace flow is broken (plus async entirely)
 On HF both flows work (saved read-after-exit, and un-saved trace-1 → trace-2 reuse, |Δ|=0).
@@ -314,3 +315,94 @@ kept the bf16 trajectory identical, TV=0.000 — so whether bf16 generation dive
 effect-strength-dependent, not a fixed property.) The unbounded realization ERRORs as predicted (the
 unbounded-iteration saves-drop). → `isb/methodologies/gen_patching.py`, `isb/specs/gen_patching.py`,
 `be.generate_patch`.
+
+## Micro + method tiers — vLLM **sync** engine backend (2026-06-14)
+
+vLLM exposes two engine modes — async (the continuous-batching server) and sync (in-process). The
+bench sweeps serving backends, and **engine mode is an explicit context coordinate** (design §3.6);
+the L3 sweep matrix (§6) named `vllm-sync` as a planned backend, deferred in v1. This adds it as a
+first-class backend (`isb/backends/vllm_sync.py`) — the same workloads, now run on the sync engine
+alongside HF and vLLM-async. The sync engine runs the trace in-process and binds saved values
+in-frame (HF's access pattern), so the backend mirrors `hf.py` with vLLM module semantics
+(`model.logits`/`.samples`, `_untuple`, RowParallelLinear, greedy sampling kwargs) — no async drain.
+The full micro tier (13 probes, parity with async) and all 7 method cells run on it; the micro tier
+gains an `EXPECTED` baseline map + a SURPRISE column (the regression detector,
+`isb/micro/{probes,run}.py`).
+
+The maps below were measured on the nnsight `vllm-construct-bugs` fix branch (vLLM 0.19.1), where the
+sync-engine construct-gaps (barrier, session, unbounded-iter — the iteration / barrier / session
+sections above, previously measured only via standalone repros) are fixed. nnsight's own gap suite
+corroborates — `tests/test_vllm.py` 11/11 gap tests pass (sync + async).
+
+**Micro sync map — 10/13 SUPPORTED, 2 surprises vs the documented pre-fix baseline:**
+
+| probe | expected (pre-fix sync) | fix branch | |
+|---|---|---|---|
+| barrier (cross-invoke patch) | SILENTLY_WRONG | **SUPPORTED** | ⚠ patch == two-trace patch, top1=1.00 tv=0.000 |
+| iteration unbounded `iter[:]` | ERROR | **SUPPORTED** | ⚠ 3 steps, step0 == single-step trace |
+| session — un-saved cross-trace | ERROR | ERROR | now the real `NameError: name 'v'` (clean), not the pre-fix misleading `UnboundLocalError` |
+| edit / scan | ERROR | ERROR | clean `NotImplementedError` gates |
+| session — saved · iter bounded · 6 data-op sites | SUPPORTED | SUPPORTED | no regressions |
+
+**Method sync map — every cell matches its declared expectation except the one flip:**
+
+| methodology (sync) | result | note |
+|---|---|---|
+| gen_steering `iter[:]` (write × unbounded-iter) | **SUPPORTED** ⚠ (exp ERROR) | top1=1.00 tv=0.000 — the composition flip |
+| gen_steering `iter[0:N]` · steering replace · logit_lens weight (gpt2/llama-fused) | SUPPORTED | top1 0.93–1.00 |
+| steering in-place · logit_lens idiomatic · attention_pattern · attribution grad | ERROR | in-place write / lm_head guard / attention-weights / grad — engine-WIDE frontiers |
+| logit_lens llama naive-plain residual | SILENTLY_WRONG | dual-residual denotation — engine-wide |
+| activation_patching · ablation | SUPPORTED_DEGRADED | bf16 near-tie; fp32-sync rerun matches HF (the dtype control) |
+| **batched** (steering replace · logit_lens weight · ablation) | SUPPORTED / SUPPORTED_DEGRADED | per-prompt `tracer.invoke`, no left-padding — matches the per-prompt truth where HF's padded batch is SILENTLY_WRONG (see the batched finding below) |
+| batched idiomatic-unembed · in-place | ERROR | engine-wide guards (lm_head guard / in-place write) |
+
+### Barrier and unbounded-iter flip to SUPPORTED on the fix branch
+On the sync engine `barrier` (the cross-invoke patch) goes SILENTLY_WRONG→SUPPORTED: pre-fix the
+trace exited clean with an empty saved dict (no error); on the fix branch the cross-invoke value
+flows and the barrier patch matches the two-trace `be.patch` (top1=1.00 tv=0.000). `iteration_unbounded`
+goes ERROR→SUPPORTED. `session_unsaved` surfaces the real `NameError` naming the un-saved variable,
+instead of the pre-fix misleading `UnboundLocalError`. These are sync-side fixes — on async the same
+probes stay ERROR (barrier and session are fixed only on sync; re-confirmed — only unbounded-iter
+flips on async).
+→ `isb/backends/vllm_sync.py`, `isb/micro/probes.py` (sync probes + `EXPECTED`), `isb/micro/run.py`.
+
+### The write × unbounded-iteration composition holds on sync once iter is fixed; other cells are engine-mode-independent
+gen_steering's unbounded `iter[:]` realization (per-step steering write inside the unbounded decode
+loop) dropped all saves pre-fix on both engines (the unbounded-iter saves-drop); on the fix branch's sync engine it flips
+ERROR→SUPPORTED and matches HF token-for-token (top1=1.00 tv=0.000) — the method-tier manifestation
+of the iteration fix composing with the replacement write (the bounded-iter × write composition). Every other method cell on sync
+matches its async/HF baseline exactly (in-place ERROR, grad ERROR, attn-weights ERROR,
+idiomatic-unembed ERROR, llama dual-residual SILENTLY_WRONG, patch/ablation SUPPORTED_DEGRADED),
+confirming those mechanisms are engine-WIDE, not engine-MODE-specific. The dtype control reruns on a
+fresh fp32 **sync** engine (`_fp32_rerun` is backend-aware), so the SUPPORTED_DEGRADED verdicts are
+validated on the same mode. Caveat: run **one spec per process** for vLLM (repeated EngineCore
+`spawn`s leak semaphores within a single process — the project's standing convention, see the
+`scripts/micro.py` header); `--spec all` in one process is not the supported path for vLLM.
+→ `isb/methodologies/*` (vllm_sync cells), `isb/sweep/driver.py`, `isb/specs/*` (sync `expected`).
+
+### Sync batched (per-prompt multi-invoke): SUPPORTED where HF's padded batch is SILENTLY_WRONG
+The sync backend's batched path runs N prompts as N independent `tracer.invoke`s in one trace
+(`VLLMSyncBackend.run_batched`) — a sync multi-invoke trace (the construct `barrier` also uses, but
+simpler: independent invokes, no cross-invoke value hand-off, so it needs none of the barrier
+machinery). **This is engine-MODE-independent, not a construct-gap fix**: re-measured on dev
+(pre-fix `944c805`), the sync batched map is identical (logit_lens weight SUPPORTED top1=0.92,
+ablation SUPPORTED_DEGRADED, steering replace SUPPORTED, llama naive-plain SILENTLY_WRONG,
+idiomatic/in-place ERROR — all "no surprises"). What the *async* engine cannot do is submit a
+multi-prompt trace at all (the async submission gate); the sync engine submits every
+invoke. Because vLLM runs each invoke as its **own request with no left-padding**, the batched
+output carries no absolute-position artifact — so it matches the per-prompt HF reference where HF's
+**own** padded batch is SILENTLY_WRONG:
+
+| batched cell | HF (padded batch) | vLLM-sync (per-prompt invoke) |
+|---|---|---|
+| logit_lens gpt2, weight unembed | **SILENTLY_WRONG** (top1=0.50, position artifact) | **SUPPORTED** (top1=0.92) |
+| ablation gpt2, mlp / attn | **SILENTLY_WRONG** (top1=0.25) | **SUPPORTED_DEGRADED** (top1=0.50 / 1.00, bf16 near-tie) |
+| steering gpt2, replace | SUPPORTED (steer dominates) | SUPPORTED (top1=1.00 tv=0.000) |
+| logit_lens llama, weight-fused / naive-plain | SUPPORTED / SUPPORTED | SUPPORTED (top1=0.98) / **SILENTLY_WRONG** (dual-residual denotation, engine-wide) |
+| idiomatic unembed; in-place write | — | ERROR (lm_head guard / inference-tensor in-place) |
+
+On GPT-2 (absolute positions) the sync batched cells match the per-prompt HF reference, while HF's
+own padded batch diverges from it — the documented left-pad position artifact; the oracle scores both
+against the per-prompt truth (§8.1). The denotation/guard outcomes (idiomatic-unembed ERROR, llama
+naive-plain SILENTLY_WRONG) are engine-WIDE, identical to the interactive cells. → `isb/backends/vllm_sync.py` (`run_batched`),
+`isb/specs/{logit_lens,ablation,steering}.py` (batched sync `expected`).

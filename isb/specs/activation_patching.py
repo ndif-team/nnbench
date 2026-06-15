@@ -29,5 +29,8 @@ activation_patching_gpt2 = CellConfig(
     expected={
         ("vllm_async", "interactive", "layer=3"): "SUPPORTED_DEGRADED",
         ("vllm_async", "interactive", "layer=9"): "SUPPORTED_DEGRADED",
+        # sync: same two-trace transplant (whole-tuple replace); bf16 near-tie -> SUPPORTED_DEGRADED.
+        ("vllm_sync", "interactive", "layer=3"): "SUPPORTED_DEGRADED",
+        ("vllm_sync", "interactive", "layer=9"): "SUPPORTED_DEGRADED",
     },
 )

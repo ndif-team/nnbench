@@ -75,4 +75,12 @@ class CellConfig:
     # the non-SUPPORTED cells need listing — anything unlisted defaults to SUPPORTED. A vllm_serve cell
     # with no entry inherits the vllm_async expectation (serve should match in-process vLLM; a mismatch
     # is a genuine transport surprise). See `expected_state` in the driver.
+    #
+    # CONVENTION (two modes, one field): an entry is the cell's known **steady state** on the bench's
+    # reference nnsight — engine-mode-independent statuses are verified identical on dev and the fix
+    # branch (e.g. the vllm_sync batched/interactive entries). The one deliberate exception is a
+    # **flip-detector**: for a cell whose status an upstream fix *in flight* will change, the entry
+    # holds the PRE-FIX baseline so the fix surfaces as a ⚠ SURPRISE on a fix-branch run (e.g.
+    # gen_steering's unbounded `iter[:]` left at ERROR; the micro tier's barrier/iteration in
+    # `isb/micro/probes.py`). Same regression-detector role, pointed at an expected change.
     expected: dict = field(default_factory=dict)

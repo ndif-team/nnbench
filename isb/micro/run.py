@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 
 from ..states import AppState
-from .probes import PROBES, names_for
+from .probes import PROBES, expected_state, names_for
 
 PROBE_TIMEOUT_S = 180.0
 
@@ -25,6 +25,8 @@ class ProbeResult:
     state: str
     note: str
     latency_s: float | None = None
+    expected: str = AppState.SUPPORTED
+    surprise: bool = False
 
 
 def _run_one(fn, be, model, timeout_s: float):
@@ -63,8 +65,11 @@ def run_micro(backend_name: str, repo: str = "openai-community/gpt2",
             if only and name not in only:
                 continue
             state, note, dt = _run_one(PROBES[(name, backend_name)], be, model, timeout_s)
-            results.append(ProbeResult(name, backend_name, state, note, dt))
-            print(f"  {name:<20}{state:<18}{dt:6.1f}s  {note}", flush=True)
+            exp = expected_state(name, backend_name)
+            surprise = state != exp
+            results.append(ProbeResult(name, backend_name, state, note, dt, exp, surprise))
+            flag = f"  <- SURPRISE (expected {exp})" if surprise else ""
+            print(f"  {name:<20}{state:<18}{dt:6.1f}s  {note}{flag}", flush=True)
             if state == AppState.HANG:
                 print("  -- HANG poisons the engine; aborting this backend's remaining probes",
                       flush=True)
@@ -77,10 +82,16 @@ def run_micro(backend_name: str, repo: str = "openai-community/gpt2",
 def print_micro_map(backend_name: str, repo: str, results: list) -> None:
     print("\n=== Micro tier — Level 0/1 primitive map ===")
     print(f"backend: {backend_name}    model: {repo}")
-    print("-" * 86)
-    print(f"{'probe':<21}{'state':<18}{'latency':<9}{'denotation check / note'}")
-    print("-" * 86)
+    print("-" * 100)
+    print(f"{'probe':<21}{'state':<18}{'expected':<18}{'!':<3}{'lat':<7}{'denotation check / note'}")
+    print("-" * 100)
     for r in results:
         lat = f"{r.latency_s:.1f}s" if r.latency_s is not None else "-"
-        print(f"{r.name:<21}{r.state:<18}{lat:<9}{r.note}")
-    print("-" * 86)
+        mark = "*" if r.surprise else ""
+        print(f"{r.name:<21}{r.state:<18}{r.expected:<18}{mark:<3}{lat:<7}{r.note}")
+    print("-" * 100)
+    surprises = [r for r in results if r.surprise]
+    n_ok = sum(1 for r in results if r.state == AppState.SUPPORTED)
+    print(f"{n_ok}/{len(results)} SUPPORTED; {len(surprises)} surprise(s) vs expected.")
+    for r in surprises:
+        print(f"  * {r.name}: expected {r.expected} -> got {r.state}  ({r.note})")

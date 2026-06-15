@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import traceback
 
-from ..backends import HFBackend, VLLMAsyncBackend, VLLMServeBackend
+from ..backends import HFBackend, VLLMAsyncBackend, VLLMServeBackend, VLLMSyncBackend
 from ..methodologies.registry import get_cell
 from ..perf.timing import time_cell
 from ..report import print_map, print_perf
@@ -33,6 +33,8 @@ def _default_backend(name, spec, serve_host=None):
         return HFBackend(**spec.hf_kwargs)
     if name == "vllm_async":
         return VLLMAsyncBackend(**spec.vllm_kwargs)
+    if name == "vllm_sync":
+        return VLLMSyncBackend(**spec.vllm_kwargs)
     if name == "vllm_serve":
         if serve_host is None:
             raise ValueError("the vllm_serve backend needs a server URL (pass serve_host= / --serve)")
@@ -96,7 +98,9 @@ def _fp32_rerun(spec, params, workload):
     whole prompt list would hit vLLM's batched gate and fail, making every bf16 near-tie look like a
     bug)."""
     def rerun(c):
-        impl = VLLMAsyncBackend(dtype=spec.dtype_control)
+        # match the cell's backend mode so the fp32 control is measured on the same engine
+        BE = VLLMSyncBackend if c.backend == "vllm_sync" else VLLMAsyncBackend
+        impl = BE(dtype=spec.dtype_control)
         model = None
         try:
             model = impl.load(spec.repo)
@@ -255,7 +259,7 @@ def run_sweep(spec, backends=("hf", "vllm_async"), backend_factory=None,
                             throughput=_throughput(workload, timing),
                             overhead_vs_baseline=(timing.median_ms / base_timing.median_ms)
                             if (base_timing and base_timing.median_ms) else None,
-                            enforce_eager=True if name == "vllm_async" else None)
+                            enforce_eager=True if name in ("vllm_async", "vllm_sync") else None)
                         results.append(CellResult(
                             spec.methodology, spec.family, name, label, "RAN",
                             latency_s=timing.median_ms / 1000.0, value=warm,

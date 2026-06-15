@@ -605,3 +605,263 @@ def session_unsaved_vllm(be, model):
         ) from e
     state = AppState.SUPPORTED if val < 1e-3 else AppState.SILENTLY_WRONG
     return state, f"cross-trace value reuse, |Δ|={val:.2e}"
+
+
+# ---------------------------------------------------------------------------
+# vLLM-sync probes (the in-process synchronous engine)
+#
+# The sync engine runs the trace in-process and pushes saved values back into the trace
+# frame — HF's access pattern — so these mirror the HF probes (synchronous, individual
+# `.save()` vars, read in-frame) but with vLLM module semantics (`model.logits`/`.samples`,
+# `_untuple`, RowParallelLinear recon, flat logits) and greedy sampling kwargs. No async
+# drain. This is the engine where the construct-gap fixes land (barrier cross-invoke,
+# session saved-flow, unbounded iter), so the gap probes below carry the measurable flips.
+# Registration order = safest-first (a HANG aborts the rest); barrier/session last.
+# ---------------------------------------------------------------------------
+
+_S = {"temperature": 0.0, "top_p": 1, "max_tokens": 1}   # greedy single-step
+
+
+@probe("input_boundary", "vllm_sync")
+def input_boundary_vllm_sync(be, model):
+    with model.trace(PROMPT, **_S):
+        out5 = _untuple(model.transformer.h[5].output).save()
+        inp6 = model.transformer.h[6].input.save()
+    return _verdict_close(_rel_dev(inp6, out5), 1e-5, "h[6].input vs h[5].output")
+
+
+@probe("engine_logits", "vllm_sync")
+def engine_logits_vllm_sync(be, model):
+    """Engine site `model.logits` vs the portable unembed of the final block. The c_proj/
+    unembed weights are real only in the worker, so the reconstruction runs INSIDE the trace."""
+    with model.trace(PROMPT, **_S):
+        with torch.no_grad():
+            normed = model.transformer.ln_f(_untuple(model.transformer.h[-1].output))
+            manual = F.linear(normed, model.lm_head.weight)[-1:, :].save()
+        eng = model.logits.save()
+    return _verdict_compare(_cpu(manual), _cpu(eng), "model.logits vs portable unembed")
+
+
+@probe("engine_samples", "vllm_sync")
+def engine_samples_vllm_sync(be, model):
+    with model.trace(PROMPT, **_S):
+        lg = model.logits.save()
+        smp = model.samples.save()
+    tok = int(_cpu(smp).flatten()[-1].item())
+    arg = int(_cpu(lg).argmax(-1).flatten()[-1].item())
+    state = AppState.SUPPORTED if tok == arg else AppState.SILENTLY_WRONG
+    return state, f"sampled id {tok} vs greedy logits argmax {arg}"
+
+
+@probe("derived_head", "vllm_sync")
+def derived_head_vllm_sync(be, model):
+    attn = model.transformer.h[6].attn
+    with model.trace(PROMPT, **_S):
+        with torch.no_grad():
+            cp_in = _untuple(attn.c_proj.input)
+            recon = F.linear(cp_in, attn.c_proj.weight, attn.c_proj.bias).save()
+            cp_in = cp_in.save()
+            attn_out = _untuple(attn.output).save()
+    H = attn.num_heads
+    x = _cpu(cp_in)
+    head4 = x.view(*x.shape[:-1], H, x.shape[-1] // H)[..., 4, :]
+    state, note = _verdict_close(_rel_dev(recon, attn_out), 5e-2, "c_proj recon vs attn.output")
+    return state, f"head slice {tuple(head4.shape)}; {note}"
+
+
+@probe("derived_neuron", "vllm_sync")
+def derived_neuron_vllm_sync(be, model):
+    mlp = model.transformer.h[6].mlp
+    with model.trace(PROMPT, **_S):
+        cfc = _untuple(mlp.c_fc.output).save()
+        act = _untuple(mlp.act.output).save()
+    neuron7 = _cpu(act)[..., 7]
+    recon = F.gelu(_cpu(cfc), approximate="tanh")
+    state, note = _verdict_close(_rel_dev(recon, act), 5e-2, "gelu_new(c_fc) vs act.output")
+    return state, f"neuron slice {tuple(neuron7.shape)}; {note}"
+
+
+@probe("source_mlp", "vllm_sync")
+def source_mlp_vllm_sync(be, model):
+    mlp = model.transformer.h[6].mlp
+    with model.trace(PROMPT, **_S):
+        direct = _untuple(mlp.c_fc.output).save()
+    with model.trace(PROMPT, **_S):
+        via = mlp.source.self_c_fc_0.output[0].save()
+    return _verdict_close(_rel_dev(via, direct), 1e-5, "source.self_c_fc_0 vs c_fc.output")
+
+
+def _iter_sync(be, model, bounded: bool):
+    """Per-step `model.logits` reads over max_tokens=3. The UNBOUNDED realization
+    (`tracer.iter[:]`) dropped ALL saves on the sync engine pre-fix (UnboundLocalError on the
+    saved list); the construct-gap fix sets a per-request stop bound and publishes saves on the
+    unwind, so both forms now collect 3 rows (vllm-construct-gaps.md §1)."""
+    with model.trace(PROMPT, **_S):
+        ref = model.logits.save()
+    with model.trace(PROMPT, temperature=0.0, top_p=1, max_tokens=3) as tracer:
+        rows = list().save()
+        if bounded:
+            for _step in tracer.iter[0:3]:
+                rows.append(model.logits)
+        else:
+            for _step in tracer.iter[:]:
+                rows.append(model.logits)
+    form = "bounded iter[0:3]" if bounded else "unbounded iter[:] (the documented idiom)"
+    if len(rows) != 3:
+        return AppState.SILENTLY_WRONG, f"{form}: expected 3 per-step reads, got {len(rows)}"
+    state, note = _verdict_compare(_cpu(ref), _cpu(rows[0]), "step0 vs single-step trace")
+    return state, f"{form}: 3 steps; {note}"
+
+
+@probe("iteration_bounded", "vllm_sync")
+def iteration_bounded_vllm_sync(be, model):
+    return _iter_sync(be, model, bounded=True)
+
+
+@probe("iteration_unbounded", "vllm_sync")
+def iteration_unbounded_vllm_sync(be, model):
+    return _iter_sync(be, model, bounded=False)
+
+
+@probe("scan", "vllm_sync")
+def scan_vllm_sync(be, model):
+    """Shape-only execution. On the fix branch `VLLM.scan()` is GATED (raises a clear
+    NotImplementedError) — the runner records that as a clean ERROR."""
+    import nnsight
+
+    n_tok = len(model.tokenizer(PROMPT)["input_ids"])
+    with model.scan(PROMPT):
+        shp = nnsight.save(tuple(_untuple(model.transformer.h[0].output).shape))
+    state = (AppState.SUPPORTED
+             if (len(shp) >= 2 and shp[-2] == n_tok) or shp[0] == n_tok
+             else AppState.SILENTLY_WRONG)
+    return state, f"scanned shape {tuple(shp)} (prompt tokens={n_tok})"
+
+
+@probe("edit", "vllm_sync")
+def edit_vllm_sync(be, model):
+    """Persistent edit. On the fix branch `VLLM.edit()` is GATED (raises NotImplementedError at
+    creation) — recorded as a clean ERROR. If a future serialization-only fix lets it through but
+    drops the edit, the baseline-equality branch catches the SILENTLY_WRONG outcome."""
+    with model.trace(PROMPT, **_S):
+        base = model.logits.save()
+
+    with model.edit() as edited:
+        out = edited.transformer.h[6].attn.output
+        if isinstance(out, tuple):
+            edited.transformer.h[6].attn.output = (torch.zeros_like(out[0]), *out[1:])
+        else:
+            edited.transformer.h[6].attn.output = torch.zeros_like(out)
+
+    with edited.trace(PROMPT, **_S):
+        ed = edited.logits.save()
+    if is_equivalent(compare(_cpu(base), _cpu(ed))):
+        return AppState.SILENTLY_WRONG, "edit silently dropped (edited == unedited baseline)"
+    return AppState.SUPPORTED, "edit applied (edited logits diverge from baseline)"
+
+
+@probe("barrier", "vllm_sync")
+def barrier_vllm_sync(be, model):
+    """tracer.barrier(2) sharing an unsaved activation across two invokes on the SYNC engine.
+    Pre-fix this was the SILENTLY_WRONG cell — the trace exited clean and the saved dict came
+    back EMPTY (no error). The construct-gap fix (shared Barrier + shared frame + per-name save
+    registration) makes it work; denotation: equals the two-trace patch of the same edit."""
+    def capture():
+        return _untuple(model.transformer.h[5].output)[-1:, :]
+
+    def patch_fn(clean_act):
+        out = model.transformer.h[5].output
+        hs = _untuple(out).clone()
+        hs[-1:, :] = clean_act.to(hs.dtype).to(hs.device)
+        if isinstance(out, tuple):
+            model.transformer.h[5].output = (hs, *out[1:])
+        else:
+            model.transformer.h[5].output = hs
+        return model.logits
+
+    ref = be.patch(model, CLEAN, CORRUPT, capture, patch_fn)
+
+    with model.trace(temperature=0.0, top_p=1, max_tokens=1) as tracer:
+        res = dict().save()
+        barrier = tracer.barrier(2)
+        with tracer.invoke(CLEAN):
+            clean_hs = _untuple(model.transformer.h[5].output)[-1:, :]
+            barrier()
+        with tracer.invoke(CORRUPT):
+            barrier()
+            out = model.transformer.h[5].output
+            hs = _untuple(out).clone()
+            hs[-1:, :] = clean_hs
+            if isinstance(out, tuple):
+                model.transformer.h[5].output = (hs, *out[1:])
+            else:
+                model.transformer.h[5].output = hs
+            res["patched"] = model.logits
+    if not (isinstance(res, dict) and "patched" in res):
+        keys = sorted(res) if isinstance(res, dict) else repr(res)
+        return AppState.SILENTLY_WRONG, f"post-barrier save dropped, no error (keys={keys})"
+    return _verdict_compare(_cpu(ref), _cpu(res["patched"]), "barrier patch vs two-trace patch")
+
+
+@probe("session_saved", "vllm_sync")
+def session_saved_vllm_sync(be, model):
+    """SAVED session flow: `.save()` in a session trace, read after session exit. Works on the
+    sync engine (vllm-construct-gaps.md §3)."""
+    with model.trace(PROMPT, **_S):
+        ref = model.logits.save()
+    with model.session():
+        with model.trace(PROMPT, **_S):
+            lg = model.logits.save()
+    return _verdict_compare(_cpu(ref), _cpu(lg.detach()), "session-saved read vs plain trace")
+
+
+@probe("session_unsaved", "vllm_sync")
+def session_unsaved_vllm_sync(be, model):
+    """UN-SAVED cross-trace session flow: a trace-1 variable without `.save()` consumed in
+    trace 2. Only `Globals.saves` ship back from the worker, so this is a user error — and the
+    fix makes it a CLEAN error (the real NameError naming the unsaved var) instead of the
+    pre-fix misleading UnboundLocalError. Either way the runner records ERROR."""
+    try:
+        with model.session():
+            with model.trace(PROMPT, **_S):
+                v = model.logits
+            with model.trace(PROMPT, **_S):
+                diff = (model.logits - v).abs().max().save()
+        val = float(_cpu(diff.detach()))
+    except (NameError, UnboundLocalError) as e:
+        raise RuntimeError(
+            "un-saved trace-1 value never materializes client-side (only saves ship back from "
+            "the worker); on sync the fix surfaces the real NameError naming the upstream var — "
+            "vllm-construct-gaps.md §3"
+        ) from e
+    state = AppState.SUPPORTED if val < 1e-3 else AppState.SILENTLY_WRONG
+    return state, f"cross-trace value reuse, |Δ|={val:.2e}"
+
+
+# ---------------------------------------------------------------------------
+# Expected states — the encoded benchmark knowledge (design.md §8.1; the CellConfig.expected
+# convention, here for the micro tier). Values are the DOCUMENTED PRE-FIX baseline
+# (nnsight docs/developing/vllm-construct-gaps.md, diagnosed on vLLM 0.15.1 & 0.19.1). An
+# unlisted (name, backend) defaults to SUPPORTED. Running against the construct-bugs fix branch
+# makes the runner mark deviations as SURPRISE — the regression detector: a surprise is a landed
+# fix now, and (after promoting these to the post-fix map) a regression later.
+# ---------------------------------------------------------------------------
+EXPECTED = {
+    # vLLM sync — the fixes land here:
+    ("iteration_unbounded", "vllm_sync"): AppState.ERROR,        # all saves lost (UnboundLocalError)
+    ("barrier", "vllm_sync"): AppState.SILENTLY_WRONG,           # trace exits clean, saved dict EMPTY
+    ("session_unsaved", "vllm_sync"): AppState.ERROR,            # misleading UnboundLocalError (pre-fix)
+    ("edit", "vllm_sync"): AppState.ERROR,                       # PicklingError -> now gated
+    ("scan", "vllm_sync"): AppState.ERROR,                       # msgspec 'hook' -> now gated
+    # vLLM async — only unbounded-iter is fixed on this engine; barrier/session stay open:
+    ("iteration_unbounded", "vllm_async"): AppState.ERROR,
+    ("barrier", "vllm_async"): AppState.ERROR,
+    ("session_saved", "vllm_async"): AppState.ERROR,
+    ("session_unsaved", "vllm_async"): AppState.ERROR,
+    ("edit", "vllm_async"): AppState.ERROR,
+    ("scan", "vllm_async"): AppState.ERROR,
+}
+
+
+def expected_state(name: str, backend: str) -> str:
+    return EXPECTED.get((name, backend), AppState.SUPPORTED)

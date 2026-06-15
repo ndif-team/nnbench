@@ -30,5 +30,12 @@ ablation_gpt2 = CellConfig(
         ("hf", "batched", "target=attn"): "SILENTLY_WRONG",
         ("vllm_async", "batched", "target=mlp"): "ERROR",       # batched gated (awaiting upstream fix)
         ("vllm_async", "batched", "target=attn"): "ERROR",
+        # sync: same whole-tuple-replace knockout; bf16 near-tie -> SUPPORTED_DEGRADED (precision,
+        # engine-wide). Batched runs each prompt as its own vLLM request (no left-padding), so it
+        # matches the per-prompt truth where HF's padded batch is SILENTLY_WRONG -> SUPPORTED_DEGRADED.
+        ("vllm_sync", "interactive", "target=mlp"): "SUPPORTED_DEGRADED",
+        ("vllm_sync", "interactive", "target=attn"): "SUPPORTED_DEGRADED",
+        ("vllm_sync", "batched", "target=mlp"): "SUPPORTED_DEGRADED",
+        ("vllm_sync", "batched", "target=attn"): "SUPPORTED_DEGRADED",
     },
 )
