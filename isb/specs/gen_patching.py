@@ -38,8 +38,14 @@ gen_patching_gpt2 = CellConfig(
     # bounded: the composition prediction — SUPPORTED_DEGRADED, mirroring the single-forward patch's
     # bf16 near-tie; the fp32 dtype control gives the mechanism verdict. unbounded iter[:]: the loop
     # overruns and drops all per-step saves on vLLM -> ERROR (the saves-drop), the frontier marker.
+    # vllm_serve: generation over the serve transport is not wired (be.generate_patch raises
+    # NotImplementedError), so both realizations are ERROR. These are declared explicitly because a
+    # serve cell otherwise inherits the vllm_async expectation (SUPPORTED_DEGRADED for bounded),
+    # which would report the deliberate follow-up as a surprise.
     expected={
         ("vllm_async", "generation", "bound=iter[0:N]"): "SUPPORTED_DEGRADED",
         ("vllm_async", "generation", "bound=iter[:]"): "ERROR",
+        ("vllm_serve", "generation", "bound=iter[0:N]"): "ERROR",
+        ("vllm_serve", "generation", "bound=iter[:]"): "ERROR",
     },
 )

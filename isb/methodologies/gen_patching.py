@@ -50,19 +50,28 @@ def _capture(blocks, layer, residual):
         return _resid(blocks[layer].output, residual).clone()
 
 
-def _inject_at_prefill(blocks, layer, clean_act):
-    """Replace `layer`'s residual with the captured clean snapshot — but ONLY at the prefill step,
-    detected by shape: the prefill residual spans the whole prompt and matches the captured shape,
-    while each decode step's residual is length-1 (the new token alone) and is left untouched. The
-    transplant therefore lands once, at prefill, and rides the request's own KV cache from there.
-    Whole-tuple replacement (the vLLM-safe write; in-place raises on inference tensors)."""
+def _inject_transplant(blocks, layer, clean_act):
+    """Replace `layer`'s residual with the captured clean snapshot (whole-tuple replacement — the
+    vLLM-safe write; in-place raises on inference tensors). The cell calls this exactly once, on the
+    PREFILL forward (the first generation forward, which holds the whole prompt); the transplant then
+    rides the request's own KV cache through the decode steps. The prefill step is identified by the
+    caller's first-forward flag, NOT by shape — a shape test would misfire on a one-token prompt,
+    whose decode steps share the prefill's [1, hidden] shape and would be re-patched every step.
+
+    Raises if the snapshot's shape does not match the residual being replaced — i.e. the
+    clean/corrupted prompts are not length-matched (or the prefill was chunked), which makes a
+    position-aligned whole-residual replacement ill-defined; failing loudly beats a silent no-op."""
     with torch.no_grad():
         out = blocks[layer].output
         is_tuple = isinstance(out, tuple)
         hidden = out[0] if is_tuple else out
         clean = clean_act.to(device=hidden.device, dtype=hidden.dtype)
-        if tuple(clean.shape) == tuple(hidden.shape):          # prefill: full-prompt residual
-            blocks[layer].output = (clean, *out[1:]) if is_tuple else clean
+        if tuple(clean.shape) != tuple(hidden.shape):
+            raise ValueError(
+                f"transplant shape {tuple(clean.shape)} != prefill residual {tuple(hidden.shape)} — "
+                f"clean/corrupted prompts must be length-matched for position-aligned patching"
+            )
+        blocks[layer].output = (clean, *out[1:]) if is_tuple else clean
 
 
 def _check_bound(bound):
@@ -81,8 +90,12 @@ def gen_patching_gpt2_hf(be, model, prompts, *, layer=9, residual="plain",
         return be.generate(model, [corrupted], lambda: model.lm_head.output[:, -1, :],
                            new_tokens=new_tokens, bounded=(bound == "bounded"))
 
+    injected = [False]                                         # inject once, on the prefill forward
+
     def step(clean_act):
-        _inject_at_prefill(h, layer, clean_act)
+        if not injected[0]:                                    # the first generation forward IS prefill
+            _inject_transplant(h, layer, clean_act)
+            injected[0] = True
         return model.lm_head.output[:, -1, :]                 # this step's next-token logits
 
     return be.generate_patch(model, clean, corrupted,
@@ -101,8 +114,12 @@ def gen_patching_gpt2_vllm(be, model, prompts, *, layer=9, residual="plain",
         return be.generate(model, [corrupted], lambda: model.logits[-1:, :],
                            new_tokens=new_tokens, bounded=(bound == "bounded"))
 
+    injected = [False]                                         # inject once, on the prefill forward
+
     def step(clean_act):
-        _inject_at_prefill(h, layer, clean_act)
+        if not injected[0]:                                    # the first generation forward IS prefill
+            _inject_transplant(h, layer, clean_act)
+            injected[0] = True
         return model.logits[-1:, :]                            # engine site == portable unembed
 
     return be.generate_patch(model, clean, corrupted,

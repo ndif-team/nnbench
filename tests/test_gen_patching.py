@@ -17,10 +17,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import isb.methodologies  # noqa: F401,E402  (registers cells)
 import isb.sweep.driver as driver  # noqa: E402
+import isb.methodologies.gen_patching as gen_patching  # noqa: E402
 from isb.methodologies.gen_patching import (  # noqa: E402
     _capture,
     _check_bound,
-    _inject_at_prefill,
+    _inject_transplant,
 )
 from isb.methodologies.registry import CELLS, get_cell  # noqa: E402
 from isb.states import AppState  # noqa: E402
@@ -41,31 +42,42 @@ def test_cells_registered_and_serve_falls_back():
         ("gen_patching", "gpt2", "vllm_async")]
 
 
-def test_inject_replaces_at_prefill_only():
+def test_serve_expectations_are_explicit_error():
+    # generation over serve is not wired (be.generate_patch raises NotImplementedError) -> ERROR.
+    # The spec must declare this explicitly: a serve cell otherwise inherits the vllm_async
+    # expectation (SUPPORTED_DEGRADED for bounded), reporting the deliberate follow-up as a surprise.
+    from isb.specs.gen_patching import gen_patching_gpt2
+    from isb.sweep.driver import expected_state
+    assert expected_state(gen_patching_gpt2, "vllm_serve", "generation", "bound=iter[0:N]") == AppState.ERROR
+    assert expected_state(gen_patching_gpt2, "vllm_serve", "generation", "bound=iter[:]") == AppState.ERROR
+    # async expectations are unchanged by the explicit serve entries
+    assert expected_state(
+        gen_patching_gpt2, "vllm_async", "generation", "bound=iter[0:N]") == AppState.SUPPORTED_DEGRADED
+
+
+def test_inject_replaces_residual():
     clean = torch.arange(3 * HID, dtype=torch.float32).reshape(3, HID)   # a 3-token prompt residual
-    # PREFILL: block residual spans the whole prompt (shape matches the capture) -> replaced
     blocks = [_Block((torch.zeros(3, HID), "kv"))]
-    _inject_at_prefill(blocks, 0, clean)
+    _inject_transplant(blocks, 0, clean)
     new_hidden, tail = blocks[0].output[0], blocks[0].output[1]
     assert tail == "kv"                                  # tuple tail preserved
-    assert torch.equal(new_hidden, clean)                # the transplant landed
-    assert new_hidden.data_ptr() != clean.data_ptr() or True  # replacement (value-equal is the point)
+    assert torch.equal(new_hidden, clean)                # the transplant landed (whole-tuple replace)
 
 
-def test_inject_skips_decode_step():
-    clean = torch.arange(3 * HID, dtype=torch.float32).reshape(3, HID)   # captured prefill shape
-    decode_hidden = torch.zeros(1, HID)                  # a decode step: the new token alone
-    blocks = [_Block((decode_hidden, "kv"))]
-    _inject_at_prefill(blocks, 0, clean)
-    # shapes differ (1 != 3) -> NOT injected; the patch lives in the KV from prefill, nothing to do
-    assert torch.equal(blocks[0].output[0], decode_hidden)
-    assert blocks[0].output[0].data_ptr() == decode_hidden.data_ptr()
+def test_inject_raises_on_length_mismatch():
+    clean = torch.arange(3 * HID, dtype=torch.float32).reshape(3, HID)   # captured 3-token residual
+    blocks = [_Block((torch.zeros(1, HID), "kv"))]       # a 1-token residual -> shapes disagree
+    try:
+        _inject_transplant(blocks, 0, clean)
+        raise AssertionError("mismatched clean/corrupted lengths must raise, not silently no-op")
+    except ValueError:
+        pass
 
 
 def test_inject_handles_plain_tensor_output():
     clean = torch.ones(2, HID)
     blocks = [_Block(torch.zeros(2, HID))]               # non-tuple block output
-    _inject_at_prefill(blocks, 0, clean)
+    _inject_transplant(blocks, 0, clean)
     assert not isinstance(blocks[0].output, tuple)
     assert torch.equal(blocks[0].output, clean)
 
@@ -99,7 +111,7 @@ class _TF:
 
 class _PatchModel:
     """A 2-block model whose layer-0 output is a tuple matching the captured prompt residual, so the
-    cell's per-step injection actually fires at the (fake) prefill; lm_head/logits are fixed reads."""
+    cell's transplant actually fires at the (fake) prefill; lm_head/logits are fixed reads."""
 
     def __init__(self, prompt_len=3):
         self.transformer = _TF([_Block((torch.zeros(prompt_len, HID), "kv")) for _ in range(2)])
@@ -129,7 +141,7 @@ class _PatchBackend:
         return torch.cat([r.detach().float().cpu() for r in rows], dim=0)
 
 
-def test_patched_cell_captures_then_injects_per_step():
+def test_patched_cell_captures_then_injects():
     be, model = _PatchBackend(), _PatchModel(prompt_len=3)
     fn = get_cell("gen_patching", "gpt2", "hf")
     out = fn(be, model, ["clean prompt", "corrupt prompt"],
@@ -139,8 +151,25 @@ def test_patched_cell_captures_then_injects_per_step():
     assert c["source"] == "clean prompt" and c["base"] == "corrupt prompt"
     assert c["new_tokens"] == 4 and c["bounded"] is False       # bound="unbounded" -> bounded=False
     assert out.shape == (4, VOCAB)
-    # the capture (layer-0 residual, all ones-shape zeros here) was injected at the fake prefill
+    # the capture (layer-0 residual) was injected at the fake prefill (whole-tuple replace)
     assert torch.equal(model.transformer.h[0].output[0], torch.zeros(3, HID))
+
+
+def test_cell_injects_exactly_once_even_for_one_token_prompt():
+    # Regression: shape-only prefill detection re-injects on EVERY decode step of a one-token prompt
+    # (decode hidden shares the prefill's [1, hidden] shape). The first-forward flag must inject
+    # exactly once regardless of prompt length — else the method silently changes outside the
+    # length>1 benchmark prompts.
+    be, model = _PatchBackend(), _PatchModel(prompt_len=1)
+    calls = []
+    orig = gen_patching._inject_transplant
+    gen_patching._inject_transplant = lambda *a, **k: calls.append(1)
+    try:
+        fn = get_cell("gen_patching", "gpt2", "hf")
+        fn(be, model, ["a", "b"], layer=0, bound="bounded", new_tokens=5, patch=True)
+    finally:
+        gen_patching._inject_transplant = orig
+    assert calls == [1], f"expected exactly one injection over 5 decode steps, got {len(calls)}"
 
 
 def test_baseline_cell_uses_generate_with_no_capture():
