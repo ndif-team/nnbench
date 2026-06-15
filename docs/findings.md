@@ -274,3 +274,43 @@ flag on the path_steering footprint into a measured cell
 (`docs/causalab-portability-audit.md` §4). The unbounded realization rides along as a predicted
 ERROR (the unbounded-iteration saves-drop), so the spec doubles as the flip-detector for the
 upstream saves fix. → `isb/methodologies/gen_steering.py`, `isb/specs/gen_steering.py`.
+
+## Method tier — generation-time cross-prompt patching, GPT-2, HF vs vLLM-async (2026-06-15)
+
+Result (`results/gen_patching_gpt2.txt`): the cross-prompt transplant (activation patching) run
+UNDER a 5-step greedy decode — capture the clean residual at layer 9, inject it at the corrupted
+prompt's prefill, score per-step logits. The transplant is decisive (effect-size on the HF control:
+top1=0.00, TV=0.896 — it changes the whole generated continuation).
+
+| realization | hf | vllm_async | note |
+|---|---|---|---|
+| bounded `iter[0:N]` | SUPPORTED | **SUPPORTED_DEGRADED** | bf16 top1=0.00 / TV=0.711; fp32 re-run matches HF |
+| unbounded `iter[:]` | SUPPORTED | **ERROR** | all per-step saves dropped (the unbounded-iteration saves-drop) — the frontier marker |
+
+### The transplant edge step-lifts correctly, but bf16 forks the whole decode trajectory
+The transplant-edge analogue of the generation-time steering result: does a cross-prompt patch stay
+valid run during a decode loop? The single verdict "SUPPORTED_DEGRADED" carries two distinct facts
+that must be read apart:
+
+- **Mechanism: confirmed.** At the control's precision (fp32) the vLLM patched *generation* matches
+  HF — the dtype control's match is what makes the verdict DEGRADED, not SILENTLY_WRONG. So the
+  step-lift law holds for the transplant edge: injecting at prefill and letting the request's own
+  (intra-request) KV cache carry it through the decode steps reproduces HF exactly at matched
+  precision. No new primitive, no KV-propagation gap — the composition is sound.
+- **bf16 product: a full trajectory fork, not a near-tie.** At vLLM's bf16 default the per-step
+  divergence is top1=0.00 / TV=0.711 — an order of magnitude past the single-forward patch's bf16
+  degradation (TV=0.083). The cause is greedy-decode compounding: one early step's bf16
+  near-tie flips a token, that token is the next step's input, and the two engines' generations
+  diverge completely from there. This is **precision, attributed by the dtype control** — but the
+  consequence is sharper than the single-forward patch's: at the production default the patched vLLM
+  run emits *different text* than HF even though the patch is mechanically correct.
+
+The methodology point this makes concrete: **comparing HF and vLLM generated trajectories is fragile
+by construction** — two engines that differ by a bf16 epsilon fork at the first near-tie and stop
+being comparable, for reasons unrelated to the intervention. The mechanism verdict must come from
+the matched-precision (fp32) run; the bf16 trajectory comparison measures engine divergence, not
+patch correctness. (Contrast the generation-time steering result, where a *dominant* steering effect
+kept the bf16 trajectory identical, TV=0.000 — so whether bf16 generation diverges is
+effect-strength-dependent, not a fixed property.) The unbounded realization ERRORs as predicted (the
+unbounded-iteration saves-drop). → `isb/methodologies/gen_patching.py`, `isb/specs/gen_patching.py`,
+`be.generate_patch`.

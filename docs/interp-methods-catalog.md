@@ -222,6 +222,7 @@ Status: ✓ = already an nnbench cell. **frontier** = exercises a primitive wher
 | **Ablation / knockout** | zero- or mean-out a component, measure the damage | `read` `write` `injection` · base: injection (mean variant adds `accumulation` ∘ aggregation) | any transformer | ✓ (zero); mean = the accumulation roadmap cell |
 | **Steering / ActAdd** | add a direction into the residual at run time to push behavior | `read` `write` `injection` · base: injection | any decoder-only LM | ✓ |
 | **Generation-time steering** | the steering write applied at EVERY decode step of a greedy generation, per-step logits read | `write/boundary/step/replacement` + `step/bounded` + `injection` + `loop-carried` + `live-out` · steering ∘ step-lift | any decoder-only LM; vLLM needs the bounded `iter[0:N]` realization | ✓ — **composition confirmed** (write × bounded-iter SUPPORTED on vLLM, top1=1.00 tv=0.000; unbounded = the unbounded-iteration saves-drop frontier marker; a direct step-lift law test — base vs lifted on one backend — is queued) |
+| **Generation-time cross-prompt patching** | the cross-prompt transplant injected at prefill, scored on the generated tokens (the causalab `locate` footprint) | `read` + `write/boundary/replacement` + `transplant` + `step/bounded` + `live-out` · activation patching ∘ step-lift | any transformer; length-matched pair; vLLM needs bounded `iter[0:N]` | ✓ — **composition confirmed at fp32** (transplant step-lifts correctly); bf16 forks the whole greedy trajectory (top1=0.00 tv=0.711, SUPPORTED_DEGRADED) — precision compounding, NOT a mechanism bug |
 | **Attribution patching** | gradient linear-approx of patching for *every* component in one fwd+bwd | `read` `grad` `derivative` · activation patching ∘ linearization (a scientific approximation, not an equivalence) | any differentiable model | ✓ — **frontier confirmed** (`grad`: vLLM ERROR — the no-autograd-on-vLLM result) |
 | **Path patching** | patch specific component→component *edges* (not whole activations) | `read` `write` `xprompt` `.source` `rewiring` · base: rewiring | any transformer; more plumbing | TODO (composite; the rewiring edge has no measuring cell) |
 
@@ -296,9 +297,10 @@ criterion):**
    proxy; makes the `trained` tag structural).
 3. **Dataset-lift law cell on a relative-position family** — the positive control for the
    measured GPT-2 absolute-position model-side failure (attribution: model).
-4. **Generation-time cross-prompt patching** — transplant × step-lift; with the generation-time
-   steering composition result in hand, this completes the causalab audit's two flagged
-   predictions.
+4. ~~**Generation-time cross-prompt patching**~~ — ✓ **DONE** (2026-06-15): transplant ×
+   step-lift; the composition holds at fp32 (transplant survives the decode loop), bf16 forks the
+   trajectory (precision, not a bug). Completes the causalab audit's second flagged prediction
+   (locate's footprint) and is the recipe for the Macro-tier locate port.
 5. **Per-head ablation** — write × derived address (head-sliced write is still unexercised).
 6. **Direct logit attribution** — observation × internal site; exact read-only decomposition
    over the now-measured non-attention `.source` site.

@@ -67,7 +67,7 @@ rescues the analysis; failure kinds per design.md §3.6.
 | analysis | vLLM (re-expressed) | failure kind / working idiom | measured rows it rests on |
 |---|---|---|---|
 | baseline | ✓ predicted | engine sites measured (`model.logits`, `model.samples`); batched regime currently per-prompt only (async multi-prompt gated) | the portable-sites result; invoke row |
-| locate (interchange) | ✓ predicted — **composition unmeasured** | two-trace idiom for the cross-prompt transplant (barrier broken: the barrier sync/async split); replacement WRITE; bounded `iter[0:N]`; fused-residual read on Llama-family | the in-place-write restriction, the fused-residual denotation mismatch, the unbounded-iteration saves-drop, the barrier sync/async split; patching cells |
+| locate (interchange) | ✓ **measured** (fp32; bf16 DEGRADED) | two-trace idiom for the cross-prompt transplant (barrier broken: the barrier sync/async split); replacement WRITE; bounded `iter[0:N]`; fused-residual read on Llama-family | the in-place-write restriction, the fused-residual denotation mismatch, the unbounded-iteration saves-drop, the barrier sync/async split, and the generation-time cross-prompt patching result; patching + gen_patching cells |
 | locate (dbm_binary) | ✗ | **operation-unsupported**: no autograd in inference mode (the no-autograd-on-vLLM result); no working idiom — fall back to `method: interchange` | gradients are unavailable on vLLM (inference mode, no autograd) |
 | subspace (pca) | ✓ predicted | collect = READ+SAVE, measured; PCA is offline | logit-lens cells; micro READ rows |
 | subspace (das/dbm/boundless) | ✗ | **operation-unsupported** (gradients are unavailable on vLLM (inference mode, no autograd)); HF-only — train on HF, *apply* the trained rotation on vLLM (apply is COMPUTE∘WRITE, supported) | gradients are unavailable on vLLM (inference mode, no autograd), the inference-tensor no_grad requirement, the in-place-write restriction |
@@ -86,11 +86,11 @@ gradient-trained method variant (DAS, DBM, boundless, locate's `dbm_binary`) is
 operation-unsupported, leaving those analyses their gradient-free methods only. All blockers are
 *loud* — clean errors, not traps. The traps are in the portable six (next section).
 
-The two "composition unmeasured" flags are the same gap: no bench cell yet composes a WRITE (or
-cross-prompt transplant) with the bounded-iteration construct. That composition is causalab's
-*default* execution mode (§2), which independently confirms the roadmap's top priority
-(generation-time steering) and adds a second composite right behind it (generation-time
-cross-prompt patching = locate's footprint).
+Both "composition" flags above are now **measured** (the generation-time steering and
+generation-time cross-prompt patching results): the WRITE (injection) and the cross-prompt
+transplant each compose correctly with the bounded-iteration construct on vLLM at matched precision. That composition is causalab's *default* execution mode (§2), so confirming it
+de-risks the whole generative half of the suite — the remaining gap to a real causalab verdict is
+the Macro-tier end-to-end run, not another primitive.
 
 ## 5. The silently-wrong census — why this audit matters
 
@@ -139,7 +139,18 @@ No new Level-0 op was needed — the closed-core claim survived contact with a r
 > (top1=1.00, tv=0.000 vs the HF control over 8 prompts × 8 steps, at default bf16); the
 > unbounded realization errors as predicted (the unbounded-iteration saves-drop). The path_steering row in §4 is no longer a
 > prediction — and it is the first method-tier confirmation of §3.6's composes-upward claim.
-> The locate row's composition (cross-prompt transplant × iteration) remains the open one.
+>
+> **Addendum (2026-06-15):** the SECOND flagged composition is now MEASURED too. The
+> generation-time cross-prompt patching cell (`isb/methodologies/gen_patching.py`)
+> is locate's footprint — the clean residual captured from the source prompt, injected at the base
+> prompt's prefill, scored on the generated tokens. The transplant step-lifts correctly: at matched
+> precision (fp32) the vLLM patched generation reproduces HF, so the cross-prompt interchange
+> survives the decode loop on a production engine. (At the bf16 default the greedy trajectory forks
+> on precision compounding — top1=0.00, tv=0.711 — a SUPPORTED_DEGRADED, not a mechanism failure.)
+> **Both of the audit's flagged locate/path_steering compositions are now measured**, so the
+> §4 predictions for those rows are confirmed, not inferred. The remaining gap to a real causalab
+> verdict is the Macro-tier port (running locate end-to-end with a task's counterfactual pairs and
+> its flip-rate scoring), not another primitive.
 
 - **Macro-tier candidates, in order:** path_steering (= the generation-time steering cell the
   roadmap already ranks first; now doubly motivated), then locate-via-interchange (generation-time

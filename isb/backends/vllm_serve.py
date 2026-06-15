@@ -139,6 +139,15 @@ class VLLMServeBackend(Backend):
             "through the serve transport"
         )
 
+    def generate_patch(self, model, source_prompt, base_prompt, capture, build_step,
+                       *, new_tokens, bounded=True):
+        # Inherits the same gap as generate() over serve (the iteration loop is not wired through
+        # the transport), plus the two-trace transplant — a follow-up for the serve venue.
+        raise NotImplementedError(
+            "generate_patch over serve is a follow-up; the per-step iteration loop is not yet "
+            "wired through the serve transport"
+        )
+
     def last(self, t):
         return t[-1:, :]  # server returns flat [tokens, vocab] (vLLM shape), like vllm_async
 
