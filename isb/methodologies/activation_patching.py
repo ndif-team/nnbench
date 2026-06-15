@@ -13,11 +13,12 @@ guarantee ordering and need no barrier, so the methodology is the same shape on 
 
 `clean` and `corrupted` are a length-matched minimal pair (differ at one token), so (a) the residual
 shapes align for replacement and (b) the patch actually changes the corrupted output — without that
-effect the SUPPORTED verdict would be vacuous (cf. the steering effect-size guard, F-6).
+effect the SUPPORTED verdict would be vacuous (cf. the steering effect-size guard).
 
-The patch uses whole-tuple **replacement** (the vLLM-safe write form; in-place raises on vLLM
-inference tensors, F-5). Variances (params): `layer` (which block's residual to transplant),
-`residual` ("plain" | "fused" — same fused-residual reconstruction as logit-lens F-7, so this ports
+The patch uses whole-tuple **replacement** (the vLLM-safe write form; in-place writes raise on vLLM
+inference tensors). Variances (params): `layer` (which block's residual to transplant),
+`residual` ("plain" | "fused" — same fused-residual reconstruction as logit-lens, where vLLM
+fused-residual blocks return (hidden, residual) whose sum is the true stream, so this ports
 to vLLM-Llama too).
 """
 from __future__ import annotations

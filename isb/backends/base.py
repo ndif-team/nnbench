@@ -52,7 +52,7 @@ class Backend:
 
         `bounded` selects the iteration REALIZATION (Level 1.5): True = `tracer.iter[0:N]`
         (carries its own stop bound — the working idiom on vLLM); False = `tracer.iter[:]`
-        (relies on the engine-supplied stop bound — works on HF, drops ALL saves on vLLM, F-13).
+        (relies on the engine-supplied stop bound — works on HF, drops ALL saves on vLLM).
         Single prompt: generation is the per-trace decode regime, not a batching axis.
         """
         raise NotImplementedError

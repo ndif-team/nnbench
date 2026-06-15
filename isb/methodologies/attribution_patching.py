@@ -8,7 +8,7 @@ corrupt forward+backward. For a residual activation `a` and metric `M`:
 
 so the per-layer attribution is `((a_clean - a_corrupt) * grad_corrupt).sum()`. Metric here is the
 logit difference `logit[clean_answer] - logit[corrupt_answer]` on the corrupt run (portable unembed,
-so no `lm_head.forward` guard, F-2); a high positive score at layer L means "patching L's clean
+so the weight matmul sidesteps vLLM's guarded `lm_head.forward`); a high positive score at layer L means "patching L's clean
 residual would most raise the clean-vs-corrupt logit gap".
 
 **Backend frontier — this cell exercises the `grad` primitive.** It needs autograd (a backward pass).
@@ -17,7 +17,8 @@ HF supports it -> SUPPORTED. vLLM runs in inference mode; its activations are in
 HF-only) is the finding. The clean/corrupt prompts are a length-matched minimal pair so the residual
 shapes align and the subtraction is position-aligned.
 
-Variances (params): `residual` ("plain" | "fused", the same reconstruction as logit-lens F-7);
+Variances (params): `residual` ("plain" | "fused", the same reconstruction as logit-lens, where
+vLLM fused-residual blocks return (hidden, residual) whose sum is the true stream);
 `grad` (True = the attribution; False = the forward-only baseline, the overhead denominator — it
 reads the metric with no backward and so runs on both backends).
 """

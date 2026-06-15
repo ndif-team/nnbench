@@ -18,7 +18,7 @@ logit_lens_gpt2 = CellConfig(
     baseline=BaselineSpec(params={"unembed": "weight", "layers": [-1]}),
     effect=None,
     expected={
-        # idiomatic unembed calls the guarded ParallelLMHead.forward on vLLM -> ERROR (F-2)
+        # idiomatic unembed calls the guarded ParallelLMHead.forward on vLLM -> ERROR (lm_head.forward is guarded on vLLM)
         ("vllm_async", "interactive", "unembed=module"): "ERROR",
         # GPT-2 left-pads without position_ids -> padded rows' absolute positions shift -> HF's own
         # batched output diverges from its per-prompt truth (a documented absolute-position artifact)
@@ -44,9 +44,10 @@ logit_lens_llama = CellConfig(
     baseline=BaselineSpec(params={"unembed": "weight", "layers": [-1]}),
     effect=None,
     expected={
-        ("vllm_async", "interactive", "unembed=module"): "ERROR",                          # F-2
-        # naive GPT-2 port reads only stream[0]; vLLM-Llama's residual is hidden+residual (Gap 1.2,
-        # F-7) -> drops the accumulated residual -> SILENTLY_WRONG. residual=fused is the working form.
+        ("vllm_async", "interactive", "unembed=module"): "ERROR",                          # guarded lm_head call
+        # naive GPT-2 port reads only stream[0]; vLLM-Llama's residual is hidden+residual (the
+        # fused-residual denotation mismatch: a plain read is silently wrong) -> drops the accumulated
+        # residual -> SILENTLY_WRONG. residual=fused is the working form.
         ("vllm_async", "interactive", "unembed=weight, residual=plain (naive port)"): "SILENTLY_WRONG",
         # llama is RoPE (relative positions) -> batched HF matches its per-prompt truth -> SUPPORTED.
         ("vllm_async", "batched", "unembed=module"): "ERROR",                       # gated (+ guard)

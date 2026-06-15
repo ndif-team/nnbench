@@ -3,8 +3,8 @@
 > Status: written 2026-06-12. This is the "portability audit" proposed in
 > `agents-and-the-primitive-model.md` — a **static join**: each causalab analysis is decomposed
 > into its primitive footprint (citing causalab source), and each footprint line is looked up in
-> the measured per-context status inventory (`interp-methods-catalog.md`; evidence tags `F-n` =
-> `findings.md`). Nothing here was executed; predictions are inferences from measured rows, to be
+> the measured per-context status inventory (`interp-methods-catalog.md`; the findings themselves
+> are described in `findings.md`). Nothing here was executed; predictions are inferences from measured rows, to be
 > validated by Macro-tier runs. Source audited: `goodfire-ai/causalab` @ `bf15b353` (read-only
 > clone at `/disk/u/zikai/causalab`).
 
@@ -36,7 +36,7 @@ generation.
 
 In nnsight terms every interventional footprint therefore composes with the **iteration
 construct**. On vLLM the bounded realization `iter[0:N]` is measured SUPPORTED and the unbounded
-`iter[:]` drops all saves (F-13) — so the bounded form is the mandatory idiom for every
+`iter[:]` drops all saves (the unbounded-iteration saves-drop) — so the bounded form is the mandatory idiom for every
 re-expressed analysis below.
 
 ## 3. Footprints (ops × sites × idioms, with citations)
@@ -56,7 +56,7 @@ re-expressed analysis below.
 
 Featurizer-space interventions (rotated interchange, masked interchange, steering add) decompose
 as COMPUTE (the chain is plain torch) ∘ WRITE (replacement write-back); on vLLM the COMPUTE runs
-under `torch.no_grad()` and the WRITE must be the replacement realization (F-1, F-5).
+under `torch.no_grad()` and the WRITE must be the replacement realization (the inference-tensor no_grad requirement, the in-place-write restriction).
 
 ## 4. The join — predicted applicability per backend
 
@@ -66,16 +66,16 @@ rescues the analysis; failure kinds per design.md §3.6.
 
 | analysis | vLLM (re-expressed) | failure kind / working idiom | measured rows it rests on |
 |---|---|---|---|
-| baseline | ✓ predicted | engine sites measured (`model.logits`, `model.samples`); batched regime currently per-prompt only (async multi-prompt gated) | F-12; invoke row |
-| locate (interchange) | ✓ predicted — **composition unmeasured** | two-trace idiom for the cross-prompt transplant (barrier broken: F-14); replacement WRITE; bounded `iter[0:N]`; fused-residual read on Llama-family | F-5, F-7, F-13, F-14; patching cells |
-| locate (dbm_binary) | ✗ | **operation-unsupported**: no autograd in inference mode (F-11); no working idiom — fall back to `method: interchange` | F-11 |
+| baseline | ✓ predicted | engine sites measured (`model.logits`, `model.samples`); batched regime currently per-prompt only (async multi-prompt gated) | the portable-sites result; invoke row |
+| locate (interchange) | ✓ predicted — **composition unmeasured** | two-trace idiom for the cross-prompt transplant (barrier broken: the barrier sync/async split); replacement WRITE; bounded `iter[0:N]`; fused-residual read on Llama-family | the in-place-write restriction, the fused-residual denotation mismatch, the unbounded-iteration saves-drop, the barrier sync/async split; patching cells |
+| locate (dbm_binary) | ✗ | **operation-unsupported**: no autograd in inference mode (the no-autograd-on-vLLM result); no working idiom — fall back to `method: interchange` | gradients are unavailable on vLLM (inference mode, no autograd) |
 | subspace (pca) | ✓ predicted | collect = READ+SAVE, measured; PCA is offline | logit-lens cells; micro READ rows |
-| subspace (das/dbm/boundless) | ✗ | **operation-unsupported** (F-11); HF-only — train on HF, *apply* the trained rotation on vLLM (apply is COMPUTE∘WRITE, supported) | F-11, F-1, F-5 |
+| subspace (das/dbm/boundless) | ✗ | **operation-unsupported** (gradients are unavailable on vLLM (inference mode, no autograd)); HF-only — train on HF, *apply* the trained rotation on vLLM (apply is COMPUTE∘WRITE, supported) | gradients are unavailable on vLLM (inference mode, no autograd), the inference-tensor no_grad requirement, the in-place-write restriction |
 | activation_manifold | ✓ (substrate-independent) | touches no engine; optional decoding eval inherits the generation rows | — |
-| output_manifold | ✓ predicted | per-step logits via bounded iteration; the unbounded idiom would silently drop every step | F-12, F-13 |
-| path_steering | ✓ predicted — **composition unmeasured** | replacement steering write + featurizer COMPUTE under no_grad + bounded iteration — this is exactly the roadmap's "generation-time steering" cell | F-1, F-5, F-13 |
-| pullback | ✗ | **operation-unsupported** (F-11); no working idiom (optimization *is* the method) | F-11 |
-| attention_pattern | ✗ | **site-absent**: paged/flash attention never materializes the matrix (F-10); no working idiom | F-10 |
+| output_manifold | ✓ predicted | per-step logits via bounded iteration; the unbounded idiom would silently drop every step | the portable-sites result, the unbounded-iteration saves-drop |
+| path_steering | ✓ predicted — **composition unmeasured** | replacement steering write + featurizer COMPUTE under no_grad + bounded iteration — this is exactly the roadmap's "generation-time steering" cell | the inference-tensor no_grad requirement, the in-place-write restriction, the unbounded-iteration saves-drop |
+| pullback | ✗ | **operation-unsupported** (gradients are unavailable on vLLM (inference mode, no autograd)); no working idiom (optimization *is* the method) | gradients are unavailable on vLLM (inference mode, no autograd) |
+| attention_pattern | ✗ | **site-absent**: paged/flash attention never materializes the matrix (the attention-weights site-absence); no working idiom | attention weights have no denotation under vLLM's paged attention |
 
 **Headline:** of the eight analyses, **6 are predicted portable** to a production engine once
 re-expressed in the working idioms — baseline, locate, subspace, activation_manifold,
@@ -96,12 +96,12 @@ cross-prompt patching = locate's footprint).
 
 causalab's primary tested model is **Llama-3.1-8B** (README; ≥24 GB VRAM) — a fused-residual
 family. On vLLM, every `component: residual_stream` read in a naive port returns only `out[0]`
-of `(hidden, residual)` — **half the stream, no error** (F-7: top-1 agreement 0.13 on the same
+of `(hidden, residual)` — **half the stream, no error** (the fused-residual denotation mismatch: top-1 agreement 0.13 on the same
 mistake in our logit-lens cell). That poisons locate's entire (layer × position) heatmap, every
 subspace fit on those activations, and every manifold built downstream — and causalab's own
 pipeline has no numerical oracle that could notice: scores stay plausible, the faithfulness
 conclusion is just wrong. The other documented trap it would inherit: the unbounded-iteration
-idiom silently losing all per-step saves on the generation analyses (F-13).
+idiom silently losing all per-step saves on the generation analyses (the unbounded-iteration saves-drop).
 
 This is the division of labor stated in `agents-and-the-primitive-model.md`: causalab verifies
 the science *assuming the substrate*; the substrate assumption is precisely what this map
@@ -122,7 +122,7 @@ strain, with three findings at the edges:
 2. **Feature-space realization deserves a named idiom row.** "Intervene in f(x)-space, write
    back via f⁻¹" (rotation/PCA/manifold chains) decomposes cleanly as COMPUTE∘WRITE, but it is
    a *recurring* realization with its own failure surface (the chain must run inside the trace,
-   under no_grad, on the worker — the meta-model gotcha from F-12 applies to its weights). Worth
+   under no_grad, on the worker — the meta-model gotcha from the result that Level-1 sites are portable on vLLM, with weight-using checks run in the worker, applies to its weights). Worth
    a Level-1.5 row rather than re-deriving per methodology.
 3. **Generation-time intervention is a composition, not a primitive — and it is unmeasured.**
    The vocabulary expresses it (WRITE × iteration), the inventory has both rows measured
@@ -134,10 +134,10 @@ No new Level-0 op was needed — the closed-core claim survived contact with a r
 ## 7. What to do with this
 
 > **Addendum (2026-06-12, same day):** the first flagged composition is now MEASURED. The
-> generation-time steering cell (`isb/methodologies/gen_steering.py`, finding F-17) runs the
+> generation-time steering cell (`isb/methodologies/gen_steering.py`, the generation-time steering composition result) runs the
 > replacement write inside `iter[0:N]` at every decode step: **SUPPORTED on vLLM, exactly**
 > (top1=1.00, tv=0.000 vs the HF control over 8 prompts × 8 steps, at default bf16); the
-> unbounded realization errors as predicted (F-13). The path_steering row in §4 is no longer a
+> unbounded realization errors as predicted (the unbounded-iteration saves-drop). The path_steering row in §4 is no longer a
 > prediction — and it is the first method-tier confirmation of §3.6's composes-upward claim.
 > The locate row's composition (cross-prompt transplant × iteration) remains the open one.
 

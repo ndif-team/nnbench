@@ -2,8 +2,8 @@
 
 Each section is a smoke run of one methodology; the table is the applicability-map row(s)
 with the oracle's measured top1/TV per cell. Where a cell's behavior reflects a known
-HF↔vLLM representational difference, the note cites the relevant intervention-gaps gap number
-for context (`nnsight/src/nnsight/modeling/vllm/intervention-gaps/`).
+HF↔vLLM representational difference, the note describes the relevant intervention-gaps
+mechanism for context (`nnsight/src/nnsight/modeling/vllm/intervention-gaps/`).
 
 ## Smoke tier — logit lens, GPT-2, HF vs vLLM-async (2026-06)
 
@@ -14,18 +14,18 @@ Result (`results/smoke_gpt2.txt`):
 | `logit_lens` (idiomatic: `lm_head(ln_f(h))`) | SUPPORTED | **ERROR** | vLLM `ParallelLMHead.forward()` guards: *"LMHead's weights should be used in the sampler."* |
 | `logit_lens.weight` (unembed via weight matmul) | SUPPORTED | **SUPPORTED** | top1=1.00 / TV=0.021 across 12 layers (maxabs=0.89 is kernel/dtype drift, diagnostic only) |
 
-### F-1 — vLLM intermediates are inference-mode tensors
+### vLLM intermediates are inference-mode tensors
 Applying a grad-enabled sub-module (e.g. `ln_f`) to a vLLM activation raises
 *"Inference tensors cannot be saved for backward."* Fix that keeps one methodology for both
 backends: wrap forward-only aux compute in `torch.no_grad()` (harmless on HF, required
 on vLLM). → `isb/methodologies/logit_lens.py`.
 
-### F-2 — `lm_head` cannot be called directly on vLLM
+### `lm_head` cannot be called directly on vLLM
 vLLM's `ParallelLMHead.forward()` deliberately raises; its weights are consumed by the
 sampler. So the *idiomatic* logit lens (`model.lm_head(...)`) is a genuine frontier
 marker on vLLM. The portable form does `F.linear(normed, lm_head.weight)`, which works.
 
-### F-3 — intervention errors are isolated; the engine survives (corrects an earlier claim)
+### Intervention errors are isolated; the engine survives (corrects an earlier claim)
 A worker intervention error (e.g. the guarded `lm_head` call) surfaces as a clean per-cell
 `ERROR` via nnsight's deferred-exception mechanism and does **not** kill the EngineCore. With
 one engine amortized across all cells, an `lm_head`-guard ERROR is immediately followed by a
@@ -36,7 +36,7 @@ model load across all cells rather than reloading per cell. (Separately: driving
 engine with repeated `asyncio.run` calls *does* kill it by closing the loop its background task
 runs on — the benchmark avoids that with a persistent event loop. → `isb/backends/vllm_async.py`.)
 
-### F-4 (harness, not nnsight) — vLLM pads the vocab
+### vLLM pads the vocab (harness, not nnsight)
 `ParallelLMHead` pads vocab (50257→50304). The oracle must align the last dim to the
 real vocab before comparing, or padding positions skew argmax/max-abs and a correct
 result is mislabeled `SILENTLY_WRONG`. This near-miss is why the equivalence oracle +
@@ -55,13 +55,13 @@ so the write genuinely moves the control and the verdicts below are not vacuous.
 | `steering` (`mode=inplace`, `hidden[:] += vec`) | SUPPORTED | **ERROR** | vLLM: *"Inplace update to inference tensor outside InferenceMode is not allowed."* |
 | `steering` (`mode=replace`, whole-tuple new tensor) | SUPPORTED | **SUPPORTED** | top1=1.00 / TV=0.000 / maxabs=0.32 — steered logits match HF exactly |
 
-### F-5 — vLLM residual writes: in-place raises, replacement works
+### vLLM residual writes: in-place raises, replacement works
 In-place (`output[0][:] += v`) raises on vLLM (`Inplace update to inference tensor outside
 InferenceMode`); whole-tuple replacement is applied faithfully (TV=0.000 vs HF). On vLLM, steer/patch
-by replacement. (vLLM activations are inference tensors; cf. intervention-gaps Gap 1.1.)
-→ `isb/methodologies/steering.py`.
+by replacement. (vLLM activations are inference tensors; cf. the clone-on-save inference-tensor
+protection in nnsight's intervention-gaps.) → `isb/methodologies/steering.py`.
 
-### F-6 (methodology) — a write cell's verdict needs an effect-size guard
+### A write cell's verdict needs an effect-size guard (methodology)
 A backend that silently no-ops a write would score `SUPPORTED` against a control whose own
 output barely moved — a false pass. So a write methodology must first prove the write moves
 the control (here TV=0.994 unsteered-vs-steered) before any `SUPPORTED`/`SILENTLY_WRONG`
@@ -76,16 +76,17 @@ Result (`results/smoke_llama.txt`):
 
 | workload | hf | vllm_async | note |
 |---|---|---|---|
-| `logit_lens` (idiomatic `lm_head(...)`) | SUPPORTED | **ERROR** | `ParallelLMHead.forward` guarded — same frontier as GPT-2 (F-2) |
+| `logit_lens` (idiomatic `lm_head(...)`) | SUPPORTED | **ERROR** | `ParallelLMHead.forward` guarded — same frontier as GPT-2 |
 | `logit_lens.weight` + `residual=fused` (backend-aware) | SUPPORTED | **SUPPORTED** | top1=0.97 / TV=0.017 — matches HF |
 | `logit_lens.weight` + `residual=plain` (naive GPT-2 port) | SUPPORTED | **SILENTLY_WRONG** | top1=0.13 / TV=0.897 / maxabs=78.55 |
 
-### F-7 — vLLM-Llama logit lens needs the dual residual stream
+### vLLM-Llama logit lens needs the dual residual stream
 On vLLM, decoder layers expose a dual residual stream `(hidden, residual)` whose sum is the residual
-stream (intervention-gaps Gap 1.2). The single-tensor form (`output[0]` only) is `SILENTLY_WRONG`:
-top1=0.13, TV=0.897 — no error. Combining the streams (`residual="fused"` = `out[0]+out[1]`) gives
-top1=0.97, TV=0.017, matching HF. Applies to any fused-residual-RMSNorm vLLM model
-(Llama/Mistral/Qwen2/Gemma). → `isb/methodologies/logit_lens.py` `_resid`.
+stream (the dual-residual-stream issue documented in nnsight's intervention-gaps). The single-tensor
+form (`output[0]` only) is `SILENTLY_WRONG`: top1=0.13, TV=0.897 — no error. Combining the streams
+(`residual="fused"` = `out[0]+out[1]`) gives top1=0.97, TV=0.017, matching HF. Applies to any
+fused-residual-RMSNorm vLLM model (Llama/Mistral/Qwen2/Gemma). → `isb/methodologies/logit_lens.py`
+`_resid`.
 
 ## Smoke tier — activation patching (causal tracing), GPT-2, HF vs vLLM-async (2026-06)
 
@@ -100,7 +101,7 @@ layers 3 & 9 identical):
 | hf | SUPPORTED | per-family control; non-vacuity guard TV(unpatched, patched)=0.753 |
 | vllm_async (default bf16) | **SUPPORTED_DEGRADED** | top1=0.00 TV=0.083 vs HF; at fp32, top1=1.00 TV=0.0006 |
 
-### F-8 — activation patching: a dtype control separates precision from a bug
+### Activation patching: a dtype control separates precision from a bug
 The two-trace patch matches HF at fp32 (top1=1.00, TV=0.0006); at vLLM's default bf16 the patched
 top-1 flips (top1=0.00) with TV=0.083 — a near-tie precision effect, so `SUPPORTED_DEGRADED`, not
 `SILENTLY_WRONG`. The strict gate alone can't tell these apart, so the smoke re-runs the failing
@@ -120,11 +121,12 @@ top1=0.00/TV=0.100 (flips the top-1 — a substantive ablation). Result (`result
 | ablation `target=mlp` | SUPPORTED | **SUPPORTED_DEGRADED** | bf16 top1=1.00/TV=0.081; fp32 matches HF |
 | ablation `target=attn` | SUPPORTED | **SUPPORTED_DEGRADED** | bf16 top1=1.00/TV=0.061; fp32 matches HF |
 
-### F-9 — ablation ports to vLLM; default bf16 is a near-tie precision divergence
+### Ablation ports to vLLM; default bf16 is a near-tie precision divergence
 The replacement-form knockout is applied faithfully on vLLM (matches HF at fp32, top-1 agrees). At
 default bf16 the ablated distribution diverges from HF-fp32 by TV≈0.06–0.08 — the same precision
-near-tie as patching (F-8), resolved to `SUPPORTED_DEGRADED` by the dtype control. In-place zeroing
-would raise on vLLM (F-5); the cell uses replacement. → `isb/methodologies/ablation.py`.
+near-tie as the single-forward patch, resolved to `SUPPORTED_DEGRADED` by the dtype control. In-place
+zeroing would raise on vLLM (in-place writes raise; replacement works); the cell uses replacement.
+→ `isb/methodologies/ablation.py`.
 
 ## Smoke tier — attention-pattern read, GPT-2, HF vs vLLM-async (2026-06)
 
@@ -138,7 +140,7 @@ distribution. Result (`isb/specs/attention_pattern.py`):
 |---|---|---|---|
 | attention-pattern `layers=all` | SUPPORTED | **ERROR** | `AttributeError: 'SourceEnvoy' has no attribute 'attention_interface_0'` |
 
-### F-10 — reading attention weights is HF-only; vLLM's paged attention exposes no probability matrix
+### Reading attention weights is HF-only; vLLM's paged attention exposes no probability matrix
 This is the `attn-weights` frontier. HF eager computes `attn_output, attn_weights = attention_interface(...)`,
 so `.source.attention_interface_0` returns the matrix. vLLM runs a different forward (paged/flash
 attention) that computes attention implicitly and never materializes the probability matrix, and has
@@ -158,7 +160,7 @@ portable unembed). New backend primitive `be.attribute` (clean trace + corrupt t
 |---|---|---|---|
 | attribution `residual=plain` | SUPPORTED (overhead 3.4× fwd) | **ERROR** | `Inference tensors cannot be saved for backward … created in inference mode` |
 
-### F-11 — gradient-based attribution is HF-only; vLLM is inference-mode (no autograd)
+### Gradient-based attribution is HF-only; vLLM is inference-mode (no autograd)
 This is the `grad` frontier — a whole class of methods (attribution patching, edge attribution
 patching, any gradient saliency) is HF-only. HF runs the forward with autograd, so
 `requires_grad_` + `with metric.sum().backward(): act.grad` works and the per-layer attribution is
@@ -195,15 +197,15 @@ rel-dev). **vLLM-async: 7 SUPPORTED / 6 ERROR**:
 | session — saved flow | SUPPORTED | **ERROR** async (no drain point); works on the sync engine (construct-gaps repros) |
 | session — un-saved cross-trace flow | SUPPORTED | **ERROR** (both engines) |
 
-### F-12 — Level-1 sites are portable on vLLM; weight-using checks must run in the worker
+### Level-1 sites are portable on vLLM; weight-using checks must run in the worker
 Boundary `.input`, engine `logits`/`samples`, derived head/neuron views, and non-attention
 `.source` all hold on vLLM with exact (or bf16-roundoff) denotation checks — the vLLM MLP forward
-is plain Python, so `.source` rewriting works there; the attention-weights case (F-10) stays the
-only absent internal site. Gotcha: the client-side envoy is the META model — a reconstruction that
+is plain Python, so `.source` rewriting works there; reading attention weights stays the only
+absent internal site. Gotcha: the client-side envoy is the META model — a reconstruction that
 touches `.weight` must run INSIDE the trace (in the worker), else `Cannot copy out of meta tensor`.
 → `isb/micro/probes.py` (`derived_head_vllm`).
 
-### F-13 — UNBOUNDED `tracer.iter[:]` drops all saves on vLLM; bounded slices work
+### Unbounded `tracer.iter[:]` drops all saves on vLLM; bounded slices work
 The documented multi-token idiom (`for step in tracer.iter[:]: rows.append(model.logits)` —
 nnsight `docs/models/vllm.md`) yields a finished output that carries **no saves at all**, while
 the identical trace without `iter` collects fine. The split is a realization (Level 1.5)
@@ -215,18 +217,18 @@ path never sets a stop bound, so the loop overruns the last step, blocks, and is
 Blocks the generation-time workload class on vLLM until fixed; the bounded realization is the
 working recipe meanwhile. → `isb/micro/probes.py` (`_iter_vllm`).
 
-### F-14 — barrier on vLLM: loud on async, SILENT on the sync engine
+### Barrier on vLLM: loud on async, SILENT on the sync engine
 The cross-invoke barrier patch (HF: matches the two-trace patch exactly) fails on vLLM with a
 per-engine split. **Async**: no saves at all — two documented causes stack (the async
 multi-prompt submission gate and the Barrier object not being shared across invokes, nnsight
 `docs/developing/barrier-vllm-not-shared.md`) — a clean ERROR. **Sync engine** (measured via the
 construct-gaps repros; a plain two-invoke trace works there): the trace **exits cleanly with the
 saved dict EMPTY** — silent post-barrier data loss, the SILENTLY_WRONG state, with no error
-signal of any kind. The two-trace `be.patch` recipe remains the working cross-prompt form (F-8).
-Note: the sync engine is not yet a bench backend — engine mode is a context axis the inventory
-currently under-represents.
+signal of any kind. The two-trace `be.patch` recipe remains the working cross-prompt form (the
+activation-patching recipe). Note: the sync engine is not yet a bench backend — engine mode is a
+context axis the inventory currently under-represents.
 
-### F-15 — session on vLLM: only the UN-SAVED cross-trace flow is broken (plus async entirely)
+### Session on vLLM: only the UN-SAVED cross-trace flow is broken (plus async entirely)
 On HF both flows work (saved read-after-exit, and un-saved trace-1 → trace-2 reuse, |Δ|=0).
 On vLLM the row splits (nnsight `docs/developing/vllm-construct-gaps.md` §3):
 - **saved flow** (`.save()` in a session trace, read after exit): **works on the sync engine**
@@ -237,7 +239,7 @@ On vLLM the row splits (nnsight `docs/developing/vllm-construct-gaps.md` §3):
   client-side; trace 2 dies and the surfaced `UnboundLocalError` misleadingly names the
   *downstream* saved variable.
 
-### F-16 — edit and scan error cleanly on the vLLM path
+### Edit and scan error cleanly on the vLLM path
 `model.edit()` stores its mediator, but replaying it into a vLLM worker trace fails to serialize
 (`PicklingError: ... source code unavailable`). `model.scan()` fails earlier — the scan machinery
 passes a `hook=` kwarg the vLLM execution path rejects. Both are per-cell ERRORs (clear signal, no
@@ -253,21 +255,22 @@ oracle-checked row-per-step over 8 probe prompts (64 rows):
 | realization | hf | vllm_async | note |
 |---|---|---|---|
 | bounded `iter[0:N]` | SUPPORTED | **SUPPORTED** | top1=1.00 / TV=0.000 at default bf16 (maxabs=1.18 diagnostic only) |
-| unbounded `iter[:]` | SUPPORTED | **ERROR** | all per-step saves dropped (F-13) — the frontier marker for the upstream fix |
+| unbounded `iter[:]` | SUPPORTED | **ERROR** | all per-step saves dropped (unbounded iter[:] drops them on vLLM) — the frontier marker for the upstream fix |
 
 Effect-size on the control: the per-step steer flips EVERY step's top-1 (top1=0.00, TV=0.999) —
 the verdict is maximally non-vacuous. Perf: vLLM 176 ms / 45.4 tok/s vs HF 197 ms / 40.6 tok/s;
 the per-step write costs ≈1.05× over the no-intervention generation baseline.
 
-### F-17 — the WRITE × bounded-iteration composition holds on vLLM, exactly
-First method-tier cell measuring a COMPOSITION of two separately measured inventory rows:
-replacement WRITE (F-5) inside the bounded iteration construct (F-13). The composed statuses
+### The WRITE × bounded-iteration composition holds on vLLM, exactly
+First method-tier cell measuring a COMPOSITION of two separately measured inventory rows: the
+replacement WRITE (in-place raises on vLLM, replacement works) inside the bounded iteration
+construct (bounded `iter[0:N]` works while unbounded drops saves). The composed statuses
 predict SUPPORTED, and the measurement agrees — *exactly*: per-step logits match HF with
 top1=1.00 / TV=0.000 across the full greedy trajectory, i.e. the steered decode follows the
 identical token path on both backends, with no precision degradation even at vLLM's default
 bf16. This is the first method-tier confirmation of the "statuses compose upward" claim
 (design.md §3.6) — and it converts the causalab portability audit's "composition unmeasured"
 flag on the path_steering footprint into a measured cell
-(`docs/causalab-portability-audit.md` §4). The unbounded realization rides along as predicted
-ERROR (F-13), so the spec doubles as the flip-detector for the upstream saves fix.
-→ `isb/methodologies/gen_steering.py`, `isb/specs/gen_steering.py`.
+(`docs/causalab-portability-audit.md` §4). The unbounded realization rides along as a predicted
+ERROR (the unbounded-iteration saves-drop), so the spec doubles as the flip-detector for the
+upstream saves fix. → `isb/methodologies/gen_steering.py`, `isb/specs/gen_steering.py`.

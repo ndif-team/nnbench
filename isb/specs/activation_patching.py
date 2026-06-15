@@ -24,7 +24,8 @@ activation_patching_gpt2 = CellConfig(
     ),
     # The two-trace cross-prompt patch (whole-tuple replace) is the documented vLLM-correct recipe and
     # is faithful at fp32 (top1=1.00, tv≈0.001); at the bf16 default the patched top-1 flips on a
-    # near-tie -> precision degradation, not a bug (findings F-8, dtype-control).
+    # near-tie -> precision degradation, not a bug (the single-forward patch matches HF at fp32 but
+    # flips a bf16 near-tie, separated by the dtype control).
     expected={
         ("vllm_async", "interactive", "layer=3"): "SUPPORTED_DEGRADED",
         ("vllm_async", "interactive", "layer=9"): "SUPPORTED_DEGRADED",
