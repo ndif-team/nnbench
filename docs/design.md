@@ -94,14 +94,16 @@ surface lowers to read(VALUE) / write(SWAP) / skip / sync / end / error.
 
 `grad` is kept a primitive (rather than folded into read-on-the-derivative-graph) because
 methodologies treat it as one, and because the derivative graph may not exist at all in a
-context (F-11) — exactly the kind of status the inventory must carry.
+context (gradients are unavailable on vLLM, which runs in inference mode with no autograd) —
+exactly the kind of status the inventory must carry.
 
 **What the criterion demotes.** COMPUTE leaves Level 0: the trace body is real Python and the
 model's parameters are readable constants, so arbitrary computation — including applying
 external `nn.Module`s (probes/SAEs) and the model's own modules as functions — is *meta-level
 code*, not a boundary crossing. The measured COMPUTE rows are NOT discarded: they become
-realization rows of **meta-compute** in a context ("aux compute needs `no_grad` on vLLM", F-1;
-"module-call unembed is guarded, weight-matmul works", F-2). `.save()` also stays out: it does
+realization rows of **meta-compute** in a context (aux compute needs `no_grad` on vLLM because
+its activations are inference tensors; module-call unembed is guarded so the unembed must use the
+weight matmul). `.save()` also stays out: it does
 not act on a value at a site — it moves a value OUT of a region. It is a data **edge** (the
 live-out), and lives with the other cross-edge movement in §3.4.
 
@@ -183,8 +185,8 @@ dissolves the old site/op blur for derived sites.
 A site name's **denotation is context-dependent** — the central Level-1 fact. Per context a site
 has three properties: **exists?** (attention weights have no denotation under paged attention),
 **denotes what?** (vLLM fused-residual blocks: "block output" exists but denotes
-`(hidden, residual)` whose SUM is the residual stream — same name, different meaning, F-7),
-**writable?**. The inventory (`interp-methods-catalog.md`) is required to carry the per-site
+`(hidden, residual)` whose SUM is the residual stream — same name, different meaning, so a plain
+read is silently wrong), **writable?**. The inventory (`interp-methods-catalog.md`) is required to carry the per-site
 **writable?** property, not just existence/denotation.
 
 ### 3.3 Level 1.5 — realizations (idioms) — generalized 2026-06-12
@@ -209,7 +211,7 @@ semantics-preserving rewrite connects them (replacement ↔ in-place; bounded �
 | dataset quantifier | batched invoke (incl. the empty invoke) / sequential traces |
 | run↔run transfer edge | barriered / un-barriered cross-invoke (CROSS_INVOKER push/pull) / two traces via the host / session variable |
 | residual read (fused-residual families) | plain `out[0]` / fused sum `out[0] + out[1]` |
-| read / live-out **value semantics** | alias (reference into the run's storage) / snapshot (clone-at-crossing) — correct value selected by the **engine memory model** (§3.6); under in-place buffer reuse the alias decays silently, so the snapshot realization is required. Runtime-checkable selector (`tensor.is_inference()`), not a backend branch; nnsight applies it automatically (clone-on-save, vLLM intervention-gaps Gap 1.1) |
+| read / live-out **value semantics** | alias (reference into the run's storage) / snapshot (clone-at-crossing) — correct value selected by the **engine memory model** (§3.6); under in-place buffer reuse the alias decays silently, so the snapshot realization is required. Runtime-checkable selector (`tensor.is_inference()`), not a backend branch; nnsight applies it automatically (clone-on-save — the vLLM intervention-gap where saved inference tensors must be cloned to survive buffer reuse) |
 | read-before-write (user's own downstream write) | alias / clone-first (`before = x.clone().save()`) — distinct from the value-semantics row above: this guards against *your* later write to the same site, not the engine's buffer reuse |
 | live-out edge (transport) | in-process / async streaming drain / over-the-wire (serve) |
 
@@ -273,9 +275,12 @@ carries most of the vLLM frontier** — loop-carried saves dropped (unbounded it
 sharing broken (barrier), cross-region flow absent (session), staging replay unserializable
 (edit) — plus one region mode (scan). Of the micro tier's data-op × site probes, 6/6 pass on
 vLLM (bounded iteration, the seventh SUPPORTED probe, is an edge realization, not a site probe).
-The non-edge failures are exactly the taxonomy's other kinds (§3.6): grad (op-level, F-11),
-attention-weights (site-level, F-10), in-place write and module-call compute (realization-level,
-F-5/F-2), fused residual (denotation, F-7). Mechanism for the edge concentration: data ops
+The non-edge failures are exactly the taxonomy's other kinds (§3.6): grad (op-level — gradients
+are unavailable on vLLM's inference mode), attention-weights (site-level — they have no denotation
+under paged attention), in-place write and module-call compute (realization-level — in-place
+writes raise while whole-tuple replacement works, and the guarded `lm_head` call forces the weight
+matmul), fused residual (denotation — the dual `(hidden, residual)` stream whose sum is the true
+value). Mechanism for the edge concentration: data ops
 execute inside one worker scope; edges must cross nnsight's process/serialization boundaries,
 and on a production engine those boundaries are real.
 
@@ -340,10 +345,11 @@ session statuses differ by it). **The engine memory model is a second explicit c
 coordinate**: HF allocates fresh storage per forward (crossed values are de-facto snapshots);
 vLLM reuses activation/KV buffers in place (crossed values alias live storage). This one
 coordinate selects two realizations and produces a notable failure asymmetry — its **write face**
-is the in-place-vs-replacement split (in-place *raises* on vLLM, loud, F-5) and its **read face**
+is the in-place-vs-replacement split (in-place *raises* on vLLM, loud, while whole-tuple
+replacement works) and its **read face**
 is the alias-vs-snapshot split (an un-cloned read *silently decays* — measured ref-vs-clone
-divergence 64.6 / 1013.8, intervention-gaps Gap 1.1 — so the snapshot realization, §3.3, is
-required and nnsight applies it automatically). The engine protects writes loudly and reads not at
+divergence 64.6 / 1013.8, the clone-on-save inference-tensor protection — so the snapshot
+realization, §3.3, is required and nnsight applies it automatically). The engine protects writes loudly and reads not at
 all, which is why the read face needed an automatic fix. Every level has a *status in a context*;
 statuses compose upward — and the composition operator is now defined:
 
@@ -371,12 +377,12 @@ denotation-mismatch.
 
 | failure kind | level (varying coordinate) | measured example |
 |---|---|---|
-| operation unsupported | L0 × context | grad on vLLM (inference mode) — F-11 |
-| site absent | L1 × context | attention weights under paged/flash attention — F-10 |
-| denotation mismatch | L1 × context | vLLM fused residual: name exists, means something else — F-7 |
-| realization unsupported | L1.5 coordinate × context | in-place write raises (F-5); `lm_head.forward` guarded (F-2) |
-| edge unsupported | L2 edge × context | the vLLM frontier: loop-carried saves dropped (F-13), fork/join sharing (F-14), cross-region flow (F-15), staging replay (F-16) |
-| mode unsupported | region parameter × context | scan (mode=fake) dies in input prep on vLLM — F-16 |
+| operation unsupported | L0 × context | grad on vLLM (inference mode, no autograd) |
+| site absent | L1 × context | attention weights have no denotation under paged/flash attention |
+| denotation mismatch | L1 × context | vLLM fused residual: name exists, means `(hidden, residual)` whose sum is the stream, so a plain read is silently wrong |
+| realization unsupported | L1.5 coordinate × context | in-place write raises while whole-tuple replacement works; `lm_head.forward` guarded so unembed uses the weight matmul |
+| edge unsupported | L2 edge × context | the vLLM frontier: loop-carried saves dropped under unbounded iteration; fork/join sharing broken by the barrier; cross-region session flow absent; staging replay unserializable |
+| mode unsupported | region parameter × context | scan (mode=fake) dies in input prep on vLLM |
 | model-side law failure (formerly "regime effect") | context alone — a lifting law fails for the model itself | batched GPT-2 absolute positions: no primitive involved — the dataset-lift law (§3.7) is invalid for absolute-position families |
 
 When a method cell's measured status disagrees with its ∧-prediction, attribute three ways:
@@ -387,7 +393,8 @@ When a method cell's measured status disagrees with its ∧-prediction, attribut
 - **implementation-side composition failure** — footprint entries interact through shared engine
   state (the upstream saves-clobbering class). Recorded `attribution: implementation`; generates
   a composition cell (the pair becomes a permanent regression row).
-- **numerics** — bf16 near-ties; the dtype control decides (F-8's `disambiguate_precision`
+- **numerics** — bf16 near-ties; the dtype control decides (the `disambiguate_precision` fp32
+  rerun, validated where the activation patch matches HF at fp32 but flips a bf16 near-tie,
   already implements this) → `SUPPORTED_DEGRADED`, `attribution: numerics`.
 
 The model-side-law-failure row is why per-cell expected-state overrides exist: it is the class
@@ -408,14 +415,15 @@ category — with a definition (a named law failing, attributed to the model) in
 
   | law | claim | tested by | measured so far |
   |---|---|---|---|
-  | step-lift | a per-forward intervention stays valid per step | base cell vs step-lifted cell, SAME backend | no direct test yet (base-vs-lifted comparison queued); F-17 supports it only indirectly — it measured the lifted cell's cross-backend agreement, which is the composition row's confirmation |
+  | step-lift | a per-forward intervention stays valid per step | base cell vs step-lifted cell, SAME backend | no direct test yet (base-vs-lifted comparison queued); the generation-time steering composition result (per-step replacement write inside bounded iteration holds on vLLM exactly) supports it only indirectly — it measured the lifted cell's cross-backend agreement, which is the composition row's confirmation |
   | dataset-lift | batched ≡ sequential per-prompt | batched-invoke cell vs sequential-traces cell | FAILS model-side for absolute-position families (batched GPT-2 positions) |
   | sweep-exchange | sweeping addresses inside one run ≡ one run per address (non-interacting reads) | multi-layer cell vs per-layer cells | untested as a named law (logit-lens cells implicitly assume it) |
-  | composition | independent footprint entries compose (∧ is sound) | any method cell vs its ∧-prediction | one confirmation (F-17); known counterexamples upstream where entries share implementation state (nnsight batched-multitoken saves clobbering; PP iteration hang) |
+  | composition | independent footprint entries compose (∧ is sound) | any method cell vs its ∧-prediction | one confirmation (the generation-time steering composition holds on vLLM exactly); known counterexamples upstream where entries share implementation state (nnsight batched-multitoken saves clobbering; PP iteration hang) |
 
   A method cell's verdict protocol: `predicted = ∧(footprint, measured map)`; run; compare.
   Agreement confirms both the entry statuses and the law instance ("statuses compose upward",
-  confirmed at method tier by F-17). Disagreement is a finding in itself and triggers the
+  confirmed at method tier by the generation-time steering composition result). Disagreement is a
+  finding in itself and triggers the
   three-way attribution (§3.6); the runner's existing surprise mechanism catches it.
 - When an upstream fix lands, the micro-tier row flips first and every dependent method cell flips
   with it — one cause, reported once.
@@ -436,8 +444,8 @@ complete component list per level":
 | **L1.5 realizations** | per element, the §3.3 table (write ×3 · meta-compute ×2 · step ×3 · dataset ×2 · run↔run transfer ×4 · residual read ×2 · read/live-out value semantics: alias/snapshot · read-before-write clone-first · live-out transport ×3) |
 | **L2 entries** | generated: (data ops + edges) × address tiers × scope positions, filtered to footprint-named combinations (§3.4); edges classified observation / rewiring / transplant / injection / accumulation / derivative |
 | **L3 methodologies** | the registry (§4), each = base program × transformations (step-lift, dataset-lift, aggregation, linearization, amortization) |
-| **meta-level (not in the language)** | COMPUTE (trace body is real Python; measured realization rows F-1/F-2) · plain `if`/`for` · `save` (= the live-out edge) · harness/address-space machinery (`rename=`, enumeration, device mgmt) |
-| **out-of-scope v1** | NDIF plane (remote/session-bundling/non-blocking/`tracer.local`/code shipping — decision F2) · deprecated iteration forms · non-greedy sampling (breaks the determinism criterion) · non-LM model classes (F2; the §6 model-type axis reserves the slot) |
+| **meta-level (not in the language)** | COMPUTE (trace body is real Python; measured realization rows: aux compute needs `no_grad` on vLLM, and the guarded `lm_head` forces the weight matmul) · plain `if`/`for` · `save` (= the live-out edge) · harness/address-space machinery (`rename=`, enumeration, device mgmt) |
+| **out-of-scope v1** | NDIF plane (remote/session-bundling/non-blocking/`tracer.local`/code shipping — deferred by the v1-scope decision) · deprecated iteration forms · non-greedy sampling (breaks the determinism criterion) · non-LM model classes (the v1-scope decision is causal-LM-only; the §6 model-type axis reserves the slot) |
 
 Maintained per-context statuses for every inventoried component live ONLY in
 `interp-methods-catalog.md` (single copy); rows added 2026-06-12 from the traverse are all
@@ -524,7 +532,7 @@ Reporter  (parquet/json → tables, plots, coverage matrix, regression diff)
   layers/attn/mlp/residual/heads/unembed; diffusion: down/mid/up blocks + timestep; VLM:
   vision tower / connector / LM). *Family* fixes the concrete binding.
 - **Resolution tiers** (a binding is `(module_ref, slice|None, access_kind)`). Vocabulary spans
-  all tiers; v1 build/expectation differs per tier (see F3):
+  all tiers; v1 build/expectation differs per tier (see the Resolver-vocabulary-resolution decision):
   - **(a) block-level** (`residual_{pre,post}`, `attn_out`, `mlp_out`) — `module.output` directly;
     mechanical from tree + config. *Portable, perf workhorse.*
   - **(b) sub-block** (`head[h]`, `neuron[j]`) — config-driven reshape/slice of a module
@@ -567,8 +575,8 @@ For each (workload × backend × config), a multi-valued state — the user guid
 | `HANG` | deadlocks | timeout |
 | `UNSUPPORTED_BY_CONSTRUCTION` | value can't exist (flash-attn attention patterns) | declared + confirmed |
 
-`SILENTLY_WRONG` is **only detectable with the equivalence oracle** → this makes F4 load-bearing,
-not optional. Each non-portable workload carries an *expected* state; the runner verifies the
+`SILENTLY_WRONG` is **only detectable with the equivalence oracle** → this makes the
+equivalence-oracle correctness goal load-bearing, not optional. Each non-portable workload carries an *expected* state; the runner verifies the
 actual state matches (and flags when vLLM returns `SILENTLY_WRONG` where `ERROR` was expected).
 
 ### 8.2 Performance
@@ -594,14 +602,14 @@ tolerance — the "same trace, same answer" claim, and the `SILENTLY_WRONG` dete
 
 ## 10. Open forks / decision log
 
-| # | Decision | Options | Lean | Status |
-|---|---|---|---|---|
-| F1 | Spec form | data / code / **hybrid** | hybrid: spec=data, builder=code, profile=data (see §11.1) | **DECIDED** |
-| F2 | v1 scope | — | causal-LM, Method+some Macro; **backends = HF + vLLM-async only**; training & diffusion/VLM & vLLM-sync/NDIF additive later | **DECIDED** |
-| F3 | Resolver vocab resolution | (a)/(b)/(c) | **vocabulary spans all of (a/b/c)**; v1 *portable+perf* addressing = (a)+(b); (c) implemented **HF-eager-only as frontier markers** (run on vLLM expecting ERROR/UNSUPPORTED, verified) | **DECIDED** |
-| F4 | Correctness goal | coverage-only vs +equivalence | **+equivalence — LOAD-BEARING**: it's the only `SILENTLY_WRONG` detector (§8.1), not just the OSDI claim | **DECIDED** |
-| F5 | Adopt pyvene vocab + causalab harness shape | yes / build fresh | adopt: pyvene names→`FamilyProfile`; causalab Hydra config groups (§11.10) | **DECIDED** |
-| F6 | Repo name | provisional `interp-serve-bench` | finalize later (avoid "InterpBench") | open |
+| Decision | Options | Lean | Status |
+|---|---|---|---|
+| Spec form | data / code / **hybrid** | hybrid: spec=data, builder=code, profile=data (see §11.1) | **DECIDED** |
+| v1 scope | — | causal-LM, Method+some Macro; **backends = HF + vLLM-async only**; training & diffusion/VLM & vLLM-sync/NDIF additive later | **DECIDED** |
+| Resolver vocab resolution | (a)/(b)/(c) | **vocabulary spans all of (a/b/c)**; v1 *portable+perf* addressing = (a)+(b); (c) implemented **HF-eager-only as frontier markers** (run on vLLM expecting ERROR/UNSUPPORTED, verified) | **DECIDED** |
+| Correctness goal | coverage-only vs +equivalence | **+equivalence — LOAD-BEARING**: it's the only `SILENTLY_WRONG` detector (§8.1), not just the OSDI claim | **DECIDED** |
+| Adopt pyvene vocab + causalab harness shape | yes / build fresh | adopt: pyvene names→`FamilyProfile`; causalab Hydra config groups (§11.10) | **DECIDED** |
+| Repo name | provisional `interp-serve-bench` | finalize later (avoid "InterpBench") | open |
 
 ---
 
@@ -614,10 +622,10 @@ tolerance — the "same trace, same answer" claim, and the `SILENTLY_WRONG` dete
 > lm_head guard, flat buffer, vocab padding) in a single motif. Kept for history; the live
 > design is §12. Original text follows.
 
-This is the load-bearing interface. It resolves **F1 (hybrid)** and **F5 (adopt pyvene vocab +
-causalab harness)** concretely.
+This is the load-bearing interface. It resolves the **spec-form decision (hybrid)** and the
+**pyvene/causalab-adoption decision** concretely.
 
-### 11.1 Three artifacts — the data/code split (F1 = hybrid)
+### 11.1 Three artifacts — the data/code split (spec form = hybrid)
 
 | Artifact | Form | Who owns family knowledge | Analogy |
 |---|---|---|---|
@@ -654,7 +662,7 @@ class Workload(BaseModel):
     expect: dict[str, AppState] = {}         # per-backend expected state; missing ⇒ predicted (11.6)
 ```
 
-### 11.3 Logical target vocabulary (causal-LM; pyvene-aligned, F5)
+### 11.3 Logical target vocabulary (causal-LM; pyvene-aligned)
 
 | Logical target | Tier | pyvene name | nnsight access (resolved) |
 |---|---|---|---|
@@ -801,7 +809,7 @@ inputs: {kind: single, prompts: ["The cat sat on the"]}
 expect: {hf: SUPPORTED, vllm_async: UNSUPPORTED_BY_CONSTRUCTION}   # flash-attn: no weights tensor
 ```
 
-### 11.10 Package + config-group layout (causalab-aligned, F5)
+### 11.10 Package + config-group layout (causalab-aligned)
 
 ```
 isb/
@@ -816,8 +824,8 @@ isb/
     workload/ model/ backend/ family/ runners/    # Hydra config groups; runner = a sweep preset
 ```
 
-**F1 → hybrid (resolved):** spec=data, builder=code, profile=data.
-**F5 → adopt (resolved):** vocabulary aligned to pyvene component names + `type_to_module_mapping`
+**Spec form → hybrid (resolved):** spec=data, builder=code, profile=data.
+**pyvene/causalab adoption → adopt (resolved):** vocabulary aligned to pyvene component names + `type_to_module_mapping`
 (`FamilyProfile`); harness uses causalab's Hydra config-group shape (`workload/model/backend`).
 
 ---
@@ -921,7 +929,8 @@ scripts/smoke.py        # enumerate the cells to run; print the map
   one cause, reported once, with every dependent method cell flipping alongside it.
   **Built 2026-06-11**: `isb/micro/probes.py` (one probe per row, self-contained denotation
   checks, watchdog HANG detection, vLLM probes ordered safest-first), `scripts/micro.py`;
-  measured maps in `results/micro_{hf,vllm_async}.txt`, findings F-12..F-16.
+  measured maps in `results/micro_{hf,vllm_async}.txt` — the micro-tier construct findings
+  (portable Level-1 sites, and the iteration, barrier, session, and edit/scan construct results).
 - Per-cell `expected` entries remain for **model-side law failures** (§3.6; formerly "regime
   effects") — the non-decomposable residue, now an explicit category rather than entries
   indistinguishable from derivable consequences.

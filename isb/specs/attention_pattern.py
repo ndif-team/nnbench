@@ -18,6 +18,7 @@ attention_pattern_gpt2 = CellConfig(
     baseline=BaselineSpec(params={"layers": [0]}),
     effect=None,
     # vLLM has no probability matrix to read (paged attention, no `.source` attention_interface op) —
-    # a genuine architectural frontier, not a missing feature (findings F-10). No working version exists.
+    # a genuine architectural frontier, not a missing feature (attention weights have no denotation
+    # under vLLM's paged attention). No working version exists.
     expected={("vllm_async", "interactive", "layers=all"): "ERROR"},
 )

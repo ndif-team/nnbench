@@ -3,14 +3,16 @@
 Zero a component's output at one layer to measure its causal contribution, then read the model's
 next-token distribution. Like steering this is a *write* methodology, but the write is a knockout
 (`output = 0`) rather than an additive steer. The vLLM-safe form is whole-tuple **replacement**
-(in-place raises on inference tensors, F-5).
+(in-place writes raise on inference tensors; replacement works).
 
 Observable = the portable unembed of the final block's residual, last token (same readout as
 steering/patching). `target="none"` skips the write -> the un-ablated baseline the effect-size guard
-needs (a knockout that doesn't move the output makes a SUPPORTED verdict vacuous, cf. F-6).
+needs (a knockout that doesn't move the output makes a SUPPORTED verdict vacuous, cf. the
+effect-size guard).
 
 Variances (params): `layer`; `target` ("mlp" | "attn" knock out that submodule, "none" = baseline);
-`residual` ("plain" | "fused" — the dual-stream reconstruction, intervention-gaps Gap 1.2).
+`residual` ("plain" | "fused" — the dual-stream reconstruction, where vLLM fused-residual blocks
+return (hidden, residual) whose sum is the true stream).
 """
 from __future__ import annotations
 

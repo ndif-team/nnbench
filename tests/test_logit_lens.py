@@ -1,6 +1,7 @@
 """logit-lens residual-extraction tests (isb/methodologies/logit_lens.py) — no GPU; torch only.
 
-`_resid` is load-bearing for the vLLM-Llama SILENTLY_WRONG finding (F-7): vLLM's fused-residual
+`_resid` is load-bearing for the vLLM-Llama SILENTLY_WRONG finding (the fused-residual denotation
+mismatch — a plain read is silently wrong): vLLM's fused-residual
 RMSNorm layers return `(hidden, residual)` whose SUM is the real residual stream. `plain` (the
 GPT-2 idiom) reads only `hidden` -> silently wrong; `fused` reconstructs the sum. These tests pin
 that distinction without a model.

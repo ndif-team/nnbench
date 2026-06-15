@@ -25,9 +25,9 @@ engine mode × parallelism × regime), orthogonal to all levels. COMPUTE is meta
 primitive); its measured rows live as meta-compute realization rows below.
 
 This section is the single maintained **per-context status inventory**. Status values are
-bench-measured (citations `F-n` = `findings.md`). The original Level 0–1 row set is FULLY
-measured for (GPT-2 × hf/vllm_async) by the **micro tier** — one minimal probe per row with a
-self-contained denotation check (`scripts/micro.py`, results in
+bench-measured; the findings themselves are described in `findings.md`. The original Level 0–1
+row set is FULLY measured for (GPT-2 × hf/vllm_async) by the **micro tier** — one minimal probe
+per row with a self-contained denotation check (`scripts/micro.py`, results in
 `results/micro_{hf,vllm_async}.txt`). The 2026-06-12 full primitive traverse
 (`design.md` §3.8; `drafts/design-revision-2026-06-12.md` Part 1) added the rows marked
 **UNTESTED** below — they are the probe queue, and **no measured status is ever invented for
@@ -35,26 +35,29 @@ them**.
 
 **The measured concentration: cross-edge data movement carries most of the vLLM frontier.** Of
 the micro tier's data-op × site probes, 6/6 pass on vLLM; the non-edge failures are the
-taxonomy's other kinds — grad (op-level, F-11), attention-weights (site-absent, F-10), in-place
-write / module-call compute (realization-level, F-5/F-2), fused residual (denotation, F-7) —
-plus one region mode (scan, F-16).
+taxonomy's other kinds — gradients unavailable (op-level: no autograd in inference mode),
+attention weights absent (site-level: paged attention exposes no probability matrix), in-place
+write and module-call compute (realization-level: in-place writes raise, and the guarded
+lm_head forces the weight matmul), and the fused residual (denotation-level: the dual residual
+stream) — plus one region mode (scan errors cleanly on the vLLM path).
 
 ### Data operations × backend
 
 | op | hf | vllm_async / vllm_serve | evidence |
 |---|---|---|---|
-| read (boundary `.output`/`.input`) | ✓ | ✓ — with per-family denotation caveats (see Level 1) | logit-lens cells; F-7 |
-| write (boundary, replacement) | ✓ (both realizations) | ✓ replacement only; in-place raises | F-5; steering/ablation/patching cells |
+| read (boundary `.output`/`.input`) | ✓ | ✓ — with per-family denotation caveats (see Level 1) | logit-lens cells; the fused-residual denotation mismatch |
+| write (boundary, replacement) | ✓ (both realizations) | ✓ replacement only; in-place raises | the in-place-write restriction; steering/ablation/patching cells |
 | write — input side (`module.input = x`) | UNTESTED | UNTESTED | traverse row; the natural form of transcoder-splice and input-side patching |
 | write — module skip (`module.skip(replacement)`) | UNTESTED | UNTESTED | traverse row; SKIP is its own Mediator event — not derivable from the SWAP rows; also a perf primitive (elides the module's FLOPs) |
-| write — gradient (`t.grad = g` mid-backward) | UNTESTED | UNTESTED | traverse row; vLLM plausibly inherits F-11's ERROR but is recorded UNTESTED, never derived-as-measured |
+| write — gradient (`t.grad = g` mid-backward) | UNTESTED | UNTESTED | traverse row; vLLM plausibly inherits the no-autograd-on-vLLM result's ERROR but is recorded UNTESTED, never derived-as-measured |
 | write — sampler forcing (`model.samples = ids`, vLLM engine site) | n/a (HF site differs) | UNTESTED | traverse row; substrate for constrained/verified decoding |
-| grad (formerly BACKWARD) | ✓ (≈3.4× a single forward) | **ERROR** — inference mode, no autograd: the `grad` frontier | F-11 |
+| grad (formerly BACKWARD) | ✓ (≈3.4× a single forward) | **ERROR** — inference mode, no autograd: the `grad` frontier | the no-autograd-on-vLLM result |
 | hooked aux application (`envoy(x, hook=True)` — routes a meta-compute through the boundary, making aux `.input`/`.output` addressable) | UNTESTED | UNTESTED | traverse row; the `ext-module` tag's observability half (SAE latent read requires it) |
 
 (`.save()` is not a data op — it is the live-out EDGE; see cross-edge movement below. COMPUTE is
 meta-level code — the trace body is real Python; its measured per-context statuses are the
-meta-compute rows of the realizations table, F-1/F-2.)
+meta-compute rows of the realizations table — the inference-tensor no_grad requirement and the
+guarded lm_head call.)
 
 ### Control quantifiers × backend
 
@@ -67,12 +70,12 @@ crossing them — so their rows live in the cross-edge table below.
 | quantifier / region parameter | engine structure | hf | vllm_async | evidence |
 |---|---|---|---|---|
 | run (trace) | one request lifecycle | ✓ | ✓ | every cell |
-| run, steps=N (multi-token decode) | the decode loop's extent | ✓ | ✓ — 8-step greedy decode, per-step logits match HF exactly (measured on the steered trajectory, F-17; the plain decode appears only as its perf baseline) | micro iteration probes; gen_steering F-17 |
-| run, mode=fake (scan) | engine bypass | ✓ — shapes correct, no kernels | **ERROR** — dies building `SamplingParams` on scan's `hook=True` kwarg, before fake mode is entered | micro; F-16; construct-gaps §5 |
+| run, steps=N (multi-token decode) | the decode loop's extent | ✓ | ✓ — 8-step greedy decode, per-step logits match HF exactly (measured on the steered trajectory — the generation-time steering composition result; the plain decode appears only as its perf baseline) | micro iteration probes; gen_steering — the generation-time steering composition result |
+| run, mode=fake (scan) | engine bypass | ✓ — shapes correct, no kernels | **ERROR** — dies building `SamplingParams` on scan's `hook=True` kwarg, before fake mode is entered | micro tier; the edit/scan clean-error result; construct-gaps §5 |
 | run, early truncation (`tracer.stop()`) | request teardown mid-forward | UNTESTED | UNTESTED | traverse row; pure perf primitive (elide the rest of the forward) + a correctness question (are pre-stop saves preserved, does the engine survive?) |
 | dataset, batched realization (invoke) | the batch | runs; **model-side law failure** (dataset-lift, formerly "regime effect") on absolute-position families — batched GPT-2 diverges from its own per-prompt truth (pending the position_ids fix) | **ERROR** — gated on the dev checkout (async multi-prompt fix pending) | spec `expected` entries; `finding-batched-position-ids.md` |
 | dataset, empty-invoke realization (`tracer.invoke()` — full combined batch; the documented out-of-order/trailing-code escape hatch) | the batch | UNTESTED | UNTESTED | traverse row; the recommended fix for two gotchas deserves a measured status |
-| step, manual-advance realization (`tracer.next()`) | the decode loop | UNTESTED | UNTESTED | traverse row; third spelling of the step quantifier (bounded/unbounded are measured, F-13) |
+| step, manual-advance realization (`tracer.next()`) | the decode loop | UNTESTED | UNTESTED | traverse row; third spelling of the step quantifier (bounded/unbounded are measured — the unbounded-iteration saves-drop) |
 
 ### Cross-edge data movement × backend — THE FRONTIER
 
@@ -86,17 +89,17 @@ ONE run↔run transfer entry.
 
 | movement (edge) | hf | vllm_async | evidence |
 |---|---|---|---|
-| `.save()` — region → caller (live-out) | ✓ | ✓ — **conditional on the snapshot realization**: nnsight auto-clones inference-mode tensors on `.save()` (Gap 1.1); without it the live-out is SILENTLY_WRONG (ref-vs-clone diff 64.6 / 1013.8 — vLLM reuses the buffer). In-process and over-the-wire (serve venue; payload measured) | all cells; serve sweep 22/22 (measured 2026-06-09/10, predates F-numbering — no F-n entry; regenerate via `docker/run_vm.sh`) |
+| `.save()` — region → caller (live-out) | ✓ | ✓ — **conditional on the snapshot realization**: nnsight auto-clones inference-mode tensors on `.save()` (clone-on-save inference-tensor protection); without it the live-out is SILENTLY_WRONG (ref-vs-clone diff 64.6 / 1013.8 — vLLM reuses the buffer). In-process and over-the-wire (serve venue; payload measured) | all cells; serve sweep 22/22 (measured 2026-06-09/10; regenerate via `docker/run_vm.sh`) |
 | live-out, async streaming-drain realization — `async for out in tracer.backend()`, saves only on `output.finished`, single-shot generator, request-order ≠ invoke-order | n/a | UNTESTED — it IS the bench's vllm_async transport, but its assumptions have no explicit measured row | traverse row |
-| iter accumulation, bounded `iter[0:N]` — step → region (loop-carried) | ✓ | ✓ — 3 steps, step-0 == single-step trace | micro; F-13 |
-| iter accumulation, unbounded `iter[:]` / `.all()` | ✓ (stop bound = `default_all` from max_new_tokens) | **ERROR** — ALL saves dropped: the vLLM path never sets a stop bound, the loop overruns and is unwound by Cancelation before the body's final push (the documented idiom is the broken one) | micro; F-13; construct-gaps §1 |
-| barrier value sharing — fork ↔ fork (communication at fork/join) | ✓ — barrier patch == two-trace patch | async: **ERROR** (no saves; stacks with the multi-prompt gate). Sync engine: **SILENTLY_WRONG** — clean exit, saved dict EMPTY (construct-gaps repros) | micro; F-14; nnsight `docs/developing/barrier-vllm-not-shared.md` |
+| iter accumulation, bounded `iter[0:N]` — step → region (loop-carried) | ✓ | ✓ — 3 steps, step-0 == single-step trace | micro tier; the unbounded-iteration saves-drop |
+| iter accumulation, unbounded `iter[:]` / `.all()` | ✓ (stop bound = `default_all` from max_new_tokens) | **ERROR** — ALL saves dropped: the vLLM path never sets a stop bound, the loop overruns and is unwound by Cancelation before the body's final push (the documented idiom is the broken one) | micro tier; the unbounded-iteration saves-drop; construct-gaps §1 |
+| barrier value sharing — fork ↔ fork (communication at fork/join) | ✓ — barrier patch == two-trace patch | async: **ERROR** (no saves; stacks with the multi-prompt gate). Sync engine: **SILENTLY_WRONG** — clean exit, saved dict EMPTY (construct-gaps repros) | micro tier; the barrier sync/async split; nnsight `docs/developing/barrier-vllm-not-shared.md` |
 | un-barriered cross-invoke flow — fork ↔ fork, automatic push/pull (gated by `CONFIG.APP.CROSS_INVOKER`; the spelling users hit *by accident*) | UNTESTED | UNTESTED — plausibly SILENTLY_WRONG-shaped risk, must be measured not assumed | traverse row |
-| session saved flow — region → region (live across regions) | ✓ | async: **ERROR** (no drain point inside a captured session body). Sync engine: **works** (construct-gaps repros) | micro; F-15; construct-gaps §3 |
-| session un-saved flow (the session contract) | ✓ (\|Δ\|=0) | **ERROR** on both engines — only saves ship back from the worker; the surfaced UnboundLocalError misleadingly names the downstream variable | micro; F-15; construct-gaps §3 |
-| cross-prompt transplant — region → region via the host (inter-region communication) | ✓ | mechanism ✓ at fp32 (top1=1.00 TV=0.0006); default bf16 = **SUPPORTED_DEGRADED** (near-tie top-1 flip — the dtype caveat is load-bearing) | patching cells; F-8 |
-| edit replay — definition → every region (staging) | ✓ — edited trace == in-trace ablation; non-inplace edit isolated from the original | **ERROR** — the stored edit mediator fails to pickle into the vLLM worker (`PicklingError: source code unavailable`); the crash is protective — a serialization-only fix would silently drop the edit | micro; F-16; construct-gaps §4 |
-| edit persistence — `export_edits` / `import_edits` (staging × serialization, across processes — the F-16 failure class one level up) | UNTESTED | UNTESTED — probe deferred until staging matters on a second backend | traverse row |
+| session saved flow — region → region (live across regions) | ✓ | async: **ERROR** (no drain point inside a captured session body). Sync engine: **works** (construct-gaps repros) | micro tier; the broken un-saved session flow; construct-gaps §3 |
+| session un-saved flow (the session contract) | ✓ (\|Δ\|=0) | **ERROR** on both engines — only saves ship back from the worker; the surfaced UnboundLocalError misleadingly names the downstream variable | micro tier; the broken un-saved session flow; construct-gaps §3 |
+| cross-prompt transplant — region → region via the host (inter-region communication) | ✓ | mechanism ✓ at fp32 (top1=1.00 TV=0.0006); default bf16 = **SUPPORTED_DEGRADED** (near-tie top-1 flip — the dtype caveat is load-bearing) | patching cells; the single-forward patch precision near-tie |
+| edit replay — definition → every region (staging) | ✓ — edited trace == in-trace ablation; non-inplace edit isolated from the original | **ERROR** — the stored edit mediator fails to pickle into the vLLM worker (`PicklingError: source code unavailable`); the crash is protective — a serialization-only fix would silently drop the edit | micro tier; the edit/scan clean-error result; construct-gaps §4 |
+| edit persistence — `export_edits` / `import_edits` (staging × serialization, across processes — the edit/scan clean-error failure class one level up) | UNTESTED | UNTESTED — probe deferred until staging matters on a second backend | traverse row |
 | rewiring — same-run read→compute→write downstream (path patching; SAE/transcoder splice) | UNTESTED | UNTESTED | edge class named by four cataloged footprints; roadmap (path-patching / splice cell) |
 | accumulation — reads across runs → meta-state → later write/analysis (mean ablation; trained probes/SAEs) | UNTESTED | UNTESTED | edge class; roadmap (mean-ablation cell — the cheapest trained-state proxy) |
 | bulk cache (`tracer.cache(...)`) — read × breadth fused with live-out | UNTESTED | UNTESTED | the fused L2 primitive (design §3.4); roadmap top |
@@ -117,19 +120,19 @@ below imply nothing about writability — write statuses live in the data-op and
 
 | site tier | hf | vllm_async | evidence |
 |---|---|---|---|
-| engine (`logits`, sampled tokens) | ✓ — `model.output.logits` == `lm_head.output`; greedy `generator.output` id == logits argmax | ✓ — `model.logits` == portable unembed; `model.samples` == greedy logits argmax | micro; F-12 |
+| engine (`logits`, sampled tokens) | ✓ — `model.output.logits` == `lm_head.output`; greedy `generator.output` id == logits argmax | ✓ — `model.logits` == portable unembed; `model.samples` == greedy logits argmax | micro tier; the portable-sites result |
 | engine — `tracer.result` (the recommended end-of-generation capture, preferred over `generator.output`) | UNTESTED | UNTESTED | traverse row |
 | engine — HF per-step token stream (`model.generator.streamer.output`) | UNTESTED | n/a (HF-only site) | traverse row; probe deferred, fold into iteration probes |
-| boundary `.output` — block | ✓ | exists, but **denotes differently** on fused-residual families (Llama/Mistral/Qwen2/Gemma): `(hidden, residual)`, true stream = their sum | F-7 |
-| boundary `.output` — submodule (attn/mlp) | ✓ | ✓ (ablation write target) | F-9 |
-| boundary `.input` | ✓ — `h[6].input` == `h[5].output[0]`, exact | ✓ — same check, exact | micro; F-12 |
+| boundary `.output` — block | ✓ | exists, but **denotes differently** on fused-residual families (Llama/Mistral/Qwen2/Gemma): `(hidden, residual)`, true stream = their sum | the fused-residual denotation mismatch |
+| boundary `.output` — submodule (attn/mlp) | ✓ | ✓ (ablation write target) | the ablation bf16 near-tie |
+| boundary `.input` | ✓ — `h[6].input` == `h[5].output[0]`, exact | ✓ — same check, exact | micro tier; the portable-sites result |
 | boundary kwargs sub-site — `args, kwargs = module.inputs` (shares the eproperty key `input` with `.input` — denotation check needed) | UNTESTED | UNTESTED | traverse row |
-| internal `.source` — attention weights | ✓ (eager only) | **site absent** — paged/flash attention never materializes the matrix | F-10 |
-| internal `.source` — other ops | ✓ — `mlp.source.self_c_fc_0` == `c_fc.output`, exact | ✓ — same check, exact (the vLLM MLP forward is plain Python, so `.source` rewrites it fine) | micro; F-12 |
+| internal `.source` — attention weights | ✓ (eager only) | **site absent** — paged/flash attention never materializes the matrix | the attention-weights site-absence |
+| internal `.source` — other ops | ✓ — `mlp.source.self_c_fc_0` == `c_fc.output`, exact | ✓ — same check, exact (the vLLM MLP forward is plain Python, so `.source` rewrites it fine) | micro tier; the portable-sites result |
 | internal — nested/recursive `.source` (`module.source.<op>.source.<inner>`) | UNTESTED | UNTESTED | traverse row; same op class as `.source`, low priority |
-| derived (head *h* / neuron *j*) | ✓ — head view validated by c_proj reconstruction; neuron by `gelu_new(c_fc)` | ✓ — same checks; weight-using reconstruction must run INSIDE the trace (the client-side envoy is the meta model) | micro; F-12 |
+| derived (head *h* / neuron *j*) | ✓ — head view validated by c_proj reconstruction; neuron by `gelu_new(c_fc)` | ✓ — same checks; weight-using reconstruction must run INSIDE the trace (the client-side envoy is the meta model) | micro tier; the portable-sites result |
 | derived — subspace / direction-valued addresses (DAS rotations, steering directions; adopted as derived-tier citizens, design.md §3.2) | UNTESTED | UNTESTED — no probe until a DAS-class cell exists | traverse row; pyvene alignment |
-| gradient space (`.grad`) | ✓ | absent (no grad — F-11) | F-11 |
+| gradient space (`.grad`) | ✓ | absent (no grad — the no-autograd-on-vLLM result) | the no-autograd-on-vLLM result |
 
 Level-1 notes: name collisions remount under `.nns_output` (address-space quirk, not a row);
 `rename=` is adopted as the harness's vary-the-names test tool, not as canonicalization
@@ -143,13 +146,13 @@ element that works in that context.
 
 | element | hf recipe | vllm recipe |
 |---|---|---|
-| write | in-place or replacement | replacement ONLY (new tensor / whole tuple) — F-5; skip-with-value realization UNTESTED (data-op table) |
-| meta-compute (unembed) | `lm_head(h)` or weight matmul | weight matmul ONLY (`ParallelLMHead.forward` guarded) — F-2 |
-| meta-compute (aux) | bare | under `torch.no_grad()` — F-1 |
-| step quantifier | bounded or unbounded | bounded `iter[0:N]` ONLY (unbounded drops all loop-carried saves) — F-13; `tracer.next()` realization UNTESTED (control table) |
-| run↔run transfer | two single-prompt traces (barrier works, measured) | two single-prompt traces ONLY (barrier broken upstream) — F-14; un-barriered realization UNTESTED (cross-edge table) |
-| residual read on fused-residual families | `out[0]` | `out[0] + out[1]` — F-7 |
-| read / live-out value semantics (engine memory model, design §3.6) | alias is fine (fresh per-forward allocation) | snapshot REQUIRED — alias decays under in-place buffer reuse; nnsight auto-clones inference-mode tensors on `.save()` (Gap 1.1, `tensor.is_inference()` selector). The read-side dual of the write in-place/replacement split; unhandled = SILENTLY_WRONG |
+| write | in-place or replacement | replacement ONLY (new tensor / whole tuple) — the in-place-write restriction; skip-with-value realization UNTESTED (data-op table) |
+| meta-compute (unembed) | `lm_head(h)` or weight matmul | weight matmul ONLY (`ParallelLMHead.forward` guarded) — the guarded lm_head call |
+| meta-compute (aux) | bare | under `torch.no_grad()` — the inference-tensor no_grad requirement |
+| step quantifier | bounded or unbounded | bounded `iter[0:N]` ONLY (unbounded drops all loop-carried saves) — the unbounded-iteration saves-drop; `tracer.next()` realization UNTESTED (control table) |
+| run↔run transfer | two single-prompt traces (barrier works, measured) | two single-prompt traces ONLY (barrier broken upstream) — the barrier sync/async split; un-barriered realization UNTESTED (cross-edge table) |
+| residual read on fused-residual families | `out[0]` | `out[0] + out[1]` — the fused-residual denotation mismatch |
+| read / live-out value semantics (engine memory model, design §3.6) | alias is fine (fresh per-forward allocation) | snapshot REQUIRED — alias decays under in-place buffer reuse; nnsight auto-clones inference-mode tensors on `.save()` (clone-on-save inference-tensor protection, `tensor.is_inference()` selector). The read-side dual of the write in-place/replacement split; unhandled = SILENTLY_WRONG |
 | read-before-write (user's own downstream write) | clone-first (`before = x.clone().save()`) — distinct from the engine-memory-model row above; denotation check (saved-var-is-a-reference is a SILENTLY_WRONG generator), folded into existing write probes, not a standalone row | same |
 
 ### Level 2 — the entry enumeration (the coverage denominator)
@@ -158,11 +161,12 @@ Per design.md §3.4 the L2 catalog is **generated, not curated**: (data ops + ed
 tiers × scope positions, filtered to combinations any cataloged method's footprint names — and
 **the tables above ARE that enumeration**: one row per L2 entry, with realization splits as
 sub-rows (bounded/unbounded; barriered/un-barriered/two-trace/session-var) and measured statuses
-carrying their `F-n` citation. Everything added by the 2026-06-12 traverse is UNTESTED. Coverage
+carrying their evidence (the corresponding finding described in `findings.md`). Everything added
+by the 2026-06-12 traverse is UNTESTED. Coverage
 = footprint-needed entries minus probe-or-cell-exercised entries, computable from this one copy
 (no second status table, so the lists can't diverge). Out-of-scope rows (recorded with reasons
 in `drafts/design-revision-2026-06-12.md` Part 1): the NDIF plane (remote trace, session
-bundling, non-blocking jobs, `tracer.local()`, code shipping — decision F2; a future `ndif`
+bundling, non-blocking jobs, `tracer.local()`, code shipping — deferred by the v1-scope decision; a future `ndif`
 backend column is reserved, no rows now), deprecated iteration forms, non-greedy sampling
 (breaks the determinism criterion), multi-backward, and extension/harness plumbing.
 
@@ -217,8 +221,8 @@ Status: ✓ = already an nnbench cell. **frontier** = exercises a primitive wher
 | **Activation patching / causal tracing** | copy an activation from a clean run into a corrupted run; measure restoration | `read` `write` `xprompt` × `sweep` · base: transplant | any transformer | ✓ |
 | **Ablation / knockout** | zero- or mean-out a component, measure the damage | `read` `write` `injection` · base: injection (mean variant adds `accumulation` ∘ aggregation) | any transformer | ✓ (zero); mean = the accumulation roadmap cell |
 | **Steering / ActAdd** | add a direction into the residual at run time to push behavior | `read` `write` `injection` · base: injection | any decoder-only LM | ✓ |
-| **Generation-time steering** | the steering write applied at EVERY decode step of a greedy generation, per-step logits read | `write/boundary/step/replacement` + `step/bounded` + `injection` + `loop-carried` + `live-out` · steering ∘ step-lift | any decoder-only LM; vLLM needs the bounded `iter[0:N]` realization | ✓ — **composition confirmed** (write × bounded-iter SUPPORTED on vLLM, top1=1.00 tv=0.000; unbounded = the F-13 frontier marker; a direct step-lift law test — base vs lifted on one backend — is queued) |
-| **Attribution patching** | gradient linear-approx of patching for *every* component in one fwd+bwd | `read` `grad` `derivative` · activation patching ∘ linearization (a scientific approximation, not an equivalence) | any differentiable model | ✓ — **frontier confirmed** (`grad`: vLLM ERROR, F-11) |
+| **Generation-time steering** | the steering write applied at EVERY decode step of a greedy generation, per-step logits read | `write/boundary/step/replacement` + `step/bounded` + `injection` + `loop-carried` + `live-out` · steering ∘ step-lift | any decoder-only LM; vLLM needs the bounded `iter[0:N]` realization | ✓ — **composition confirmed** (write × bounded-iter SUPPORTED on vLLM, top1=1.00 tv=0.000; unbounded = the unbounded-iteration saves-drop frontier marker; a direct step-lift law test — base vs lifted on one backend — is queued) |
+| **Attribution patching** | gradient linear-approx of patching for *every* component in one fwd+bwd | `read` `grad` `derivative` · activation patching ∘ linearization (a scientific approximation, not an equivalence) | any differentiable model | ✓ — **frontier confirmed** (`grad`: vLLM ERROR — the no-autograd-on-vLLM result) |
 | **Path patching** | patch specific component→component *edges* (not whole activations) | `read` `write` `xprompt` `.source` `rewiring` · base: rewiring | any transformer; more plumbing | TODO (composite; the rewiring edge has no measuring cell) |
 
 ## 3. Decomposing representations into features
@@ -232,7 +236,7 @@ Status: ✓ = already an nnbench cell. **frontier** = exercises a primitive wher
 
 | method | idea | footprint (tags) · base × transformation | models / generality | status |
 |---|---|---|---|---|
-| **Attention-pattern read** | read the attention weights (who attends to whom) | `read` `attn-weights` `.source` · base: observation × internal | any transformer (HF eager); — | ✓ — **frontier confirmed** (`attn-weights`: site absent on vLLM, F-10) |
+| **Attention-pattern read** | read the attention weights (who attends to whom) | `read` `attn-weights` `.source` · base: observation × internal | any transformer (HF eager); — | ✓ — **frontier confirmed** (`attn-weights`: site absent on vLLM — the attention-weights site-absence) |
 | **Per-head ablation / read** | zero or read an individual attention head's output | `read` `write` × derived address (head index; access path = reshape-slice realization) + `injection` | any transformer; needs head-dim reshape | TODO |
 | **Induction heads** | identify head pairs implementing "A→B … A→?B" (in-context copying) | `read` `attn-weights` (+ per-head `injection`) · observation + injection, composite | emergent in most transformers | TODO (analysis, composite) |
 | **Automated circuit discovery (ACDC / EAP)** | iteratively patch/prune edges to find a task's minimal subgraph | `read` `write` `rewiring` (`grad` `derivative` for EAP) × adaptive quantifier | any transformer; many runs | TODO (heavyweight) |
@@ -249,10 +253,11 @@ Status: ✓ = already an nnbench cell. **frontier** = exercises a primitive wher
 ## nnbench roadmap (prioritized)
 
 **The original Level 0–1 row set is fully measured** (micro tier, refined 2026-06-11: HF 13/13
-SUPPORTED; vLLM 7 SUPPORTED / 6 ERROR — F-12..F-16). Attention-pattern read and attribution
-patching graduated to ✓; generation-time steering is ✓ DONE (2026-06-12, F-17 — the composition
-prediction confirmed exactly; the unbounded form rides along as the frontier marker /
-flip-detector for the upstream saves-drop fix). The 2026-06-12 traverse added the UNTESTED rows
+SUPPORTED; vLLM 7 SUPPORTED / 6 ERROR — the micro-tier construct findings (iteration, barrier,
+session, edit/scan)). Attention-pattern read and attribution patching graduated to ✓;
+generation-time steering is ✓ DONE (2026-06-12, the generation-time steering composition result —
+the composition prediction confirmed exactly; the unbounded form rides along as the frontier
+marker / flip-detector for the upstream saves-drop fix). The 2026-06-12 traverse added the UNTESTED rows
 above; the queue
 below follows the production-engine priority order (design.md revision Part 4d: edges first,
 then grad, staging, streaming/serve live-out realizations) — production serving APIs expose
@@ -279,9 +284,9 @@ interp-serving layer must add.
    not an inventory row).
 10. **`vllm_sync` backend** — promotes the construct-gaps sync statuses (barrier SILENTLY_WRONG
     is the motivating cell) from external repros to bench-measured.
-- Folded into existing probes: clone-before-modify denotation check; the F-7 fused-residual
-  check already exists. Deferred: edit persistence (`export_edits`/`import_edits`), HF streamer
-  per-step token site.
+- Folded into existing probes: clone-before-modify denotation check; the fused-residual
+  denotation-mismatch check already exists. Deferred: edit persistence
+  (`export_edits`/`import_edits`), HF streamer per-step token site.
 
 **Method cells (each = one unexercised edge type or transformation, per the §3.5 completeness
 criterion):**
@@ -291,15 +296,17 @@ criterion):**
    proxy; makes the `trained` tag structural).
 3. **Dataset-lift law cell on a relative-position family** — the positive control for the
    measured GPT-2 absolute-position model-side failure (attribution: model).
-4. **Generation-time cross-prompt patching** — transplant × step-lift; with F-17 in hand, this
-   completes the causalab audit's two flagged predictions.
+4. **Generation-time cross-prompt patching** — transplant × step-lift; with the generation-time
+   steering composition result in hand, this completes the causalab audit's two flagged
+   predictions.
 5. **Per-head ablation** — write × derived address (head-sliced write is still unexercised).
 6. **Direct logit attribution** — observation × internal site; exact read-only decomposition
    over the now-measured non-attention `.source` site.
 7. **Sweep-exchange law cell** — multi-layer-one-run vs one-run-per-layer logit lens (free data
    from existing cells; names the law).
 - Plus: **family axis for the micro tier** — the Level-0/1 map is (GPT-2)-only; rerun on a
-  fused-residual family (SmolLM2/Llama) where boundary denotation differs (F-7).
+  fused-residual family (SmolLM2/Llama) where boundary denotation differs (the fused-residual
+  denotation mismatch).
 
 **Tier 2 — need a (cheap/available) trained artifact:**
 - Linear probing (train a probe), SAE (use an existing checkpoint, e.g. GPT-2/Gemma), tuned lens.
@@ -311,4 +318,4 @@ criterion):**
 (c) exercises a Level-2 entry (or law/transformation) not yet covered by any cell — ideally one
 where vLLM and HF *diverge* — so it adds a real coverage frontier, not just a row. By that test the
 next cells to build are **multi-layer `tracer.cache`** and **generation-time cross-prompt
-patching** (generation-time steering is done, F-17).
+patching** (generation-time steering is done — the generation-time steering composition result).

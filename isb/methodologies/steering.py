@@ -11,8 +11,8 @@ a crash-or-not check cannot tell apart:
     -> diverge from HF-steered                                           -> SILENTLY_WRONG  (the dangerous cell)
   - vLLM raises on the write (e.g. in-place update of an inference tensor) -> ERROR
 
-Observable = the **portable** unembed (weight matmul; `lm_head.forward` is guarded on vLLM, see
-findings F-2) of the FINAL block's residual, last token. We steer an *earlier* block (`layer` <
+Observable = the **portable** unembed (weight matmul; `lm_head.forward` is guarded on vLLM, so
+unembed must use the weight matmul) of the FINAL block's residual, last token. We steer an *earlier* block (`layer` <
 last) so the perturbation propagates through the remaining layers into that readout, and the write
 and the read land on different modules — no write-then-read-same-module ordering hazard.
 

@@ -20,8 +20,9 @@ ablation_gpt2 = CellConfig(
         perturbed_params={"layer": 6, "target": "attn"},
     ),
     # whole-tuple replacement knockout is faithful on vLLM at fp32; bf16 default is a near-tie
-    # precision divergence -> SUPPORTED_DEGRADED (F-9). GPT-2 batched HF hits the position artifact
-    # (F-batched) -> SILENTLY_WRONG.
+    # precision divergence -> SUPPORTED_DEGRADED (ablation ports to vLLM, bf16 default is a
+    # precision near-tie). GPT-2 batched HF hits the left-pad absolute-position artifact
+    # (padded rows' positions shift, so batched HF diverges from its per-prompt truth) -> SILENTLY_WRONG.
     expected={
         ("vllm_async", "interactive", "target=mlp"): "SUPPORTED_DEGRADED",
         ("vllm_async", "interactive", "target=attn"): "SUPPORTED_DEGRADED",

@@ -21,7 +21,7 @@ steering_gpt2 = CellConfig(
         baseline_params={**_S, "alpha": 0.0, "mode": "replace"},
         perturbed_params={**_S, "alpha": 6.0, "mode": "replace"},
     ),
-    # in-place residual write raises on vLLM inference tensors (F-5); whole-tuple `replace` is the
+    # in-place residual write raises on vLLM inference tensors (replacement works); whole-tuple `replace` is the
     # working form (matches HF exactly, tv=0.000). Batched HF is SUPPORTED here (verified — the steer
     # dominates, so it is robust to the GPT-2 position artifact, unlike logit_lens/ablation batched).
     expected={

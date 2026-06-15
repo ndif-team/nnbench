@@ -162,7 +162,7 @@ what its observations *mean*:
 
 These laws hold trivially at the language level. **The bench's method tier is, precisely, an
 empirical test of which laws survive each implementation context.** Measured so far: the
-step-lift law verified exactly (write × bounded-step, F-17); the dataset-lift law *fails for
+step-lift law verified exactly (write × bounded-step — the generation-time steering composition result); the dataset-lift law *fails for
 absolute-position families* (batched GPT-2 left-padding, the position findings) — i.e. what
 design.md §3.6 files as a "regime effect" is, in language terms, **a lifting law failing for the
 model itself**, not for the implementation. And composition is known NOT to be free where

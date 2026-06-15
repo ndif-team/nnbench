@@ -49,7 +49,7 @@ def test_capture_clones_independent_snapshot():
 def test_capture_fused_sums_hidden_and_residual():
     h, r = torch.ones(2, HID), torch.full((2, HID), 3.0)
     snap = _capture([_Block((h, r))], 0, "fused")
-    assert torch.equal(snap, h + r)                  # fused reconstruction (vLLM-Llama, F-7)
+    assert torch.equal(snap, h + r)                  # fused reconstruction (vLLM-Llama blocks return (hidden, residual) whose sum is the true stream)
 
 
 def test_patch_replaces_target_layer_residual():

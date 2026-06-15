@@ -1,4 +1,4 @@
-"""vLLM async backend infra (design.md F2; §12.3).
+"""vLLM async backend infra (design.md §12.3; the v1-scope decision fixes backends = HF + vLLM-async).
 
 `run` owns the `with model.trace(...)` and the async stream in one coroutine; the cell's
 `build()` closure runs inside the trace. After the with-exit submits the request, we
@@ -177,10 +177,11 @@ class VLLMAsyncBackend(Backend):
             if not hasattr(last, "saves"):
                 # the unbounded realization: the vLLM path never sets a stop bound, the loop
                 # overruns and is unwound by Cancelation BEFORE the body's final push — the
-                # finished output carries no saves (F-13; nnsight vllm-construct-gaps §1)
+                # finished output carries no saves (unbounded tracer.iter[:] drops all per-step
+                # saves on vLLM; nnsight vllm-construct-gaps §1)
                 raise RuntimeError(
                     "vllm_async generation: finished output carried no saves — unbounded "
-                    "tracer.iter[:] drops all per-step saves on the vLLM path (F-13)"
+                    "tracer.iter[:] drops all per-step saves on the vLLM path"
                 )
             saves = last.saves
             while (
