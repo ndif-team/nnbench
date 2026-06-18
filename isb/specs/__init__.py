@@ -8,6 +8,13 @@ from .gen_patching import gen_patching_gpt2
 from .gen_steering import gen_steering_gpt2
 from .logit_lens import logit_lens_gpt2, logit_lens_llama
 from .steering import steering_gpt2
+from .qwen import (
+    ablation_qwen,
+    activation_patching_qwen,
+    gen_steering_qwen,
+    logit_lens_qwen,
+    steering_qwen,
+)
 
 SPECS = {
     s.name: s
@@ -21,6 +28,12 @@ SPECS = {
         ablation_gpt2,
         attention_pattern_gpt2,
         attribution_patching_gpt2,
+        # Qwen2.5-14B (family=llama) — large-model TP/PP equivalence specs
+        logit_lens_qwen,
+        steering_qwen,
+        ablation_qwen,
+        activation_patching_qwen,
+        gen_steering_qwen,
     )
 }
 
