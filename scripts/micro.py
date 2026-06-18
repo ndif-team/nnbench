@@ -19,7 +19,7 @@ from isb.micro.run import print_micro_map, run_micro  # noqa: E402
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", required=True, choices=["hf", "vllm_async"])
+    ap.add_argument("--backend", required=True, choices=["hf", "vllm_async", "vllm_sync"])
     ap.add_argument("--repo", default="openai-community/gpt2")
     ap.add_argument("--probe", nargs="+", default=None, help="run only these probes")
     ap.add_argument("--timeout", type=float, default=180.0, help="per-probe watchdog seconds")

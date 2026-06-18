@@ -20,5 +20,8 @@ attention_pattern_gpt2 = CellConfig(
     # vLLM has no probability matrix to read (paged attention, no `.source` attention_interface op) —
     # a genuine architectural frontier, not a missing feature (attention weights have no denotation
     # under vLLM's paged attention). No working version exists.
-    expected={("vllm_async", "interactive", "layers=all"): "ERROR"},
+    expected={
+        ("vllm_async", "interactive", "layers=all"): "ERROR",
+        ("vllm_sync", "interactive", "layers=all"): "ERROR",   # attn-weights frontier is engine-wide
+    },
 )

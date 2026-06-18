@@ -28,5 +28,11 @@ steering_gpt2 = CellConfig(
         ("vllm_async", "interactive", "mode=inplace"): "ERROR",
         ("vllm_async", "batched", "mode=inplace"): "ERROR",     # batched gated (+ in-place)
         ("vllm_async", "batched", "mode=replace"): "ERROR",     # batched gated (awaiting upstream fix)
+        # sync: in-place still hits InferenceMode protection (engine-wide). Batched runs each prompt
+        # as its own vLLM request (multi-invoke, no left-padding), so replace is SUPPORTED — like HF
+        # here, where the steer dominates the position artifact (in-place still ERRORs).
+        ("vllm_sync", "interactive", "mode=inplace"): "ERROR",
+        ("vllm_sync", "batched", "mode=inplace"): "ERROR",
+        ("vllm_sync", "batched", "mode=replace"): "SUPPORTED",
     },
 )

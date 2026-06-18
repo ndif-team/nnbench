@@ -14,8 +14,10 @@ EXPECTED = {
 }
 
 
-def test_both_backends_cover_the_inventory_rows():
-    for backend in ("hf", "vllm_async"):
+def test_all_backends_cover_the_inventory_rows():
+    # hf, vllm_async, and vllm_sync must each register exactly the inventory rows — so adding a
+    # probe to one backend and forgetting another is caught here (CPU-only), not on a GPU run.
+    for backend in ("hf", "vllm_async", "vllm_sync"):
         assert set(names_for(backend)) == EXPECTED, backend
 
 

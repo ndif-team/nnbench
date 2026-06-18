@@ -18,5 +18,8 @@ attribution_patching_gpt2 = CellConfig(
     # vLLM runs inference-mode (no autograd), so the backward an attribution needs raises — the whole
     # `grad` frontier is HF-only (gradients are unavailable on vLLM: inference mode, no autograd).
     # No working version exists on vLLM.
-    expected={("vllm_async", "interactive", "residual=plain"): "ERROR"},
+    expected={
+        ("vllm_async", "interactive", "residual=plain"): "ERROR",
+        ("vllm_sync", "interactive", "residual=plain"): "ERROR",   # sync is inference-mode too (no grad)
+    },
 )
