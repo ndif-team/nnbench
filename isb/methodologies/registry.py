@@ -22,12 +22,15 @@ def cell(methodology: str, family: str, backend: str):
 
 def get_cell(methodology: str, family: str, backend: str):
     fn = CELLS.get((methodology, family, backend))
-    if fn is None and backend == "vllm_serve":
-        # The serve-client backend runs the SAME vLLM model via the SAME intervention code as the
-        # in-process async backend — the only difference (in-process vs over-HTTP) is fully contained
-        # in the backend object passed as `be`. So a `vllm_serve` cell is, by construction, the
-        # `vllm_async` cell; reuse it rather than duplicating every methodology×family. An explicit
-        # `vllm_serve` registration still takes precedence if a cell ever needs to differ.
+    if fn is None and backend.startswith("vllm_") and backend != "vllm_async":
+        # Every vLLM *variant* runs the SAME vLLM model via the SAME intervention code as the
+        # in-process async backend — the only difference is fully contained in the backend/model
+        # object passed as `be` (over-HTTP for `vllm_serve`, an in-process sync engine for
+        # `vllm_sync`, a pipeline/tensor-parallel engine for `vllm_pp`). So a variant cell is, by
+        # construction, the `vllm_async` cell; reuse it rather than duplicating every
+        # methodology×family. An explicit registration still takes precedence if a cell ever needs
+        # to differ — and any silent divergence would surface as an oracle/test failure, not a
+        # stale copy.
         fn = CELLS.get((methodology, family, "vllm_async"))
     return fn
 

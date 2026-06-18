@@ -45,11 +45,15 @@ def _attn_pattern(blocks, *, layers):
 
 @cell("attention_pattern", family="gpt2", backend="hf")
 def attention_pattern_gpt2_hf(be, model, prompts, *, layers="all"):
-    return be.run(model, prompts, lambda: _attn_pattern(model.transformer.h, layers=layers))
+    def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
+        return _attn_pattern(model.transformer.h, layers=layers)
+    return be.run(model, prompts, build)
 
 
 @cell("attention_pattern", family="gpt2", backend="vllm_async")
 def attention_pattern_gpt2_vllm(be, model, prompts, *, layers="all"):
     # Same explicit code as HF; the divergence is the backend's, not the cell's — vLLM has no
     # `attention_interface` op to read, so this raises and surfaces as ERROR.
-    return be.run(model, prompts, lambda: _attn_pattern(model.transformer.h, layers=layers))
+    def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
+        return _attn_pattern(model.transformer.h, layers=layers)
+    return be.run(model, prompts, build)

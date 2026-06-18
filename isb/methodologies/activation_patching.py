@@ -66,13 +66,18 @@ def _patch_cell(be, model, prompts, *, layer, residual, patch):
     clean, corrupted = prompts
     h, ln_f, head = model.transformer.h, model.transformer.ln_f, model.lm_head
     if not patch:                                        # baseline: corrupted run, no transplant
-        return be.run(model, [corrupted], lambda: _read_final(h, ln_f, head, residual, be.last))
-    return be.patch(
-        model, clean, corrupted,
-        capture=lambda: _capture(h, layer, residual),
-        patch=lambda clean_act: _patch_and_read(
-            h, ln_f, head, layer=layer, clean_act=clean_act, residual=residual, last_fn=be.last),
-    )
+        def build():  # named so nnsight can source-serialize it to the vLLM worker
+            return _read_final(h, ln_f, head, residual, be.last)
+        return be.run(model, [corrupted], build)
+
+    def capture():  # named (not a lambda) so nnsight can source-serialize to the vLLM worker
+        return _capture(h, layer, residual)
+
+    def patch_fn(clean_act):
+        return _patch_and_read(
+            h, ln_f, head, layer=layer, clean_act=clean_act, residual=residual, last_fn=be.last)
+
+    return be.patch(model, clean, corrupted, capture=capture, patch=patch_fn)
 
 
 @cell("activation_patching", family="gpt2", backend="hf")

@@ -47,14 +47,20 @@ def _attribution_cell(be, model, prompts, *, residual, grad):
     corrupt_id = model.tokenizer.encode(CORRUPT_ANSWER)[0]
 
     if not grad:   # baseline: forward-only metric on the corrupt run (no backward) — both backends
-        return be.run(model, [corrupt], lambda: _metric(
-            model.transformer.h, model.transformer.ln_f, model.lm_head, residual, clean_id, corrupt_id))
+        def build():  # named so nnsight can source-serialize it to the vLLM worker
+            return _metric(
+                model.transformer.h, model.transformer.ln_f, model.lm_head, residual, clean_id, corrupt_id)
+        return be.run(model, [corrupt], build)
+
+    def acts_of(m):  # named (not a lambda) so nnsight can source-serialize to the vLLM worker
+        return [_resid(blk.output, residual) for blk in m.transformer.h]
+
+    def metric_of(m):
+        return _metric(
+            m.transformer.h, m.transformer.ln_f, m.lm_head, residual, clean_id, corrupt_id)
 
     return be.attribute(
-        model, clean, corrupt,
-        acts_of=lambda m: [_resid(blk.output, residual) for blk in m.transformer.h],
-        metric_of=lambda m: _metric(
-            m.transformer.h, m.transformer.ln_f, m.lm_head, residual, clean_id, corrupt_id),
+        model, clean, corrupt, acts_of=acts_of, metric_of=metric_of,
         n=len(model.transformer.h),
     )
 

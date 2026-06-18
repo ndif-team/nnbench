@@ -58,18 +58,22 @@ def _lens_proxy(blocks, norm, head, *, layers, unembed, last_fn, residual="plain
 
 @cell("logit_lens", family="gpt2", backend="hf")
 def logit_lens_gpt2_hf(be, model, prompts, *, layers="all", unembed="module"):
-    return be.run(model, prompts, lambda: _lens_proxy(
-        model.transformer.h, model.transformer.ln_f, model.lm_head,
-        layers=layers, unembed=unembed, last_fn=be.last,
-    ))
+    def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
+        return _lens_proxy(
+            model.transformer.h, model.transformer.ln_f, model.lm_head,
+            layers=layers, unembed=unembed, last_fn=be.last,
+        )
+    return be.run(model, prompts, build)
 
 
 @cell("logit_lens", family="gpt2", backend="vllm_async")
 def logit_lens_gpt2_vllm(be, model, prompts, *, layers="all", unembed="weight"):
-    return be.run(model, prompts, lambda: _lens_proxy(
-        model.transformer.h, model.transformer.ln_f, model.lm_head,
-        layers=layers, unembed=unembed, last_fn=be.last,
-    ))
+    def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
+        return _lens_proxy(
+            model.transformer.h, model.transformer.ln_f, model.lm_head,
+            layers=layers, unembed=unembed, last_fn=be.last,
+        )
+    return be.run(model, prompts, build)
 
 
 # --- Llama family: same methodology, the model's OWN module names (§12.1 explicit-per-family).
@@ -77,17 +81,21 @@ def logit_lens_gpt2_vllm(be, model, prompts, *, layers="all", unembed="weight"):
 # RMSNorm not LayerNorm. _lens_proxy is reused verbatim — the reuse the design calls "bottom-up".
 @cell("logit_lens", family="llama", backend="hf")
 def logit_lens_llama_hf(be, model, prompts, *, layers="all", unembed="module", residual="plain"):
-    return be.run(model, prompts, lambda: _lens_proxy(
-        model.model.layers, model.model.norm, model.lm_head,
-        layers=layers, unembed=unembed, last_fn=be.last, residual=residual,
-    ))
+    def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
+        return _lens_proxy(
+            model.model.layers, model.model.norm, model.lm_head,
+            layers=layers, unembed=unembed, last_fn=be.last, residual=residual,
+        )
+    return be.run(model, prompts, build)
 
 
 @cell("logit_lens", family="llama", backend="vllm_async")
 def logit_lens_llama_vllm(be, model, prompts, *, layers="all", unembed="weight", residual="fused"):
     # residual="fused" is the backend-aware default: vLLM Llama uses fused-residual RMSNorm, so the
     # residual stream is hidden+residual. residual="plain" (naively ported from GPT-2) is SILENTLY_WRONG.
-    return be.run(model, prompts, lambda: _lens_proxy(
-        model.model.layers, model.model.norm, model.lm_head,
-        layers=layers, unembed=unembed, last_fn=be.last, residual=residual,
-    ))
+    def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
+        return _lens_proxy(
+            model.model.layers, model.model.norm, model.lm_head,
+            layers=layers, unembed=unembed, last_fn=be.last, residual=residual,
+        )
+    return be.run(model, prompts, build)
