@@ -74,6 +74,24 @@ class HFBackend(Backend):
                 f"hf generation collected {len(rows)} per-step rows, expected {new_tokens}")
         return torch.cat([r.detach().float().cpu() for r in rows], dim=0)   # [steps, vocab]
 
+    def generate_patch(self, model, source_prompt, base_prompt, capture, build_step,
+                       *, new_tokens, bounded=True):
+        import torch
+
+        with model.trace(source_prompt):            # trace 1: snapshot the source activation
+            ca = capture().save()
+        clean_act = ca.detach().float().cpu()       # materialized; closed over by trace 2's steps
+
+        it = slice(0, new_tokens) if bounded else slice(None)
+        with model.generate(base_prompt, max_new_tokens=new_tokens, do_sample=False) as tracer:
+            rows = list().save()
+            for _step in tracer.iter[it]:
+                rows.append(build_step(clean_act))  # inject@prefill + read this step's logits
+        if len(rows) != new_tokens:
+            raise RuntimeError(
+                f"hf generate_patch collected {len(rows)} per-step rows, expected {new_tokens}")
+        return torch.cat([r.detach().float().cpu() for r in rows], dim=0)   # [steps, vocab]
+
     def last(self, t):
         return t[:, -1, :]                  # [B, S, vocab] -> [B, vocab]
 

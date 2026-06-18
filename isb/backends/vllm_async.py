@@ -174,37 +174,68 @@ class VLLMAsyncBackend(Backend):
             last = None
             async for output in tracer.backend:
                 last = output
-            if not hasattr(last, "saves"):
-                # the unbounded realization: the vLLM path never sets a stop bound, the loop
-                # overruns and is unwound by Cancelation BEFORE the body's final push — the
-                # finished output carries no saves (unbounded tracer.iter[:] drops all per-step
-                # saves on vLLM; nnsight vllm-construct-gaps §1)
-                raise RuntimeError(
-                    "vllm_async generation: finished output carried no saves — unbounded "
-                    "tracer.iter[:] drops all per-step saves on the vLLM path"
-                )
-            saves = last.saves
-            while (
-                isinstance(saves, dict)
-                and len(saves) == 1
-                and isinstance(next(iter(saves.values())), dict)
-                and not {"type_name", "message", "traceback"} <= set(saves)
-            ):
-                saves = next(iter(saves.values()))
-            if isinstance(saves, dict) and {"type_name", "message", "traceback"} <= set(saves):
-                msg = (saves.get("message") or "").strip().splitlines()
-                raise RuntimeError(
-                    f"worker intervention: {msg[-1] if msg else saves['type_name']}"
-                )
-            v = saves["rows"] if isinstance(saves, dict) and "rows" in saves else (
-                next(iter(saves.values())) if isinstance(saves, dict) else saves
+            return self._extract_step_rows(last, new_tokens, "generation")
+
+        return self._run_coro(_go())
+
+    def _extract_step_rows(self, last, new_tokens, what):
+        """Pull the per-step `rows` list off a finished generation output and stack it
+        `[steps, vocab]`. Shared by `generate` and `generate_patch` — both build a saved `rows`
+        list in the trace frame and append one per-step proxy per decode step."""
+        import torch
+
+        if not hasattr(last, "saves"):
+            # the unbounded realization: the vLLM path never sets a stop bound, the loop overruns
+            # and is unwound by Cancelation BEFORE the body's final push — the finished output
+            # carries no saves (unbounded tracer.iter[:] drops all per-step saves on vLLM;
+            # nnsight vllm-construct-gaps §1)
+            raise RuntimeError(
+                f"vllm_async {what}: finished output carried no saves — unbounded tracer.iter[:] "
+                "drops all per-step saves on the vLLM path"
             )
-            mats = [r.detach().float().cpu() for r in v if r is not None]
-            if len(mats) != new_tokens:
-                raise RuntimeError(
-                    f"vllm_async generation collected {len(mats)} per-step rows, "
-                    f"expected {new_tokens}")
-            return torch.cat(mats, dim=0)             # per-step [1, vocab] -> [steps, vocab]
+        saves = last.saves
+        while (
+            isinstance(saves, dict)
+            and len(saves) == 1
+            and isinstance(next(iter(saves.values())), dict)
+            and not {"type_name", "message", "traceback"} <= set(saves)
+        ):
+            saves = next(iter(saves.values()))
+        if isinstance(saves, dict) and {"type_name", "message", "traceback"} <= set(saves):
+            msg = (saves.get("message") or "").strip().splitlines()
+            raise RuntimeError(
+                f"worker intervention: {msg[-1] if msg else saves['type_name']}"
+            )
+        v = saves["rows"] if isinstance(saves, dict) and "rows" in saves else (
+            next(iter(saves.values())) if isinstance(saves, dict) else saves
+        )
+        mats = [r.detach().float().cpu() for r in v if r is not None]
+        if len(mats) != new_tokens:
+            raise RuntimeError(
+                f"vllm_async {what} collected {len(mats)} per-step rows, expected {new_tokens}")
+        return torch.cat(mats, dim=0)                 # per-step [1, vocab] -> [steps, vocab]
+
+    def generate_patch(self, model, source_prompt, base_prompt, capture, build_step,
+                       *, new_tokens, bounded=True):
+        async def _go():
+            # trace 1: capture the source residual (single forward), like patch()'s clean trace
+            with model.trace(source_prompt, temperature=0.0, top_p=1, max_tokens=1) as t1:
+                ca = capture().save()  # noqa: F841 — var name IS the async .saves key
+            last1 = None
+            async for output in t1.backend:
+                last1 = output
+            clean_act = self._extract(last1)          # materialized CPU tensor
+
+            # trace 2: generate the base prompt, injecting clean_act at prefill + reading per-step
+            with model.trace(base_prompt, temperature=0.0, top_p=1, max_tokens=new_tokens) as tracer:
+                rows = list().save()  # noqa: F841 — build the list HERE; build_step mutates it
+                steps = tracer.iter[0:new_tokens] if bounded else tracer.iter[:]
+                for _step in steps:
+                    rows.append(build_step(clean_act))
+            last = None
+            async for output in tracer.backend:
+                last = output
+            return self._extract_step_rows(last, new_tokens, "generate_patch")
 
         return self._run_coro(_go())
 

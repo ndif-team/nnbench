@@ -57,6 +57,30 @@ class Backend:
         """
         raise NotImplementedError
 
+    def generate_patch(self, model, source_prompt, base_prompt, capture, build_step,
+                       *, new_tokens, bounded=True):
+        """Cross-prompt transplant run UNDER the decode loop = the two-trace patch (§be.patch)
+        composed with the generation loop (§generate). `capture()` runs in trace 1 (a single
+        forward on `source_prompt`) and returns the proxy to snapshot; `build_step(clean_cpu)` runs
+        once per decode step of `base_prompt` in trace 2 (the captured value is a materialized CPU
+        tensor by then) — it injects at the prompt positions during the PREFILL step (where the
+        full-prompt residual matches the captured shape) and reads that step's per-step proxy.
+
+        This is a COMPOSITION cell: it exercises no new primitive — the boundary read, the
+        replacement write, the two-trace transplant edge, and bounded iteration are each already
+        measured. Its job is to check the step-lift LAW for the transplant edge (does a transplant
+        stay valid run during a decode loop), and to be the recipe a causalab `locate`-style
+        analysis needs (cross-prompt interchange scored on generated tokens). Returns the stacked
+        per-step CPU tensor `[new_tokens, ...]`.
+
+        Note on the patch persisting across decode steps: the injection lands at PREFILL; decode
+        steps don't recompute prompt positions, so there is nothing to re-inject — the patched
+        residual is simply part of the forward that builds this request's (intra-request) KV cache.
+        No cross-request prefix cache is involved (nnsight disables it), so this is ordinary
+        dataflow, not a separate propagation that could fail.
+        """
+        raise NotImplementedError
+
     def last(self, t):
         """Last-token row of a logits tensor (backend-shape-specific)."""
         raise NotImplementedError
