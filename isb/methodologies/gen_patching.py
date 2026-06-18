@@ -87,10 +87,15 @@ def gen_patching_gpt2_hf(be, model, prompts, *, layer=9, residual="plain",
     h = model.transformer.h
 
     if not patch:                                              # unpatched-generation baseline
-        return be.generate(model, [corrupted], lambda: model.lm_head.output[:, -1, :],
+        def step():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
+            return model.lm_head.output[:, -1, :]
+        return be.generate(model, [corrupted], step,
                            new_tokens=new_tokens, bounded=(bound == "bounded"))
 
     injected = [False]                                         # inject once, on the prefill forward
+
+    def capture():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
+        return _capture(h, layer, residual)
 
     def step(clean_act):
         if not injected[0]:                                    # the first generation forward IS prefill
@@ -98,8 +103,7 @@ def gen_patching_gpt2_hf(be, model, prompts, *, layer=9, residual="plain",
             injected[0] = True
         return model.lm_head.output[:, -1, :]                 # this step's next-token logits
 
-    return be.generate_patch(model, clean, corrupted,
-                             capture=lambda: _capture(h, layer, residual),
+    return be.generate_patch(model, clean, corrupted, capture=capture,
                              build_step=step, new_tokens=new_tokens, bounded=(bound == "bounded"))
 
 
@@ -111,10 +115,15 @@ def gen_patching_gpt2_vllm(be, model, prompts, *, layer=9, residual="plain",
     h = model.transformer.h
 
     if not patch:
-        return be.generate(model, [corrupted], lambda: model.logits[-1:, :],
+        def step():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
+            return model.logits[-1:, :]
+        return be.generate(model, [corrupted], step,
                            new_tokens=new_tokens, bounded=(bound == "bounded"))
 
     injected = [False]                                         # inject once, on the prefill forward
+
+    def capture():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
+        return _capture(h, layer, residual)
 
     def step(clean_act):
         if not injected[0]:                                    # the first generation forward IS prefill
@@ -122,6 +131,5 @@ def gen_patching_gpt2_vllm(be, model, prompts, *, layer=9, residual="plain",
             injected[0] = True
         return model.logits[-1:, :]                            # engine site == portable unembed
 
-    return be.generate_patch(model, clean, corrupted,
-                             capture=lambda: _capture(h, layer, residual),
+    return be.generate_patch(model, clean, corrupted, capture=capture,
                              build_step=step, new_tokens=new_tokens, bounded=(bound == "bounded"))
