@@ -48,14 +48,18 @@ def _target_module(block, target):
 @cell("ablation", family="gpt2", backend="hf")
 def ablation_gpt2_hf(be, model, prompts, *, layer=6, target="mlp", residual="plain"):
     blk = model.transformer.h[layer]
-    return be.run(model, prompts, lambda: _ablate_and_read(
-        _target_module(blk, target), model.transformer.h, model.transformer.ln_f, model.lm_head,
-        target=target, residual=residual, last_fn=be.last))
+    def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
+        return _ablate_and_read(
+            _target_module(blk, target), model.transformer.h, model.transformer.ln_f, model.lm_head,
+            target=target, residual=residual, last_fn=be.last)
+    return be.run(model, prompts, build)
 
 
 @cell("ablation", family="gpt2", backend="vllm_async")
 def ablation_gpt2_vllm(be, model, prompts, *, layer=6, target="mlp", residual="plain"):
     blk = model.transformer.h[layer]
-    return be.run(model, prompts, lambda: _ablate_and_read(
-        _target_module(blk, target), model.transformer.h, model.transformer.ln_f, model.lm_head,
-        target=target, residual=residual, last_fn=be.last))
+    def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
+        return _ablate_and_read(
+            _target_module(blk, target), model.transformer.h, model.transformer.ln_f, model.lm_head,
+            target=target, residual=residual, last_fn=be.last)
+    return be.run(model, prompts, build)

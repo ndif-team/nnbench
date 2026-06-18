@@ -89,16 +89,20 @@ def _steer_and_read(blocks, norm, head, *, layer, token_id, alpha, mode, last_fn
 @cell("steering", family="gpt2", backend="hf")
 def steering_gpt2_hf(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace"):
     token_id = _resolve_token(model.tokenizer, target)
-    return be.run(model, prompts, lambda: _steer_and_read(
-        model.transformer.h, model.transformer.ln_f, model.lm_head,
-        layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
-    ))
+    def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
+        return _steer_and_read(
+            model.transformer.h, model.transformer.ln_f, model.lm_head,
+            layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
+        )
+    return be.run(model, prompts, build)
 
 
 @cell("steering", family="gpt2", backend="vllm_async")
 def steering_gpt2_vllm(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace"):
     token_id = _resolve_token(model.tokenizer, target)
-    return be.run(model, prompts, lambda: _steer_and_read(
-        model.transformer.h, model.transformer.ln_f, model.lm_head,
-        layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
-    ))
+    def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
+        return _steer_and_read(
+            model.transformer.h, model.transformer.ln_f, model.lm_head,
+            layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
+        )
+    return be.run(model, prompts, build)
