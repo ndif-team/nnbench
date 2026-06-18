@@ -20,7 +20,14 @@ from .registry import cell
 
 
 def _untuple(x):
-    return x[0] if isinstance(x, tuple) else x
+    # PP cross-stage outputs are LazyRemoteTensor, which is NOT a tuple instance even when it wraps a
+    # (hidden, residual) tuple — so `isinstance(x, tuple)` is unreliable under pipeline parallelism and
+    # would pass the lazy-wrapped tuple straight into RMSNorm (-> empty_like(tuple) TypeError on Qwen/
+    # Llama, whose blocks return tuples). Probe tensor-ness first and index [0] on everything else:
+    # real tuples index cleanly, and LazyRemoteTensor[0] returns a deferred child that pulls element 0.
+    # Matches the codebase convention (nnsight tests/vllm/pp/manual run_equivalence_matrix._hidden).
+    import torch
+    return x if isinstance(x, torch.Tensor) else x[0]
 
 
 def _resid(out, how):

@@ -33,7 +33,10 @@ from .registry import cell
 
 
 def _untuple(x):
-    return x[0] if isinstance(x, tuple) else x
+    # PP cross-stage outputs are LazyRemoteTensor (not a tuple instance even when wrapping one);
+    # probe tensor-ness first, index [0] otherwise. See logit_lens._untuple for the full rationale.
+    import torch
+    return x if isinstance(x, torch.Tensor) else x[0]
 
 
 def _resolve_token(tokenizer, target: str) -> int:
@@ -103,6 +106,30 @@ def steering_gpt2_vllm(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
         return _steer_and_read(
             model.transformer.h, model.transformer.ln_f, model.lm_head,
+            layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
+        )
+    return be.run(model, prompts, build)
+
+
+# --- llama/Qwen family: same methodology, the model's own block list (model.model.layers /
+# model.model.norm / model.lm_head). _steer_and_read is reused verbatim (family-agnostic helper).
+@cell("steering", family="llama", backend="hf")
+def steering_llama_hf(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace"):
+    token_id = _resolve_token(model.tokenizer, target)
+    def build():
+        return _steer_and_read(
+            model.model.layers, model.model.norm, model.lm_head,
+            layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
+        )
+    return be.run(model, prompts, build)
+
+
+@cell("steering", family="llama", backend="vllm_async")
+def steering_llama_vllm(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace"):
+    token_id = _resolve_token(model.tokenizer, target)
+    def build():
+        return _steer_and_read(
+            model.model.layers, model.model.norm, model.lm_head,
             layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
         )
     return be.run(model, prompts, build)
