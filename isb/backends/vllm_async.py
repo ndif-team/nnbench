@@ -18,11 +18,27 @@ from .base import Backend
 class VLLMAsyncBackend(Backend):
     name = "vllm_async"
 
-    def __init__(self, dtype: str | None = None):
+    def __init__(self, dtype: str | None = None,
+                 pipeline_parallel_size: int = 1,
+                 tensor_parallel_size: int = 1,
+                 distributed_executor_backend: str | None = None,
+                 gpu_memory_utilization: float = 0.2,
+                 max_model_len: int | None = None):
         # dtype is a real engine-config axis (design L3). Default None -> vLLM's own default
         # (bf16 for GPT-2). Forcing "float32" matches HF's precision, which is how we separate a
         # precision-degradation (SUPPORTED_DEGRADED) from a true mechanism bug (SILENTLY_WRONG).
         self.dtype = dtype
+        # Parallelism axes (default 1 == single-GPU, the v1 behaviour). PP>1/TP>1 are forwarded
+        # straight to nnsight's VLLM, which passes them to vLLM. distributed_executor_backend
+        # must be "ray" for multi-node placement; None uses vLLM's default (mp) on one node.
+        self.pipeline_parallel_size = pipeline_parallel_size
+        self.tensor_parallel_size = tensor_parallel_size
+        self.distributed_executor_backend = distributed_executor_backend
+        # Engine memory knobs. The 0.2 default is sized for tiny GPT-2; a multi-billion-param model
+        # needs a much higher fraction (e.g. 0.9) just to hold its weights, and a capped max_model_len
+        # keeps the KV reservation small. Both are forwarded to vLLM via nnsight's VLLM.
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.max_model_len = max_model_len
         self._loop = None
 
     def __getstate__(self):
@@ -50,10 +66,22 @@ class VLLMAsyncBackend(Backend):
             self._loop = asyncio.new_event_loop()
         return contextvars.copy_context().run(self._loop.run_until_complete, coro)
 
-    def load(self, repo: str, gpu_memory_utilization: float = 0.2):
+    def load(self, repo: str, gpu_memory_utilization: float | None = None):
         from nnsight.modeling.vllm import VLLM
 
+        gpu_memory_utilization = (
+            gpu_memory_utilization if gpu_memory_utilization is not None
+            else self.gpu_memory_utilization
+        )
         kw = {} if self.dtype is None else {"dtype": self.dtype}
+        if self.pipeline_parallel_size > 1:
+            kw["pipeline_parallel_size"] = self.pipeline_parallel_size
+        if self.tensor_parallel_size > 1:
+            kw["tensor_parallel_size"] = self.tensor_parallel_size
+        if self.distributed_executor_backend is not None:
+            kw["distributed_executor_backend"] = self.distributed_executor_backend
+        if self.max_model_len is not None:
+            kw["max_model_len"] = self.max_model_len
         return VLLM(
             repo, mode="async", dispatch=True,
             gpu_memory_utilization=gpu_memory_utilization, **kw,
