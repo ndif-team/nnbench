@@ -33,10 +33,12 @@ NemotronH fine (the Mamba state is NOT a wall); the correctness axis is the same
 denotation as the llama family:
   - logit_lens residual=plain -> SILENTLY_WRONG (drops vLLM's fused residual; top1=0.12); residual=
     fused -> SUPPORTED (top1=0.98); idiomatic unembed -> ERROR (guarded lm_head.forward).
-  - steering replace -> SILENTLY_WRONG: the write runs, but `_steer_and_read`'s readout uses `_untuple`
-    (plain) and drops the fused residual (top1=0.00). A fused-aware steering readout would recover it
-    (follow-up). steering in-place -> ERROR (inference-tensor write).
+  - steering replace -> SUPPORTED (top1=1.00) once the read-out uses the documented fused residual
+    (the vLLM steering cell defaults residual="fused"); steering in-place -> ERROR (inference-tensor
+    write). (An earlier plain read-out scored SILENTLY_WRONG — a benchmark-cell bug, now fixed.)
   - ablation mixer -> SUPPORTED (top1=1.00): its readout is fused-aware (residual="fused").
+All vLLM verdicts reduce to the DOCUMENTED gaps (interp-methods-catalog.md): guarded lm_head.forward,
+in-place-write restriction, fused-residual read; NemotronH adds none of its own.
 The `*_nemotron` (30B-A3B MoE) specs inherit these 4B-measured expectations as their hypothesis
 (unmeasured; needs --pp/--tp). dtype_control="bfloat16" (fp32 at this scale is impractical).
 """
@@ -94,12 +96,11 @@ def _nemotron_specs(suffix: str, repo: str):
         dtype_control=_BF16,
         vllm_kwargs=_VLLM_TRC,
         expected={
-            # MEASURED (4B): in-place write -> ERROR (inference-tensor protection, engine-wide). The
-            # replace write RUNS, but `_steer_and_read`'s readout uses `_untuple` (plain) and so drops
-            # vLLM's fused residual -> SILENTLY_WRONG (top1=0.00, tv=1.0). A fused-aware steering readout
-            # (cf. logit_lens residual="fused") would recover it — documented follow-up (§12.7).
+            # MEASURED (4B): in-place write -> ERROR (inference-tensor protection, the documented
+            # engine-wide gap). The replace write is SUPPORTED (top1=1.00, tv=0.005) once the read-out
+            # uses the documented fused residual (the vLLM steering cell now defaults residual="fused");
+            # reading plain there was a benchmark-cell bug, not a NemotronH limitation. -> default.
             ("vllm_async", "interactive", "mode=inplace"): "ERROR",
-            ("vllm_async", "interactive", "mode=replace"): "SILENTLY_WRONG",
         },
     )
     ablation = CellConfig(

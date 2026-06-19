@@ -969,20 +969,30 @@ is read from `hybrid_override_pattern` at runtime, never hardcoded.
 nnsight-on-vLLM traces NemotronH fine — the Mamba state is NOT a wall; the correctness axis is the
 fused residual:
 
-| cell (vLLM) | verdict | metric |
+| cell (vLLM, documented-correct form) | verdict | metric |
 |---|---|---|
-| logit_lens, residual=plain | **SILENTLY_WRONG** | top1=0.12, tv=0.65 — naive read drops the fused residual |
 | logit_lens, residual=fused | **SUPPORTED** | top1=0.98, tv=0.009 |
-| logit_lens, idiomatic unembed | ERROR | guarded `lm_head.forward` (engine-wide) |
-| steering, replace | **SILENTLY_WRONG** | top1=0.00 — `_steer_and_read`'s `_untuple` readout drops the fused residual |
-| steering, in-place | ERROR | in-place inference-tensor write (engine-wide) |
-| ablation, mixer (L16/L32) | **SUPPORTED** | top1=1.00 — its readout IS fused-aware (`residual="fused"`) |
+| steering replace, residual=fused | **SUPPORTED** | top1=1.00, tv=0.005 |
+| ablation mixer (L16/L32), residual=fused | **SUPPORTED** | top1=1.00, tv~0.01 |
+| logit_lens, residual=plain (naive port) | SILENTLY_WRONG | top1=0.12 — drops the fused residual (the intentional naive-port marker) |
+| logit_lens, idiomatic unembed | ERROR | guarded `lm_head.forward` |
+| steering, in-place | ERROR | in-place inference-tensor write |
 
-So the residual-stream methodologies port to the hybrid stack; what decides SUPPORTED vs
-SILENTLY_WRONG is whether the **readout reconstructs the fused residual** — `logit_lens` and `ablation`
-expose `residual="fused"` and pass, while `steering` hardcodes the plain `_untuple` readout and is
-silently wrong on vLLM. **Follow-up:** give `_steer_and_read` a fused-residual readout (the steering
-analogue of the llama logit-lens fix).
+**Conclusion: NemotronH is just another fused-residual vLLM family — it introduces NO new gaps.** Every
+vLLM verdict reduces to the documented set (interp-methods-catalog.md): the fused-residual read, the
+guarded `lm_head.forward`, the in-place-write restriction. With the documented-correct read patterns
+(`residual="fused"`, weight unembed, replacement write) all the residual-stream interventions are
+SUPPORTED; the hybrid Mamba/MoE stack is not special for these. nnsight-on-vLLM traces it fine — the
+Mamba state is not a wall.
+
+This run also exposed (and fixed) a real **benchmark-suite bug**, not a model limitation: the steering
+read-out hardcoded the plain `_untuple` read and so was silently wrong on *every* fused-residual vLLM
+family (it just had no oracle exercising it — the steering spec is GPT-2, and the qwen steering cell
+runs under the GT2 vLLM-vs-vLLM oracle where both sides share the bug). `_steer_and_read` now takes a
+`residual` arg (the documented pattern, like `_lens_proxy`/`_ablate_and_read`) and the vLLM
+llama/nemotron steering cells default `residual="fused"`; steering replace then scores SUPPORTED. The
+methodology lesson: a SILENTLY_WRONG from a cell using a known-wrong read pattern is a suite bug to
+fix, not a finding to report — check the documented gaps and use the documented-correct form first.
 
 **Not registered (frontier).** `attention_pattern` — only the few `*` layers have an attention matrix;
 iterating all blocks is undefined on Mamba/MLP/MoE layers (the §3.4 cross-edge / §12.2 family quirk).
