@@ -112,19 +112,20 @@ def _target_module_nemotron(block, target):
 
 @cell("ablation", family="nemotron", backend="hf")
 def ablation_nemotron_hf(be, model, prompts, *, layer=6, target="mixer", residual="plain"):
-    blk = model.backbone.layers[layer]
+    blk = model.model.layers[layer]
     def build():
         return _ablate_and_read(
-            _target_module_nemotron(blk, target), model.backbone.layers, model.backbone.norm_f,
+            _target_module_nemotron(blk, target), model.model.layers, model.model.norm_f,
             model.lm_head, target=target, residual=residual, last_fn=be.last)
     return be.run(model, prompts, build)
 
 
 @cell("ablation", family="nemotron", backend="vllm_async")
-def ablation_nemotron_vllm(be, model, prompts, *, layer=6, target="mixer", residual="plain"):
-    blk = model.backbone.layers[layer]
+def ablation_nemotron_vllm(be, model, prompts, *, layer=6, target="mixer", residual="fused"):
+    # Same tree as HF (model.model.layers / .norm_f, block.mixer); vLLM uses fused-residual RMSNorm.
+    blk = model.model.layers[layer]
     def build():
         return _ablate_and_read(
-            _target_module_nemotron(blk, target), model.backbone.layers, model.backbone.norm_f,
+            _target_module_nemotron(blk, target), model.model.layers, model.model.norm_f,
             model.lm_head, target=target, residual=residual, last_fn=be.last)
     return be.run(model, prompts, build)

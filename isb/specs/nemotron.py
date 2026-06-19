@@ -1,107 +1,132 @@
-"""Nemotron specs — NVIDIA **Nemotron 3 Nano (30B-A3B)**, the latest Nemotron family: a hybrid
-Mamba-2 + sparse-attention **Mixture-of-Experts** decoder (design.md §12.7).
+"""Nemotron specs — NVIDIA **Nemotron 3 Nano**, the latest Nemotron family: a hybrid Mamba-2 +
+sparse-attention decoder (the 30B is also Mixture-of-Experts). See design.md §12.7.
 
-UNMEASURED FRONTIER. These specs declare the family and encode a hypothesis; no GPU sweep has run
-yet, so every `expected` vLLM entry is a frontier *hypothesis* (held as ERROR so a future GPU run
-surfaces whatever actually happens as a ⚠ surprise — the flip-detector convention in spec.py).
+Backend loading differs (measured 2026-06-19):
+  - HF: transformers' BUILT-IN NemotronH, trust_remote_code=False. The repo's remote modeling
+    hard-requires mamba-ssm; the built-in falls back to a naive torch path when mamba-ssm/causal-conv1d
+    are absent ("fast path is not available ... naive implementation" warning) — no extra deps.
+  - vLLM: its NATIVE NemotronH for compute, but its config validation refuses an auto_map repo unless
+    trust_remote_code=True (vllm_kwargs below). That flag only permits reading the config; the remote
+    modeling is never executed, so vLLM also needs no mamba-ssm.
 
-Architecture (config of nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B):
-  - `architectures=["NemotronHForCausalLM"]`, `model_type="nemotron_h"`, ships repo-side custom code
-    via `auto_map` -> needs `trust_remote_code=True` (wired through hf_kwargs/vllm_kwargs below).
-  - 52 layers, hidden 2688, vocab 131072. `hybrid_override_pattern = "MEMEM*EMEMEM*EMEMEM*..."`:
-    M=Mamba-2 SSM, E=MoE-FFN, *=sparse attention (only a handful of * layers).
-  - MoE: `n_routed_experts=128`, `num_experts_per_tok=6`, `n_shared_experts=1`.
-  - Module tree: `model.backbone.layers[i]` (each block ONE op, exposed as `.mixer`; additive
-    residual `hidden = residual + mixer_out`; returns a single tensor) / `model.backbone.norm_f`
-    (final RMSNorm) / `model.lm_head` (untied).
+HF and vLLM share the module tree `model.model.layers[i]` (each block ONE op exposed as `.mixer` with
+a `.block_type`; additive residual) / `model.model.norm_f` / `model.lm_head` (untied); HF returns the
+plain residual tensor, vLLM uses fused-residual RMSNorm (read with residual="fused").
 
-What ports and why (§12.7): logit_lens (residual READ), steering (residual WRITE), and ablation
-(zero a block's whole `.mixer` -> that layer becomes identity) are RESIDUAL-STREAM ops, type-agnostic
-across Mamba/attention/MLP/MoE — so they port to the HF control unchanged. attention_pattern (only
-the few `*` layers have an attention matrix), attribution's backward (vLLM has no grad), and within-
-block component targeting are the documented frontier and are not registered here. The CENTRAL open
-question is whether nnsight-on-vLLM can trace NemotronH at all — its Mamba state lives in custom vLLM
-kernels and nnsight's vLLM path was built around standard attention models.
+Two registered sizes (both `NemotronHForCausalLM`, `model_type="nemotron_h"`):
 
-Scale/precision: 30B MoE. The bf16 base repo is gated (HF auth); the FP8 variant
-(`...-30B-A3B-FP8`) fits one large GPU but adds a quantization frontier. bf16 needs the parallelism
-path (`bench.py --pp/--tp`, family runs under the GT2 oracle). dtype_control="bfloat16" (fp32 30B is
-impractical).
+  - `*_nemotron_4b`  -> NVIDIA-Nemotron-3-Nano-4B-BF16: 42 layers, hidden 3136, DENSE hybrid
+    (`hybrid_override_pattern = "M-M-M-MM-M-M*-..."`; M=Mamba-2, -=MLP, *=attention). The cheap,
+    GPU-runnable member used to MEASURE the family (no MoE to complicate the read/write).
+  - `*_nemotron`     -> NVIDIA-Nemotron-3-Nano-30B-A3B-BF16: 52 layers, hidden 2688, MoE
+    (`n_routed_experts=128`, top-6, +1 shared; pattern `"MEMEM*EMEM..."`, E=MoE-FFN). The headline
+    "latest" target; needs the parallelism path (`bench.py --pp/--tp`) under the GT2 oracle.
+
+What ports and why (§12.7): the residual stream is additive across all block types, so the
+residual-stream methodologies port unchanged — logit_lens (read), steering (write), and ablation
+(zero a block's whole `.mixer` -> that layer becomes the identity; "which component" becomes "which
+LAYER"). attention_pattern (only the few `*` layers have a matrix) and attribution's backward are the
+frontier and are not registered here.
+
+MEASURED on the 4B (2026-06-19, vLLM scored vs the HF built-in control) — nnsight-on-vLLM traces
+NemotronH fine (the Mamba state is NOT a wall); the correctness axis is the same fused-residual
+denotation as the llama family:
+  - logit_lens residual=plain -> SILENTLY_WRONG (drops vLLM's fused residual; top1=0.12); residual=
+    fused -> SUPPORTED (top1=0.98); idiomatic unembed -> ERROR (guarded lm_head.forward).
+  - steering replace -> SILENTLY_WRONG: the write runs, but `_steer_and_read`'s readout uses `_untuple`
+    (plain) and drops the fused residual (top1=0.00). A fused-aware steering readout would recover it
+    (follow-up). steering in-place -> ERROR (inference-tensor write).
+  - ablation mixer -> SUPPORTED (top1=1.00): its readout is fused-aware (residual="fused").
+The `*_nemotron` (30B-A3B MoE) specs inherit these 4B-measured expectations as their hypothesis
+(unmeasured; needs --pp/--tp). dtype_control="bfloat16" (fp32 at this scale is impractical).
 """
 from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload
 from ._prompts import PROBE
 
-# bf16 base is gated (anonymous fetch 401s -> exists, needs HF auth); swap to "...-30B-A3B-FP8" for a
-# single-GPU run (quantization frontier) — bf16 30B needs multi-GPU via --pp/--tp.
-_REPO = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"
-_TRC = {"trust_remote_code": True}        # NemotronH ships auto_map custom code
+_REPO_30B = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+_REPO_4B = "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16"
 _BF16 = "bfloat16"
+# vLLM-only: its config validation refuses an auto_map repo without trust_remote_code, but it uses its
+# NATIVE NemotronH for compute (no remote modeling executed, no mamba-ssm). HF stays on the built-in
+# path (hf_kwargs left empty -> trust_remote_code=False).
+_VLLM_TRC = {"trust_remote_code": True}
 _S = {"layer": 16, "target": " Rome", "alpha": 6.0}
 
-# vLLM entries are the UNMEASURED frontier hypothesis (see module docstring): held ERROR so a GPU run
-# flags the real outcome. The open risk is NemotronH traceability under nnsight-vLLM; the idiomatic
-# unembed and the in-place write are engine-wide ERRORs independent of that.
 
-logit_lens_nemotron = CellConfig(
-    name="logit_lens_nemotron",
-    methodology="logit_lens", family="nemotron", repo=_REPO,
-    workloads=[Workload("interactive", PROBE)],
-    tasks=[
-        ({"unembed": "weight", "residual": "plain"}, "unembed=weight, residual=plain"),
-        ({"unembed": "weight", "residual": "fused"}, "unembed=weight, residual=fused"),
-        ({"unembed": "module", "residual": "plain"}, "unembed=module"),
-    ],
-    baseline=BaselineSpec(params={"unembed": "weight", "layers": [-1], "residual": "plain"}),
-    effect=None,
-    dtype_control=_BF16,
-    hf_kwargs=_TRC, vllm_kwargs=_TRC,
-    expected={
-        ("vllm_async", "interactive", "unembed=weight, residual=plain"): "ERROR",
-        ("vllm_async", "interactive", "unembed=weight, residual=fused"): "ERROR",
-        ("vllm_async", "interactive", "unembed=module"): "ERROR",   # guarded lm_head.forward + frontier
-    },
-)
+def _nemotron_specs(suffix: str, repo: str):
+    """Build the (logit_lens, steering, ablation) CellConfigs for one Nemotron size — pure spec data,
+    not a cell-construction layer (cells stay explicit per family, §12.1)."""
+    logit_lens = CellConfig(
+        name=f"logit_lens_nemotron{suffix}",
+        methodology="logit_lens", family="nemotron", repo=repo,
+        workloads=[Workload("interactive", PROBE)],
+        tasks=[
+            ({"unembed": "weight", "residual": "plain"}, "unembed=weight, residual=plain"),
+            ({"unembed": "weight", "residual": "fused"}, "unembed=weight, residual=fused"),
+            ({"unembed": "module", "residual": "plain"}, "unembed=module"),
+        ],
+        baseline=BaselineSpec(params={"unembed": "weight", "layers": [-1], "residual": "plain"}),
+        effect=None,
+        dtype_control=_BF16,
+        vllm_kwargs=_VLLM_TRC,
+        expected={
+            # MEASURED (4B, 2026-06-19, vLLM vs HF): the naive plain read drops vLLM's fused residual ->
+            # SILENTLY_WRONG (top1=0.12, tv=0.65) — the hybrid-Mamba analogue of the llama dual-residual
+            # bug; the fused read matches HF -> SUPPORTED (top1=0.98, omitted = default); idiomatic
+            # unembed hits the guarded lm_head.forward -> ERROR.
+            ("vllm_async", "interactive", "unembed=weight, residual=plain"): "SILENTLY_WRONG",
+            ("vllm_async", "interactive", "unembed=module"): "ERROR",
+        },
+    )
+    steering = CellConfig(
+        name=f"steering_nemotron{suffix}",
+        methodology="steering", family="nemotron", repo=repo,
+        workloads=[Workload("interactive", PROBE)],
+        tasks=[
+            ({**_S, "mode": "inplace"}, "mode=inplace"),
+            ({**_S, "mode": "replace"}, "mode=replace"),
+        ],
+        baseline=BaselineSpec(params={**_S, "alpha": 0.0, "mode": "replace"}),
+        effect=EffectSpec(
+            baseline_params={**_S, "alpha": 0.0, "mode": "replace"},
+            perturbed_params={**_S, "alpha": 6.0, "mode": "replace"},
+        ),
+        dtype_control=_BF16,
+        vllm_kwargs=_VLLM_TRC,
+        expected={
+            # MEASURED (4B): in-place write -> ERROR (inference-tensor protection, engine-wide). The
+            # replace write RUNS, but `_steer_and_read`'s readout uses `_untuple` (plain) and so drops
+            # vLLM's fused residual -> SILENTLY_WRONG (top1=0.00, tv=1.0). A fused-aware steering readout
+            # (cf. logit_lens residual="fused") would recover it — documented follow-up (§12.7).
+            ("vllm_async", "interactive", "mode=inplace"): "ERROR",
+            ("vllm_async", "interactive", "mode=replace"): "SILENTLY_WRONG",
+        },
+    )
+    ablation = CellConfig(
+        name=f"ablation_nemotron{suffix}",
+        methodology="ablation", family="nemotron", repo=repo,
+        workloads=[Workload("interactive", PROBE)],
+        # target="mixer" zeroes the block's single op -> that layer becomes identity. Pick `layer` to
+        # choose WHICH op type to knock out (the pattern says which indices are Mamba/attention/MoE).
+        tasks=[
+            ({"layer": 16, "target": "mixer"}, "layer=16 mixer"),
+            ({"layer": 32, "target": "mixer"}, "layer=32 mixer"),
+        ],
+        baseline=BaselineSpec(params={"layer": 16, "target": "none"}),
+        effect=EffectSpec(
+            baseline_params={"layer": 16, "target": "none"},
+            perturbed_params={"layer": 16, "target": "mixer"},
+        ),
+        dtype_control=_BF16,
+        vllm_kwargs=_VLLM_TRC,
+        expected={
+            # MEASURED (4B): zero-the-mixer ablation runs on vLLM and matches HF -> SUPPORTED
+            # (top1=1.00, tv~0.01). The readout is fused-aware (residual="fused"), so unlike steering it
+            # is not silently wrong. No entries -> both tasks default SUPPORTED.
+        },
+    )
+    return logit_lens, steering, ablation
 
-steering_nemotron = CellConfig(
-    name="steering_nemotron",
-    methodology="steering", family="nemotron", repo=_REPO,
-    workloads=[Workload("interactive", PROBE)],
-    tasks=[
-        ({**_S, "mode": "inplace"}, "mode=inplace"),
-        ({**_S, "mode": "replace"}, "mode=replace"),
-    ],
-    baseline=BaselineSpec(params={**_S, "alpha": 0.0, "mode": "replace"}),
-    effect=EffectSpec(
-        baseline_params={**_S, "alpha": 0.0, "mode": "replace"},
-        perturbed_params={**_S, "alpha": 6.0, "mode": "replace"},
-    ),
-    dtype_control=_BF16,
-    hf_kwargs=_TRC, vllm_kwargs=_TRC,
-    expected={
-        ("vllm_async", "interactive", "mode=inplace"): "ERROR",   # in-place inference-tensor write
-        ("vllm_async", "interactive", "mode=replace"): "ERROR",   # frontier: NemotronH traceability
-    },
-)
 
-ablation_nemotron = CellConfig(
-    name="ablation_nemotron",
-    methodology="ablation", family="nemotron", repo=_REPO,
-    workloads=[Workload("interactive", PROBE)],
-    # target="mixer" zeroes the whole block's single op -> that layer becomes identity. Pick `layer`
-    # to choose WHICH op type to knock out (the pattern says which indices are Mamba/attention/MoE).
-    tasks=[
-        ({"layer": 16, "target": "mixer"}, "layer=16 mixer"),
-        ({"layer": 32, "target": "mixer"}, "layer=32 mixer"),
-    ],
-    baseline=BaselineSpec(params={"layer": 16, "target": "none"}),
-    effect=EffectSpec(
-        baseline_params={"layer": 16, "target": "none"},
-        perturbed_params={"layer": 16, "target": "mixer"},
-    ),
-    dtype_control=_BF16,
-    hf_kwargs=_TRC, vllm_kwargs=_TRC,
-    expected={
-        ("vllm_async", "interactive", "layer=16 mixer"): "ERROR",   # frontier: NemotronH traceability
-        ("vllm_async", "interactive", "layer=32 mixer"): "ERROR",
-    },
-)
+logit_lens_nemotron, steering_nemotron, ablation_nemotron = _nemotron_specs("", _REPO_30B)
+logit_lens_nemotron_4b, steering_nemotron_4b, ablation_nemotron_4b = _nemotron_specs("_4b", _REPO_4B)

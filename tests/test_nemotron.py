@@ -1,12 +1,14 @@
-"""Nemotron family tests (NVIDIA Nemotron 3 Nano 30B-A3B — hybrid Mamba/MoE) — no GPU; torch only.
+"""Nemotron family tests (NVIDIA Nemotron 3 Nano — hybrid Mamba/MoE) — no GPU; torch only.
 
 Pins the nemotron-specific logic without a 30B model: the single-op-per-layer ablation target
-(`block.mixer`, not GPT-2/Llama's within-block `mlp`/`attn`), and that the cells read the NemotronH
-module tree (`model.backbone.layers` / `.norm_f` / `lm_head`) rather than any other family's names.
-The residual read/write math itself is the shared `_lens_proxy`/`_steer_and_read`/`_ablate_and_read`
-already covered by the logit_lens/steering/ablation tests — nemotron only rewires the module paths,
-so the fake model below deliberately carries ONLY NemotronH names (no `model.layers`, no
-`transformer.h`): a cell that silently assumed another family would AttributeError here.
+(`block.mixer`, not GPT-2/Llama's within-block `mlp`/`attn`), and that the cells read the built-in
+NemotronH tree (`model.model.layers` / `.norm_f` / `lm_head`, each block exposing one `.mixer`). The
+residual read/write math is the shared `_lens_proxy`/`_steer_and_read`/`_ablate_and_read`, already
+covered elsewhere — nemotron only rewires the module paths. nemotron and llama share
+`model.model.layers`, so the fake below distinguishes nemotron by the NemotronH-specific names it must
+use: the final norm is `norm_f` (NOT llama's `norm`) and a block exposes `.mixer` (NOT `.self_attn`/
+`.mlp`). A cell that assumed gpt2 (`transformer.h`) or llama (`model.norm` / `block.mlp`) would
+AttributeError against this fake.
 """
 import sys
 from pathlib import Path
@@ -50,18 +52,19 @@ class _Head:
         return torch.nn.functional.linear(x, self.weight)
 
 
-class _Backbone:
+class _Inner:
+    """The NemotronHModel: `.layers` + `.norm_f` (the NemotronH final-norm name — NOT llama's `.norm`)."""
     def __init__(self, layers):
         self.layers = layers
         self.norm_f = _Norm()
 
 
 class _NemoModel:
-    """A NemotronH-shaped model carrying ONLY the NemotronH names."""
+    """NemotronHForCausalLM-shaped: `model.model.layers` / `.norm_f` / `lm_head`; no `backbone`,
+    no `transformer`, no `model.norm`."""
     def __init__(self, n_layers=6):
-        # distinct per-layer residuals so the lens stack is non-degenerate
         layers = [_NemoBlock(torch.full((2, HID), float(i))) for i in range(n_layers)]
-        self.backbone = _Backbone(layers)
+        self.model = _Inner(layers)
         self.lm_head = _Head()
 
 
@@ -111,7 +114,7 @@ def test_ablate_makes_layer_identity():
     assert torch.count_nonzero(mixer.output) == 0
 
 
-def test_logit_lens_reads_backbone_tree():
+def test_logit_lens_reads_model_tree():
     model = _NemoModel(n_layers=6)
     cell = get_cell("logit_lens", "nemotron", "hf")
     out = cell(_FakeBE(), model, ["p"], unembed="weight", residual="plain")
@@ -127,12 +130,15 @@ def test_logit_lens_module_unembed_uses_head_call():
     assert out.shape == (3, 1, HID)
 
 
-def test_cell_does_not_assume_other_family_names():
-    # the fake model has backbone.* only; a cell reaching for model.model.layers / transformer.h would
-    # AttributeError. Success of the run above already proves backbone; assert the negative explicitly.
+def test_cell_uses_nemotron_names_not_gpt2_or_llama():
+    # nemotron shares model.model.layers with llama but NOT the final-norm name (norm_f vs norm) or the
+    # block layout (.mixer vs .self_attn/.mlp). The fake has only the NemotronH names; a cell reaching
+    # for transformer.h (gpt2), model.norm (llama), or block.mlp (llama) would AttributeError.
     model = _NemoModel(n_layers=2)
-    assert not hasattr(model, "model")
-    assert not hasattr(model, "transformer")
+    assert not hasattr(model, "transformer")            # not gpt2
+    assert not hasattr(model, "backbone")               # not the remote-code layout
+    assert not hasattr(model.model, "norm")             # llama's final-norm name is absent
+    assert not hasattr(model.model.layers[0], "mlp")    # no within-block component split
     get_cell("logit_lens", "nemotron", "hf")(_FakeBE(), model, ["p"], unembed="weight")  # must not raise
 
 

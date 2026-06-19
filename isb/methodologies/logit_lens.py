@@ -117,31 +117,30 @@ def logit_lens_llama_vllm(be, model, prompts, *, layers="all", unembed="weight",
 
 
 # --- nemotron family (NVIDIA Nemotron-H / Nemotron 3): a HYBRID stack where each block is a single
-# op (Mamba-2 SSM | sparse attention | MLP | MoE), under `model.backbone.layers` / `.norm_f`, with an
-# untied `lm_head` (§12.7). The residual stream is standard-additive across ALL block types
-# (`hidden = residual + mixer_out`), and logit-lens is a residual-stream READ — so it ports unchanged:
-# the lens does not care whether layer i is Mamba or attention. `_lens_proxy` is reused verbatim. The
-# open frontier is whether nnsight-on-vLLM can trace NemotronH at all (its Mamba state lives in custom
-# vLLM kernels), not the lens math.
+# op (Mamba-2 SSM | sparse attention | MLP | MoE), loaded via transformers' BUILT-IN NemotronH — NOT
+# trust_remote_code. (The repo's remote modeling hard-requires mamba-ssm; the built-in falls back to a
+# naive torch path that needs neither — measured 2026-06-19.) HF and vLLM share the module tree
+# `model.model.layers` / `.norm_f` / `lm_head` (untied), §12.7. The residual is standard-additive
+# across ALL block types (`hidden = residual + mixer_out`), and logit-lens is a residual-stream READ,
+# so it ports unchanged whether layer i is Mamba or attention. `_lens_proxy` is reused verbatim.
 @cell("logit_lens", family="nemotron", backend="hf")
 def logit_lens_nemotron_hf(be, model, prompts, *, layers="all", unembed="module", residual="plain"):
     def build():
         return _lens_proxy(
-            model.backbone.layers, model.backbone.norm_f, model.lm_head,
+            model.model.layers, model.model.norm_f, model.lm_head,
             layers=layers, unembed=unembed, last_fn=be.last, residual=residual,
         )
     return be.run(model, prompts, build)
 
 
 @cell("logit_lens", family="nemotron", backend="vllm_async")
-def logit_lens_nemotron_vllm(be, model, prompts, *, layers="all", unembed="weight", residual="plain"):
-    # residual default "plain": HF NemotronH blocks already carry the full additive residual. Whether
-    # vLLM's NemotronH impl fuses `(hidden, residual)` the way its Llama path does is UNMEASURED — the
-    # spec runs both residual=plain and residual=fused tasks so a GPU sweep decides which is correct on
-    # the vLLM side (§12.7).
+def logit_lens_nemotron_vllm(be, model, prompts, *, layers="all", unembed="weight", residual="fused"):
+    # Same tree as HF (`model.model.layers` / `.norm_f`); the only difference is that vLLM's NemotronH
+    # decoder layers use fused-residual RMSNorm (block.output is (hidden, residual)), so residual="fused"
+    # is the correct read here, where the HF built-in returns the plain residual tensor (§12.7).
     def build():
         return _lens_proxy(
-            model.backbone.layers, model.backbone.norm_f, model.lm_head,
+            model.model.layers, model.model.norm_f, model.lm_head,
             layers=layers, unembed=unembed, last_fn=be.last, residual=residual,
         )
     return be.run(model, prompts, build)

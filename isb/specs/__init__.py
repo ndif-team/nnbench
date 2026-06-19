@@ -17,8 +17,11 @@ from .qwen import (
 )
 from .nemotron import (
     ablation_nemotron,
+    ablation_nemotron_4b,
     logit_lens_nemotron,
+    logit_lens_nemotron_4b,
     steering_nemotron,
+    steering_nemotron_4b,
 )
 
 SPECS = {
@@ -39,7 +42,10 @@ SPECS = {
         ablation_qwen,
         activation_patching_qwen,
         gen_steering_qwen,
-        # Nemotron 3 Nano 30B-A3B (family=nemotron) — hybrid Mamba/MoE frontier; UNMEASURED hypothesis
+        # Nemotron 3 Nano (family=nemotron) — hybrid Mamba; 4B dense (runnable) + 30B-A3B MoE (headline)
+        logit_lens_nemotron_4b,
+        steering_nemotron_4b,
+        ablation_nemotron_4b,
         logit_lens_nemotron,
         steering_nemotron,
         ablation_nemotron,

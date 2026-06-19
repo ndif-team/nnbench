@@ -7,18 +7,11 @@ from .base import Backend
 class HFBackend(Backend):
     name = "hf"
 
-    def __init__(self, trust_remote_code: bool = False):
-        # Some families ship their architecture as repo-side custom code (HF `auto_map`), e.g.
-        # NemotronH (`modeling_nemotron_h.py`) — those need trust_remote_code=True at load. Flows in
-        # via `spec.hf_kwargs` (driver constructs `HFBackend(**spec.hf_kwargs)`); default off.
-        self.trust_remote_code = trust_remote_code
-
     def load(self, repo: str, device: str = "cuda:0"):
         from nnsight import LanguageModel
 
         return LanguageModel(
-            repo, device_map=device, dispatch=True, attn_implementation="eager",
-            trust_remote_code=self.trust_remote_code,
+            repo, device_map=device, dispatch=True, attn_implementation="eager"
         )
 
     def run(self, model, prompts, build):

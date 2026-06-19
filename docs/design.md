@@ -937,55 +937,62 @@ scripts/smoke.py        # enumerate the cells to run; print the map
 - The maintained Level-0/1 status inventory (measured vs UNTESTED per backend) lives in
   `interp-methods-catalog.md`; the UNTESTED rows there are the coverage queue.
 
-### 12.7 The `nemotron` family — a hybrid Mamba/MoE frontier (added 2026-06-19, UNMEASURED)
+### 12.7 The `nemotron` family — a hybrid Mamba/MoE model, MEASURED on the 4B (2026-06-19)
 
-The latest Nemotron family, **Nemotron 3 Nano (30B-A3B)**, is the first corpus member that breaks the
-§12.1 homogeneous-transformer assumption. It is a hybrid **Mamba-2 + sparse-attention Mixture-of-
-Experts** decoder (`architectures=["NemotronHForCausalLM"]`, `model_type="nemotron_h"`, repo-side
-custom code via `auto_map` → `trust_remote_code=True`). Config of `nvidia/NVIDIA-Nemotron-3-Nano-30B-
-A3B`: 52 layers, hidden 2688, vocab 131072, `hybrid_override_pattern="MEMEM*EMEM..."` (M=Mamba-2,
-E=MoE-FFN, *=attention — only a handful of `*`), MoE `n_routed_experts=128` top-6 + 1 shared.
+**Nemotron 3 Nano** is the first corpus member that breaks the §12.1 homogeneous-transformer
+assumption: a hybrid **Mamba-2 + sparse-attention** decoder (`architectures=["NemotronHForCausalLM"]`,
+`model_type="nemotron_h"`), MoE at the 30B size. Two registered sizes — the dense **4B**
+(`...-Nano-4B-BF16`, 42 layers, `hybrid_override_pattern="M-M-M-MM-M-M*-..."`, the cheap GPU-runnable
+member that was actually measured) and the **30B-A3B** MoE (`n_routed_experts=128` top-6 + 1 shared,
+pattern `"MEMEM*..."`, the headline target; needs `--pp/--tp`, inherits the 4B verdicts as hypothesis).
 
-**Module tree (HF control):** `model.backbone.layers[i]` (each `NemotronHBlock` is ONE op exposed as
-`.mixer`, with a `.block_type ∈ {mamba, attention, mlp, moe}`; the block returns a single tensor and
-the residual is standard-additive, `hidden = residual + mixer_out`) / `model.backbone.norm_f` /
-`model.lm_head` (untied). This is a new explicit per-family path (§12.1), not a reuse of `llama`'s
-`model.model.layers`.
+**Loading — built-in, NOT remote code (the key correction).** The repo ships custom modeling
+(`auto_map`) that hard-requires `mamba-ssm`. Do not use it:
+- **HF** loads transformers' **built-in** `NemotronH` with `trust_remote_code=False`; with
+  `mamba-ssm`/`causal-conv1d` absent it prints "fast path is not available … naive implementation" and
+  runs a pure-torch fallback — no extra deps.
+- **vLLM** uses its **native** `NemotronH` for compute, but its config validator refuses an `auto_map`
+  repo unless `trust_remote_code=True`; that flag only permits *reading* the config — the remote
+  modeling is never executed, so vLLM also needs no `mamba-ssm`. Hence the per-backend split:
+  `hf_kwargs={}`, `vllm_kwargs={"trust_remote_code": True}`.
 
-**What ports, and why.** The residual stream is uniform across all four block types, so the
-**residual-stream** methodologies port unchanged — they never inspect what kind of layer they read or
-write:
-- `logit_lens` — residual READ at each block boundary (`_lens_proxy` reused verbatim).
-- `steering` — residual WRITE at a chosen boundary (`_steer_and_read` reused verbatim).
-- `ablation` — the single-op-per-layer reframe: there is no attn-vs-mlp split *within* a block, so
-  ablation zeroes the whole layer's `.mixer` output → `hidden = residual + 0`, i.e. the layer becomes
-  the identity. GPT-2/Llama's "which component" (`target="mlp"|"attn"`) becomes "which **layer**"
-  (pick an index whose `block_type` is the op you want to knock out); `_target_module_nemotron`
-  returns `block.mixer` and rejects the within-block targets. Cells stay type-agnostic; which layer is
-  Mamba vs attention vs MoE is read from the config's `hybrid_override_pattern` at runtime, never
-  hardcoded.
+**Module tree (HF built-in AND vLLM both):** `model.model.layers[i]` (each `NemotronHBlock` is ONE op
+exposed as `.mixer`, with `.block_type ∈ {mamba, attention, mlp, moe}`; additive residual
+`hidden = residual + mixer_out`) / `model.model.norm_f` / `model.lm_head` (untied). HF returns the
+plain residual tensor; vLLM uses fused-residual RMSNorm (block output is `(hidden, residual)`) so the
+true stream is their sum — the same dual-residual denotation as the llama family. (The remote code's
+`backbone` name is not used.) The single-op-per-layer ablation reframe is `_target_module_nemotron` →
+`block.mixer` (rejecting the within-block `mlp`/`attn` targets); which layers are Mamba/attention/MoE
+is read from `hybrid_override_pattern` at runtime, never hardcoded.
 
-**The frontier (the actual result this family measures).** Two things do *not* port, and one is the
-real open question:
-- `attention_pattern` — only the few `*` layers have an attention matrix; iterating all blocks for an
-  attention read is undefined on Mamba/MLP/MoE layers (the §3.4 cross-edge / §12.2 family-specific
-  quirk). Not registered for `nemotron`.
-- `attribution_patching`'s backward — unchanged from the general vLLM story (inference-mode, no grad).
-- **CENTRAL:** whether **nnsight-on-vLLM can trace NemotronH at all.** vLLM serves Nemotron via custom
-  Mamba/SSM kernels and nnsight's vLLM path was built around standard attention models; the
-  module names vLLM exposes for a hybrid model may differ from the HF `backbone.layers` tree, and the
-  Mamba state is not a residual-stream module. So the `vllm_async` cells are written against the
-  HF-consistent path and the spec holds their `expected` as **ERROR — a frontier HYPOTHESIS**, not a
-  measurement (the flip-detector convention, §spec.py): a GPU run surfaces whatever actually happens
-  as a ⚠ surprise. Per §12.2 this is the "backend bug/limitation in vLLM's <family> path" cell —
-  except here the open question is the *interpretability stack's* reach into the architecture, not the
-  serving stack's.
+**Measured (4B; vLLM scored against the HF built-in control via `--dump-refs`/`--refs`).**
+nnsight-on-vLLM traces NemotronH fine — the Mamba state is NOT a wall; the correctness axis is the
+fused residual:
 
-**Scale/precision.** 30B MoE: the bf16 base repo is gated (HF auth), the FP8 variant fits one large
-GPU but adds a quantization frontier, and bf16 needs the parallelism path (`bench.py --pp/--tp`, run
-under the GT2 parallel-vs-single oracle, §driver). `trust_remote_code` is plumbed through
-`HFBackend`/`VLLMAsyncBackend` (via `spec.hf_kwargs`/`vllm_kwargs`). **Status: no GPU sweep has run —
-the cells are structurally verified by the no-GPU tests (`tests/test_nemotron.py`, against a
-NemotronH-shaped fake model) and the HF residual ops are high-confidence; every vLLM verdict and the
-HF-on-a-30B-MoE behavior remain to be measured.** → `isb/specs/nemotron.py`,
-`isb/methodologies/{logit_lens,steering,ablation}.py` (the `nemotron` cells).
+| cell (vLLM) | verdict | metric |
+|---|---|---|
+| logit_lens, residual=plain | **SILENTLY_WRONG** | top1=0.12, tv=0.65 — naive read drops the fused residual |
+| logit_lens, residual=fused | **SUPPORTED** | top1=0.98, tv=0.009 |
+| logit_lens, idiomatic unembed | ERROR | guarded `lm_head.forward` (engine-wide) |
+| steering, replace | **SILENTLY_WRONG** | top1=0.00 — `_steer_and_read`'s `_untuple` readout drops the fused residual |
+| steering, in-place | ERROR | in-place inference-tensor write (engine-wide) |
+| ablation, mixer (L16/L32) | **SUPPORTED** | top1=1.00 — its readout IS fused-aware (`residual="fused"`) |
+
+So the residual-stream methodologies port to the hybrid stack; what decides SUPPORTED vs
+SILENTLY_WRONG is whether the **readout reconstructs the fused residual** — `logit_lens` and `ablation`
+expose `residual="fused"` and pass, while `steering` hardcodes the plain `_untuple` readout and is
+silently wrong on vLLM. **Follow-up:** give `_steer_and_read` a fused-residual readout (the steering
+analogue of the llama logit-lens fix).
+
+**Not registered (frontier).** `attention_pattern` — only the few `*` layers have an attention matrix;
+iterating all blocks is undefined on Mamba/MLP/MoE layers (the §3.4 cross-edge / §12.2 family quirk).
+`attribution_patching`'s backward — inference-mode on vLLM, no grad (the general story).
+
+**Driver fix exposed here.** `_fp32_rerun` (precision disambiguation) built its vLLM backend without
+the spec's `vllm_kwargs`, so on NemotronH the rerun hit the `trust_remote_code` config-validate error;
+it now forwards `spec.vllm_kwargs`.
+
+**Envs (current split, not the stale CLAUDE.md pin):** HF on **nnsight-tf** (transformers 5.12.1,
+built-in), vLLM on **ndif-dev** (vLLM 0.19.1). The 30B-A3B MoE remains to be measured (multi-GPU
+`--pp/--tp`). → `isb/specs/nemotron.py`, `isb/methodologies/{logit_lens,steering,ablation}.py`,
+`isb/sweep/driver.py` (`_fp32_rerun`).

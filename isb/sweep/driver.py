@@ -98,9 +98,11 @@ def _fp32_rerun(spec, params, workload):
     whole prompt list would hit vLLM's batched gate and fail, making every bf16 near-tie look like a
     bug)."""
     def rerun(c):
-        # match the cell's backend mode so the fp32 control is measured on the same engine
+        # match the cell's backend mode so the fp32 control is measured on the same engine, and carry
+        # the spec's vLLM engine config (e.g. trust_remote_code for NemotronH) so the rerun can load
+        # the same model the cell did — otherwise disambiguation silently fails on those specs.
         BE = VLLMSyncBackend if c.backend == "vllm_sync" else VLLMAsyncBackend
-        impl = BE(dtype=spec.dtype_control)
+        impl = BE(dtype=spec.dtype_control, **spec.vllm_kwargs)
         model = None
         try:
             model = impl.load(spec.repo)

@@ -40,8 +40,11 @@ class VLLMAsyncBackend(Backend):
         # keeps the KV reservation small. Both are forwarded to vLLM via nnsight's VLLM.
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
-        # Repo-side custom architectures (HF auto_map; e.g. NemotronH) need trust_remote_code at load;
-        # forwarded to nnsight's VLLM -> vLLM. Flows in via spec.vllm_kwargs. Default off.
+        # vLLM uses its NATIVE NemotronH for compute, but its config validation refuses to even read a
+        # repo whose config declares custom code (auto_map) unless trust_remote_code=True. So this flag
+        # only permits reading the config — the remote modeling is never executed, no mamba-ssm needed.
+        # (HF, by contrast, takes the built-in path with trust_remote_code=False.) Flows in via
+        # spec.vllm_kwargs.
         self.trust_remote_code = trust_remote_code
         self._loop = None
 
