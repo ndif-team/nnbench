@@ -133,3 +133,29 @@ def steering_llama_vllm(be, model, prompts, *, layer=8, target=" Rome", alpha=6.
             layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
         )
     return be.run(model, prompts, build)
+
+
+# --- nemotron family (Nemotron-H / Nemotron 3): steering is a residual-stream WRITE at a chosen block
+# boundary, and like the read it is type-agnostic across Mamba/attention/MLP/MoE layers — the write
+# lands on `model.backbone.layers[layer].output` (the additive residual) regardless of the block's
+# op. `_steer_and_read` is reused verbatim; `model.backbone.norm_f` / `model.lm_head` are the readout.
+@cell("steering", family="nemotron", backend="hf")
+def steering_nemotron_hf(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace"):
+    token_id = _resolve_token(model.tokenizer, target)
+    def build():
+        return _steer_and_read(
+            model.backbone.layers, model.backbone.norm_f, model.lm_head,
+            layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
+        )
+    return be.run(model, prompts, build)
+
+
+@cell("steering", family="nemotron", backend="vllm_async")
+def steering_nemotron_vllm(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace"):
+    token_id = _resolve_token(model.tokenizer, target)
+    def build():
+        return _steer_and_read(
+            model.backbone.layers, model.backbone.norm_f, model.lm_head,
+            layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
+        )
+    return be.run(model, prompts, build)

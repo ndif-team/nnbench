@@ -23,7 +23,8 @@ class VLLMAsyncBackend(Backend):
                  tensor_parallel_size: int = 1,
                  distributed_executor_backend: str | None = None,
                  gpu_memory_utilization: float = 0.2,
-                 max_model_len: int | None = None):
+                 max_model_len: int | None = None,
+                 trust_remote_code: bool = False):
         # dtype is a real engine-config axis (design L3). Default None -> vLLM's own default
         # (bf16 for GPT-2). Forcing "float32" matches HF's precision, which is how we separate a
         # precision-degradation (SUPPORTED_DEGRADED) from a true mechanism bug (SILENTLY_WRONG).
@@ -39,6 +40,9 @@ class VLLMAsyncBackend(Backend):
         # keeps the KV reservation small. Both are forwarded to vLLM via nnsight's VLLM.
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
+        # Repo-side custom architectures (HF auto_map; e.g. NemotronH) need trust_remote_code at load;
+        # forwarded to nnsight's VLLM -> vLLM. Flows in via spec.vllm_kwargs. Default off.
+        self.trust_remote_code = trust_remote_code
         self._loop = None
 
     def __getstate__(self):
@@ -82,6 +86,8 @@ class VLLMAsyncBackend(Backend):
             kw["distributed_executor_backend"] = self.distributed_executor_backend
         if self.max_model_len is not None:
             kw["max_model_len"] = self.max_model_len
+        if self.trust_remote_code:
+            kw["trust_remote_code"] = True
         return VLLM(
             repo, mode="async", dispatch=True,
             gpu_memory_utilization=gpu_memory_utilization, **kw,

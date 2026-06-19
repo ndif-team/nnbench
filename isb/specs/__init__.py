@@ -15,6 +15,11 @@ from .qwen import (
     logit_lens_qwen,
     steering_qwen,
 )
+from .nemotron import (
+    ablation_nemotron,
+    logit_lens_nemotron,
+    steering_nemotron,
+)
 
 SPECS = {
     s.name: s
@@ -34,6 +39,10 @@ SPECS = {
         ablation_qwen,
         activation_patching_qwen,
         gen_steering_qwen,
+        # Nemotron 3 Nano 30B-A3B (family=nemotron) — hybrid Mamba/MoE frontier; UNMEASURED hypothesis
+        logit_lens_nemotron,
+        steering_nemotron,
+        ablation_nemotron,
     )
 }
 
