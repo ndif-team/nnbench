@@ -9,6 +9,17 @@ def print_map(methodology: str, family: str, label: str, repo: str, cells) -> No
         title += f"  [{label}]"
     print(f"task  : {title}")
     print(f"model : {repo}")
+    # A --pp/--tp run reports the PARALLELISM-EQUIVALENCE axis: `state` is EQUIVALENT/DIVERGENT vs
+    # single-GPU vLLM, a DIFFERENT question from vs-HF correctness. Make that explicit and show the
+    # declared vs-HF correctness as its own dimension, so a known-wrong read reads "EQUIVALENT under
+    # tp, SILENTLY_WRONG vs HF" rather than being collapsed onto one SUPPORTED label. The
+    # default-success state is then EQUIVALENT (not SUPPORTED), so only a non-default expectation is
+    # annotated.
+    gt2 = any(getattr(c, "correctness", None) is not None for c in cells)
+    default_ok = "EQUIVALENT" if gt2 else "SUPPORTED"
+    if gt2:
+        print("axis  : parallel-equivalence — candidate (tp,pp) vs single-GPU vLLM; "
+              "'vs-HF' = declared correctness, NOT measured here")
     print("-" * 86)
     print(f"{'backend':<14}{'actual':<22}{'vs expected':<24}{'latency':<9}{'metrics / note'}")
     print("-" * 86)
@@ -22,10 +33,13 @@ def print_map(methodology: str, family: str, label: str, repo: str, cells) -> No
             )
         else:
             note = c.error or ""
+        corr = getattr(c, "correctness", None)
+        if corr is not None:                         # the orthogonal vs-HF axis (declared), GT2 runs only
+            note = f"{note}   vs-HF: {corr}".strip()
         # the delta column: ✓ when actual matches the declared expectation, ⚠ when it doesn't
         if getattr(c, "surprise", False):
             vs = f"⚠ SURPRISE (exp {c.expected})"
-        elif c.expected is not None and c.expected != "SUPPORTED":
+        elif c.expected is not None and c.expected != default_ok:
             vs = f"✓ expected {c.expected}"          # a known frontier/degraded cell, as documented
         else:
             vs = "✓"

@@ -186,26 +186,41 @@ def dump_control_refs(spec, dirpath):
     print(f"[dump-ctl-refs] wrote {len(dump)} control-dtype refs -> {_ctl_ref_file(dirpath, spec.name)}")
 
 
-def expected_state(spec, backend, workload_kind, label, control="hf"):
-    """The cell's DECLARED expectation (the benchmark's encoded knowledge); default SUPPORTED, so only
-    the known non-SUPPORTED cells need listing in `spec.expected`. Any vLLM *variant* (`vllm_serve`,
-    `vllm_pp`) with no entry inherits the `vllm_async` expectation — a variant should match in-process
-    single-GPU vLLM, so the interesting event is a DIVERGENCE from it (a real transport / parallelism
-    surprise), not the variant reproducing vLLM's own known limitation. So a cell that ERRORs on both
-    vllm_async and vllm_pp is 'expected', while vllm_pp diverging from a SUPPORTED vllm_async is the
-    surprise the PP run exists to catch.
-
-    In parallelism-equivalence mode (control != "hf") SUPPORTED_DEGRADED is not a meaningful state:
-    it only ever meant "vLLM-bf16 vs HF-fp32 precision near-tie", and that comparison is gone. Both
-    sides here are same-dtype vLLM, so a correct cell is simply SUPPORTED. Any declared (or inherited)
-    SUPPORTED_DEGRADED expectation is therefore coerced to SUPPORTED for this mode."""
+def _declared(spec, backend, workload_kind, label):
+    """The cell's DECLARED vs-HF correctness expectation (the benchmark's encoded knowledge); default
+    SUPPORTED, so only the known non-SUPPORTED cells need listing in `spec.expected`. Any vLLM
+    *variant* (`vllm_serve`, `vllm_pp`) with no own entry inherits the `vllm_async` declaration — a
+    variant should match in-process single-GPU vLLM, so the interesting event is a DIVERGENCE from it
+    (a real transport / parallelism surprise), not the variant reproducing vLLM's own known
+    limitation. This is the CORRECTNESS axis only — never coerced; in a `--pp/--tp` run it is carried
+    for display (CellResult.correctness), not compared against the equivalence verdict."""
     e = spec.expected
     v = e.get((backend, workload_kind, label))
     if v is None and backend.startswith("vllm_") and backend != "vllm_async":
         v = e.get(("vllm_async", workload_kind, label))
-    if control != "hf" and v == AppState.SUPPORTED_DEGRADED:
-        v = AppState.SUPPORTED
     return v if v is not None else AppState.SUPPORTED
+
+
+def expected_state(spec, backend, workload_kind, label, control="hf"):
+    """The expected state on the AXIS this run measures.
+
+    Correctness mode (`control="hf"`): the cell's declared vs-HF expectation (`_declared`) — SUPPORTED
+    / SILENTLY_WRONG / SUPPORTED_DEGRADED / ERROR. A cell that ERRORs on both vllm_async and vllm_pp is
+    'expected'; a vLLM variant diverging from a SUPPORTED vllm_async is the surprise the run exists to
+    catch.
+
+    Parallelism-equivalence mode (`control != "hf"`, `bench.py --pp/--tp`): a DIFFERENT axis — does the
+    (tp,pp) candidate reproduce single-GPU vLLM? The correctness vocabulary does not apply, so the
+    declared vs-HF state is NOT coerced into SUPPORTED (that overload is exactly what stamped a
+    known-wrong read as "SUPPORTED"). Instead it maps to the equivalence axis: the only vs-HF state
+    that carries over is ERROR (a cell that errors does so on both topologies); every cell that RUNS is
+    expected to be EQUIVALENT (the candidate should match single-GPU — naive-vs-HF read and all). A
+    SILENTLY_WRONG-vs-HF cell is thus expected EQUIVALENT here, and the genuine surprise is a cell that
+    comes back DIVERGENT — a real parallelism break — which the oracle scores directly."""
+    decl = _declared(spec, backend, workload_kind, label)
+    if control == "hf":
+        return decl
+    return AppState.ERROR if decl == AppState.ERROR else AppState.EQUIVALENT
 
 
 def run_sweep(spec, backends=("hf", "vllm_async"), backend_factory=None,
@@ -351,7 +366,16 @@ def run_sweep(spec, backends=("hf", "vllm_async"), backend_factory=None,
             # the benchmark's DELTA: actual vs the declared expectation (NO_REFERENCE can't be judged)
             for c in cells:
                 c.expected = expected_state(spec, c.backend, c.workload, c.label, control)
-                c.surprise = c.state != AppState.NO_REFERENCE and c.state != c.expected
+                # In a --pp/--tp run, `state` is the equivalence verdict; carry the orthogonal vs-HF
+                # correctness (declared) so the map can show "EQUIVALENT under tp, yet SILENTLY_WRONG
+                # vs HF" instead of collapsing the two onto one SUPPORTED label.
+                if control != "hf":
+                    c.correctness = _declared(spec, c.backend, c.workload, c.label)
+                # EQUIVALENT_DEGRADED is "equivalent up to TP reduction-order noise" — not a surprise
+                # against an EQUIVALENT expectation, so normalize it before the delta (the band state
+                # still displays distinctly in the map; it just doesn't headline as a divergence).
+                actual = AppState.EQUIVALENT if c.state == AppState.EQUIVALENT_DEGRADED else c.state
+                c.surprise = c.state != AppState.NO_REFERENCE and actual != c.expected
                 n_total += 1
                 n_surprise += int(c.surprise)
             if workload.kind in effect:

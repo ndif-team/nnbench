@@ -279,6 +279,97 @@ def test_expected_state_serve_inherits_vllm_async():
     assert expected_state(spec, "hf", "interactive", "a") == "SUPPORTED"          # hf != async
 
 
+def test_expected_state_separates_equivalence_from_correctness():
+    """A --pp/--tp run measures the PARALLELISM-EQUIVALENCE axis, not correctness, so expected_state
+    must NOT collapse a vs-HF correctness state into SUPPORTED — that overload is exactly what stamped a
+    known-wrong read 'SUPPORTED'. In equivalence mode every cell that RUNS is expected EQUIVALENT (the
+    candidate should reproduce single-GPU, naive-vs-HF read and all); only ERROR carries over (a cell
+    errors on both topologies). The declared vs-HF correctness stays available via `_declared`,
+    untouched, for display. Correctness mode (control="hf") returns the declared state verbatim."""
+    from isb.sweep.driver import _declared, expected_state
+
+    spec = CellConfig(
+        name="p", methodology="m", family="f", repo="r",
+        workloads=[Workload("interactive", ["p"])],
+        tasks=[({}, "wrong"), ({}, "degraded"), ({}, "err")],
+        baseline=BaselineSpec(params={}), effect=None,
+        expected={
+            ("vllm_async", "interactive", "wrong"): AppState.SILENTLY_WRONG,
+            ("vllm_async", "interactive", "degraded"): AppState.SUPPORTED_DEGRADED,
+            ("vllm_async", "interactive", "err"): AppState.ERROR,
+        })
+
+    # equivalence mode (control != "hf"): a cell that RUNS -> EQUIVALENT (never SUPPORTED), however
+    # wrong it is vs HF; a cell that ERRORs on both topologies -> ERROR.
+    assert expected_state(spec, "vllm_pp", "interactive", "wrong", control="vllm_async") == AppState.EQUIVALENT
+    assert expected_state(spec, "vllm_pp", "interactive", "degraded", control="vllm_async") == AppState.EQUIVALENT
+    assert expected_state(spec, "vllm_pp", "interactive", "err", control="vllm_async") == AppState.ERROR
+    assert expected_state(spec, "vllm_pp", "interactive", "wrong", control="vllm_async") != AppState.SUPPORTED
+    # the declared vs-HF correctness is preserved (display), NOT coerced
+    assert _declared(spec, "vllm_pp", "interactive", "wrong") == AppState.SILENTLY_WRONG       # inherits async
+    assert _declared(spec, "vllm_pp", "interactive", "degraded") == AppState.SUPPORTED_DEGRADED
+    assert _declared(spec, "vllm_pp", "interactive", "z") == AppState.SUPPORTED                # unlisted -> default
+    # correctness mode (control="hf") is the declared state verbatim
+    assert expected_state(spec, "vllm_async", "interactive", "wrong", control="hf") == AppState.SILENTLY_WRONG
+    assert expected_state(spec, "vllm_async", "interactive", "degraded", control="hf") == AppState.SUPPORTED_DEGRADED
+
+
+def test_evaluate_equivalence_mode_emits_equivalent_divergent():
+    """In equivalence mode (control != "hf") the oracle scores the candidate vs single-GPU vLLM and
+    emits EQUIVALENT / DIVERGENT — never the correctness vocabulary (SUPPORTED / SILENTLY_WRONG). A
+    candidate matching the control is EQUIVALENT even if both are 'wrong' vs HF; a candidate diverging
+    is DIVERGENT (the real parallelism break a --pp/--tp run exists to catch)."""
+    from isb.runner.run import CellResult, evaluate
+
+    # task "a": candidate reproduces single-GPU; task "b": candidate diverges. evaluate scores per
+    # (methodology, family, workload) group, so each task is its own evaluate call (as the driver does).
+    ctrl_a = CellResult("m", "f", "vllm_async", "a", "RAN", value=_onehot(3), workload="interactive")
+    cand_a = CellResult("m", "f", "vllm_pp", "a", "RAN", value=_onehot(3), workload="interactive")
+    ctrl_b = CellResult("m", "f", "vllm_async", "b", "RAN", value=_onehot(3), workload="interactive")
+    cand_b = CellResult("m", "f", "vllm_pp", "b", "RAN", value=_onehot(7), workload="interactive")
+    evaluate([ctrl_a, cand_a], control="vllm_async")
+    evaluate([ctrl_b, cand_b], control="vllm_async")
+    assert ctrl_a.state == AppState.EQUIVALENT        # the single-GPU reference, trivially equivalent
+    assert cand_a.state == AppState.EQUIVALENT        # candidate reproduces single-GPU
+    assert cand_b.state == AppState.DIVERGENT         # candidate diverges from single-GPU
+    assert cand_b.state not in (AppState.SUPPORTED, AppState.SILENTLY_WRONG)  # not the correctness axis
+
+
+def test_evaluate_equivalence_within_noise_band():
+    """In equivalence mode, a candidate whose softmax distributions MATCH within tolerance (tv <=
+    tv_tol) but whose argmax flips on a few near-tie tokens (top1 < top1_thresh) is EQUIVALENT_DEGRADED
+    — within TP reduction-order noise, not a real divergence. A genuine distributional divergence
+    (tv > tv_tol) stays DIVERGENT, so the band does not swallow real breaks."""
+    import torch
+
+    from isb.runner.run import CellResult, evaluate
+
+    # 8 near-tie rows ([10.0, 9.98] -> softmax ~[.505,.495]); flipping a row's argmax barely moves the
+    # distribution, so tv stays tiny while top1 drops.
+    def near_tie(flip_rows):
+        rows = []
+        for i in range(8):
+            a, b = (9.98, 10.0) if i in flip_rows else (10.0, 9.98)
+            rows.append(torch.tensor([[a, b]]))
+        return torch.cat(rows, dim=-2)  # [8, 2]
+
+    ref = near_tie(set())
+    ctrl = CellResult("m", "f", "vllm_async", "a", "RAN", value=ref.clone(), workload="interactive")
+    noisy = CellResult("m", "f", "vllm_pp", "a", "RAN", value=near_tie({0, 1}), workload="interactive")
+    evaluate([ctrl, noisy], control="vllm_async")
+    assert noisy.state == AppState.EQUIVALENT_DEGRADED, (noisy.state, noisy.metrics)
+    assert noisy.metrics["tv"] <= 0.05 and noisy.metrics["top1_agree"] < 0.9  # tv passes, top1 doesn't
+
+    # a genuine divergence: distributions strongly disagree (tv large) -> DIVERGENT, NOT the band
+    far_ref = torch.tensor([[12.0, 0.0]]).repeat(8, 1)
+    far_cand = torch.tensor([[0.0, 12.0]]).repeat(8, 1)
+    ctrl2 = CellResult("m", "f", "vllm_async", "b", "RAN", value=far_ref, workload="interactive")
+    div = CellResult("m", "f", "vllm_pp", "b", "RAN", value=far_cand, workload="interactive")
+    evaluate([ctrl2, div], control="vllm_async")
+    assert div.state == AppState.DIVERGENT
+    assert div.metrics["tv"] > 0.05
+
+
 def test_aggregate_interactive_scores_over_all_prompts():
     """An aggregate-interactive workload runs each prompt as its OWN trace and scores the verdict over
     ALL of them — so a backend that is right on 1 prompt but wrong on another is caught, where a

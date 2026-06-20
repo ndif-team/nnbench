@@ -882,6 +882,34 @@ delta within a family**:
 compared against **HF-Llama**, never against GPT-2. `family` is a *grouping key* in the runner,
 not an abstraction in the code.
 
+**Parallelism divergences are findings to classify, default-owned by nnsight (CORE RULE).** A separate
+axis from the HF-vs-vLLM correctness above is **parallelism-equivalence**: `bench.py --pp/--tp` scores a
+tensor/pipeline-parallel vLLM engine against single-GPU vLLM — the GT2 oracle, emitting `EQUIVALENT` /
+`DIVERGENT`, a *different question* from correctness (so it does not reuse `SUPPORTED`/`SILENTLY_WRONG`;
+the cell's vs-HF correctness is carried as a separate dimension). The default assumption is that TP/PP
+and single-GPU share **the same behavior and the same interface** — identical intervention code runs
+identically on 1 and N GPUs. When the benchmark catches a cell that is correct on single-GPU but
+`DIVERGENT` under parallelism, that is the benchmark *working*, and the outcome is a **finding to
+classify and document, NOT a cell bug to patch**:
+
+- classify it as either **(a)** an interface change users must be made aware of, or **(b)** a translation
+  gap nnsight should fix;
+- for parallelism-related divergences the **default owner is nnsight (b)** — an interpretability user
+  must not have to know or handle the underlying sharding/distribution, so nnsight should make the
+  single-GPU interface work transparently under TP/PP. Rewriting the cell to manually work around the
+  sharding is the wrong move: it hides the finding and pushes the distribution problem onto users.
+
+Worked example (measured 2026-06-19, Qwen2.5-0.5B under `--tp 2`, env `nnsight-vllm`/`pp-on-dev`): the
+steering cell reads its direction as `direction = head.weight[token_id]` — correct single-GPU code
+(token `token_id`'s unembed row). Under TP, vLLM **vocab-shards `lm_head`** (`lm_head.weight.shape[0]`
+is 151936 at tp=1, **75968** at tp=2) and nnsight exposes the sharded view, so the same index returns a
+*shard-local* row on the rank that doesn't own the token — tp=2 steered toward token
+`97686 = 75968 + 21718` (the steer token indexed into the second shard). The cell is right; the finding
+is an **nnsight TP-transparency gap** (single-row indexing of a vocab-parallel parameter should resolve
+to the correct *global* row), to be fixed in nnsight's translation layer — or, failing that, documented
+as an interface caveat. This is distinct from a cell using a *known-wrong* read pattern (e.g. the plain
+residual on a fused-residual family, §12.7), which IS a suite bug to fix in the cell.
+
 ### 12.3 What is kept vs dropped from §11
 
 - **Dropped:** `isb/resolve/` (Resolver, FamilyProfile, Binding, read_value, predict), the heavy

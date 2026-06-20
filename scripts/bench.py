@@ -33,8 +33,13 @@ def _pp_backend_factory(pp, tp, executor, gpu_mem=0.2, max_model_len=None):
     from isb.backends import VLLMAsyncBackend
 
     def factory(name, sp):
-        dt = sp.dtype_control
-        common = dict(dtype=dt, gpu_memory_utilization=gpu_mem, max_model_len=max_model_len)
+        # Carry the spec's vLLM engine kwargs (e.g. trust_remote_code for NemotronH) into BOTH the
+        # (1,1) control and the (tp,pp) candidate — without it a spec that needs trust_remote_code to
+        # even read its config cannot load in PP/TP mode. The explicit PP/TP knobs (control-dtype +
+        # memory) are pinned last so they override anything in vllm_kwargs: parallelism equivalence
+        # must vary nothing but the engine topology.
+        common = dict(sp.vllm_kwargs)
+        common.update(dtype=sp.dtype_control, gpu_memory_utilization=gpu_mem, max_model_len=max_model_len)
         if name == "vllm_async":
             return VLLMAsyncBackend(**common)
         if name == "vllm_pp":
