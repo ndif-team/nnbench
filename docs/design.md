@@ -1031,6 +1031,17 @@ the spec's `vllm_kwargs`, so on NemotronH the rerun hit the `trust_remote_code` 
 it now forwards `spec.vllm_kwargs`.
 
 **Envs (current split, not the stale CLAUDE.md pin):** HF on **nnsight-tf** (transformers 5.12.1,
-built-in), vLLM on **ndif-dev** (vLLM 0.19.1). The 30B-A3B MoE remains to be measured (multi-GPU
-`--pp/--tp`). → `isb/specs/nemotron.py`, `isb/methodologies/{logit_lens,steering,ablation}.py`,
+built-in), vLLM on **nnsight-vllm** (vLLM 0.19.1; the env earlier named `ndif-dev`).
+
+**30B-A3B MoE — MEASURED under tensor parallelism (2026-06-20, findings.md).** The headline MoE size
+(`n_routed_experts=128`, top-6 + 1 shared) needs ≥2 GPUs, so it is scored on the §12.2
+parallel-equivalence axis (tp=2 vLLM vs single-GPU vLLM, GT2 oracle). Residual reads (logit_lens,
+ablation) are **EQUIVALENT**. The manual-unembed steering write was **DIVERGENT** (top1=0.50, tv=0.355)
+— *not* a model limit but a **tensor-parallel parameter-gather bug in nnsight**: TP vocab-shards
+`lm_head`, so the cell's `head.weight[token_id]` returned a shard-local row on the non-owning rank
+(SILENTLY_WRONG, surfaced only by the parallel oracle). Fixed in nnsight (PR #677, gather sharded
+params on read); after the fix tv → 0.040 and the residual argmax flip is within-noise (MoE-router
+reduction order) → `EQUIVALENT_DEGRADED`. **PP was not validly testable** — nnsight `dev` has no
+pipeline parallelism (it lives on `pp-on-dev`); `--pp 2` `EngineDeadError` is an unimplemented-path
+artifact, retracted. → `isb/specs/nemotron.py`, `isb/methodologies/{logit_lens,steering,ablation}.py`,
 `isb/sweep/driver.py` (`_fp32_rerun`).
