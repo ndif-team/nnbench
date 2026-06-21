@@ -37,4 +37,18 @@ SPECS = {
     )
 }
 
-__all__ = ["SPECS"]
+# The corpus swept by `bench.py --spec all`: the small smoke specs (gpt2 + SmolLM2-135M), which load
+# on one modest GPU. Allowlist by design — large specs (Qwen 14B, and any later big model) are run by
+# exact name and stay out of `all` automatically.
+_DEFAULT_SPECS = (
+    logit_lens_gpt2, logit_lens_llama, steering_gpt2, gen_steering_gpt2, gen_patching_gpt2,
+    activation_patching_gpt2, ablation_gpt2, attention_pattern_gpt2, attribution_patching_gpt2,
+)
+
+
+def default_specs():
+    """Spec names swept by `bench.py --spec all` — the small default corpus (large specs run by name)."""
+    return [s.name for s in _DEFAULT_SPECS]
+
+
+__all__ = ["SPECS", "default_specs"]

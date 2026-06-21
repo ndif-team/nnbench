@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import isb.methodologies  # noqa: F401,E402  (registers the cells)
-from isb.specs import SPECS  # noqa: E402
+from isb.specs import SPECS, default_specs  # noqa: E402
 from isb.sweep import run_sweep  # noqa: E402
 
 
@@ -81,7 +81,7 @@ def main():
 
     parallel = args.pp > 1 or args.tp > 1
 
-    names = list(SPECS) if args.spec == "all" else [args.spec]
+    names = default_specs() if args.spec == "all" else [args.spec]
     for name in names:
         if name not in SPECS:
             raise SystemExit(f"unknown spec {name!r}; choices: {', '.join(SPECS)} or 'all'")
