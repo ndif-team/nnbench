@@ -160,7 +160,7 @@ def dump_control_refs(spec, dirpath):
     .source / autograd) raise and are simply skipped — they have no working version to disambiguate."""
     import torch
 
-    impl = VLLMAsyncBackend(dtype=spec.dtype_control)
+    impl = VLLMAsyncBackend(dtype=spec.dtype_control, **spec.vllm_kwargs)  # e.g. trust_remote_code for NemotronH
     dump, model = {}, None
     try:
         model = impl.load(spec.repo)

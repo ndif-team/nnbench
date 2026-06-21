@@ -12,23 +12,22 @@ from __future__ import annotations
 
 import contextlib
 
-from .base import Backend
+from .vllm_base import VLLMBackend
 
 
-class VLLMAsyncBackend(Backend):
+class VLLMAsyncBackend(VLLMBackend):
     name = "vllm_async"
 
     def __init__(self, dtype: str | None = None,
+                 trust_remote_code: bool = False,
                  pipeline_parallel_size: int = 1,
                  tensor_parallel_size: int = 1,
                  distributed_executor_backend: str | None = None,
                  gpu_memory_utilization: float = 0.2,
-                 max_model_len: int | None = None,
-                 trust_remote_code: bool = False):
-        # dtype is a real engine-config axis (design L3). Default None -> vLLM's own default
-        # (bf16 for GPT-2). Forcing "float32" matches HF's precision, which is how we separate a
-        # precision-degradation (SUPPORTED_DEGRADED) from a true mechanism bug (SILENTLY_WRONG).
-        self.dtype = dtype
+                 max_model_len: int | None = None):
+        # dtype + trust_remote_code are the engine-config shared with the sync/serve backends (see
+        # VLLMBackend); the parallelism + memory knobs below are specific to the in-process async engine.
+        super().__init__(dtype=dtype, trust_remote_code=trust_remote_code)
         # Parallelism axes (default 1 == single-GPU, the v1 behaviour). PP>1/TP>1 are forwarded
         # straight to nnsight's VLLM, which passes them to vLLM. distributed_executor_backend
         # must be "ray" for multi-node placement; None uses vLLM's default (mp) on one node.
@@ -40,12 +39,6 @@ class VLLMAsyncBackend(Backend):
         # keeps the KV reservation small. Both are forwarded to vLLM via nnsight's VLLM.
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
-        # vLLM uses its NATIVE NemotronH for compute, but its config validation refuses to even read a
-        # repo whose config declares custom code (auto_map) unless trust_remote_code=True. So this flag
-        # only permits reading the config — the remote modeling is never executed, no mamba-ssm needed.
-        # (HF, by contrast, takes the built-in path with trust_remote_code=False.) Flows in via
-        # spec.vllm_kwargs.
-        self.trust_remote_code = trust_remote_code
         self._loop = None
 
     def __getstate__(self):
@@ -80,7 +73,7 @@ class VLLMAsyncBackend(Backend):
             gpu_memory_utilization if gpu_memory_utilization is not None
             else self.gpu_memory_utilization
         )
-        kw = {} if self.dtype is None else {"dtype": self.dtype}
+        kw = self._engine_kwargs()                  # dtype + trust_remote_code (shared engine-config)
         if self.pipeline_parallel_size > 1:
             kw["pipeline_parallel_size"] = self.pipeline_parallel_size
         if self.tensor_parallel_size > 1:
@@ -89,8 +82,6 @@ class VLLMAsyncBackend(Backend):
             kw["distributed_executor_backend"] = self.distributed_executor_backend
         if self.max_model_len is not None:
             kw["max_model_len"] = self.max_model_len
-        if self.trust_remote_code:
-            kw["trust_remote_code"] = True
         return VLLM(
             repo, mode="async", dispatch=True,
             gpu_memory_utilization=gpu_memory_utilization, **kw,
