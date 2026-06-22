@@ -63,3 +63,33 @@ def ablation_gpt2_vllm(be, model, prompts, *, layer=6, target="mlp", residual="p
             _target_module(blk, target), model.transformer.h, model.transformer.ln_f, model.lm_head,
             target=target, residual=residual, last_fn=be.last)
     return be.run(model, prompts, build)
+
+
+# --- llama/Qwen family: blocks are model.model.layers; the attention submodule is `self_attn`
+# (not GPT-2's `attn`), and the mlp is `mlp` (same name). _ablate_and_read is reused verbatim.
+def _target_module_llama(block, target):
+    if target in ("mlp", "none"):
+        return block.mlp        # "none" never reads it; mlp is a harmless placeholder
+    if target == "attn":
+        return block.self_attn
+    raise ValueError(f"unknown ablation target {target!r}")
+
+
+@cell("ablation", family="llama", backend="hf")
+def ablation_llama_hf(be, model, prompts, *, layer=6, target="mlp", residual="plain"):
+    blk = model.model.layers[layer]
+    def build():
+        return _ablate_and_read(
+            _target_module_llama(blk, target), model.model.layers, model.model.norm, model.lm_head,
+            target=target, residual=residual, last_fn=be.last)
+    return be.run(model, prompts, build)
+
+
+@cell("ablation", family="llama", backend="vllm_async")
+def ablation_llama_vllm(be, model, prompts, *, layer=6, target="mlp", residual="plain"):
+    blk = model.model.layers[layer]
+    def build():
+        return _ablate_and_read(
+            _target_module_llama(blk, target), model.model.layers, model.model.norm, model.lm_head,
+            target=target, residual=residual, last_fn=be.last)
+    return be.run(model, prompts, build)

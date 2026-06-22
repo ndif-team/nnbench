@@ -184,21 +184,39 @@ def dump_control_refs(spec, dirpath):
     print(f"[dump-ctl-refs] wrote {len(dump)} control-dtype refs -> {_ctl_ref_file(dirpath, spec.name)}")
 
 
-def expected_state(spec, backend, workload_kind, label):
+def expected_state(spec, backend, workload_kind, label, control="hf"):
     """The cell's DECLARED expectation (the benchmark's encoded knowledge); default SUPPORTED, so only
-    the known non-SUPPORTED cells need listing in `spec.expected`. A `vllm_serve` cell with no entry
-    inherits the `vllm_async` expectation — serve should match in-process vLLM, so a divergence is a
-    genuine transport surprise rather than something silently absorbed."""
+    the known non-SUPPORTED cells need listing in `spec.expected`. Any vLLM *variant* (`vllm_serve`,
+    `vllm_pp`) with no entry inherits the `vllm_async` expectation — a variant should match in-process
+    single-GPU vLLM, so the interesting event is a DIVERGENCE from it (a real transport / parallelism
+    surprise), not the variant reproducing vLLM's own known limitation. So a cell that ERRORs on both
+    vllm_async and vllm_pp is 'expected', while vllm_pp diverging from a SUPPORTED vllm_async is the
+    surprise the PP run exists to catch.
+
+    In parallelism-equivalence mode (control != "hf") SUPPORTED_DEGRADED is not a meaningful state:
+    it only ever meant "vLLM-bf16 vs HF-fp32 precision near-tie", and that comparison is gone. Both
+    sides here are same-dtype vLLM, so a correct cell is simply SUPPORTED. Any declared (or inherited)
+    SUPPORTED_DEGRADED expectation is therefore coerced to SUPPORTED for this mode."""
     e = spec.expected
     v = e.get((backend, workload_kind, label))
-    if v is None and backend == "vllm_serve":
+    if v is None and backend.startswith("vllm_") and backend != "vllm_async":
         v = e.get(("vllm_async", workload_kind, label))
+    if control != "hf" and v == AppState.SUPPORTED_DEGRADED:
+        v = AppState.SUPPORTED
     return v if v is not None else AppState.SUPPORTED
 
 
 def run_sweep(spec, backends=("hf", "vllm_async"), backend_factory=None,
-              serve_host=None, dump_refs=None, refs=None, ctl_refs=None):
+              serve_host=None, dump_refs=None, refs=None, ctl_refs=None,
+              control="hf"):
     """Run a spec across `backends`.
+
+    `control` names the backend the oracle scores every other cell against (default "hf", the
+    cross-backend correctness check). For the PARALLELISM-EQUIVALENCE mode (`bench.py --pp/--tp`)
+    it is "vllm_async": the single-GPU (1,1) vLLM run is the ground truth and the (tp,pp) candidate
+    ("vllm_pp") is scored against it — "same intervention at tp=1,pp=1" (GT2). The effect-size guard
+    runs on that control, confirming the intervention is non-vacuous (GT1). No HF reference involved;
+    precision disambiguation (an HF-fp32 vs vLLM-bf16 concept) is skipped when control != "hf".
 
     VM-style serve mode: `backends=("vllm_serve",)` + `serve_host=<url>` runs the cells against a
     remote nnsight-vllm-serve server. The GPU-less client can't run the HF control, so pass
@@ -265,7 +283,7 @@ def run_sweep(spec, backends=("hf", "vllm_async"), backend_factory=None,
                             latency_s=timing.median_ms / 1000.0, value=warm,
                             workload=workload.kind, perf=perf))
                         # persist the interactive HF control output as the cached VM-mode reference
-                        if dump_refs and name == "hf" and workload.kind == "interactive":
+                        if dump_refs and name == control and workload.kind == "interactive":
                             ref_dump[("interactive", label)] = warm
                     except Exception as e:                       # isolated — engine survives, continue
                         traceback.print_exc()
@@ -275,7 +293,7 @@ def run_sweep(spec, backends=("hf", "vllm_async"), backend_factory=None,
 
                 # effect-size guard on the control (HF, interactive/generation — the per-trace
                 # regimes a write cell runs in), reusing the loaded model
-                if name == "hf" and spec.effect is not None \
+                if name == control and spec.effect is not None \
                         and workload.kind in ("interactive", "generation"):
                     try:
                         b = _call_cell(name, impl, model, workload.prompts, spec.methodology,
@@ -289,7 +307,7 @@ def run_sweep(spec, backends=("hf", "vllm_async"), backend_factory=None,
 
                 # per-prompt-interactive reference for the batched oracle, built on HF (the control)
                 # while its model is loaded — the same padded HF batch cannot be its own reference.
-                if name == "hf" and workload.kind == "batched":
+                if name == control and workload.kind == "batched":
                     for params, label in spec.tasks:
                         try:
                             batched_refs[label] = _per_prompt_stack(
@@ -317,20 +335,20 @@ def run_sweep(spec, backends=("hf", "vllm_async"), backend_factory=None,
                 ref = loaded_refs.get((workload.kind, label))
             else:
                 ref = batched_refs.get(label) if workload.kind == "batched" else None
-            hf_val = ref if ref is not None else next((c.value for c in cells if c.backend == "hf"), None)
-            evaluate(cells, control="hf", ref_override=ref)
+            hf_val = ref if ref is not None else next((c.value for c in cells if c.backend == control), None)
+            evaluate(cells, control=control, ref_override=ref)
             # Precision disambiguation. In-process: re-run the flagged cell on a live fp32 engine. On
             # the GPU-less serve client that isn't possible, so use the cached fp32-vLLM control output
             # (dump_control_refs) when supplied — same logic, precomputed. Without it, a serve bf16
             # near-tie stays SILENTLY_WRONG (honest: undisambiguated, not silently passed).
-            if serve_host is None:
+            if control == "hf" and serve_host is None:
                 disambiguate_precision(cells, hf_val, _fp32_rerun(spec, params, workload))
-            elif loaded_ctl_refs:
+            elif control == "hf" and loaded_ctl_refs:
                 disambiguate_precision(
                     cells, hf_val, lambda c: loaded_ctl_refs.get((c.workload, c.label)))
             # the benchmark's DELTA: actual vs the declared expectation (NO_REFERENCE can't be judged)
             for c in cells:
-                c.expected = expected_state(spec, c.backend, c.workload, c.label)
+                c.expected = expected_state(spec, c.backend, c.workload, c.label, control)
                 c.surprise = c.state != AppState.NO_REFERENCE and c.state != c.expected
                 n_total += 1
                 n_surprise += int(c.surprise)

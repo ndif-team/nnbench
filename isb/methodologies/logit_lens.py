@@ -20,7 +20,14 @@ from .registry import cell
 
 
 def _untuple(x):
-    return x[0] if isinstance(x, tuple) else x
+    # PP cross-stage outputs are LazyRemoteTensor, which is NOT a tuple instance even when it wraps a
+    # (hidden, residual) tuple — so `isinstance(x, tuple)` is unreliable under pipeline parallelism and
+    # would pass the lazy-wrapped tuple straight into RMSNorm (-> empty_like(tuple) TypeError on Qwen/
+    # Llama, whose blocks return tuples). Probe tensor-ness first and index [0] on everything else:
+    # real tuples index cleanly, and LazyRemoteTensor[0] returns a deferred child that pulls element 0.
+    # Matches the codebase convention (nnsight tests/vllm/pp/manual run_equivalence_matrix._hidden).
+    import torch
+    return x if isinstance(x, torch.Tensor) else x[0]
 
 
 def _resid(out, how):
@@ -33,10 +40,18 @@ def _resid(out, how):
     residual stream is their SUM — vLLM computes exactly `hidden + residual` for its own aux hidden
     states (vllm .../models/llama.py:425; VLLM_GUIDE "Logit Lens" prescribes `out[0] + out[1]`).
     Reading only `[0]` (as `plain` does) drops the accumulated residual -> silently wrong logits.
-    Falls back to `plain` when the output is not a 2-tuple, so it is safe on HF.
+    Falls back to `plain` when the output is not a `(hidden, residual)` container, so it is safe on HF.
+    The second branch handles **pipeline parallelism**: a PP cross-stage output is a `LazyRemoteTensor`
+    wrapping `(hidden, residual)` — NOT a tuple instance — so `isinstance(out, tuple)` alone would skip
+    the fused branch and silently drop the residual on the PP candidate (the same reason `_untuple`
+    probes tensor-ness). `fused` is only ever requested by vLLM dual-residual cells, where a non-tensor
+    output always carries `(hidden, residual)`.
     """
-    if how == "fused" and isinstance(out, tuple) and len(out) >= 2:
-        return out[0] + out[1]
+    if how == "fused":
+        if isinstance(out, tuple) and len(out) >= 2:        # real tuple (HF / single-GPU vLLM)
+            return out[0] + out[1]
+        if not isinstance(out, (torch.Tensor, tuple)):      # PP LazyRemoteTensor wrapping (hidden, residual)
+            return out[0] + out[1]
     return _untuple(out)
 
 

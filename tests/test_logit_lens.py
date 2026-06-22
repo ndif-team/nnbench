@@ -43,6 +43,23 @@ def test_fused_safe_on_hf_kv_tuple_via_plain_only():
     assert torch.equal(_resid((hidden, fake_kv), "plain"), hidden)
 
 
+def test_fused_sums_pp_lazy_tuple_not_just_hidden():
+    # Under pipeline parallelism a block's output is a LazyRemoteTensor wrapping (hidden, residual):
+    # NOT a tuple instance, but [i]-indexable. `fused` must still sum both halves on the PP candidate;
+    # an isinstance(out, tuple) check would drop the residual (read only hidden) and score a spurious
+    # divergence vs the single-GPU control (which sees a real tuple).
+    class FakeLazy:                     # stand-in for nnsight's LazyRemoteTensor (not Tensor, not tuple)
+        def __init__(self, parts):
+            self._parts = parts
+
+        def __getitem__(self, i):
+            return self._parts[i]
+
+    h, r = torch.ones(2, 4), torch.full((2, 4), 9.0)
+    assert torch.equal(_resid(FakeLazy([h, r]), "fused"), h + r)   # the fix: sum, do not drop residual
+    assert torch.equal(_resid(FakeLazy([h, r]), "plain"), h)       # plain still reads element 0
+
+
 def test_untuple_helper():
     h = torch.ones(3)
     assert torch.equal(_untuple((h, "x")), h)
