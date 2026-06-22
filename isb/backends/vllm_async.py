@@ -12,22 +12,22 @@ from __future__ import annotations
 
 import contextlib
 
-from .base import Backend
+from .vllm_base import VLLMBackend
 
 
-class VLLMAsyncBackend(Backend):
+class VLLMAsyncBackend(VLLMBackend):
     name = "vllm_async"
 
     def __init__(self, dtype: str | None = None,
+                 trust_remote_code: bool = False,
                  pipeline_parallel_size: int = 1,
                  tensor_parallel_size: int = 1,
                  distributed_executor_backend: str | None = None,
                  gpu_memory_utilization: float = 0.2,
                  max_model_len: int | None = None):
-        # dtype is a real engine-config axis (design L3). Default None -> vLLM's own default
-        # (bf16 for GPT-2). Forcing "float32" matches HF's precision, which is how we separate a
-        # precision-degradation (SUPPORTED_DEGRADED) from a true mechanism bug (SILENTLY_WRONG).
-        self.dtype = dtype
+        # dtype + trust_remote_code are the engine-config shared with the sync/serve backends (see
+        # VLLMBackend); the parallelism + memory knobs below are specific to the in-process async engine.
+        super().__init__(dtype=dtype, trust_remote_code=trust_remote_code)
         # Parallelism axes (default 1 == single-GPU, the v1 behaviour). PP>1/TP>1 are forwarded
         # straight to nnsight's VLLM, which passes them to vLLM. distributed_executor_backend
         # must be "ray" for multi-node placement; None uses vLLM's default (mp) on one node.
@@ -73,7 +73,7 @@ class VLLMAsyncBackend(Backend):
             gpu_memory_utilization if gpu_memory_utilization is not None
             else self.gpu_memory_utilization
         )
-        kw = {} if self.dtype is None else {"dtype": self.dtype}
+        kw = self._engine_kwargs()                  # dtype + trust_remote_code (shared engine-config)
         if self.pipeline_parallel_size > 1:
             kw["pipeline_parallel_size"] = self.pipeline_parallel_size
         if self.tensor_parallel_size > 1:

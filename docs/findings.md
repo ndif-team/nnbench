@@ -406,3 +406,51 @@ own padded batch diverges from it — the documented left-pad position artifact;
 against the per-prompt truth (§8.1). The denotation/guard outcomes (idiomatic-unembed ERROR, llama
 naive-plain SILENTLY_WRONG) are engine-WIDE, identical to the interactive cells. → `isb/backends/vllm_sync.py` (`run_batched`),
 `isb/specs/{logit_lens,ablation,steering}.py` (batched sync `expected`).
+
+## Family tier — Nemotron 30B-A3B MoE under tensor parallelism, vLLM tp=2 vs tp=1 (2026-06-20)
+
+The 30B-A3B MoE (the headline §12.7 target — `n_routed_experts=128`, top-6 + 1 shared) needs ≥2 GPUs,
+so it is the first member measured under the **parallel-equivalence axis** (§12.2): the GT2 oracle
+scores the **tp=2 vLLM cell against the same cell on single-GPU vLLM** (not vs HF — HF can't shard), so
+a verdict is `EQUIVALENT`/`DIVERGENT` with `vs-HF` carried as a second display dimension. Run on two
+A100s (`CUDA_VISIBLE_DEVICES=2,7`), `bench.py --spec {logit_lens,steering,ablation}_nemotron --tp 2
+--executor mp --max-model-len 4096`, vLLM 0.19.1, benchmark importing nnsight `dev` (has TP). The
+residual reads ported unchanged; the manual-unembed write did not:
+
+| cell (tp=2 vs tp=1 vLLM) | nnsight `dev` | metric |
+|---|---|---|
+| logit_lens, residual=fused | **EQUIVALENT** | top1≥0.94, tv≤0.035 |
+| ablation mixer (L16/L32) | **EQUIVALENT** | top1=1.00, tv=0.031 |
+| steering replace (`head.weight[token_id]`) | **DIVERGENT** ⚠ | top1=0.50, tv=0.355, maxabs=7.50 |
+
+### The steering DIVERGENT was a tensor-parallel parameter-gather bug in nnsight, not a model limit
+`bench.py --spec steering_nemotron --tp 2` scored the steering-replace cell DIVERGENT (top1=0.50,
+tv=0.355) where tp=1 was EQUIVALENT. The cell reads `head.weight[token_id]` to build the steering
+vector — correct single-GPU code. Under TP, vLLM **vocab-shards** `lm_head` (`weight.shape[0]` 151936 →
+75968 at tp=2), so on the rank that does not own `token_id` the same index returns a **shard-local
+row** — a different token's embedding. At tp=2 the cell steered toward `97686 = 75968 + 21718` (the
+owning-rank offset of the intended id). The save still ships from TP-rank-0, so it ran with no error:
+SILENTLY_WRONG — exactly the state the benchmark exists to catch, surfaced only because the
+parallel-equivalence oracle compared it against tp=1. (`model.logits` is unaffected: vLLM's
+LogitsProcessor gathers it; only a *manual* weight read like this one is shard-local.)
+
+Per the design rule (§12.2): a TP divergence of correct single-GPU code is **nnsight's to fix
+transparently**, not a cell rewrite — an interp user must not have to know vLLM shards the vocab. Fixed
+in nnsight (`fix/vllm-tp-param-gather`, PR #677): a parameter gather (`tensor_model_parallel_all_gather`
+on read, shard dim keyed off the module class — RowParallelLinear→1, Column/Vocab→0) so a sharded
+weight read inside a trace returns the full logical tensor on every rank. Re-running the same spec with
+that nnsight: **tv 0.355 → 0.040 (≈9×), top1 0.50 → 0.88**.
+
+### The residual tv=0.040 flip is within-noise (MoE router reduction order) → EQUIVALENT_DEGRADED
+After the gather fix the steering cell still flagged DIVERGENT — but on a single near-tie argmax, not a
+systematic shift (top1=0.88, tv=0.040, far under the SILENTLY_WRONG band). TP changes the reduction
+order of the MoE router / all-reduce, so a few near-degenerate top-1 tokens flip non-deterministically.
+The within-noise band `EQUIVALENT_DEGRADED` (distributions match, tv ≤ tol, a few argmax ties flip)
+classifies this — the same role bf16 precision plays vs HF. An alpha sweep confirmed it is a fragile
+tie, not a trend: α=2 EQUIVALENT (tv=0.021), α=12 EQUIVALENT (tv=0.011), only α=6 flips.
+
+**PP=2 not validly testable here.** The benchmark imports nnsight `dev`, which implements TP but **not
+pipeline parallelism** (PP lives on the `pp-on-dev` branch); `--pp 2` on every spec died with
+`EngineDeadError`. That is an artifact of exercising an unimplemented path, not a frontier marker —
+retracted, to be measured against a PP-capable nnsight. → nnsight PR #677; `isb/states.py`,
+`isb/runner/run.py`, `isb/sweep/driver.py`, `isb/report/applicability.py`.

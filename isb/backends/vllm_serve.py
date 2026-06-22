@@ -18,7 +18,7 @@ from __future__ import annotations
 import time
 import urllib.request
 
-from .base import Backend
+from .vllm_base import VLLMBackend
 
 
 def _force_cpu_platform_when_no_gpu() -> None:
@@ -50,22 +50,23 @@ def _force_cpu_platform_when_no_gpu() -> None:
     platforms.builtin_platform_plugins["cpu"] = cpu_when_no_gpu
 
 
-class VLLMServeBackend(Backend):
+class VLLMServeBackend(VLLMBackend):
     name = "vllm_serve"
 
     HEALTH_TIMEOUT = 120.0  # seconds to wait for the server's /health before giving up
 
-    def __init__(self, host: str, dtype: str | None = None):
-        # `host` is the serve URL (e.g. "http://server:6677"). `dtype` is kept for interface parity
-        # with the async backend's precision knob, but precision is the SERVER's engine config here
-        # (the client is meta-only), so it is informational — not applied client-side.
+    def __init__(self, host: str, dtype: str | None = None, trust_remote_code: bool = False):
+        # `host` is the serve URL (e.g. "http://server:6677"). dtype/trust_remote_code share the
+        # VLLMBackend engine-config signature so the driver can splat spec.vllm_kwargs here too. dtype
+        # is informational client-side (precision is the SERVER's engine config — the client is
+        # meta-only); trust_remote_code IS applied, because even the meta build reads the repo config.
+        super().__init__(dtype=dtype, trust_remote_code=trust_remote_code)
         self.host = host.rstrip("/")
-        self.dtype = dtype
 
     # No __getstate__ needed: unlike vllm_async (which carries a non-picklable event loop), this
-    # backend holds only `host`/`dtype`. The cell's `build` closure captures `be.last` (a bound
-    # method), so the backend IS serialized into the request sent to the server — and it must be, and
-    # is, fully picklable.
+    # backend holds only host/dtype/trust_remote_code. The cell's `build` closure captures `be.last`
+    # (a bound method), so the backend IS serialized into the request sent to the server — and it must
+    # be, and is, fully picklable.
 
     def load(self, repo: str):
         # Force vLLM's CPU platform when no GPU is visible BEFORE importing the vLLM model — otherwise
@@ -75,8 +76,10 @@ class VLLMServeBackend(Backend):
         from nnsight.modeling.vllm import VLLM
 
         self._wait_for_health()
-        # Meta model: architecture / envoy tree only — no engine, no weights, no GPU.
-        return VLLM(repo)
+        # Meta model: architecture / envoy tree only — no engine, no weights, no GPU. trust_remote_code
+        # is still needed to READ an auto_map repo's config (dtype is server-side, so it is omitted).
+        kw = {"trust_remote_code": True} if self.trust_remote_code else {}
+        return VLLM(repo, **kw)
 
     def _wait_for_health(self) -> None:
         url = f"{self.host}/health"

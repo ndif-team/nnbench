@@ -46,8 +46,10 @@ class CellResult:
     value: Any = None                # cpu tensor; cleared by evaluate() after comparison
     workload: str = "interactive"    # "interactive" | "batched" — a coverage axis (oracle-checked per regime)
     perf: Optional["PerfResult"] = None  # filled only by the perf path, only for SUPPORTED*/cells
-    expected: Optional[str] = None   # the spec's declared expectation for this cell (default SUPPORTED)
+    expected: Optional[str] = None   # the spec's declared expectation on the axis this run measures
     surprise: bool = False           # actual state != expected -> the only thing a run should headline
+    correctness: Optional[str] = None  # GT2 (--pp/--tp) only: the cell's DECLARED vs-HF correctness,
+    #                                    the axis orthogonal to the equivalence `state` (display only)
 
 
 def run_cell(
@@ -100,6 +102,16 @@ def evaluate(cells, control: str = "hf", top1_thresh: float = 0.9, tv_tol: float
     """
     from collections import defaultdict
 
+    # The axis this comparison measures. control="hf" is the CORRECTNESS axis (vs the HF ground
+    # truth) -> SUPPORTED / SILENTLY_WRONG. control != "hf" is the PARALLELISM-EQUIVALENCE axis
+    # (bench.py --pp/--tp): the (tp,pp) candidate vs single-GPU vLLM -> EQUIVALENT / DIVERGENT. These
+    # are different questions and get different vocabularies on purpose: a read that is wrong vs HF
+    # but faithfully reproduced under parallelism is EQUIVALENT, never SUPPORTED (the vs-HF wrongness
+    # lives on the orthogonal correctness axis, set by the driver, not here).
+    equivalence = control != "hf"
+    ok_state = AppState.EQUIVALENT if equivalence else AppState.SUPPORTED
+    bad_state = AppState.DIVERGENT if equivalence else AppState.SILENTLY_WRONG
+
     groups = defaultdict(list)
     for c in cells:
         # group by workload too: batching can change correctness, so a batched cell is scored only
@@ -118,14 +130,22 @@ def evaluate(cells, control: str = "hf", top1_thresh: float = 0.9, tv_tol: float
             if refval is None:
                 c.state = AppState.NO_REFERENCE
             elif c.backend == control and not external:
-                c.state = AppState.SUPPORTED   # same-backend control IS the reference by definition
+                # the reference cell: the HF control (SUPPORTED by definition) or, in equivalence
+                # mode, single-GPU vLLM (trivially EQUIVALENT to itself).
+                c.state = ok_state
             else:
                 c.metrics = compare(refval, c.value)
-                c.state = (
-                    AppState.SUPPORTED
-                    if is_equivalent(c.metrics, top1_thresh, tv_tol)
-                    else AppState.SILENTLY_WRONG
-                )
+                if is_equivalent(c.metrics, top1_thresh, tv_tol):
+                    c.state = ok_state
+                elif equivalence and c.metrics["shape_match"] and c.metrics["tv"] <= tv_tol:
+                    # Equivalence mode only: the softmax distributions match within tolerance
+                    # (tv <= tv_tol) but a few near-tie argmaxes flipped (top1 < top1_thresh). On a
+                    # parallel engine that is TP reduction-order non-determinism (the all-reduce sums
+                    # in a different order; a sensitive step like a MoE router's top-k flips on a
+                    # borderline token), not a real divergence -> within-noise band.
+                    c.state = AppState.EQUIVALENT_DEGRADED
+                else:
+                    c.state = bad_state
     for c in cells:
         c.value = None
     return cells

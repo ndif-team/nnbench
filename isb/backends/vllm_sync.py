@@ -13,27 +13,24 @@ from __future__ import annotations
 
 import contextlib
 
-from .base import Backend
+from .vllm_base import VLLMBackend
 
 # Greedy, single forward step — the deterministic regime the oracle compares against.
 _SAMPLING = {"temperature": 0.0, "top_p": 1, "max_tokens": 1}
 
 
-class VLLMSyncBackend(Backend):
+class VLLMSyncBackend(VLLMBackend):
     name = "vllm_sync"
 
-    def __init__(self, dtype: str | None = None):
-        # dtype is a real engine-config axis (design L3); None -> vLLM's default (bf16 for
-        # GPT-2). Forcing "float32" matches HF precision, separating DEGRADED from SILENTLY_WRONG.
-        self.dtype = dtype
+    # dtype + trust_remote_code come from VLLMBackend — the engine-config shared with the async/serve
+    # backends, so the driver can splat the same spec.vllm_kwargs into any of them.
 
     def load(self, repo: str, gpu_memory_utilization: float = 0.2):
         from nnsight.modeling.vllm import VLLM
 
-        kw = {} if self.dtype is None else {"dtype": self.dtype}
         return VLLM(
             repo, mode="sync", dispatch=True,
-            gpu_memory_utilization=gpu_memory_utilization, **kw,
+            gpu_memory_utilization=gpu_memory_utilization, **self._engine_kwargs(),
         )
 
     def run(self, model, prompts, build):

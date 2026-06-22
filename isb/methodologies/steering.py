@@ -29,14 +29,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from .logit_lens import _resid       # the documented read pattern: plain vs fused (out[0]+out[1])
 from .registry import cell
-
-
-def _untuple(x):
-    # PP cross-stage outputs are LazyRemoteTensor (not a tuple instance even when wrapping one);
-    # probe tensor-ness first, index [0] otherwise. See logit_lens._untuple for the full rationale.
-    import torch
-    return x if isinstance(x, torch.Tensor) else x[0]
 
 
 def _resolve_token(tokenizer, target: str) -> int:
@@ -47,17 +41,22 @@ def _resolve_token(tokenizer, target: str) -> int:
     return ids[-1]  # most content-bearing piece for a multi-token target
 
 
-def _steer_and_read(blocks, norm, head, *, layer, token_id, alpha, mode, last_fn):
+def _steer_and_read(blocks, norm, head, *, layer, token_id, alpha, mode, last_fn, residual="plain"):
     """Steer blocks[layer], read the final block's portable-unembed logits. Runs INSIDE a trace.
 
     `alpha=0` performs no write at all (the honest unsteered baseline), so the same cell yields the
     control the effect-size check needs — run in the SAME `mode` as the cell under test.
 
-    Reuse contract (the invariants the readout assumes — assert/keep these if reusing for new
-    families): the residual stream is tuple element `[0]` (true for GPT-2/HF blocks); the final
-    block's output is the PRE-final-norm residual (so `norm(...)` then a weight matmul reproduces
-    the model's logits); and `layer` is strictly before the read-out (final) block, enforced below
-    so the write and the read never collide on the same module.
+    `residual` selects the read-out denotation, the documented vLLM gap (interp-methods-catalog.md):
+    "plain" reads `out[0]`; "fused" reads `out[0] + out[1]` — REQUIRED on vLLM fused-residual RMSNorm
+    families (Llama/Qwen/NemotronH/...), where the final block's output is `(hidden, residual)` and the
+    true stream is their sum. Reading plain there drops the accumulated residual -> SILENTLY_WRONG (the
+    same denotation `_lens_proxy`/`_ablate_and_read` already thread through). Falls back to plain on a
+    bare tensor, so HF/GPT-2 are unaffected.
+
+    Reuse contract: the final block's output is the PRE-final-norm residual stream (so `norm(...)` then
+    a weight matmul reproduces the model's logits), and `layer` is strictly before the read-out (final)
+    block, enforced below so the write and the read never collide on the same module.
     """
     n = len(blocks)
     if alpha != 0 and layer % n == n - 1:
@@ -84,7 +83,7 @@ def _steer_and_read(blocks, norm, head, *, layer, token_id, alpha, mode, last_fn
             else:
                 raise ValueError(f"unknown steering mode {mode!r}")
 
-        normed = norm(_untuple(blocks[-1].output))          # final residual -> final norm
+        normed = norm(_resid(blocks[-1].output, residual))  # residual stream (fused on vLLM RMSNorm) -> norm
         logits = F.linear(normed, head.weight)              # portable unembed (lm_head.forward guarded)
     return last_fn(logits)
 
@@ -125,11 +124,43 @@ def steering_llama_hf(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0,
 
 
 @cell("steering", family="llama", backend="vllm_async")
-def steering_llama_vllm(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace"):
+def steering_llama_vllm(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace",
+                        residual="fused"):
+    # residual="fused": vLLM Llama uses fused-residual RMSNorm, so the read-out must sum (hidden, residual)
+    # (the documented vLLM gap, interp-methods-catalog.md). Plain drops the accumulated residual.
     token_id = _resolve_token(model.tokenizer, target)
     def build():
         return _steer_and_read(
             model.model.layers, model.model.norm, model.lm_head,
+            layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last, residual=residual,
+        )
+    return be.run(model, prompts, build)
+
+
+# --- nemotron family (Nemotron-H / Nemotron 3): steering is a residual-stream WRITE at a chosen block
+# boundary, type-agnostic across Mamba/attention/MLP/MoE layers — the write lands on
+# `model.model.layers[layer].output` (the additive residual) regardless of the block's op. Built-in
+# transformers NemotronH (NOT trust_remote_code); HF and vLLM share `model.model.*`. `_steer_and_read`
+# is reused verbatim.
+@cell("steering", family="nemotron", backend="hf")
+def steering_nemotron_hf(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace"):
+    token_id = _resolve_token(model.tokenizer, target)
+    def build():
+        return _steer_and_read(
+            model.model.layers, model.model.norm_f, model.lm_head,
             layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
+        )
+    return be.run(model, prompts, build)
+
+
+@cell("steering", family="nemotron", backend="vllm_async")
+def steering_nemotron_vllm(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace",
+                           residual="fused"):
+    # residual="fused": NemotronH on vLLM is a fused-residual RMSNorm family too — same documented gap.
+    token_id = _resolve_token(model.tokenizer, target)
+    def build():
+        return _steer_and_read(
+            model.model.layers, model.model.norm_f, model.lm_head,
+            layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last, residual=residual,
         )
     return be.run(model, prompts, build)

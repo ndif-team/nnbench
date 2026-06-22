@@ -882,6 +882,34 @@ delta within a family**:
 compared against **HF-Llama**, never against GPT-2. `family` is a *grouping key* in the runner,
 not an abstraction in the code.
 
+**Parallelism divergences are findings to classify, default-owned by nnsight (CORE RULE).** A separate
+axis from the HF-vs-vLLM correctness above is **parallelism-equivalence**: `bench.py --pp/--tp` scores a
+tensor/pipeline-parallel vLLM engine against single-GPU vLLM — the GT2 oracle, emitting `EQUIVALENT` /
+`DIVERGENT`, a *different question* from correctness (so it does not reuse `SUPPORTED`/`SILENTLY_WRONG`;
+the cell's vs-HF correctness is carried as a separate dimension). The default assumption is that TP/PP
+and single-GPU share **the same behavior and the same interface** — identical intervention code runs
+identically on 1 and N GPUs. When the benchmark catches a cell that is correct on single-GPU but
+`DIVERGENT` under parallelism, that is the benchmark *working*, and the outcome is a **finding to
+classify and document, NOT a cell bug to patch**:
+
+- classify it as either **(a)** an interface change users must be made aware of, or **(b)** a translation
+  gap nnsight should fix;
+- for parallelism-related divergences the **default owner is nnsight (b)** — an interpretability user
+  must not have to know or handle the underlying sharding/distribution, so nnsight should make the
+  single-GPU interface work transparently under TP/PP. Rewriting the cell to manually work around the
+  sharding is the wrong move: it hides the finding and pushes the distribution problem onto users.
+
+Worked example (measured 2026-06-19, Qwen2.5-0.5B under `--tp 2`, env `nnsight-vllm`/`pp-on-dev`): the
+steering cell reads its direction as `direction = head.weight[token_id]` — correct single-GPU code
+(token `token_id`'s unembed row). Under TP, vLLM **vocab-shards `lm_head`** (`lm_head.weight.shape[0]`
+is 151936 at tp=1, **75968** at tp=2) and nnsight exposes the sharded view, so the same index returns a
+*shard-local* row on the rank that doesn't own the token — tp=2 steered toward token
+`97686 = 75968 + 21718` (the steer token indexed into the second shard). The cell is right; the finding
+is an **nnsight TP-transparency gap** (single-row indexing of a vocab-parallel parameter should resolve
+to the correct *global* row), to be fixed in nnsight's translation layer — or, failing that, documented
+as an interface caveat. This is distinct from a cell using a *known-wrong* read pattern (e.g. the plain
+residual on a fused-residual family, §12.7), which IS a suite bug to fix in the cell.
+
 ### 12.3 What is kept vs dropped from §11
 
 - **Dropped:** `isb/resolve/` (Resolver, FamilyProfile, Binding, read_value, predict), the heavy
@@ -936,3 +964,84 @@ scripts/smoke.py        # enumerate the cells to run; print the map
   indistinguishable from derivable consequences.
 - The maintained Level-0/1 status inventory (measured vs UNTESTED per backend) lives in
   `interp-methods-catalog.md`; the UNTESTED rows there are the coverage queue.
+
+### 12.7 The `nemotron` family — a hybrid Mamba/MoE model, MEASURED on the 4B (2026-06-19)
+
+**Nemotron 3 Nano** is the first corpus member that breaks the §12.1 homogeneous-transformer
+assumption: a hybrid **Mamba-2 + sparse-attention** decoder (`architectures=["NemotronHForCausalLM"]`,
+`model_type="nemotron_h"`), MoE at the 30B size. Two registered sizes — the dense **4B**
+(`...-Nano-4B-BF16`, 42 layers, `hybrid_override_pattern="M-M-M-MM-M-M*-..."`, the cheap GPU-runnable
+member that was actually measured) and the **30B-A3B** MoE (`n_routed_experts=128` top-6 + 1 shared,
+pattern `"MEMEM*..."`, the headline target; needs `--pp/--tp`, inherits the 4B verdicts as hypothesis).
+
+**Loading — built-in, NOT remote code (the key correction).** The repo ships custom modeling
+(`auto_map`) that hard-requires `mamba-ssm`. Do not use it:
+- **HF** loads transformers' **built-in** `NemotronH` with `trust_remote_code=False`; with
+  `mamba-ssm`/`causal-conv1d` absent it prints "fast path is not available … naive implementation" and
+  runs a pure-torch fallback — no extra deps.
+- **vLLM** uses its **native** `NemotronH` for compute, but its config validator refuses an `auto_map`
+  repo unless `trust_remote_code=True`; that flag only permits *reading* the config — the remote
+  modeling is never executed, so vLLM also needs no `mamba-ssm`. Hence the per-backend split:
+  `hf_kwargs={}`, `vllm_kwargs={"trust_remote_code": True}`.
+
+**Module tree (HF built-in AND vLLM both):** `model.model.layers[i]` (each `NemotronHBlock` is ONE op
+exposed as `.mixer`, with `.block_type ∈ {mamba, attention, mlp, moe}`; additive residual
+`hidden = residual + mixer_out`) / `model.model.norm_f` / `model.lm_head` (untied). HF returns the
+plain residual tensor; vLLM uses fused-residual RMSNorm (block output is `(hidden, residual)`) so the
+true stream is their sum — the same dual-residual denotation as the llama family. (The remote code's
+`backbone` name is not used.) The single-op-per-layer ablation reframe is `_target_module_nemotron` →
+`block.mixer` (rejecting the within-block `mlp`/`attn` targets); which layers are Mamba/attention/MoE
+is read from `hybrid_override_pattern` at runtime, never hardcoded.
+
+**Measured (4B; vLLM scored against the HF built-in control via `--dump-refs`/`--refs`).**
+nnsight-on-vLLM traces NemotronH fine — the Mamba state is NOT a wall; the correctness axis is the
+fused residual:
+
+| cell (vLLM, documented-correct form) | verdict | metric |
+|---|---|---|
+| logit_lens, residual=fused | **SUPPORTED** | top1=0.98, tv=0.009 |
+| steering replace, residual=fused | **SUPPORTED** | top1=1.00, tv=0.005 |
+| ablation mixer (L16/L32), residual=fused | **SUPPORTED** | top1=1.00, tv~0.01 |
+| logit_lens, residual=plain (naive port) | SILENTLY_WRONG | top1=0.12 — drops the fused residual (the intentional naive-port marker) |
+| logit_lens, idiomatic unembed | ERROR | guarded `lm_head.forward` |
+| steering, in-place | ERROR | in-place inference-tensor write |
+
+**Conclusion: NemotronH is just another fused-residual vLLM family — it introduces NO new gaps.** Every
+vLLM verdict reduces to the documented set (interp-methods-catalog.md): the fused-residual read, the
+guarded `lm_head.forward`, the in-place-write restriction. With the documented-correct read patterns
+(`residual="fused"`, weight unembed, replacement write) all the residual-stream interventions are
+SUPPORTED; the hybrid Mamba/MoE stack is not special for these. nnsight-on-vLLM traces it fine — the
+Mamba state is not a wall.
+
+This run also exposed (and fixed) a real **benchmark-suite bug**, not a model limitation: the steering
+read-out hardcoded the plain `_untuple` read and so was silently wrong on *every* fused-residual vLLM
+family (it just had no oracle exercising it — the steering spec is GPT-2, and the qwen steering cell
+runs under the GT2 vLLM-vs-vLLM oracle where both sides share the bug). `_steer_and_read` now takes a
+`residual` arg (the documented pattern, like `_lens_proxy`/`_ablate_and_read`) and the vLLM
+llama/nemotron steering cells default `residual="fused"`; steering replace then scores SUPPORTED. The
+methodology lesson: a SILENTLY_WRONG from a cell using a known-wrong read pattern is a suite bug to
+fix, not a finding to report — check the documented gaps and use the documented-correct form first.
+
+**Not registered (frontier).** `attention_pattern` — only the few `*` layers have an attention matrix;
+iterating all blocks is undefined on Mamba/MLP/MoE layers (the §3.4 cross-edge / §12.2 family quirk).
+`attribution_patching`'s backward — inference-mode on vLLM, no grad (the general story).
+
+**Driver fix exposed here.** `_fp32_rerun` (precision disambiguation) built its vLLM backend without
+the spec's `vllm_kwargs`, so on NemotronH the rerun hit the `trust_remote_code` config-validate error;
+it now forwards `spec.vllm_kwargs`.
+
+**Envs (current split, not the stale CLAUDE.md pin):** HF on **nnsight-tf** (transformers 5.12.1,
+built-in), vLLM on **nnsight-vllm** (vLLM 0.19.1; the env earlier named `ndif-dev`).
+
+**30B-A3B MoE — MEASURED under tensor parallelism (2026-06-20, findings.md).** The headline MoE size
+(`n_routed_experts=128`, top-6 + 1 shared) needs ≥2 GPUs, so it is scored on the §12.2
+parallel-equivalence axis (tp=2 vLLM vs single-GPU vLLM, GT2 oracle). Residual reads (logit_lens,
+ablation) are **EQUIVALENT**. The manual-unembed steering write was **DIVERGENT** (top1=0.50, tv=0.355)
+— *not* a model limit but a **tensor-parallel parameter-gather bug in nnsight**: TP vocab-shards
+`lm_head`, so the cell's `head.weight[token_id]` returned a shard-local row on the non-owning rank
+(SILENTLY_WRONG, surfaced only by the parallel oracle). Fixed in nnsight (PR #677, gather sharded
+params on read); after the fix tv → 0.040 and the residual argmax flip is within-noise (MoE-router
+reduction order) → `EQUIVALENT_DEGRADED`. **PP was not validly testable** — nnsight `dev` has no
+pipeline parallelism (it lives on `pp-on-dev`); `--pp 2` `EngineDeadError` is an unimplemented-path
+artifact, retracted. → `isb/specs/nemotron.py`, `isb/methodologies/{logit_lens,steering,ablation}.py`,
+`isb/sweep/driver.py` (`_fp32_rerun`).
