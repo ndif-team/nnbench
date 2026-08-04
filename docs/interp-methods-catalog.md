@@ -251,6 +251,100 @@ Status: ✓ = already an nnbench cell. **frontier** = exercises a primitive wher
 
 ---
 
+## Serving-feature context axis — which engine optimization attacks which primitive (predictions)
+
+The backend axis today is single-GPU `hf` vs `vllm_async/serve`. Production serving stacks add a
+second axis of **engine optimizations** (`engine-config × parallelism`, design §3.6) that the
+inventory above under-represents. This section is that axis. The discipline is unchanged: a feature
+does not attack a *method*, it attacks a **primitive component** (a site denotation, an edge, a
+realization, a quantifier); a method inherits the break iff its footprint names that component (∧,
+§3.6). So the rows are primitive/footprint-level, and every catalogued method maps in through its
+cluster.
+
+**Statuses are PREDICTED from (footprint × feature-attack) and are UNTESTED in the bench unless
+★-marked.** No measured status is invented (the catalog's rule). ★ = bench- or repro-measured, with
+the finding in `findings.md`.
+
+### A. The generator — feature → primitive it attacks → predicted failure
+
+| feature | engine effect | primitive attacked | failure kind | today |
+|---|---|---|---|---|
+| **TP** tensor-parallel | shards heads / MLP-interm / vocab(`lm_head`); residual all-reduced full-width at the block boundary | L1 denotation of *sharded* sites; reduction order | a sharded-site read/write sees a shard (denotation); all-reduce reorders near-ties | ★ `lm_head` vocab-shard SW (steer/DLA via weights); ★ reduction-order EQUIVALENT_DEGRADED; ★ residual reads EQUIVALENT |
+| **PP** pipeline-parallel | layers split across stage processes | L1 site existence (per stage); L2 cross-stage edge | read at layer L only on its owner stage; cross-stage read→write crosses processes | ★ cross-stage write via whole-output replacement; ★ fused-residual `LazyRemoteTensor` summed (logit-lens PP-aware) |
+| **EP** expert-parallel (MoE only) | experts sharded; routing is data-dependent | L1 expert-site location; router top-k near-tie | reading a specific expert's activation off-rank; router flips a near-tie | ★ Nemotron param-gather; ★ router near-tie EQUIVALENT_DEGRADED |
+| **PD** prefill/decode disagg | prefill and decode on separate engines; KV shipped between | L2 cross-region edge (prefill→decode) | any read-at-prefill → write/read-at-decode spans two engines | UNTESTED (high risk) |
+| **KV cache** paged + in-place reuse | KV in paged buffers; activation buffers reused | L1 unnamed KV site; L1.5 read value-semantics | direct KV read/write has no site name; un-cloned read decays | ★ clone-on-save (alias → SW without it) |
+| **prefix cache** (often default-on) | a cached prompt prefix is **not recomputed** on a hit | L1 site existence at cached prompt positions | a read/write at a cached position never runs the forward → silently no-op | UNTESTED — predicted SW, the highest-value untested cell |
+| **chunked prefill** (V1 default) | a long prompt's prefill is split across scheduler steps | L0 scope position (prefill fragmented); L2 cross-chunk accumulation | "read at prefill" fires per-chunk; multi-position prompt ops fragment | UNTESTED |
+| **spec decode** | draft proposes K tokens, target verifies, some rejected | L0 step-quantifier denotation | a per-step decode write/read fires on draft steps that get thrown away | UNTESTED |
+| **quantization** fp8/awq/gptq | activations/weights de/quantized | L1 denotation + precision | activation reads degraded; weight-reading ops see quantized weights | UNTESTED |
+| **CUDA graphs** (`enforce_eager=False`) | the forward is captured into a replayed graph | L0/L1.5 injected hook vs captured graph | interventions error or are skipped unless eager | partly known (perf runs force `enforce_eager`) |
+| (continuous batching) | dynamic batching of requests | model-side lift law (positions) | batched ≢ sequential for absolute-position families | ★ batched GPT-2 positions (model-side law failure) |
+
+### B. Footprint clusters — where every catalogued method lands
+
+Each method inherits its cluster's grid row; composites inherit the worst of their clusters.
+
+- **R · residual read+project** — Logit lens, Tuned lens. `read`(boundary block) `sweep` `live-out` (+`ext-module` for tuned).
+- **I · residual inject/write** — Steering/ActAdd, Zero-ablation, RepE-apply. `read` `write/replacement` `injection`.
+- **S · internal/derived-site read/write** — DLA (per-head), Per-head ablation/read, Attention-pattern read, Induction heads. `read`/`write` × internal(`.source`/`attn-weights`) / derived(head/neuron).
+- **X · cross-run transplant** — Activation patching / causal tracing. `read` `write` `xprompt`.
+- **G · per-step generation lift** — Generation-time steering, Generation-time cross-prompt patching. cluster I/X + `step/bounded` `loop-carried`.
+- **D · gradient** — Attribution patching, EAP-grad. `grad` `derivative`.
+- **E · external-module compute** — SAE read/splice, Transcoder, Linear probe, Circuit Tracer. `read` `ext-module` (`rewiring`/`accumulation`) (+`write`).
+- **M · multi-run edge search** — Path patching, ACDC / EAP. `rewiring` `adaptive` (+`grad` for EAP).
+
+### C. Cluster × serving-feature — predicted status
+
+`·` no attacked component (predicted EQUIVALENT) · `SW` silently-wrong · `ERR` loud error · `DEG`
+degraded / near-tie · `n/a` op unsupported regardless · ★ measured · `/` idiom-dependent (left =
+safe idiom, right = broken idiom). EP applies on MoE families only.
+
+| cluster | TP | PP | EP | PD | KV | PFX | CHP | SPEC | QNT | CG |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **R** read+project | ★·/SW¹ | ★· | DEG | ·/SW | ★· | SW² | DEG | SW³ | DEG | ERR⁴ |
+| **I** inject/write | ★·/★SW¹ | · | DEG | SW | ★· | **SW²** | SW | · | DEG | ERR⁴ |
+| **S** internal/derived | SW⁵ | · | SW⁶ | SW | ★·/SW | SW | SW | SW | DEG | ERR⁴ |
+| **X** transplant | ·/SW | ★· | DEG | **SW**⁷ | ★· | **SW²** | SW | SW | DEG | ERR⁴ |
+| **G** gen-step lift | ·/SW | · | DEG | **SW**⁷ | ★· | SW | ·⁸ | **SW³** | DEG | ERR⁴ |
+| **D** gradient | n/a⁹ | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
+| **E** ext-module | ·/SW⁵ | ·¹⁰ | DEG | SW | ★· | SW | SW | SW | DEG | ERR⁴ |
+| **M** multi-run search | ·/SW | · | DEG | SW | ★· | SW | SW | SW | DEG | ERR⁴ |
+
+¹ the residual is full-width (safe), but a manual `lm_head` / weight matmul or `head.weight[id]`
+index hits the vocab/row shard → SW (the measured `lm_head` finding); the engine `logits` site is
+gathered (safe) — idiom-dependent. ² cached prompt position: the forward never runs there, so the
+read is stale/absent and the write is dropped, no error. ³ a per-step or decode-step op fires on
+draft steps the verifier rejects → you read/steer a token that is never emitted. ⁴ nnsight
+interventions are not in the captured graph → forces eager or errors (why perf uses
+`enforce_eager`); read-only may survive, UNTESTED. ⁵ heads / MLP-intermediate are TP-sharded → a
+head/neuron read or an SAE applied there sees a shard. ⁶ a specific expert's activation lives on one
+rank (the param-gather finding). ⁷ the transplant / per-step edge crosses the prefill→decode engine
+split. ⁸ decode is not chunked, so gen-step decode writes are safe; only the prefill-position part
+fragments. ⁹ grad is ERROR on vLLM regardless of any optimization. ¹⁰ an external module must live
+on the stage that owns layer L (device placement), else it cannot run there.
+
+### The load-bearing predictions
+
+- **prefix cache × {steering, patching, any prompt-position read}** is the densest SILENTLY_WRONG
+  region and is entirely unmeasured: a steer injected at a cached prompt token is silently dropped;
+  a patch whose clean/corrupted activations are cached never runs. Default-on, no error raised.
+- **spec decode × generation-time steering** silently steers rejected draft tokens.
+- **PD disaggregation × {transplant, gen-step}** splits one method's read and write across two
+  engines.
+- **TP / EP × internal-site methods** (per-head, DLA, expert-level SAE) read shards, not whole
+  tensors — the measured `lm_head` / param-gather class generalized to every head/expert-level
+  method.
+
+### What is measured today
+
+TP (residual EQUIVALENT, `lm_head` shard SW, reduction-order DEG), PP (cross-stage write,
+fused-residual), EP (MoE param-gather, router near-tie), KV reuse (clone-on-save), continuous
+batching (positions). Everything in columns PD / prefix-cache / chunked-prefill / spec-decode /
+quant is PREDICTED and UNTESTED — that gap is the serving-feature roadmap.
+
+---
+
 ## nnbench roadmap (prioritized)
 
 **The original Level 0–1 row set is fully measured** (micro tier, refined 2026-06-11: HF 13/13
