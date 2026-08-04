@@ -2,7 +2,7 @@
 plumbing) — no GPU; torch + fakes only.
 
 Pins (1) the per-step replacement-write semantics (the part whose vLLM divergence the GPU sweep
-measures), (2) the generation Workload validation + the driver's new_tokens injection (the regime
+measures), (2) the generation Workload validation + the execute layer's new_tokens injection (the regime
 axis lives on the Workload, cells must still receive it), and (3) a fake-backend sweep over a
 generation workload: oracle on [steps, vocab] stacks, tokens/s throughput, effect-size in the
 generation regime. The bounded-vs-unbounded iteration REALIZATION itself is backend behavior —
@@ -16,11 +16,14 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import isb.methodologies  # noqa: F401,E402  (registers cells)
-import isb.sweep.driver as driver  # noqa: E402
+import isb.sweep.execute as execute_mod  # noqa: E402
 from isb.methodologies.gen_steering import _check_bound, _steer_step  # noqa: E402
 from isb.methodologies.registry import CELLS, get_cell  # noqa: E402
+from isb.runfile import load_run  # noqa: E402
+from isb.runs import EngineConfig, RunConfig  # noqa: E402
 from isb.states import AppState  # noqa: E402
-from isb.sweep.driver import _task_params, _throughput  # noqa: E402
+from isb.sweep.execute import _task_params, _throughput, execute_run  # noqa: E402
+from isb.sweep.score import score_runs  # noqa: E402
 from isb.sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload  # noqa: E402
 
 VOCAB, HID = 11, 4
@@ -37,11 +40,13 @@ class _Head:
 
 
 def test_cells_registered_and_serve_falls_back():
-    assert ("gen_steering", "gpt2", "hf") in CELLS
-    assert ("gen_steering", "gpt2", "vllm_async") in CELLS
+    # family-generic (§12.8): registered once under family="*", resolved per profiled family
+    assert ("gen_steering", "*", "hf") in CELLS
+    assert ("gen_steering", "*", "vllm_async") in CELLS
     # the serve backend reuses the in-process vLLM cell by construction
-    assert get_cell("gen_steering", "gpt2", "vllm_serve") is CELLS[
-        ("gen_steering", "gpt2", "vllm_async")]
+    # serve reuses the in-process vLLM cell: same underlying generic fn behind the profile-bound wrapper
+    assert get_cell("gen_steering", "gpt2", "vllm_serve").__wrapped__ is CELLS[
+        ("gen_steering", "*", "vllm_async")]
 
 
 def test_generation_workload_validates():
@@ -59,7 +64,7 @@ def test_generation_workload_validates():
         pass
 
 
-def test_driver_injects_new_tokens_from_workload():
+def test_execute_layer_injects_new_tokens_from_workload():
     gen = Workload("generation", ["p"], new_tokens=5)
     assert _task_params(gen, {"alpha": 1.0}) == {"alpha": 1.0, "new_tokens": 5}
     inter = Workload("interactive", ["p"])
@@ -165,7 +170,7 @@ def _logits(seed, steps=4):
 
 def _fake_get_cell(methodology, family, backend):
     def fn(impl, model, prompts, **params):
-        assert params["new_tokens"] == 4, "driver must inject the workload's new_tokens"
+        assert params["new_tokens"] == 4, "the execute layer must inject the workload's new_tokens"
         if params.get("alpha") == 0.0:
             return _logits(0)                       # unsteered baseline distribution
         return _logits(3 if params["bound"] == "bounded" else 5)
@@ -173,17 +178,32 @@ def _fake_get_cell(methodology, family, backend):
 
 
 class _FakeBackend:
-    def __init__(self, name):
-        self.name = name
-
     def load(self, repo):
-        return f"model::{self.name}"
+        return "model"
 
     def teardown(self, model):
         pass
 
 
+def _execute_fake(spec, out_dir, name, engine_kind):
+    orig = execute_mod.get_cell, execute_mod.make_backend, execute_mod.resolve_provenance
+    execute_mod.get_cell = _fake_get_cell
+    execute_mod.make_backend = lambda run, sp: _FakeBackend()
+    execute_mod.resolve_provenance = lambda run: {
+        "client": {"nnsight": {"commit": "c"}, "vllm": None, "transformers": "5.x"},
+        "deployment": {"kind": "local"},
+        "engine": {"kind": run.engine.kind, "mode": run.engine.mode, "params": {}},
+        "host": {"hostname": "testbox", "gpus": []},
+    }
+    try:
+        execute_run(spec, RunConfig(engine=EngineConfig(engine_kind)), out_dir, name)
+    finally:
+        execute_mod.get_cell, execute_mod.make_backend, execute_mod.resolve_provenance = orig
+
+
 def test_generation_sweep_oracle_throughput_and_effect():
+    import tempfile
+
     spec = CellConfig(
         name="fake_gen", methodology="m", family="fam", repo="repo://x",
         workloads=[Workload("generation", ["p1", "p2"], new_tokens=4)],
@@ -194,22 +214,19 @@ def test_generation_sweep_oracle_throughput_and_effect():
                           perturbed_params={"alpha": 6.0, "bound": "bounded"}),
         warmup=0, n_trials=1,
     )
-    orig_gc, orig_fp = driver.get_cell, driver._fp32_rerun
-    driver.get_cell = _fake_get_cell
-    driver._fp32_rerun = lambda *a, **k: (lambda c: None)
-    try:
-        results = driver.run_sweep(spec, backends=("hf", "vllm_async"),
-                                   backend_factory=lambda n, s: _FakeBackend(n))
-    finally:
-        driver.get_cell, driver._fp32_rerun = orig_gc, orig_fp
+    with tempfile.TemporaryDirectory() as d:
+        _execute_fake(spec, d, "hf", "transformers")
+        _execute_fake(spec, d, "vllm", "vllm")
+        cells = score_runs(spec, d, "vllm", "hf", quiet=True)
+        meta = load_run(d, "vllm")[0][("__meta__",)]
 
-    by = {(c.backend, c.label): c for c in results}
-    for be_name in ("hf", "vllm_async"):                  # same fake output both backends
-        assert by[(be_name, "bound=iter[0:N]")].state == AppState.SUPPORTED
-        assert by[(be_name, "bound=iter[:]")].state == AppState.SUPPORTED
-    p = by[("vllm_async", "bound=iter[0:N]")].perf
-    assert p is not None and p.throughput is not None     # tokens/s populated for generation
-    assert by[("hf", "bound=iter[0:N]")].workload == "generation"
+    by = {c.label: c for c in cells}
+    for label in ("bound=iter[0:N]", "bound=iter[:]"):     # same fake output both engines
+        assert by[label].state == AppState.SUPPORTED
+    assert by["bound=iter[0:N]"].workload == "generation"
+    m = meta[("generation", "bound=iter[0:N]")]
+    assert m["throughput"] is not None                     # tokens/s populated for generation
+    assert meta[("__effect__", "generation")]["strong"]    # steering moves the fake control
 
 
 def _run_all():

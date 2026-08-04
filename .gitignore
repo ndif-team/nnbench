@@ -6,3 +6,4 @@ results/
 
 # SLURM job output
 slurm/logs/
+runs/

@@ -28,22 +28,16 @@ residual-stream methodologies port unchanged — logit_lens (read), steering (wr
 LAYER"). attention_pattern (only the few `*` layers have a matrix) and attribution's backward are the
 frontier and are not registered here.
 
-MEASURED on the 4B (2026-06-19, vLLM scored vs the HF built-in control) — nnsight-on-vLLM traces
-NemotronH fine (the Mamba state is NOT a wall); the correctness axis is the same fused-residual
-denotation as the llama family:
-  - logit_lens residual=plain -> SILENTLY_WRONG (drops vLLM's fused residual; top1=0.12); residual=
-    fused -> SUPPORTED (top1=0.98); idiomatic unembed -> ERROR (guarded lm_head.forward).
-  - steering replace -> SUPPORTED (top1=1.00) once the read-out uses the documented fused residual
-    (the vLLM steering cell defaults residual="fused"); steering in-place -> ERROR (inference-tensor
-    write). (An earlier plain read-out scored SILENTLY_WRONG — a benchmark-cell bug, now fixed.)
-  - ablation mixer -> SUPPORTED (top1=1.00): its readout is fused-aware (residual="fused").
-All vLLM verdicts reduce to the DOCUMENTED gaps (interp-methods-catalog.md): guarded lm_head.forward,
-in-place-write restriction, fused-residual read; NemotronH adds none of its own.
-The `*_nemotron` (30B-A3B MoE) specs inherit these 4B-measured expectations as their hypothesis
-(unmeasured; needs --pp/--tp). dtype_control="bfloat16" (fp32 at this scale is impractical).
+Measured results for the 4B (2026-06-19) live in findings.md; every vLLM verdict there reduces to
+the documented gaps (interp-methods-catalog.md): guarded lm_head.forward, in-place-write
+restriction, fused-residual read. NemotronH adds none of its own. The `*_nemotron` (30B-A3B MoE)
+specs need --pp/--tp to measure. dtype_control="bfloat16" (fp32 at this scale is impractical).
 """
 from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload
-from ._prompts import PROBE
+from ..data import DataRef
+
+# data is a named, swappable source, sized for the 4B/30B nemotron runs
+PROBE = DataRef("factual", 32)
 
 _REPO_30B = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 _REPO_4B = "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16"
@@ -71,14 +65,6 @@ def _nemotron_specs(suffix: str, repo: str):
         effect=None,
         dtype_control=_BF16,
         vllm_kwargs=_VLLM_TRC,
-        expected={
-            # MEASURED (4B, 2026-06-19, vLLM vs HF): the naive plain read drops vLLM's fused residual ->
-            # SILENTLY_WRONG (top1=0.12, tv=0.65) — the hybrid-Mamba analogue of the llama dual-residual
-            # bug; the fused read matches HF -> SUPPORTED (top1=0.98, omitted = default); idiomatic
-            # unembed hits the guarded lm_head.forward -> ERROR.
-            ("vllm_async", "interactive", "unembed=weight, residual=plain"): "SILENTLY_WRONG",
-            ("vllm_async", "interactive", "unembed=module"): "ERROR",
-        },
     )
     steering = CellConfig(
         name=f"steering_nemotron{suffix}",
@@ -95,13 +81,6 @@ def _nemotron_specs(suffix: str, repo: str):
         ),
         dtype_control=_BF16,
         vllm_kwargs=_VLLM_TRC,
-        expected={
-            # MEASURED (4B): in-place write -> ERROR (inference-tensor protection, the documented
-            # engine-wide gap). The replace write is SUPPORTED (top1=1.00, tv=0.005) once the read-out
-            # uses the documented fused residual (the vLLM steering cell now defaults residual="fused");
-            # reading plain there was a benchmark-cell bug, not a NemotronH limitation. -> default.
-            ("vllm_async", "interactive", "mode=inplace"): "ERROR",
-        },
     )
     ablation = CellConfig(
         name=f"ablation_nemotron{suffix}",
@@ -120,11 +99,6 @@ def _nemotron_specs(suffix: str, repo: str):
         ),
         dtype_control=_BF16,
         vllm_kwargs=_VLLM_TRC,
-        expected={
-            # MEASURED (4B): zero-the-mixer ablation runs on vLLM and matches HF -> SUPPORTED
-            # (top1=1.00, tv~0.01). The readout is fused-aware (residual="fused"), so unlike steering it
-            # is not silently wrong. No entries -> both tasks default SUPPORTED.
-        },
     )
     return logit_lens, steering, ablation
 

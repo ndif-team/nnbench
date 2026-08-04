@@ -10,25 +10,49 @@ from isb.methodologies.registry import CELLS, families_for, get_cell  # noqa: E4
 
 
 def test_cells_registered_by_method_family_backend():
-    assert ("logit_lens", "gpt2", "hf") in CELLS
-    assert ("logit_lens", "gpt2", "vllm_async") in CELLS
+    # logit_lens is family-generic (§12.8): registered once under family="*", resolved for any
+    # profiled family with that family's ModelProfile bound at lookup
+    assert ("logit_lens", "*", "hf") in CELLS
+    assert ("logit_lens", "*", "vllm_async") in CELLS
     assert get_cell("logit_lens", "gpt2", "hf") is not None
-    assert get_cell("logit_lens", "gpt2", "nope") is None       # missing cell -> None
+    assert get_cell("logit_lens", "gpt2", "nope") is None       # missing backend -> None
     assert "gpt2" in families_for("logit_lens", "hf")
 
 
-def test_llama_logit_lens_registered_as_own_family():
-    # second family, same methodology -> separate cells, grouped under family="llama"
-    assert ("logit_lens", "llama", "hf") in CELLS
-    assert ("logit_lens", "llama", "vllm_async") in CELLS
+def test_generic_cell_serves_every_profiled_family_and_only_those():
+    # one "*" registration serves each family that has a ModelProfile; an unprofiled family stays
+    # None (no silent guess about an unknown module tree)
     fams = families_for("logit_lens", "hf")
-    assert {"gpt2", "llama"} <= set(fams)
+    assert {"gpt2", "llama", "nemotron"} <= set(fams)
+    for fam in ("gpt2", "llama", "nemotron"):
+        assert get_cell("logit_lens", fam, "hf") is not None
+        assert get_cell("logit_lens", fam, "vllm_async") is not None
+    assert get_cell("logit_lens", "no-such-family", "hf") is None
+
+
+def test_explicit_family_registration_overrides_generic():
+    # the §12.8 override hatch: an exact (methodology, family, backend) cell beats the "*" cell
+    def special(be, model, prompts, **params):
+        return "explicit"
+    key = ("logit_lens", "gpt2", "hf")
+    prev = CELLS.get(key)
+    CELLS[key] = special
+    try:
+        assert get_cell("logit_lens", "gpt2", "hf") is special
+        # other families still resolve through the generic cell
+        assert get_cell("logit_lens", "llama", "hf") is not special
+    finally:
+        if prev is None:
+            del CELLS[key]
+        else:
+            CELLS[key] = prev
 
 
 def test_cell_accepts_variances():
     fn = get_cell("logit_lens", "gpt2", "hf")
+    # the profile-bound wrapper carries the generic cell via functools.wraps, so signature
+    # inspection sees the real params (m + prompts + the variance knobs)
     params = inspect.signature(fn).parameters
-    # prompts (multiple) + observe-knob (layers) + formulation variant (unembed)
     assert "prompts" in params
     assert "layers" in params and params["layers"].default == "all"
     assert "unembed" in params

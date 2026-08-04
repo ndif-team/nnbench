@@ -73,7 +73,8 @@ def test_runner_sweep_with_echo(tmp_path: Path):
     planf.write_text(json.dumps(plan))
     r = subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "perf.py"), "sweep",
-         "--plan", str(planf), "--out", str(outf)],
+         "--plan", str(planf), "--run-dir", str(tmp_path / "runs"), "--name", "perf-echo",
+         "--out", str(outf)],
         capture_output=True, text=True, timeout=120,
     )
     assert r.returncode == 0, r.stderr
@@ -83,6 +84,12 @@ def test_runner_sweep_with_echo(tmp_path: Path):
     assert by_op["none"]["median_tok_per_s"] > 0
     assert by_op["read"]["median_tok_per_s"] > 0
     assert "HANG" in (by_op["hang"]["error"] or "")
+    # the sweep also writes ONE run file: rows as outputs + provenance marking it perf_micro
+    from isb.runfile import load_run
+    outputs, prov = load_run(str(tmp_path / "runs"), "perf-echo")
+    assert prov["coordinates"]["methodology"] == "perf_micro"
+    assert [r["cell"] for r in outputs[("perf_rows",)]] == [r["cell"] for r in rows]
+    assert "_echo" in prov["perf_envs"]
 
 
 def test_env_for_mapping():
@@ -92,9 +99,9 @@ def test_env_for_mapping():
     # unmapped (e.g. the _echo stub) -> current interpreter, no extra env
     py, extra = perf._env_for("_echo")
     assert py == sys.executable and extra == {}
-    # nnsight carries PYTHONPATH to the dev src
+    # nnsight measures the env's own editable checkout (the corpus stack): no PYTHONPATH override
     py, extra = perf._env_for("nnsight_vllm")
-    assert "nnsight-vllm" in py and "PYTHONPATH" in extra
+    assert "nnsight-vllm" in py and extra == {}
     # ISB_PY_<system> overrides the python
     os.environ["ISB_PY_vllm_hook"] = "/custom/python"
     try:

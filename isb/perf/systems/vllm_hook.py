@@ -1,6 +1,7 @@
 """vllm-hook perf cell: read, steer, qk (system=vllm_hook). Needs the `vllm_hook_plugins` package.
 
-Source-grounded against the installed plugin (runtime-unverified, no GPU yet). vllm-hook is driven
+Source-grounded against the installed plugin and run measured on GPU (bench-vllm-hook env,
+vLLM 0.19.1): read, qk, and steer all execute. vllm-hook is driven
 through `HookLLM`, not raw extra_args: `worker_name` selects the worker and config sets the targets.
   read  -> worker probe_hidden_states ; _output_layers + _hs_mode (last_token|all_tokens)
   qk    -> worker probe_hook_qk        ; layer_to_heads (keys = layers) + _hookq_mode

@@ -55,68 +55,35 @@ def _check_bound(bound):
         raise ValueError(f"unknown iteration bound {bound!r} (expected 'bounded' or 'unbounded')")
 
 
-@cell("gen_steering", family="gpt2", backend="hf")
-def gen_steering_gpt2_hf(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0,
-                         bound="bounded", new_tokens=8):
+@cell("gen_steering", family="*", backend="hf")
+def gen_steering_hf(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0,
+                    bound="bounded", new_tokens=8):
     _check_bound(bound)
     token_id = _resolve_token(model.tokenizer, target)
 
     def step():
         if alpha != 0:
-            _steer_step(model.transformer.h, model.lm_head,
+            _steer_step(m.blocks(model), m.head(model),
                         layer=layer, token_id=token_id, alpha=alpha)
-        return model.lm_head.output[:, -1, :]            # this step's next-token logits [1, vocab]
+        return m.head(model).output[:, -1, :]            # this step's next-token logits [1, vocab]
 
     return be.generate(model, prompts, step, new_tokens=new_tokens,
                        bounded=(bound == "bounded"))
 
 
-@cell("gen_steering", family="gpt2", backend="vllm_async")
-def gen_steering_gpt2_vllm(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0,
-                           bound="bounded", new_tokens=8):
+@cell("gen_steering", family="*", backend="vllm_async")
+def gen_steering_vllm(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0,
+                      bound="bounded", new_tokens=8):
     _check_bound(bound)
     token_id = _resolve_token(model.tokenizer, target)
 
     def step():
         if alpha != 0:
-            _steer_step(model.transformer.h, model.lm_head,
+            _steer_step(m.blocks(model), m.head(model),
                         layer=layer, token_id=token_id, alpha=alpha)
-        # engine site == portable unembed (Level-1 sites are portable on vLLM); [-1:, :] keeps the step's LAST row so the
-        # prefill step (which may carry more than one logits row) matches HF's [:, -1, :] read
-        return model.logits[-1:, :]
-
-    return be.generate(model, prompts, step, new_tokens=new_tokens,
-                       bounded=(bound == "bounded"))
-
-
-# --- llama/Qwen family: blocks are model.model.layers; readout sites unchanged (lm_head on HF,
-# engine `model.logits` on vLLM). _steer_step is reused verbatim.
-@cell("gen_steering", family="llama", backend="hf")
-def gen_steering_llama_hf(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0,
-                          bound="bounded", new_tokens=8):
-    _check_bound(bound)
-    token_id = _resolve_token(model.tokenizer, target)
-
-    def step():
-        if alpha != 0:
-            _steer_step(model.model.layers, model.lm_head,
-                        layer=layer, token_id=token_id, alpha=alpha)
-        return model.lm_head.output[:, -1, :]
-
-    return be.generate(model, prompts, step, new_tokens=new_tokens,
-                       bounded=(bound == "bounded"))
-
-
-@cell("gen_steering", family="llama", backend="vllm_async")
-def gen_steering_llama_vllm(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0,
-                            bound="bounded", new_tokens=8):
-    _check_bound(bound)
-    token_id = _resolve_token(model.tokenizer, target)
-
-    def step():
-        if alpha != 0:
-            _steer_step(model.model.layers, model.lm_head,
-                        layer=layer, token_id=token_id, alpha=alpha)
+        # engine site == portable unembed (Level-1 sites are portable on vLLM); [-1:, :] keeps the
+        # step's LAST row so the prefill step (which may carry more than one logits row) matches
+        # HF's [:, -1, :] read
         return model.logits[-1:, :]
 
     return be.generate(model, prompts, step, new_tokens=new_tokens,

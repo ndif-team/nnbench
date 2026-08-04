@@ -22,7 +22,7 @@ class AppState:
     # near-tie argmaxes flipped (top1 < top1_thresh). On a parallel engine that signature is TP
     # reduction-order non-determinism — the all-reduce sums in a different order than single-GPU, and a
     # sensitive step (e.g. a MoE router's top-k expert selection) flips on a borderline token — NOT a
-    # mechanism divergence. The same-precision (both bf16) analogue of SUPPORTED_DEGRADED; treated as a
-    # non-surprise (it is equivalent up to numerical non-determinism), but surfaced distinctly so the
-    # near-tie is visible rather than rounded up to a clean EQUIVALENT.
+    # mechanism divergence. The same-precision (both bf16) analogue of SUPPORTED_DEGRADED: equivalent
+    # up to numerical non-determinism, surfaced distinctly so the near-tie is visible rather than
+    # rounded up to a clean EQUIVALENT.
     EQUIVALENT_DEGRADED = "EQUIVALENT_DEGRADED"

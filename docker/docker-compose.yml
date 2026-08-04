@@ -75,7 +75,7 @@ services:
       - ${NNSIGHT_SRC:-/disk/u/zikai/nnsight}:/nnsight:ro
       - ..:/nnbench:ro
       - ${HF_CACHE:-/disk/u/models}:/models:ro
-      - ../results/refs:/refs:ro                           # cached integrated references for the oracle
+      - ../results/runs:/refs                              # reference run files; the client also writes its serve run here
     entrypoint: ["python3", "/nnbench/scripts/bench.py"]
     command:
       - --spec
@@ -84,10 +84,10 @@ services:
       - vllm_serve
       - --serve
       - http://server:6677
-      - --refs
+      - --out
       - /refs
-      - --ctl-refs
-      - /refs
+      - --score-vs
+      - hf
     depends_on:
       server:
         condition: service_healthy

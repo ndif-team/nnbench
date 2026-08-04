@@ -388,7 +388,7 @@ denotation-mismatch.
 When a method cell's measured status disagrees with its ∧-prediction, attribute three ways:
 
 - **model-side law failure** — the scientist's lift was invalid for this model
-  (absolute positions under dataset-lift). Recorded as a per-cell expected override with
+  (absolute positions under dataset-lift). Recorded as a dated finding with
   `attribution: model`; it does NOT impeach the entry statuses or ∧.
 - **implementation-side composition failure** — footprint entries interact through shared engine
   state (the upstream saves-clobbering class). Recorded `attribution: implementation`; generates
@@ -397,7 +397,7 @@ When a method cell's measured status disagrees with its ∧-prediction, attribut
   rerun, validated where the activation patch matches HF at fp32 but flips a bf16 near-tie,
   already implements this) → `SUPPORTED_DEGRADED`, `attribution: numerics`.
 
-The model-side-law-failure row is why per-cell expected-state overrides exist: it is the class
+The model-side-law-failure row is why the attribution taxonomy exists: it is the class
 that does NOT decompose through the levels, and the model makes it an explicit, interesting
 category — with a definition (a named law failing, attributed to the model) instead of a vibe.
 
@@ -424,7 +424,7 @@ category — with a definition (a named law failing, attributed to the model) in
   Agreement confirms both the entry statuses and the law instance ("statuses compose upward",
   confirmed at method tier by the generation-time steering composition result). Disagreement is a
   finding in itself and triggers the
-  three-way attribution (§3.6); the runner's existing surprise mechanism catches it.
+  three-way attribution (§3.6); scoring against the stored baseline run surfaces it (§12.11).
 - When an upstream fix lands, the micro-tier row flips first and every dependent method cell flips
   with it — one cause, reported once.
 
@@ -576,8 +576,9 @@ For each (workload × backend × config), a multi-valued state — the user guid
 | `UNSUPPORTED_BY_CONSTRUCTION` | value can't exist (flash-attn attention patterns) | declared + confirmed |
 
 `SILENTLY_WRONG` is **only detectable with the equivalence oracle** → this makes the
-equivalence-oracle correctness goal load-bearing, not optional. Each non-portable workload carries an *expected* state; the runner verifies the
-actual state matches (and flags when vLLM returns `SILENTLY_WRONG` where `ERROR` was expected).
+equivalence-oracle correctness goal load-bearing, not optional. What a state means for a cell —
+known frontier, regression, fix landed — is answered at runtime by scoring against a stored
+baseline run (§12.11); the documented status record lives in the catalog and findings.md.
 
 ### 8.2 Performance
 
@@ -952,16 +953,16 @@ scripts/smoke.py        # enumerate the cells to run; print the map
   next to the registration — pure data, consumed only by reporting/derivation.
 - The **micro tier** (§2, §3.7) is one minimal cell per (Level-0/1/1.5 entry × backend) — most
   extractable from existing cell code — producing the measured primitive-status map that
-  (a) explains method-level expected states, (b) carries the version stamp (provenance attaches to
+  (a) explains method-level statuses, (b) carries the version stamp (provenance attaches to
   ~a dozen primitive rows, not to every cell), and (c) flips first when an upstream fix lands —
   one cause, reported once, with every dependent method cell flipping alongside it.
   **Built 2026-06-11**: `isb/micro/probes.py` (one probe per row, self-contained denotation
   checks, watchdog HANG detection, vLLM probes ordered safest-first), `scripts/micro.py`;
   measured maps in `results/micro_{hf,vllm_async}.txt` — the micro-tier construct findings
   (portable Level-1 sites, and the iteration, barrier, session, and edit/scan construct results).
-- Per-cell `expected` entries remain for **model-side law failures** (§3.6; formerly "regime
-  effects") — the non-decomposable residue, now an explicit category rather than entries
-  indistinguishable from derivable consequences.
+- Model-side law failures (§3.6; formerly "regime effects") are the non-decomposable residue —
+  an explicit attributed category in the findings record rather than entries indistinguishable
+  from derivable consequences.
 - The maintained Level-0/1 status inventory (measured vs UNTESTED per backend) lives in
   `interp-methods-catalog.md`; the UNTESTED rows there are the coverage queue.
 
@@ -1045,3 +1046,127 @@ reduction order) → `EQUIVALENT_DEGRADED`. **PP was not validly testable** — 
 pipeline parallelism (it lives on `pp-on-dev`); `--pp 2` `EngineDeadError` is an unimplemented-path
 artifact, retracted. → `isb/specs/nemotron.py`, `isb/methodologies/{logit_lens,steering,ablation}.py`,
 `isb/sweep/driver.py` (`_fp32_rerun`).
+
+### 12.8 Model profiles, family-generic cells, tasks (2026-07-21)
+
+Per-family knowledge splits in two: model IDENTITY (repo, load kwargs) already lived in specs;
+model IMPLEMENTATION (module-tree paths, the family's vLLM residual denotation) was copy-pasted
+into every methodology file (~55 hardcoded paths; adding a family meant editing ~8 files). It now
+lives once as DATA: `isb/profiles.py` (`ModelProfile`, one row per architecture; `_resid` moved
+there, re-exported from `logit_lens` for its importers). A family-generic cell registers
+`family="*"` and receives the profile as `m`; `registry.get_cell` binds the spec's family string
+to its profile at lookup. An exact `(methodology, family, backend)` registration still wins: the
+override hatch for a family whose intervention code genuinely differs (that case stays an
+explicit cell, preserving §12.1's explicitness exactly where it carries information). The profile
+is an index of module locations, never a construction layer (§11's Resolver lesson holds:
+nothing generates intervention code). Adding a model = a spec (+ one profile row if it is a new
+architecture); zero methodology edits. Converted so far: logit_lens (six per-family cells → one
+hf + one vllm_async generic pair); steering/ablation keep their explicit nemotron cells (the
+single-mixer target is genuinely nemotron-specific code, i.e. the override case).
+
+**Tasks** (`isb/tasks/`) are the corpus-growth form that needs no framework: one function
+`task(be, model, m, items, **knobs)` plus its dataset verbatim (no trace schema; a task's items
+are whatever JSON it consumes). Portability comes only from `be` (backend interface) and `m`
+(profile). First external reproduction: the Jacobian-lens `lens-eval-*` sets
+(`isb/tasks/lens_eval.py`, data in `data/jlens/`, upstream Apache-2.0): all six datasets are one
+function whose only per-dataset knob is the readout-position rule; `transport=None` is the plain
+logit lens, `transport=[J_l]` the J-lens (one extra matmul before the final norm).
+
+### 12.9 Split-run is the canonical method-tier mode (2026-07-23)
+
+The integrated one-process sweep (control + candidate co-resident) was a holdover from the
+smoke-script era, and co-residency produced real failures: the object-patch import-order crash
+(HF traces first, then vLLM's import chain hits a library whose classes can no longer be
+defined), the transformers version conflict (the control needs an arch newer than the vLLM env's
+pin — qwen3_5 made the integrated sweep impossible), shared-GPU teardown ordering, and CUDA init
+in the parent forcing vLLM's worker spawn. Every other tier already isolates per process (micro:
+one backend per process; perf-micro: one system per process; serve/VM: refs files across
+machines). The method tier now does the same by default: `bench.py` runs one subprocess
+per backend (`isb/sweep/split.py`); the control run writes per-(workload, label) refs, every
+other backend's run is scored against them — the serve/VM refs contract, promoted to the standard
+path. A per-backend interpreter map (`--backend-python hf=<env python>`) gives each backend its
+own conda env, which is what makes newer-than-the-pin models benchable. The fp32 precision
+disambiguation is unchanged: a scored run reruns its own backend at the control dtype in-process
+(same stack, no co-residency), or uses `--ctl-refs` where a live rerun is impossible.
+
+**2026-08-01 — folded onto execute/score.** The refs handoff above was a second, weaker copy of
+the run-file contract §12.10 introduced (outputs without provenance, a live fp32 rerun instead of
+a control-dtype run, its own on-disk format). `bench.py` is now a thin orchestrator over that one
+contract: each backend runs as a `scripts/execute.py` subprocess writing a run file into `--out`
+(default: the inbox), and scoring is `score_runs` — the pure-CPU step — over those files, with a
+control-dtype vLLM run (`<spec>-vllm-fp32`, skippable via `--no-ctl`) replacing the live fp32
+rerun. PP/TP equivalence mode is the same shape: the (1,1) control and the (tp,pp) candidate are
+two execute runs whose same-engine provenance selects the equivalence axis at score time. The
+GPU-less serve client executes its over-HTTP run and scores with `--score-vs hf` against
+reference run files produced earlier on a GPU host (`--ctl-only` stocks the control-dtype runs).
+`run_sweep`, the refs files, and the in-process fp32 rerun are deleted; every path — bench sweep,
+hand-run execute/score, the manager — now produces and consumes the same run files.
+
+### 12.10 Runs, data bindings, execute/score, provenance (2026-07-24)
+
+A result's identity is (spec × data × run config), each axis independent:
+
+- **RunConfig** (`isb/runs.py`): engine (transformers|vllm, mode, params — the §6 config axes,
+  incl. serving features like prefix caching) × deployment (local | serve | ndif, each with its
+  own host/commit/env — NDIF is a deployment, not an engine; transformers or vllm runs inside it)
+  × client (interpreter -> env -> nnsight checkout). Backends are thin executors picked by
+  (engine, mode, deployment); `vllm_pp` is gone as a concept (topology is engine params).
+- **Data** (`isb/data.py`): named, swappable sources (the six upstream lens-evals with their
+  readout rules as knobs; the generated sets, `isb/tracegen.py`). Specs bind a default by
+  DataRef; `--data` rebinds every workload, naming the run `<spec>@<source>`.
+- **execute** (`isb/sweep/execute.py`, `scripts/execute.py`): one run, one process, ALWAYS writes
+  ONE self-contained run file `<name>.pt` (`isb/runfile.py`): cell outputs (per-prompt stacks for
+  batched-reference duty; per-cell perf + the effect guard) together with the four-layer
+  provenance (client incl. nnsight commit+dirty+remote, deployment, engine, host hardware), the
+  run's coordinates, and release-check findings when certified. Fresh runs land in the inbox
+  (`runs/inbox`); archiving a run into a collection directory is a file move. Provenance is
+  DESCRIPTIVE: declared values recorded next to resolved ones, drift visible, nothing refuses.
+- **score** (`isb/sweep/score.py`, `scripts/score.py`): a pure CPU step over any two output
+  files. Axis derived from provenance (cross-engine -> correctness; same engine -> equivalence);
+  batched candidates score against the reference's per-prompt stack; `--ctl` disambiguates
+  precision from a control-dtype RUN (data, not a live rerun); the header names both stacks —
+  the visibility whose absence turned the nnsight branch skew (§12.9) into a two-day hunt.
+- **--release** (`isb/preflight.py`): serious-measurement mode only — verifies the visible GPUs
+  are free of other work and disk has headroom, REFUSES on contamination naming the offenders,
+  never waits (scheduling is cluster tooling, not benchmark logic). Casual runs see none of it.
+
+### 12.11 Verdict baselines are stored runs, not spec fields (2026-07-24)
+
+`CellConfig.expected` and the micro tier's `EXPECTED` map are gone. A hardcoded per-cell verdict
+is a measurement: it is only true of the stack it was measured on (nnsight commit, engine
+version, transformers pin), and naming that stack "dev" in a comment pins it to a moving branch
+head. The batched-HF flip (the 2026-07-24 client-tier finding: SILENTLY_WRONG at nnsight 944c8056,
+SUPPORTED at 5166eb12, same cell/model/data) made the failure mode concrete: the field either
+goes stale silently or accretes per-branch annotations inside spec code.
+
+The replacement is the run layer, which already holds every axis the old field lacked:
+
+- A **baseline is a stored run** (`execute` output + provenance). "Did anything change?" is
+  `score` over (new run, old run): the same machinery as cross-engine correctness, with both
+  stacks named in the header and the resolved commits recorded.
+- The **map reports measured states only**; whether a state is a known frontier or a regression
+  is not a property of the spec. The documented status record stays single-copy in
+  interp-methods-catalog.md and findings.md.
+- Specs are back to pure procedure: methodology × workloads × tasks × oracle knobs.
+
+### 12.12 The run manager (2026-07-28; templated package 2026-07-31)
+
+A collection is a directory of run files with one baseline PER SPEC (a run can only reference
+runs of its own spec and data); the manager renders exactly the runs in a selected directory.
+Every run flows through the ONE scoring path (`score_runs`; `reference=None` for baselines,
+whose rows carry raw states because a verdict against itself would be fabricated). Fresh runs
+land in the inbox and appear in no map; archive and discard are file moves, so `mv` from the
+shell is equivalent to the UI buttons.
+
+The code is shaped like the site: a fixed template stamped over uniform data (`isb/manager/`):
+- `model.py` — Collection (entries, per-spec baselines, scored results; mtime caches), rollup,
+  perf points, archive/discard. Pages never touch files or scoring.
+- `htmlkit.py` — every tag, class, and format rule (one table builder, one chip builder, one
+  latency format); pages pass text, the kit escapes.
+- `figure.py` — the operating-point scatter.
+- `pages.py` — composition only, plus ROUTES: the single registry the server
+  (`scripts/manager.py`), the one-file static export (`--export`), and the tests share, so a
+  routed page is exported and crawlable by construction.
+
+The server binds 127.0.0.1 only (run files are unpickled on load) and rejects archive/discard
+names that are not inbox members.

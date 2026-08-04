@@ -39,8 +39,9 @@ def _last(t):
 
 
 def test_cells_registered():
-    assert ("ablation", "gpt2", "hf") in CELLS
-    assert ("ablation", "gpt2", "vllm_async") in CELLS
+    # family-generic (§12.8): registered once under family="*", resolved per profiled family
+    assert ("ablation", "*", "hf") in CELLS
+    assert ("ablation", "*", "vllm_async") in CELLS
     assert get_cell("ablation", "gpt2", "hf") is not None
 
 

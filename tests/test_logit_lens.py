@@ -1,4 +1,4 @@
-"""logit-lens residual-extraction tests (isb/methodologies/logit_lens.py) — no GPU; torch only.
+"""Residual-extraction tests (isb/profiles.py `_resid`/`_untuple`); no GPU, torch only.
 
 `_resid` is load-bearing for the vLLM-Llama SILENTLY_WRONG finding (the fused-residual denotation
 mismatch — a plain read is silently wrong): vLLM's fused-residual
@@ -13,7 +13,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from isb.methodologies.logit_lens import _resid, _untuple  # noqa: E402
+from isb.profiles import _resid, _untuple  # noqa: E402
 
 
 def test_plain_takes_first_element_or_bare():

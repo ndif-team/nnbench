@@ -8,12 +8,14 @@ vLLM async path regardless of model). These exist to exercise the GT2 oracle —
 single-GPU (1,1), same dtype — on a real multi-billion-param model.
 
 Note: under GT2 both sides run the SAME cell, so a cell only needs to RUN and be deterministic;
-absolute correctness vs HF (the fused-residual subtlety) is not what's scored here. `expected` lists
-only cells that genuinely cannot run on vLLM (guarded lm_head.forward, in-place inference-tensor
-write, unbounded iter[:] dropping per-step saves) — the "naturally not supported" set.
+absolute correctness vs HF (the fused-residual subtlety) is not what's scored here.
 """
 from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload
-from ._prompts import CLEAN, CORRUPTED, PROBE
+from ..data import DataRef
+
+# data is a named, swappable source, sized for a 14B two-GPU GT2 run
+PROBE = DataRef("factual", 32)
+_PAIRS = DataRef("ioi_pairs", 16)
 
 _QWEN = "Qwen/Qwen2.5-14B-Instruct"
 _BF16 = "bfloat16"
@@ -34,7 +36,6 @@ logit_lens_qwen = CellConfig(
     baseline=BaselineSpec(params={"unembed": "weight", "layers": [-1], "residual": "plain"}),
     effect=None,
     dtype_control=_BF16,
-    expected={("vllm_async", "interactive", "unembed=module"): "ERROR"},  # guarded lm_head.forward
 )
 
 steering_qwen = CellConfig(
@@ -51,7 +52,6 @@ steering_qwen = CellConfig(
         perturbed_params={**_S, "alpha": 6.0, "mode": "replace"},
     ),
     dtype_control=_BF16,
-    expected={("vllm_async", "interactive", "mode=inplace"): "ERROR"},  # in-place write on inference tensor
 )
 
 ablation_qwen = CellConfig(
@@ -68,13 +68,14 @@ ablation_qwen = CellConfig(
         perturbed_params={"layer": 16, "target": "attn"},
     ),
     dtype_control=_BF16,
-    expected={},
 )
 
 activation_patching_qwen = CellConfig(
     name="activation_patching_qwen",
     methodology="activation_patching", family="llama", repo=_QWEN,
-    workloads=[Workload("interactive", [CLEAN, CORRUPTED], aggregate=False)],
+    # each unit is a (clean, corrupted) IOI pair; the driver runs each pair as its own two-trace
+    # patch and aggregates the equivalence verdict over the set
+    workloads=[Workload("interactive", _PAIRS, aggregate=True)],
     tasks=[
         ({"layer": 8, "residual": "plain"}, "layer=8"),
         ({"layer": 24, "residual": "plain"}, "layer=24"),
@@ -85,7 +86,6 @@ activation_patching_qwen = CellConfig(
         perturbed_params={"layer": 24, "residual": "plain", "patch": True},
     ),
     dtype_control=_BF16,
-    expected={},
 )
 
 gen_steering_qwen = CellConfig(
@@ -102,5 +102,4 @@ gen_steering_qwen = CellConfig(
         perturbed_params={**_S, "bound": "bounded"},
     ),
     dtype_control=_BF16,
-    expected={("vllm_async", "generation", "bound=iter[:]"): "ERROR"},  # unbounded iter[:] drops saves
 )

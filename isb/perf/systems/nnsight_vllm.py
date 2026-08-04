@@ -65,13 +65,17 @@ def run(cfg: Config) -> dict:
             # comparable to vllm-hook's Q/K capture). The attention PATTERN is unreadable on vLLM
             # (paged/flash never materializes it; attention_pattern.py confirms it ERRORs), so this
             # reads projections, not weights. Structural probe over the family's attn + qkv names.
+            # presence checks must be `is not None`, never truthiness: these are nnsight Envoys,
+            # and bool(envoy) delegates to len() on the wrapped module (TypeError on attention)
             saved = []
             for i in idx:
-                attn = getattr(blocks[i], "self_attn", None) or getattr(blocks[i], "attn", None)
+                attn = next((a for a in (getattr(blocks[i], n, None)
+                                         for n in ("self_attn", "attn")) if a is not None), None)
                 if attn is None:
                     raise AttributeError(f"no attention submodule on block {i}")
-                qkv = (getattr(attn, "qkv_proj", None) or getattr(attn, "c_attn", None)
-                       or getattr(attn, "q_proj", None))
+                qkv = next((q for q in (getattr(attn, n, None)
+                                        for n in ("qkv_proj", "c_attn", "q_proj"))
+                            if q is not None), None)
                 if qkv is None:
                     raise AttributeError(f"no qkv projection on {type(attn).__name__}")
                 saved.append(_resid(qkv.output).save())

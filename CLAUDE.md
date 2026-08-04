@@ -29,8 +29,12 @@ CUDA_VISIBLE_DEVICES=0 timeout 1800 $PY scripts/bench.py --spec all --backends h
 # Micro tier (Level 0/1 primitive map) — ONE backend per process, always under `timeout`
 CUDA_VISIBLE_DEVICES=0 timeout 1800 $PY scripts/micro.py --backend hf
 
+# Perf micro (op cost across systems; docs/perf-micro-design.md) — one subprocess per cell,
+# each system in its own conda env; writes ONE perf_micro run file into the inbox
+CUDA_VISIBLE_DEVICES=0 timeout 3600 $PY scripts/perf.py sweep --plan plans/read_footprint_qwen.json
+
 # Client/server (vllm_serve) split — see docker/README.md
-GPU=5 docker/run_vm.sh                      # after dumping refs with bench.py --dump-refs / --dump-ctl-refs
+GPU=5 docker/run_vm.sh                      # after stocking reference run files with bench.py --backends hf / --ctl-only
 ```
 
 vLLM EngineCore uses spawn: every entrypoint must run under an `if __name__ == "__main__"` guard.
@@ -39,11 +43,11 @@ vLLM EngineCore uses spawn: every entrypoint must run under an `if __name__ == "
 
 The core unit is a **cell**: one explicit function per `(methodology, family, backend)`, registered with `@cell(...)` in `isb/methodologies/` (registry in `isb/methodologies/registry.py`). Variances (prompts, layers, idiomatic-vs-portable formulation) are runtime **params** to the cell, not separate registrations. This flatness is deliberate — an earlier "Resolver" abstraction that *generated* intervention code from declarations was killed (design.md §11–12); the leveled primitive model in design.md §3 only *indexes* cells, never constructs them. Do not reintroduce a construction layer. Every `vllm_*` variant cell (`vllm_serve`, `vllm_sync`, `vllm_pp`, …) falls back to the `vllm_async` cell automatically (same intervention code; the variant difference — over-HTTP, in-process-sync, pipeline/tensor-parallel — lives entirely in the backend object).
 
-Data flow for one spec (`scripts/bench.py` → `isb/sweep/driver.py:run_sweep`):
+Data flow for one spec (`scripts/bench.py` → per-run `scripts/execute.py` subprocesses → `isb/sweep/score.py`; run files in between):
 
 1. **Spec** (`isb/specs/`): a `CellConfig` + `Workload`s (interactive / batched) per methodology. Batching is a *coverage axis* — each workload is oracle-checked in its own regime, not just timed.
 2. **Backend** (`isb/backends/`): `be` objects — `hf` (the per-family control), `vllm_async` (in-process system under test), `vllm_serve` (over-HTTP). One model load per backend, amortized across all tasks; an intervention error is isolated (engine survives, later tasks still run).
-3. **Oracle** (`isb/oracle/equivalence.py`): each non-HF cell is scored against the HF cell of the same family via top-1 token agreement + softmax total-variation distance. Precision divergence is disambiguated by an fp32 rerun (in-process) or cached fp32-vLLM refs (`--ctl-refs`, for the GPU-less serve client) → `SUPPORTED_DEGRADED` vs `SILENTLY_WRONG`.
+3. **Oracle** (`isb/oracle/equivalence.py`): each non-HF cell is scored against the HF cell of the same family via top-1 token agreement + softmax total-variation distance. Precision divergence is disambiguated by a control-dtype vLLM run file (`<spec>-vllm-fp32`, executed alongside the sweep; `score.py --ctl`) → `SUPPORTED_DEGRADED` vs `SILENTLY_WRONG`.
 4. **Perf** (`isb/perf/`): warm timing (warmup + N trials, CUDA-synced, median±std, peak mem) — correctness is verified in the same warm/batched regime perf is measured in.
 5. **Report** (`isb/report/`): applicability map (`AppState` in `isb/states.py`) + performance table.
 
@@ -56,5 +60,5 @@ The **micro tier** (`isb/micro/`) probes individual nnsight primitives per backe
 - `docs/design.md` is the living design doc; code comments cite its sections (e.g. `§12.2`) — keep those citations accurate when changing design-relevant code. Measured results go in `docs/findings.md`; the per-context primitive status inventory lives only in `docs/interp-methods-catalog.md` (single copy, so lists can't diverge).
 - The corpus deliberately includes non-portable workloads as frontier markers — an `ERROR` cell on vLLM is a *result*, not a gap to "fix" by deleting the cell. Methodologies often come as matched pairs: the naive port (frontier marker) and the documented-correct form for the backend.
 - **A TP/PP divergence is a finding to classify and document, NOT a cell bug to patch.** By default tensor/pipeline parallelism is assumed to share the *same behavior and same interface* as single-GPU — identical intervention code runs identically on 1 and N GPUs. When `bench.py --pp/--tp` finds a cell that is correct on single-GPU but `DIVERGENT` (the GT2 oracle scores parallel-vs-single vLLM, not vs HF — see design §12.2), that is the benchmark *working*. Classify the divergence as either an interface change users must be made aware of, or — the **default for parallelism** — a translation gap **nnsight** should fix, because an interp user must not have to handle the underlying sharding/distribution. Do NOT rewrite the cell to work around it (that hides the finding and pushes distribution onto users). E.g. `head.weight[token_id]` is correct single-GPU code; under TP vLLM vocab-shards `lm_head`, so the same index returns a shard-local row → an nnsight TP-transparency finding, not a steering-cell fix. (Distinct from a cell using a *known-wrong* pattern like reading the plain residual on a fused-residual family, which IS a suite bug to fix in the cell.)
-- Tests are no-GPU by design: cell logic, oracle, driver invariants run against fake backends. GPU behavior is exercised by `scripts/bench.py`, not the test suite.
+- Tests are no-GPU by design: cell logic, oracle, execute/score invariants run against fake backends. GPU behavior is exercised by `scripts/bench.py`, not the test suite.
 - `serve.cli --host 0.0.0.0` executes pickled Python from the network — only safe on the trusted docker compose bridge; never expose port 6677.

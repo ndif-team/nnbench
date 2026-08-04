@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .logit_lens import _resid
+from ..profiles import _resid
 from .registry import cell
 
 
@@ -45,52 +45,30 @@ def _target_module(block, target):
     raise ValueError(f"unknown ablation target {target!r}")
 
 
-@cell("ablation", family="gpt2", backend="hf")
-def ablation_gpt2_hf(be, model, prompts, *, layer=6, target="mlp", residual="plain"):
-    blk = model.transformer.h[layer]
+@cell("ablation", family="*", backend="hf")
+def ablation_hf(be, model, m, prompts, *, layer=6, target="mlp", residual="plain"):
+    blk = m.blocks(model)[layer]
+    tgt = m.submodule(blk, "mlp" if target == "none" else target)  # "none" never reads it
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
         return _ablate_and_read(
-            _target_module(blk, target), model.transformer.h, model.transformer.ln_f, model.lm_head,
+            tgt, m.blocks(model), m.norm(model), m.head(model),
             target=target, residual=residual, last_fn=be.last)
     return be.run(model, prompts, build)
 
 
-@cell("ablation", family="gpt2", backend="vllm_async")
-def ablation_gpt2_vllm(be, model, prompts, *, layer=6, target="mlp", residual="plain"):
-    blk = model.transformer.h[layer]
+@cell("ablation", family="*", backend="vllm_async")
+def ablation_vllm(be, model, m, prompts, *, layer=6, target="mlp", residual="plain"):
+    # residual defaults to "plain" for BOTH gpt2 and llama, preserving the pre-conversion per-family
+    # defaults verbatim: the llama-vllm plain default is load-bearing for the qwen GT2 specs (both
+    # sides of the parallel-equivalence oracle read the residual the same way; specs/qwen.py). It is
+    # deliberately NOT derived from m.residual_denotation here; changing the llama ablation read is
+    # a behavior decision to take in the specs, not silently in a refactor. (Nemotron's explicit
+    # cells keep their own fused default.)
+    blk = m.blocks(model)[layer]
+    tgt = m.submodule(blk, "mlp" if target == "none" else target)  # "none" never reads it
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
         return _ablate_and_read(
-            _target_module(blk, target), model.transformer.h, model.transformer.ln_f, model.lm_head,
-            target=target, residual=residual, last_fn=be.last)
-    return be.run(model, prompts, build)
-
-
-# --- llama/Qwen family: blocks are model.model.layers; the attention submodule is `self_attn`
-# (not GPT-2's `attn`), and the mlp is `mlp` (same name). _ablate_and_read is reused verbatim.
-def _target_module_llama(block, target):
-    if target in ("mlp", "none"):
-        return block.mlp        # "none" never reads it; mlp is a harmless placeholder
-    if target == "attn":
-        return block.self_attn
-    raise ValueError(f"unknown ablation target {target!r}")
-
-
-@cell("ablation", family="llama", backend="hf")
-def ablation_llama_hf(be, model, prompts, *, layer=6, target="mlp", residual="plain"):
-    blk = model.model.layers[layer]
-    def build():
-        return _ablate_and_read(
-            _target_module_llama(blk, target), model.model.layers, model.model.norm, model.lm_head,
-            target=target, residual=residual, last_fn=be.last)
-    return be.run(model, prompts, build)
-
-
-@cell("ablation", family="llama", backend="vllm_async")
-def ablation_llama_vllm(be, model, prompts, *, layer=6, target="mlp", residual="plain"):
-    blk = model.model.layers[layer]
-    def build():
-        return _ablate_and_read(
-            _target_module_llama(blk, target), model.model.layers, model.model.norm, model.lm_head,
+            tgt, m.blocks(model), m.norm(model), m.head(model),
             target=target, residual=residual, last_fn=be.last)
     return be.run(model, prompts, build)
 

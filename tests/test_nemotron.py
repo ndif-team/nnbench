@@ -78,12 +78,20 @@ class _FakeBE:
 
 
 def test_cells_registered_for_both_backends():
-    for methodology in ("logit_lens", "steering", "ablation"):
+    # ablation keeps explicit nemotron cells (the single-mixer target is nemotron-specific code:
+    # the §12.8 override case); logit_lens and steering are family-generic and resolve through the
+    # "*" cell + the nemotron profile (the boundary write/read is type-agnostic across hybrid blocks)
+    for backend in ("hf", "vllm_async"):
+        assert ("ablation", "nemotron", backend) in CELLS, backend
+        assert get_cell("ablation", "nemotron", backend) is not None
+    for methodology in ("logit_lens", "steering"):
         for backend in ("hf", "vllm_async"):
-            assert (methodology, "nemotron", backend) in CELLS, (methodology, backend)
+            assert (methodology, "nemotron", backend) not in CELLS
             assert get_cell(methodology, "nemotron", backend) is not None
-    # every vllm_* variant falls back to the vllm_async nemotron cell (generalized routing)
-    assert get_cell("logit_lens", "nemotron", "vllm_pp") is get_cell("logit_lens", "nemotron", "vllm_async")
+    # every vllm_* variant falls back to the vllm_async cell (generalized routing); for the generic
+    # cell each lookup returns a fresh profile-bound wrapper, so pin the shared underlying fn
+    assert (get_cell("logit_lens", "nemotron", "vllm_pp").__wrapped__
+            is get_cell("logit_lens", "nemotron", "vllm_async").__wrapped__)
 
 
 def test_target_module_is_the_single_mixer():

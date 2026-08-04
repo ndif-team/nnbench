@@ -454,3 +454,53 @@ pipeline parallelism** (PP lives on the `pp-on-dev` branch); `--pp 2` on every s
 `EngineDeadError`. That is an artifact of exercising an unimplemented path, not a frontier marker —
 retracted, to be measured against a PP-capable nnsight. → nnsight PR #677; `isb/states.py`,
 `isb/runner/run.py`, `isb/sweep/driver.py`, `isb/report/applicability.py`.
+
+## Client tier: the batched-HF verdict depends on the nnsight commit (2026-07-24)
+
+The GPT-2 batched-HF cells are `expected: SILENTLY_WRONG` on the left-pad absolute-position
+artifact: the tokenizer left-pads a multi-row batch, a bare `forward` defaults `position_ids` to
+`0..seq_len-1`, so every padded row's learned position embeddings shift by its pad count. That
+verdict is a property of the **client** (which nnsight the interpreter imports), not of GPT-2:
+nnsight `pp-on-dev` (5166eb12) added `_supply_left_pad_position_ids`
+(`src/nnsight/modeling/language.py`), which derives `position_ids` from the attention mask on the
+bare-forward trace path, while `dev` (944c8056) passes the padded batch through unchanged.
+
+Measured (2026-07-24, GPT-2 fp32 on one GPU, 4 prompts of 1–18 words left-padded to one batch,
+final-position logits vs each prompt's own single-prompt forward;
+`scripts/repro_padded_batch.py`):
+
+| client | padded rows (3 of 4) | unpadded longest row |
+|---|---|---|
+| raw transformers 5.12.1, and 4.57.6 | max-abs 59.3–99.9, TV 0.88–0.99, top-1 flips | max-abs 6e-5 |
+| nnsight `dev` (944c8056), tf 5.12.1 | identical to raw (76.4 / 59.3 / 99.9) | max-abs 6e-5 |
+| nnsight `pp-on-dev` (5166eb12), tf 4.57.6 | max-abs ≤ 3e-4, TV ≤ 3.2e-5, top-1 all match | same |
+
+Raw transformers shows the identical artifact on both 4.57.6 and 5.12.1, so the healing is the
+nnsight fix, not the transformers version. Consequence for the map: the same cell, model, and
+data score `SILENTLY_WRONG` at nnsight 944c8056 and `SUPPORTED` at 5166eb12, so a batched-HF
+verdict means nothing without the resolved nnsight commit next to it. This is the motivating case
+for run provenance (§12.10): a 07-24 batched-HF run scored an "impossible" tv=0.000 against the
+per-prompt reference because the run inherited an interpreter whose editable nnsight was the
+fixed branch while the intended client was the unfixed one: a real measurement of the other
+branch, invisible until the run record carried the resolved commit. It is also why verdict
+baselines are stored runs rather than spec fields (§12.11): a hardcoded expectation would pin
+this verdict to whatever a branch name pointed at on measurement day. Change detection is
+`score` over (new run, stored baseline run), commits named in the header.
+→ `isb/runs.py` (provenance), `scripts/repro_padded_batch.py` (repro).
+
+## Client tier: GPT-2 block outputs lost their tuple wrapper on nnsight main + transformers 5 (2026-07-30)
+
+Measured with `scripts/repro_output_wrapper.py` (GPT-2 on CPU, env nnsight-tf: nnsight main,
+transformers 5.12.1): inside a trace, `model.transformer.h[5].output` is a bare tensor of shape
+(1, 7, 768). On the 2026-06 stack the same read returned a tuple with the hidden states at [0].
+Consequence: code written for the tuple wrapper misreads silently, because `output[0]` on a bare
+tensor selects the batch row (7, 768) instead of the hidden states, and a whole-tuple replacement
+write `(hs, *out[1:])` hands the next module a tuple
+(`TypeError: layer_norm(): argument 'input' must be Tensor, not tuple`).
+
+Two micro probes carried the tuple assumption and mis-scored this client (scan compared against a
+hardcoded batched shape; barrier indexed and wrote through [0]): fixed by normalizing through
+`_hidden`/`_with_hidden` in `isb/micro/probes.py`, after which all 13 hf probes pass (scan
+matches the traced shape; barrier patch equals the two-trace patch, top1=1.00 tv=0.000). The
+method cells were unaffected: their reads already normalize the wrapper.
+→ `scripts/repro_output_wrapper.py` (repro), `isb/micro/probes.py` (probe fix).

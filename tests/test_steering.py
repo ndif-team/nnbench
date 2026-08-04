@@ -41,8 +41,9 @@ def _blocks(steer_out, final_hidden):
 
 
 def test_cells_registered():
-    assert ("steering", "gpt2", "hf") in CELLS
-    assert ("steering", "gpt2", "vllm_async") in CELLS
+    # family-generic (§12.8): registered once under family="*", resolved per profiled family
+    assert ("steering", "*", "hf") in CELLS
+    assert ("steering", "*", "vllm_async") in CELLS
     assert get_cell("steering", "gpt2", "hf") is not None
 
 
