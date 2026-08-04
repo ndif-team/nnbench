@@ -1,8 +1,8 @@
 """vllm-lens perf cell: read, steer (system=vllm_lens). Needs the `vllm-lens` plugin installed.
 
-SCAFFOLD. The read path matches their own benchmark (extra_args output_residual_stream); the steer
-path uses their steering-vector config and is marked VERIFY (exact key/object). No Q/K path (they
-do not expose one). Plugin auto-registers on install.
+The read path matches their own benchmark (extra_args output_residual_stream); the steer path uses
+their SteeringVector config. Both run measured on GPU (bench-vllm-lens env, vLLM 0.19.1). No Q/K
+path (they do not expose one). Plugin auto-registers on install.
 """
 from __future__ import annotations
 
