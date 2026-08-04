@@ -26,7 +26,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .logit_lens import _resid
+from ..profiles import _resid
 from .registry import cell
 
 
@@ -62,9 +62,9 @@ def _patch_and_read(blocks, norm, head, *, layer, clean_act, residual, last_fn):
     return last_fn(logits)
 
 
-def _patch_cell(be, model, prompts, *, layer, residual, patch):
+def _patch_cell(be, model, m, prompts, *, layer, residual, patch):
     clean, corrupted = prompts
-    h, ln_f, head = model.transformer.h, model.transformer.ln_f, model.lm_head
+    h, ln_f, head = m.blocks(model), m.norm(model), m.head(model)
     if not patch:                                        # baseline: corrupted run, no transplant
         def build():  # named so nnsight can source-serialize it to the vLLM worker
             return _read_final(h, ln_f, head, residual, be.last)
@@ -80,41 +80,11 @@ def _patch_cell(be, model, prompts, *, layer, residual, patch):
     return be.patch(model, clean, corrupted, capture=capture, patch=patch_fn)
 
 
-@cell("activation_patching", family="gpt2", backend="hf")
-def patch_gpt2_hf(be, model, prompts, *, layer=6, residual="plain", patch=True):
-    return _patch_cell(be, model, prompts, layer=layer, residual=residual, patch=patch)
+@cell("activation_patching", family="*", backend="hf")
+def patch_hf(be, model, m, prompts, *, layer=6, residual="plain", patch=True):
+    return _patch_cell(be, model, m, prompts, layer=layer, residual=residual, patch=patch)
 
 
-@cell("activation_patching", family="gpt2", backend="vllm_async")
-def patch_gpt2_vllm(be, model, prompts, *, layer=6, residual="plain", patch=True):
-    return _patch_cell(be, model, prompts, layer=layer, residual=residual, patch=patch)
-
-
-# --- llama/Qwen family: blocks/norm/head are model.model.layers / model.model.norm / model.lm_head.
-# Same two-trace capture+inject shape; the capture/read/patch helpers are family-agnostic.
-def _patch_cell_llama(be, model, prompts, *, layer, residual, patch):
-    clean, corrupted = prompts
-    h, ln_f, head = model.model.layers, model.model.norm, model.lm_head
-    if not patch:
-        def build():
-            return _read_final(h, ln_f, head, residual, be.last)
-        return be.run(model, [corrupted], build)
-
-    def capture():
-        return _capture(h, layer, residual)
-
-    def patch_fn(clean_act):
-        return _patch_and_read(
-            h, ln_f, head, layer=layer, clean_act=clean_act, residual=residual, last_fn=be.last)
-
-    return be.patch(model, clean, corrupted, capture=capture, patch=patch_fn)
-
-
-@cell("activation_patching", family="llama", backend="hf")
-def patch_llama_hf(be, model, prompts, *, layer=6, residual="plain", patch=True):
-    return _patch_cell_llama(be, model, prompts, layer=layer, residual=residual, patch=patch)
-
-
-@cell("activation_patching", family="llama", backend="vllm_async")
-def patch_llama_vllm(be, model, prompts, *, layer=6, residual="plain", patch=True):
-    return _patch_cell_llama(be, model, prompts, layer=layer, residual=residual, patch=patch)
+@cell("activation_patching", family="*", backend="vllm_async")
+def patch_vllm(be, model, m, prompts, *, layer=6, residual="plain", patch=True):
+    return _patch_cell(be, model, m, prompts, layer=layer, residual=residual, patch=patch)

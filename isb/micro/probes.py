@@ -54,6 +54,19 @@ def _untuple(x):
     return x[0] if isinstance(x, tuple) else x
 
 
+def _hidden(out):
+    """The hidden-states tensor of a block output. The wrapper is the client's choice: the
+    2026-06 stack returned a tuple with the hidden states at [0]; nnsight main on transformers 5
+    returns the bare tensor. Indexing a bare tensor with [0] silently selects the batch row,
+    which is how the stale probes mis-measured this client."""
+    return out[0] if isinstance(out, tuple) else out
+
+
+def _with_hidden(out, hs):
+    """Whole-output replacement matching the client's output wrapper (see _hidden)."""
+    return (hs, *out[1:]) if isinstance(out, tuple) else hs
+
+
 def _cpu(t):
     return t.detach().float().cpu()
 
@@ -207,17 +220,22 @@ def iteration_unbounded_hf(be, model):
 
 @probe("scan", "hf")
 def scan_hf(be, model):
-    """Level-0 construct: shape-only execution. Denotation: the block-output shape
-    matches (1, n_prompt_tokens, hidden) without running real kernels."""
+    """Level-0 construct: shape-only execution. Denotation: the block-output shape matches the
+    REAL trace's shape without running real kernels. The expected shape is taken from a trace,
+    never hardcoded: the batch dim's presence is the client's choice (nnsight main returns
+    (tokens, hidden) for a single prompt where the 2026-06 stack returned (1, tokens, hidden)),
+    and scan must reproduce whatever the client's real shape is."""
     import nnsight
 
     n_tok = len(model.tokenizer(PROMPT)["input_ids"])
     hidden = model.config.n_embd
+    with model.trace(PROMPT):
+        real = nnsight.save(tuple(_hidden(model.transformer.h[0].output).shape))
     with model.scan(PROMPT):
-        shp = nnsight.save(tuple(model.transformer.h[0].output[0].shape))
-    want = (1, n_tok, hidden)
-    state = AppState.SUPPORTED if tuple(shp) == want else AppState.SILENTLY_WRONG
-    return state, f"scanned shape {tuple(shp)} vs expected {want}"
+        shp = nnsight.save(tuple(_hidden(model.transformer.h[0].output).shape))
+    ok = tuple(shp) == tuple(real) and tuple(shp)[-2:] == (n_tok, hidden)
+    state = AppState.SUPPORTED if ok else AppState.SILENTLY_WRONG
+    return state, f"scanned shape {tuple(shp)} vs traced {tuple(real)}"
 
 
 @probe("edit", "hf")
@@ -281,29 +299,29 @@ def barrier_hf(be, model):
     """Level-0 construct: tracer.barrier(2) sharing a value across two invokes that
     touch the SAME module. Denotation: equals the two-trace patch of the same edit."""
     def capture():
-        return model.transformer.h[5].output[0][:, -1, :]
+        return _hidden(model.transformer.h[5].output)[..., -1, :]
 
     def patch_fn(clean_act):
         out = model.transformer.h[5].output
-        hs = out[0].clone()
-        hs[:, -1, :] = clean_act.to(hs.dtype).to(hs.device)
-        model.transformer.h[5].output = (hs, *out[1:])
-        return model.lm_head.output[:, -1, :]
+        hs = _hidden(out).clone()
+        hs[..., -1, :] = clean_act.to(hs.dtype).to(hs.device)
+        model.transformer.h[5].output = _with_hidden(out, hs)
+        return model.lm_head.output[..., -1, :]
 
     ref = be.patch(model, CLEAN, CORRUPT, capture, patch_fn)
 
     with model.trace() as tracer:
         barrier = tracer.barrier(2)
         with tracer.invoke(CLEAN):
-            clean_hs = model.transformer.h[5].output[0][:, -1, :]
+            clean_hs = _hidden(model.transformer.h[5].output)[..., -1, :]
             barrier()
         with tracer.invoke(CORRUPT):
             barrier()
             out = model.transformer.h[5].output
-            hs = out[0].clone()
-            hs[:, -1, :] = clean_hs
-            model.transformer.h[5].output = (hs, *out[1:])
-            patched = model.lm_head.output[:, -1, :].save()
+            hs = _hidden(out).clone()
+            hs[..., -1, :] = clean_hs
+            model.transformer.h[5].output = _with_hidden(out, hs)
+            patched = model.lm_head.output[..., -1, :].save()
     return _verdict_compare(_cpu(ref), _cpu(patched), "barrier patch vs two-trace patch")
 
 
@@ -838,30 +856,3 @@ def session_unsaved_vllm_sync(be, model):
     return state, f"cross-trace value reuse, |Δ|={val:.2e}"
 
 
-# ---------------------------------------------------------------------------
-# Expected states — the encoded benchmark knowledge (design.md §8.1; the CellConfig.expected
-# convention, here for the micro tier). Values are the DOCUMENTED PRE-FIX baseline
-# (nnsight docs/developing/vllm-construct-gaps.md, diagnosed on vLLM 0.15.1 & 0.19.1). An
-# unlisted (name, backend) defaults to SUPPORTED. Running against the construct-bugs fix branch
-# makes the runner mark deviations as SURPRISE — the regression detector: a surprise is a landed
-# fix now, and (after promoting these to the post-fix map) a regression later.
-# ---------------------------------------------------------------------------
-EXPECTED = {
-    # vLLM sync — the fixes land here:
-    ("iteration_unbounded", "vllm_sync"): AppState.ERROR,        # all saves lost (UnboundLocalError)
-    ("barrier", "vllm_sync"): AppState.SILENTLY_WRONG,           # trace exits clean, saved dict EMPTY
-    ("session_unsaved", "vllm_sync"): AppState.ERROR,            # misleading UnboundLocalError (pre-fix)
-    ("edit", "vllm_sync"): AppState.ERROR,                       # PicklingError -> now gated
-    ("scan", "vllm_sync"): AppState.ERROR,                       # msgspec 'hook' -> now gated
-    # vLLM async — only unbounded-iter is fixed on this engine; barrier/session stay open:
-    ("iteration_unbounded", "vllm_async"): AppState.ERROR,
-    ("barrier", "vllm_async"): AppState.ERROR,
-    ("session_saved", "vllm_async"): AppState.ERROR,
-    ("session_unsaved", "vllm_async"): AppState.ERROR,
-    ("edit", "vllm_async"): AppState.ERROR,
-    ("scan", "vllm_async"): AppState.ERROR,
-}
-
-
-def expected_state(name: str, backend: str) -> str:
-    return EXPECTED.get((name, backend), AppState.SUPPORTED)

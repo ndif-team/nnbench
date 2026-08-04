@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Run the VM-style nnbench split. The serve server hosts ONE model, so specs are grouped by model:
 # for each model we bring the GPU server up ONCE, run the GPU-less client per spec against it, then
-# tear down. Generate the cached references first (a GPU integrated run) — see the README:
-#   CUDA_VISIBLE_DEVICES=N python scripts/bench.py --spec all --backends hf --dump-refs results/refs
+# tear down. Stock the reference run files first (GPU runs) — see the README:
+#   CUDA_VISIBLE_DEVICES=N python scripts/bench.py --spec all --backends hf --out results/runs
+#   CUDA_VISIBLE_DEVICES=N python scripts/bench.py --spec all --ctl-only --out results/runs
 #
 #   ./run_vm.sh                          # every spec below
 #   GPU=5 ./run_vm.sh steering_gpt2 ablation_gpt2   # selected specs on GPU 5
@@ -48,7 +49,7 @@ for model in "${!BY_MODEL[@]}"; do
     echo "-------------------- spec=$spec --------------------"
     # one-shot client against the already-running server (its command is overridden here)
     MODEL="$model" timeout "${CLIENT_TIMEOUT:-360}" docker compose run --rm --no-deps client \
-      --spec "$spec" --backends vllm_serve --serve http://server:6677 --refs /refs --ctl-refs /refs || true
+      --spec "$spec" --backends vllm_serve --serve http://server:6677 --out /refs --score-vs hf || true
   done
   MODEL="$model" docker compose down -v
 done

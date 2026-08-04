@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import isb.methodologies  # noqa: F401,E402  (registers cells)
 from isb.backends import IMPLS, VLLMServeBackend  # noqa: E402
 from isb.methodologies.registry import get_cell  # noqa: E402
-from isb.sweep.driver import _default_backend  # noqa: E402
+from isb.runs import DeploymentConfig, EngineConfig, RunConfig, make_backend  # noqa: E402
 from isb.specs import SPECS  # noqa: E402
 
 
@@ -31,13 +31,14 @@ def test_registered_in_impls():
 def test_registry_fallback_serve_reuses_async_cell():
     # No explicit vllm_serve cell is registered; get_cell must fall back to the vllm_async cell (the
     # serve backend runs the same vLLM model via the same intervention code, differing only in `be`).
+    # logit_lens is family-generic (§12.8), so each lookup returns a fresh profile-bound wrapper;
+    # "same intervention code" is pinned via the wrapper's underlying function (functools.wraps).
     for method in ("logit_lens",):
         for family in ("gpt2", "llama"):
-            assert (
-                get_cell(method, family, "vllm_serve")
-                is get_cell(method, family, "vllm_async")
-                is not None
-            )
+            serve, asyn = (get_cell(method, family, "vllm_serve"),
+                           get_cell(method, family, "vllm_async"))
+            assert serve is not None and asyn is not None
+            assert serve.__wrapped__ is asyn.__wrapped__
     # a genuinely missing (method, family) is still None, not a spurious fallback
     assert get_cell("logit_lens", "no-such-family", "vllm_serve") is None
 
@@ -114,16 +115,19 @@ def test_teardown_is_clean_noop():
     VLLMServeBackend("http://x").teardown(model=object())
 
 
-def test_default_backend_factory_and_no_host_guard():
+def test_serve_deployment_maps_to_serve_backend_and_no_host_guard():
     spec = next(iter(SPECS.values()))
-    be = _default_backend("vllm_serve", spec, serve_host="http://server:6677")
+    run = RunConfig(engine=EngineConfig("vllm"),
+                    deployment=DeploymentConfig(kind="serve", host="http://server:6677"))
+    be = make_backend(run, spec)
     assert isinstance(be, VLLMServeBackend) and be.host == "http://server:6677"
     raised = False
     try:
-        _default_backend("vllm_serve", spec, serve_host=None)
+        make_backend(RunConfig(engine=EngineConfig("vllm"),
+                               deployment=DeploymentConfig(kind="serve")), spec)
     except ValueError:
         raised = True
-    assert raised, "vllm_serve without a server URL must raise"
+    assert raised, "a serve deployment without a server URL must raise"
 
 
 def _run_all():

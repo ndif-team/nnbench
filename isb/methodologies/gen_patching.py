@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import torch
 
-from .logit_lens import _resid
+from ..profiles import _resid
 from .registry import cell
 
 
@@ -79,16 +79,17 @@ def _check_bound(bound):
         raise ValueError(f"unknown iteration bound {bound!r} (expected 'bounded' or 'unbounded')")
 
 
-@cell("gen_patching", family="gpt2", backend="hf")
-def gen_patching_gpt2_hf(be, model, prompts, *, layer=9, residual="plain",
-                         bound="bounded", new_tokens=8, patch=True):
+@cell("gen_patching", family="*", backend="hf")
+def gen_patching_hf(be, model, m, prompts, *, layer=9, residual="plain",
+                    bound="bounded", new_tokens=8, patch=True):
     _check_bound(bound)
     clean, corrupted = prompts
-    h = model.transformer.h
+    h = m.blocks(model)
+    head = m.head(model)
 
     if not patch:                                              # unpatched-generation baseline
         def step():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
-            return model.lm_head.output[:, -1, :]
+            return head.output[:, -1, :]
         return be.generate(model, [corrupted], step,
                            new_tokens=new_tokens, bounded=(bound == "bounded"))
 
@@ -101,18 +102,18 @@ def gen_patching_gpt2_hf(be, model, prompts, *, layer=9, residual="plain",
         if not injected[0]:                                    # the first generation forward IS prefill
             _inject_transplant(h, layer, clean_act)
             injected[0] = True
-        return model.lm_head.output[:, -1, :]                 # this step's next-token logits
+        return head.output[:, -1, :]                           # this step's next-token logits
 
     return be.generate_patch(model, clean, corrupted, capture=capture,
                              build_step=step, new_tokens=new_tokens, bounded=(bound == "bounded"))
 
 
-@cell("gen_patching", family="gpt2", backend="vllm_async")
-def gen_patching_gpt2_vllm(be, model, prompts, *, layer=9, residual="plain",
-                           bound="bounded", new_tokens=8, patch=True):
+@cell("gen_patching", family="*", backend="vllm_async")
+def gen_patching_vllm(be, model, m, prompts, *, layer=9, residual="plain",
+                      bound="bounded", new_tokens=8, patch=True):
     _check_bound(bound)
     clean, corrupted = prompts
-    h = model.transformer.h
+    h = m.blocks(model)
 
     if not patch:
         def step():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker

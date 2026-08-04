@@ -2,15 +2,19 @@
 
 Two modes:
   worker --config-file F   run ONE cell in this process, print `RESULT_JSON {...}`.
-  sweep  --plan P --out O   launch one subprocess per cell (timeout watchdog), collect, attach
-                            overhead, write O. One system per process (vllm-lens / vllm-hook /
-                            nnsight never share an interpreter; vLLM EngineCore uses spawn).
+  sweep  --plan P          launch one subprocess per cell (timeout watchdog), collect, attach
+                           overhead, write ONE run file (methodology "perf_micro") into
+                           --run-dir (default: the inbox), so perf sweeps flow through the same
+                           inbox -> archive -> manager path as every other run. `--out F` also
+                           writes the rows as plain JSON. One system per process (vllm-lens /
+                           vllm-hook / nnsight never share an interpreter; vLLM EngineCore uses
+                           spawn).
 
 Each cell runs in its own conda env (per-system, see _SYSTEM_ENV). The sweep launcher can be any
 python that imports isb.perf.core; each cell subprocess is launched with its system's env python.
 Example:
   CUDA_VISIBLE_DEVICES=5 /disk/u/zikai/anaconda3/envs/nnsight-vllm/bin/python scripts/perf.py sweep \
-      --plan plans/read_footprint.json --out results/read_footprint.json
+      --plan plans/read_footprint_qwen.json --name perf-read-qwen
 """
 from __future__ import annotations
 
@@ -34,10 +38,11 @@ _PREFIX = "RESULT_JSON "
 # The auto-registering plugins (vllm-lens / vllm-hook) must run in isolated envs; nnsight / pure /
 # native share nnsight-vllm (nnsight is opt-in import, no auto-registration). The worker puts isb on
 # sys.path itself, so the env python does not need interp-serve-bench installed.
+# nnsight_vllm carries NO PYTHONPATH override: it measures the env's own editable nnsight, the
+# same stack every vllm run in the correctness corpus records in its provenance.
 _ENVS = "/disk/u/zikai/anaconda3/envs"
-_NNSIGHT_SRC = "/disk/u/zikai/nnsight/src"
 _SYSTEM_ENV: dict[str, tuple[str, dict]] = {
-    "nnsight_vllm": (f"{_ENVS}/nnsight-vllm/bin/python", {"PYTHONPATH": _NNSIGHT_SRC}),
+    "nnsight_vllm": (f"{_ENVS}/nnsight-vllm/bin/python", {}),
     "pure_vllm":    (f"{_ENVS}/nnsight-vllm/bin/python", {}),
     "native_eagle": (f"{_ENVS}/nnsight-vllm/bin/python", {}),
     "vllm_lens":    (f"{_ENVS}/bench-vllm-lens/bin/python", {}),
@@ -104,7 +109,25 @@ def _teardown_note(row: dict) -> None:
           f"err={row.get('error')}", file=sys.stderr, flush=True)
 
 
-def sweep(plan_path: str, out_path: str) -> None:
+def _write_run_file(plan: list[Config], rows: list[dict], run_dir: str, name: str) -> str:
+    """One run file per sweep (methodology "perf_micro"): the rows as outputs, the launcher's
+    resolved provenance, and the per-system env pythons the cells actually ran under."""
+    from isb.runfile import save_run
+    from isb.runs import EngineConfig, RunConfig, resolve_provenance
+
+    prov = resolve_provenance(RunConfig(engine=EngineConfig("vllm")))
+    prov["coordinates"] = {
+        "spec": name, "methodology": "perf_micro", "family": "-",
+        "repo": ", ".join(sorted({c.repo for c in plan})),
+        "data": [], "workloads": [],
+        "tasks": [r["cell"] for r in rows],
+        "interface": "perf",
+    }
+    prov["perf_envs"] = {s: _env_for(s)[0] for s in sorted({c.system for c in plan})}
+    return save_run(run_dir, name, {("perf_rows",): rows, ("__meta__",): {}}, prov)
+
+
+def sweep(plan_path: str, run_dir: str, name: str | None, out_path: str | None) -> None:
     plan = [Config(**c) for c in json.load(open(plan_path))]
     rows = []
     for i, cfg in enumerate(plan, 1):
@@ -113,25 +136,32 @@ def sweep(plan_path: str, out_path: str) -> None:
         _teardown_note(row)
         rows.append(row)
     attach_overhead(rows)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    json.dump(rows, open(out_path, "w"), indent=2)
-    print(f"wrote {len(rows)} rows -> {out_path}", file=sys.stderr)
+    if out_path:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        json.dump(rows, open(out_path, "w"), indent=2)
+        print(f"wrote {len(rows)} rows -> {out_path}", file=sys.stderr)
+    path = _write_run_file(plan, rows, run_dir, name or Path(plan_path).stem)
+    print(f"wrote perf run file ({len(rows)} rows) -> {path}", file=sys.stderr)
 
 
 def main() -> None:
+    from isb.runfile import INBOX
+
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="mode", required=True)
     w = sub.add_parser("worker")
     w.add_argument("--config-file", required=True)
     s = sub.add_parser("sweep")
     s.add_argument("--plan", required=True)
-    s.add_argument("--out", required=True)
+    s.add_argument("--run-dir", default=INBOX, help="run-file directory (default: the inbox)")
+    s.add_argument("--name", default=None, help="run name (default: the plan file's stem)")
+    s.add_argument("--out", default=None, help="also write the rows as plain JSON to this path")
     args = ap.parse_args()
 
     if args.mode == "worker":
         worker(Config.from_json(Path(args.config_file).read_text()))
     else:
-        sweep(args.plan, args.out)
+        sweep(args.plan, args.run_dir, args.name, args.out)
 
 
 if __name__ == "__main__":

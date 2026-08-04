@@ -27,7 +27,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .logit_lens import _resid
+from ..profiles import _resid
 from .registry import cell
 
 CLEAN_ANSWER = " Paris"      # answer for "...France..."
@@ -41,37 +41,36 @@ def _metric(blocks, norm, head, residual, clean_id, corrupt_id):
     return logits[:, clean_id] - logits[:, corrupt_id]
 
 
-def _attribution_cell(be, model, prompts, *, residual, grad):
+def _attribution_cell(be, model, m, prompts, *, residual, grad):
     clean, corrupt = prompts
     clean_id = model.tokenizer.encode(CLEAN_ANSWER)[0]
     corrupt_id = model.tokenizer.encode(CORRUPT_ANSWER)[0]
+    blocks, ln_f, head = m.blocks(model), m.norm(model), m.head(model)
 
-    if not grad:   # baseline: forward-only metric on the corrupt run (no backward) — both backends
+    if not grad:   # baseline: forward-only metric on the corrupt run (no backward), both backends
         def build():  # named so nnsight can source-serialize it to the vLLM worker
-            return _metric(
-                model.transformer.h, model.transformer.ln_f, model.lm_head, residual, clean_id, corrupt_id)
+            return _metric(blocks, ln_f, head, residual, clean_id, corrupt_id)
         return be.run(model, [corrupt], build)
 
-    def acts_of(m):  # named (not a lambda) so nnsight can source-serialize to the vLLM worker
-        return [_resid(blk.output, residual) for blk in m.transformer.h]
+    def acts_of(mdl):  # named (not a lambda) so nnsight can source-serialize to the vLLM worker
+        return [_resid(blk.output, residual) for blk in m.blocks(mdl)]
 
-    def metric_of(m):
-        return _metric(
-            m.transformer.h, m.transformer.ln_f, m.lm_head, residual, clean_id, corrupt_id)
+    def metric_of(mdl):
+        return _metric(m.blocks(mdl), m.norm(mdl), m.head(mdl), residual, clean_id, corrupt_id)
 
     return be.attribute(
         model, clean, corrupt, acts_of=acts_of, metric_of=metric_of,
-        n=len(model.transformer.h),
+        n=len(blocks),
     )
 
 
-@cell("attribution_patching", family="gpt2", backend="hf")
-def attribution_patching_gpt2_hf(be, model, prompts, *, residual="plain", grad=True):
-    return _attribution_cell(be, model, prompts, residual=residual, grad=grad)
+@cell("attribution_patching", family="*", backend="hf")
+def attribution_patching_hf(be, model, m, prompts, *, residual="plain", grad=True):
+    return _attribution_cell(be, model, m, prompts, residual=residual, grad=grad)
 
 
-@cell("attribution_patching", family="gpt2", backend="vllm_async")
-def attribution_patching_gpt2_vllm(be, model, prompts, *, residual="plain", grad=True):
-    # Same explicit code as HF; the divergence is the backend's — vLLM has no autograd, so the
+@cell("attribution_patching", family="*", backend="vllm_async")
+def attribution_patching_vllm(be, model, m, prompts, *, residual="plain", grad=True):
+    # Same explicit code as HF; the divergence is the backend's: vLLM has no autograd, so the
     # backward in `be.attribute` raises and surfaces as ERROR.
-    return _attribution_cell(be, model, prompts, residual=residual, grad=grad)
+    return _attribution_cell(be, model, m, prompts, residual=residual, grad=grad)

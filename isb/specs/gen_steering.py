@@ -11,7 +11,11 @@ Baseline = alpha=0 (no write, same decode loop) -> overhead× isolates the steer
 inside the generation regime; effect-size = TV(alpha=0, alpha=6) per step on the HF control.
 """
 from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload
-from ._prompts import PROBE
+from ..data import DataRef
+
+# data is a named, swappable source: 32 factual prompts, each greedily decoded with the per-step
+# steer; the verdict aggregates per-step logits over all of them
+PROBE = DataRef("factual", 32)
 
 _S = {"layer": 8, "target": " Rome", "alpha": 6.0}
 
@@ -31,11 +35,4 @@ gen_steering_gpt2 = CellConfig(
     # unbounded iter[:] never sets a stop bound on the vLLM path -> the loop overruns and ALL
     # per-step saves are dropped (unbounded iter[:] drops all per-step saves on vLLM) -> clean ERROR. Bounded is the audit's prediction
     # (SUPPORTED via working idioms) — the composition this spec exists to measure.
-    expected={
-        ("vllm_async", "generation", "bound=iter[:]"): "ERROR",
-        # sync pre-fix: unbounded iter[:] dropped all per-step saves (UnboundLocalError) too. The
-        # construct-gap fix sets a per-request stop bound + publishes saves on the unwind, so this
-        # flips to SUPPORTED on the fix branch — the write × unbounded-iter composition, now measurable.
-        ("vllm_sync", "generation", "bound=iter[:]"): "ERROR",
-    },
 )

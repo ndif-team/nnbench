@@ -29,7 +29,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .logit_lens import _resid       # the documented read pattern: plain vs fused (out[0]+out[1])
+from ..profiles import _resid        # the documented read pattern: plain vs fused (out[0]+out[1])
 from .registry import cell
 
 
@@ -88,79 +88,30 @@ def _steer_and_read(blocks, norm, head, *, layer, token_id, alpha, mode, last_fn
     return last_fn(logits)
 
 
-@cell("steering", family="gpt2", backend="hf")
-def steering_gpt2_hf(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace"):
+@cell("steering", family="*", backend="hf")
+def steering_hf(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace"):
     token_id = _resolve_token(model.tokenizer, target)
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
         return _steer_and_read(
-            model.transformer.h, model.transformer.ln_f, model.lm_head,
+            m.blocks(model), m.norm(model), m.head(model),
             layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
         )
     return be.run(model, prompts, build)
 
 
-@cell("steering", family="gpt2", backend="vllm_async")
-def steering_gpt2_vllm(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace"):
+@cell("steering", family="*", backend="vllm_async")
+def steering_vllm(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace",
+                  residual=None):
+    # The read-out residual default derives from the family's vLLM denotation (fused-residual
+    # RMSNorm families must read hidden+residual; plain drops the accumulated residual). Matches
+    # the previous per-family defaults exactly: gpt2 plain, llama/nemotron fused. An explicit
+    # residual= param still overrides.
+    residual = residual if residual is not None else m.default_residual(be.name)
     token_id = _resolve_token(model.tokenizer, target)
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
         return _steer_and_read(
-            model.transformer.h, model.transformer.ln_f, model.lm_head,
+            m.blocks(model), m.norm(model), m.head(model),
             layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
-        )
-    return be.run(model, prompts, build)
-
-
-# --- llama/Qwen family: same methodology, the model's own block list (model.model.layers /
-# model.model.norm / model.lm_head). _steer_and_read is reused verbatim (family-agnostic helper).
-@cell("steering", family="llama", backend="hf")
-def steering_llama_hf(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace"):
-    token_id = _resolve_token(model.tokenizer, target)
-    def build():
-        return _steer_and_read(
-            model.model.layers, model.model.norm, model.lm_head,
-            layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
-        )
-    return be.run(model, prompts, build)
-
-
-@cell("steering", family="llama", backend="vllm_async")
-def steering_llama_vllm(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace",
-                        residual="fused"):
-    # residual="fused": vLLM Llama uses fused-residual RMSNorm, so the read-out must sum (hidden, residual)
-    # (the documented vLLM gap, interp-methods-catalog.md). Plain drops the accumulated residual.
-    token_id = _resolve_token(model.tokenizer, target)
-    def build():
-        return _steer_and_read(
-            model.model.layers, model.model.norm, model.lm_head,
-            layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last, residual=residual,
-        )
-    return be.run(model, prompts, build)
-
-
-# --- nemotron family (Nemotron-H / Nemotron 3): steering is a residual-stream WRITE at a chosen block
-# boundary, type-agnostic across Mamba/attention/MLP/MoE layers — the write lands on
-# `model.model.layers[layer].output` (the additive residual) regardless of the block's op. Built-in
-# transformers NemotronH (NOT trust_remote_code); HF and vLLM share `model.model.*`. `_steer_and_read`
-# is reused verbatim.
-@cell("steering", family="nemotron", backend="hf")
-def steering_nemotron_hf(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace"):
-    token_id = _resolve_token(model.tokenizer, target)
-    def build():
-        return _steer_and_read(
-            model.model.layers, model.model.norm_f, model.lm_head,
-            layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
-        )
-    return be.run(model, prompts, build)
-
-
-@cell("steering", family="nemotron", backend="vllm_async")
-def steering_nemotron_vllm(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace",
-                           residual="fused"):
-    # residual="fused": NemotronH on vLLM is a fused-residual RMSNorm family too — same documented gap.
-    token_id = _resolve_token(model.tokenizer, target)
-    def build():
-        return _steer_and_read(
-            model.model.layers, model.model.norm_f, model.lm_head,
-            layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last, residual=residual,
+            residual=residual,
         )
     return be.run(model, prompts, build)

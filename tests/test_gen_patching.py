@@ -16,8 +16,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import isb.methodologies  # noqa: F401,E402  (registers cells)
-import isb.sweep.driver as driver  # noqa: E402
 import isb.methodologies.gen_patching as gen_patching  # noqa: E402
+import isb.sweep.execute as execute_mod  # noqa: E402
 from isb.methodologies.gen_patching import (  # noqa: E402
     _capture,
     _check_bound,
@@ -36,23 +36,12 @@ class _Block:
 
 
 def test_cells_registered_and_serve_falls_back():
-    assert ("gen_patching", "gpt2", "hf") in CELLS
-    assert ("gen_patching", "gpt2", "vllm_async") in CELLS
-    assert get_cell("gen_patching", "gpt2", "vllm_serve") is CELLS[
-        ("gen_patching", "gpt2", "vllm_async")]
-
-
-def test_serve_expectations_are_explicit_error():
-    # generation over serve is not wired (be.generate_patch raises NotImplementedError) -> ERROR.
-    # The spec must declare this explicitly: a serve cell otherwise inherits the vllm_async
-    # expectation (SUPPORTED_DEGRADED for bounded), reporting the deliberate follow-up as a surprise.
-    from isb.specs.gen_patching import gen_patching_gpt2
-    from isb.sweep.driver import expected_state
-    assert expected_state(gen_patching_gpt2, "vllm_serve", "generation", "bound=iter[0:N]") == AppState.ERROR
-    assert expected_state(gen_patching_gpt2, "vllm_serve", "generation", "bound=iter[:]") == AppState.ERROR
-    # async expectations are unchanged by the explicit serve entries
-    assert expected_state(
-        gen_patching_gpt2, "vllm_async", "generation", "bound=iter[0:N]") == AppState.SUPPORTED_DEGRADED
+    # family-generic (§12.8): registered once under family="*", resolved per profiled family
+    assert ("gen_patching", "*", "hf") in CELLS
+    assert ("gen_patching", "*", "vllm_async") in CELLS
+    # serve reuses the in-process vLLM cell: same underlying generic fn behind the profile-bound wrapper
+    assert get_cell("gen_patching", "gpt2", "vllm_serve").__wrapped__ is CELLS[
+        ("gen_patching", "*", "vllm_async")]
 
 
 def test_inject_replaces_residual():
@@ -199,7 +188,7 @@ def _logits(seed, steps=5):
 
 def _fake_get_cell(methodology, family, backend):
     def fn(impl, model, prompts, **params):
-        assert params["new_tokens"] == 5, "driver must inject the workload's new_tokens"
+        assert params["new_tokens"] == 5, "the execute layer must inject the workload's new_tokens"
         assert isinstance(prompts, (list, tuple)) and len(prompts) == 2, "pair consumed as one unit"
         if not params.get("patch", True):
             return _logits(0)                            # unpatched-generation baseline
@@ -208,17 +197,21 @@ def _fake_get_cell(methodology, family, backend):
 
 
 class _FakeBackend:
-    def __init__(self, name):
-        self.name = name
-
     def load(self, repo):
-        return f"model::{self.name}"
+        return "model"
 
     def teardown(self, model):
         pass
 
 
 def test_generation_pair_sweep_oracle_and_effect():
+    import tempfile
+
+    from isb.runfile import load_run
+    from isb.runs import EngineConfig, RunConfig
+    from isb.sweep.execute import execute_run
+    from isb.sweep.score import score_runs
+
     spec = CellConfig(
         name="fake_gp", methodology="m", family="fam", repo="repo://x",
         workloads=[Workload("generation", ["CLEAN", "CORRUPT"], new_tokens=5, aggregate=False)],
@@ -229,21 +222,34 @@ def test_generation_pair_sweep_oracle_and_effect():
                           perturbed_params={"bound": "bounded", "patch": True}),
         warmup=0, n_trials=1,
     )
-    orig_gc, orig_fp = driver.get_cell, driver._fp32_rerun
-    driver.get_cell = _fake_get_cell
-    driver._fp32_rerun = lambda *a, **k: (lambda c: None)
-    try:
-        results = driver.run_sweep(spec, backends=("hf", "vllm_async"),
-                                   backend_factory=lambda n, s: _FakeBackend(n))
-    finally:
-        driver.get_cell, driver._fp32_rerun = orig_gc, orig_fp
 
-    by = {(c.backend, c.label): c for c in results}
-    for be_name in ("hf", "vllm_async"):                 # same fake output both backends -> match
-        assert by[(be_name, "bound=iter[0:N]")].state == AppState.SUPPORTED
-    assert by[("hf", "bound=iter[0:N]")].workload == "generation"
-    p = by[("vllm_async", "bound=iter[0:N]")].perf
-    assert p is not None and p.throughput is not None    # tokens/s populated for generation
+    def execute_fake(out_dir, name, engine_kind):
+        orig = execute_mod.get_cell, execute_mod.make_backend, execute_mod.resolve_provenance
+        execute_mod.get_cell = _fake_get_cell
+        execute_mod.make_backend = lambda run, sp: _FakeBackend()
+        execute_mod.resolve_provenance = lambda run: {
+            "client": {"nnsight": {"commit": "c"}, "vllm": None, "transformers": "5.x"},
+            "deployment": {"kind": "local"},
+            "engine": {"kind": run.engine.kind, "mode": run.engine.mode, "params": {}},
+            "host": {"hostname": "testbox", "gpus": []},
+        }
+        try:
+            execute_run(spec, RunConfig(engine=EngineConfig(engine_kind)), out_dir, name)
+        finally:
+            execute_mod.get_cell, execute_mod.make_backend, execute_mod.resolve_provenance = orig
+
+    with tempfile.TemporaryDirectory() as d:
+        execute_fake(d, "hf", "transformers")
+        execute_fake(d, "vllm", "vllm")
+        cells = score_runs(spec, d, "vllm", "hf", quiet=True)
+        meta = load_run(d, "vllm")[0][("__meta__",)]
+
+    by = {c.label: c for c in cells}
+    assert by["bound=iter[0:N]"].state == AppState.SUPPORTED   # same fake output both engines
+    assert by["bound=iter[0:N]"].workload == "generation"
+    m = meta[("generation", "bound=iter[0:N]")]
+    assert m["throughput"] is not None                         # tokens/s populated for generation
+    assert meta[("__effect__", "generation")]["strong"]        # the patch moves the fake control
 
 
 def _run_all():

@@ -14,7 +14,8 @@ from .base import Backend
 
 
 class VLLMBackend(Backend):
-    def __init__(self, dtype: str | None = None, trust_remote_code: bool = False):
+    def __init__(self, dtype: str | None = None, trust_remote_code: bool = False,
+                 max_model_len: int | None = None, tokenizer: str | None = None):
         # dtype: precision axis (None -> vLLM's default, bf16 for GPT-2; "float32" matches HF, which is
         # how the oracle separates SUPPORTED_DEGRADED from a true SILENTLY_WRONG bug).
         self.dtype = dtype
@@ -22,6 +23,15 @@ class VLLMBackend(Backend):
         # remote modeling is never executed (vLLM uses its native impl) — needed by NemotronH, arrives
         # via spec.vllm_kwargs.
         self.trust_remote_code = trust_remote_code
+        # max_model_len: caps the KV reservation so big weights + KV fit; a per-model requirement
+        # (specs) or per-run choice (RunConfig), meaningful to every vLLM venue, so it lives here
+        # per this base's one-signature rule. The serve client carries it for provenance even
+        # though the server's engine was configured at deploy time.
+        self.max_model_len = max_model_len
+        # tokenizer: an explicit path/repo for the tokenizer when it differs from the weights repo
+        # (e.g. a shared weights cache whose tokenizer files are unwritable-by-us); forwarded to
+        # vLLM's own `tokenizer=` engine arg.
+        self.tokenizer = tokenizer
 
     def _engine_kwargs(self) -> dict:
         """vLLM engine kwargs shared by the in-process backends — fed to nnsight's `VLLM(...)`."""
@@ -30,4 +40,8 @@ class VLLMBackend(Backend):
             kw["dtype"] = self.dtype
         if self.trust_remote_code:
             kw["trust_remote_code"] = True
+        if self.max_model_len is not None:
+            kw["max_model_len"] = self.max_model_len
+        if self.tokenizer is not None:
+            kw["tokenizer"] = self.tokenizer
         return kw

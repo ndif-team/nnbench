@@ -1,0 +1,91 @@
+"""Data registry + spec rebinding tests (isb/data.py, spec_with_data); no GPU.
+
+Pins the data/spec split: sources resolve by name with their per-dataset knobs, specs bind data
+by reference, rebinding swaps the feed without touching the procedure, and unit-kind mismatches
+are loud. The knob-injection path (dataset knob -> cell params, task param wins) is pinned at the
+execute layer's merge point.
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from isb.data import SOURCES, DataRef, load_data, unit_kind  # noqa: E402
+from isb.sweep.execute import _task_params  # noqa: E402
+from isb.sweep.spec import Workload, spec_with_data  # noqa: E402
+
+
+def test_sources_resolve_with_counts_and_knobs():
+    units, knobs = load_data(DataRef("jlens/multihop"))
+    assert len(units) == 93 and isinstance(units[0], str)
+    assert knobs == {"position": "last"}
+    units, knobs = load_data(DataRef("jlens/poetry"))
+    assert len(units) == 98
+    assert knobs == {"position": "last_newline"}          # the per-dataset readout rule rides along
+    units, _ = load_data(DataRef("jlens/poetry", n=5))
+    assert len(units) == 5                                # file sources slice on demand
+    pairs, _ = load_data(DataRef("ioi_pairs", 7))
+    assert len(pairs) == 7 and isinstance(pairs[0], tuple)
+
+
+def test_unknown_source_and_missing_size_are_loud():
+    try:
+        load_data(DataRef("no-such-set"))
+        raise AssertionError("unknown source must raise with the available list")
+    except KeyError as e:
+        assert "available" in str(e)
+    try:
+        load_data(DataRef("factual"))                     # generated sources require a size
+        raise AssertionError("generated source without n must raise")
+    except ValueError:
+        pass
+
+
+def test_workload_binds_a_dataref_and_carries_its_knobs():
+    w = Workload("interactive", DataRef("jlens/poetry", n=4))
+    assert len(w.prompts) == 4 and w.data_name == "jlens/poetry"
+    assert w.data_knobs == {"position": "last_newline"}
+    # literal lists keep working untouched (the bespoke single-trace specs)
+    w2 = Workload("interactive", ["p1", "p2"])
+    assert w2.prompts == ["p1", "p2"] and w2.data_knobs == {} and w2.data_name is None
+
+
+def test_driver_injects_knobs_under_task_params():
+    w = Workload("interactive", DataRef("jlens/poetry", n=2))
+    assert _task_params(w, {"unembed": "weight"}) == {"position": "last_newline", "unembed": "weight"}
+    # an explicit task param always wins over the dataset default
+    assert _task_params(w, {"position": "last"})["position"] == "last"
+
+
+def test_spec_with_data_swaps_feed_not_procedure():
+    from isb.specs import SPECS
+    spec = SPECS["jacobian_lens_gpt2"]
+    rebound = spec_with_data(spec, DataRef("jlens/poetry"))
+    assert rebound.name == "jacobian_lens_gpt2@jlens-poetry"      # refs/banners never collide
+    assert len(rebound.workloads[0].prompts) == 98
+    assert rebound.workloads[0].data_knobs == {"position": "last_newline"}
+    assert rebound.tasks == spec.tasks                            # procedure untouched
+    assert len(SPECS["jacobian_lens_gpt2"].workloads[0].prompts) == 93        # original untouched
+    # unit-kind mismatch is loud: pair data cannot feed a prompt procedure
+    try:
+        spec_with_data(spec, DataRef("ioi_pairs", 8))
+        raise AssertionError("pair data bound to a prompt procedure must raise")
+    except ValueError:
+        pass
+
+
+def test_every_registered_source_declares_a_unit_kind():
+    for name in SOURCES:
+        assert unit_kind(name) in ("prompt", "pair"), name
+
+
+def _run_all():
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    for fn in fns:
+        fn()
+        print(f"  PASS {fn.__name__}")
+    print(f"\n{len(fns)} tests passed.")
+
+
+if __name__ == "__main__":
+    _run_all()

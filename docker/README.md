@@ -34,11 +34,11 @@ vLLM version; the map records that boundary honestly.
 ## Precision: SUPPORTED_DEGRADED vs SILENTLY_WRONG
 
 ablation/patching diverge from fp32-HF by a small `tv` at the server's bf16 default — a precision
-near-tie, not a bug (they match HF to `tv≈0.001` at fp32). The in-process benchmark separates these by
-re-running at fp32; the GPU-less client can't, so it disambiguates against a **cached fp32-vLLM**
-output (`dump_control_refs`): if the fp32-vLLM result matches the HF control → SUPPORTED_DEGRADED, else
-the divergence is a real mechanism bug → stays SILENTLY_WRONG (e.g. llama `residual=plain`, whose
-fp32-vLLM output still drops the residual).
+near-tie, not a bug (they match HF to `tv≈0.001` at fp32). The GPU-less client disambiguates against a
+**control-dtype vLLM run file** (`<spec>-vllm-fp32.pt`, produced on a GPU host with `bench.py
+--ctl-only`): if the fp32-vLLM result matches the HF control → SUPPORTED_DEGRADED, else the divergence
+is a real mechanism bug → stays SILENTLY_WRONG (e.g. llama `residual=plain`, whose fp32-vLLM output
+still drops the residual).
 
 ## Why the client needs CPU-platform forcing
 
@@ -62,21 +62,23 @@ docker run --rm -e NVIDIA_VISIBLE_DEVICES=void -e HF_HUB_CACHE=/models -e PYTHON
    ```
    docker build -t nnbench-serve:v0.15.1 -f docker/Dockerfile docker/
    ```
-2. **Generate cached references on a GPU host** — the GPU-less client scores against them:
+2. **Stock reference run files on a GPU host** — the GPU-less client scores against them:
    ```
-   # HF control (correctness reference)
-   CUDA_VISIBLE_DEVICES=5 python scripts/bench.py --spec all --backends hf --dump-refs results/refs
-   # fp32-vLLM control-dtype output (for serve precision disambiguation)
-   CUDA_VISIBLE_DEVICES=5 python scripts/bench.py --spec all --dump-ctl-refs results/refs
+   # HF control (correctness reference): writes <spec>-hf.pt run files
+   CUDA_VISIBLE_DEVICES=5 python scripts/bench.py --spec all --backends hf --out results/runs
+   # control-dtype vLLM runs (for serve precision disambiguation): writes <spec>-vllm-fp32.pt
+   CUDA_VISIBLE_DEVICES=5 python scripts/bench.py --spec all --ctl-only --out results/runs
    ```
 3. **Run the split** — specs are grouped by model; one server per model serves all its specs:
    ```
    GPU=5 docker/run_vm.sh                       # every spec
    GPU=5 docker/run_vm.sh steering_gpt2         # selected
    ```
-   Each client prints the applicability map + perf, scoring serve cells against `results/refs`
-   (HF control + fp32-vLLM disambiguation). `DTYPE=float32 docker/run_vm.sh …` runs the server at
-   matched precision (shows the working forms SUPPORTED rather than DEGRADED).
+   Each client executes its over-HTTP run into `results/runs` (mounted at `/refs`) and prints the
+   applicability map, scoring the serve run against the HF reference run file (`--score-vs hf`,
+   control-dtype disambiguation picked up automatically when present). `DTYPE=float32
+   docker/run_vm.sh …` runs the server at matched precision (shows the working forms SUPPORTED
+   rather than DEGRADED).
 
 ## Security
 

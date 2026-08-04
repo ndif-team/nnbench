@@ -2,7 +2,7 @@
 
 The 5 near-identical `scripts/smoke_*.py` collapse to one CellConfig each: the hardcoded
 METHOD/FAMILY/REPO/PROMPTS/TASKS plus the per-script effect-size baseline become data here, and the
-single driver (`isb/sweep/driver.py`) consumes them. No Resolver / YAML — the spec is Python next to
+single execute layer (`isb/sweep/execute.py`) consumes them. No Resolver / YAML — the spec is Python next to
 the cells, matching the flat `@cell` registry idiom.
 """
 from __future__ import annotations
@@ -14,10 +14,16 @@ from typing import Optional
 @dataclass
 class Workload:
     """An input regime. Batching is a coverage axis (it can change correctness), so each workload is
-    oracle-checked in its own regime, not just timed."""
+    oracle-checked in its own regime, not just timed.
+
+    `prompts` is either a literal unit list (the bespoke single-trace specs) or a `DataRef` naming a
+    registered source (isb/data.py) — data is a replaceable feed, so the same procedure runs any
+    compatible dataset. A DataRef resolves at construction: its units land in `.prompts` and its
+    per-dataset cell-param defaults in `.data_knobs` (injected UNDER task params by the driver, so
+    an explicit task param always wins)."""
     kind: str                 # "interactive" (N independent prompts) | "batched" (N prompts) |
                               # "generation" (greedy multi-token decode; cells read/intervene per step)
-    prompts: list
+    prompts: object           # list of units, or a DataRef
     new_tokens: int = 0       # generation: decode steps per prompt; injected into cell params by the
                               # driver (the regime axis lives on the Workload, not in every task dict)
     aggregate: bool = True    # interactive/generation: run each prompt as its OWN trace and score the
@@ -25,8 +31,17 @@ class Workload:
                               # not a single-token anecdote. Set False for cells that consume their
                               # prompt list as ONE unit (clean/corrupt pairs) or can't stack (attention
                               # maps).
+    data_knobs: dict = field(default_factory=dict)
+    data_name: str | None = None
 
     def __post_init__(self):
+        from ..data import DataRef, load_data
+
+        if isinstance(self.prompts, DataRef):
+            ref = self.prompts
+            self.prompts, knobs = load_data(ref)
+            self.data_knobs = {**knobs, **self.data_knobs}
+            self.data_name = ref.name
         if self.kind == "generation" and self.new_tokens <= 0:
             raise ValueError("generation workload needs new_tokens>0")
         if self.kind not in ("interactive", "batched", "generation"):
@@ -70,17 +85,32 @@ class CellConfig:
     n_trials: int = 7
     hf_kwargs: dict = field(default_factory=dict)
     vllm_kwargs: dict = field(default_factory=dict)
-    # The benchmark's encoded knowledge: what each cell is EXPECTED to do, so a run reports the DELTA
-    # ("cell X flipped") instead of restating the map. Keyed by (backend, workload_kind, label); only
-    # the non-SUPPORTED cells need listing — anything unlisted defaults to SUPPORTED. A vllm_serve cell
-    # with no entry inherits the vllm_async expectation (serve should match in-process vLLM; a mismatch
-    # is a genuine transport surprise). See `expected_state` in the driver.
-    #
-    # CONVENTION (two modes, one field): an entry is the cell's known **steady state** on the bench's
-    # reference nnsight — engine-mode-independent statuses are verified identical on dev and the fix
-    # branch (e.g. the vllm_sync batched/interactive entries). The one deliberate exception is a
-    # **flip-detector**: for a cell whose status an upstream fix *in flight* will change, the entry
-    # holds the PRE-FIX baseline so the fix surfaces as a ⚠ SURPRISE on a fix-branch run (e.g.
-    # gen_steering's unbounded `iter[:]` left at ERROR; the micro tier's barrier/iteration in
-    # `isb/micro/probes.py`). Same regression-detector role, pointed at an expected change.
-    expected: dict = field(default_factory=dict)
+
+
+def spec_with_data(spec: CellConfig, ref) -> CellConfig:
+    """The same procedure over a different data source (`bench.py --data`): interactive/generation
+    workloads rebind to `ref`'s units; a batched workload rebuilds from the first 16 units of the
+    same source (the padded-batch REGIME is the point there, not volume). Unit kinds must match —
+    binding pair-data to a prompt-procedure (or vice versa) is a loud error. The copy's name gains
+    an `@source` suffix so refs, outputs, and banners never collide with the default binding."""
+    import dataclasses
+
+    from ..data import load_data, unit_kind
+
+    units, knobs = load_data(ref)
+    rebound = []
+    for w in spec.workloads:
+        current = "pair" if (w.prompts and isinstance(w.prompts[0], tuple)) else "prompt"
+        if unit_kind(ref.name) != current:
+            raise ValueError(
+                f"data source {ref.name!r} yields {unit_kind(ref.name)!r} units but "
+                f"{spec.name!r}'s {w.kind} workload consumes {current!r} units")
+        if w.kind == "batched":
+            rebound.append(Workload("batched", units[:16],
+                                    data_knobs=dict(knobs), data_name=ref.name))
+        else:
+            rebound.append(Workload(w.kind, list(units), new_tokens=w.new_tokens,
+                                    aggregate=w.aggregate,
+                                    data_knobs=dict(knobs), data_name=ref.name))
+    return dataclasses.replace(
+        spec, name=f"{spec.name}@{ref.name.replace('/', '-')}", workloads=rebound)

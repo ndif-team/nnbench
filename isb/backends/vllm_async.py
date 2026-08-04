@@ -24,21 +24,22 @@ class VLLMAsyncBackend(VLLMBackend):
                  tensor_parallel_size: int = 1,
                  distributed_executor_backend: str | None = None,
                  gpu_memory_utilization: float = 0.2,
-                 max_model_len: int | None = None):
-        # dtype + trust_remote_code are the engine-config shared with the sync/serve backends (see
-        # VLLMBackend); the parallelism + memory knobs below are specific to the in-process async engine.
-        super().__init__(dtype=dtype, trust_remote_code=trust_remote_code)
+                 max_model_len: int | None = None,
+                 tokenizer: str | None = None):
+        # dtype + trust_remote_code + max_model_len are engine-config shared with the sync/serve
+        # backends (see VLLMBackend); the parallelism + memory knobs below are specific to the
+        # in-process async engine.
+        super().__init__(dtype=dtype, trust_remote_code=trust_remote_code,
+                         max_model_len=max_model_len, tokenizer=tokenizer)
         # Parallelism axes (default 1 == single-GPU, the v1 behaviour). PP>1/TP>1 are forwarded
         # straight to nnsight's VLLM, which passes them to vLLM. distributed_executor_backend
         # must be "ray" for multi-node placement; None uses vLLM's default (mp) on one node.
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
         self.distributed_executor_backend = distributed_executor_backend
-        # Engine memory knobs. The 0.2 default is sized for tiny GPT-2; a multi-billion-param model
-        # needs a much higher fraction (e.g. 0.9) just to hold its weights, and a capped max_model_len
-        # keeps the KV reservation small. Both are forwarded to vLLM via nnsight's VLLM.
+        # The 0.2 default is sized for tiny GPT-2; a multi-billion-param model needs a much higher
+        # fraction (e.g. 0.9) just to hold its weights alongside the (max_model_len-capped) KV.
         self.gpu_memory_utilization = gpu_memory_utilization
-        self.max_model_len = max_model_len
         self._loop = None
 
     def __getstate__(self):
@@ -73,15 +74,13 @@ class VLLMAsyncBackend(VLLMBackend):
             gpu_memory_utilization if gpu_memory_utilization is not None
             else self.gpu_memory_utilization
         )
-        kw = self._engine_kwargs()                  # dtype + trust_remote_code (shared engine-config)
+        kw = self._engine_kwargs()          # dtype + trust_remote_code + max_model_len (shared)
         if self.pipeline_parallel_size > 1:
             kw["pipeline_parallel_size"] = self.pipeline_parallel_size
         if self.tensor_parallel_size > 1:
             kw["tensor_parallel_size"] = self.tensor_parallel_size
         if self.distributed_executor_backend is not None:
             kw["distributed_executor_backend"] = self.distributed_executor_backend
-        if self.max_model_len is not None:
-            kw["max_model_len"] = self.max_model_len
         return VLLM(
             repo, mode="async", dispatch=True,
             gpu_memory_utilization=gpu_memory_utilization, **kw,
