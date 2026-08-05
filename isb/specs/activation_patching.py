@@ -9,8 +9,11 @@ transplant); effect-size = TV(unpatched, patched) aggregated over the pairs on t
 from ..data import DataRef
 from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload
 
-# data is a named, swappable pair source; each unit is one (clean, corrupted) trace
-_PAIRS = DataRef("ioi_pairs", 40)
+# data is a named, swappable pair source; each unit is one (clean, corrupted) trace.
+# Default: the MIB circuit-track IOI snapshot (data/mib/README.md) — clean prompt +
+# s2_io_flip counterfactual, BPE-length-matched. The template bank stays available
+# via --data ioi_pairs.
+_PAIRS = DataRef("mib/ioi", 40)
 
 activation_patching_gpt2 = CellConfig(
     name="activation_patching_gpt2",

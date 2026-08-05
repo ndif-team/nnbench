@@ -16,7 +16,8 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-_JLENS_DIR = Path(__file__).resolve().parents[1] / "data" / "jlens"
+_DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+_JLENS_DIR = _DATA_DIR / "jlens"
 
 # the upstream per-dataset readout rules (data/jlens/README-upstream.md); single copy
 POSITION_RULES = {
@@ -52,6 +53,17 @@ def _jlens_loader(slug: str):
     return load
 
 
+def _mib_ioi(field_):
+    """MIB IOI snapshot (data/mib/README.md): 'pair' -> (clean, corrupted) tuples for
+    activation patching, 'prompt' -> clean prompts for ablation. Same file, two views."""
+    def load(n=None):
+        items = json.load(open(_DATA_DIR / "mib" / "ioi.json"))["items"]
+        units = ([(it["clean"], it["corrupted"]) for it in items] if field_ == "pair"
+                 else [it["clean"] for it in items])
+        return units[:n] if n else units
+    return load
+
+
 def _generated(fn):
     def load(n=None):
         if n is None:
@@ -71,6 +83,8 @@ def _sources() -> dict:
     for slug, rule in POSITION_RULES.items():
         short = slug.removeprefix("lens-eval-")
         out[f"jlens/{short}"] = Source("prompt", _jlens_loader(slug), knobs={"position": rule})
+    out["mib/ioi"] = Source("pair", _mib_ioi("pair"))
+    out["mib/ioi_prompts"] = Source("prompt", _mib_ioi("prompt"))
     return out
 
 

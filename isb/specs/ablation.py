@@ -6,9 +6,11 @@ the control.
 from ..data import DataRef
 from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload
 
-# data is a named, swappable source — see logit_lens.py
-PROBE = DataRef("factual", 100)
-BATCHED = DataRef("factual", 16)
+# data is a named, swappable source — see logit_lens.py. Default: clean prompts from the
+# MIB circuit-track IOI snapshot (data/mib/README.md) — component knockout over the IOI
+# task is the MIB ablation setting. The template bank stays available via --data factual.
+PROBE = DataRef("mib/ioi_prompts", 100)
+BATCHED = DataRef("mib/ioi_prompts", 16)
 
 ablation_gpt2 = CellConfig(
     name="ablation_gpt2",
