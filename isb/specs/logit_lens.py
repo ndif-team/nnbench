@@ -7,11 +7,12 @@ baseline reflects the per-layer lens cost.
 from ..data import DataRef
 from ..sweep.spec import BaselineSpec, CellConfig, Workload
 
-# Data is a named, swappable source (isb/data.py; override at the CLI with --data). The defaults:
-# the generated factual pool — interactive scores over 100 units; batched pads a size-16 subset
-# (batched is a regime check, not a volume axis).
-PROBE = DataRef("factual", 100)
-BATCHED = DataRef("factual", 16)
+# Data is a named, swappable source (isb/data.py; override at the CLI with --data). The default:
+# CounterFact factual-recall prompts (data/counterfact/README.md) — interactive scores over 100
+# units; batched pads a size-16 subset (batched is a regime check, not a volume axis). The
+# template bank stays available via --data factual.
+PROBE = DataRef("counterfact", 100)
+BATCHED = DataRef("counterfact", 16)
 
 logit_lens_gpt2 = CellConfig(
     name="logit_lens_gpt2",

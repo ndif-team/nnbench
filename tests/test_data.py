@@ -40,6 +40,14 @@ def test_mib_ioi_views_share_the_snapshot():
     assert unit_kind("mib/ioi") == "pair" and unit_kind("mib/ioi_prompts") == "prompt"
 
 
+def test_counterfact_source():
+    prompts, knobs = load_data(DataRef("counterfact"))
+    assert len(prompts) == 1000 and knobs == {}
+    assert all(isinstance(p, str) and p == p.rstrip() for p in prompts)  # pre-answer form, no tail space
+    assert unit_kind("counterfact") == "prompt"
+    assert len(load_data(DataRef("counterfact", 16))[0]) == 16
+
+
 def test_unknown_source_and_missing_size_are_loud():
     try:
         load_data(DataRef("no-such-set"))

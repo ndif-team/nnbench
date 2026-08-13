@@ -64,6 +64,16 @@ def _mib_ioi(field_):
     return load
 
 
+def _counterfact():
+    """CounterFact snapshot (data/counterfact/README.md): factual-recall prompts; the
+    per-item true/counterfactual targets stay in the file for answer-based metrics."""
+    def load(n=None):
+        items = json.load(open(_DATA_DIR / "counterfact" / "counterfact.json"))["items"]
+        prompts = [it["prompt"] for it in items]
+        return prompts[:n] if n else prompts
+    return load
+
+
 def _generated(fn):
     def load(n=None):
         if n is None:
@@ -85,6 +95,7 @@ def _sources() -> dict:
         out[f"jlens/{short}"] = Source("prompt", _jlens_loader(slug), knobs={"position": rule})
     out["mib/ioi"] = Source("pair", _mib_ioi("pair"))
     out["mib/ioi_prompts"] = Source("prompt", _mib_ioi("prompt"))
+    out["counterfact"] = Source("prompt", _counterfact())
     return out
 
 
