@@ -21,9 +21,10 @@ failure vs the cross-engine greedy-trajectory artifact), not an assumed pass.
 from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload
 from ..data import DataRef
 
-# data is a named, swappable pair source; 12 keeps the generation regime (pair x 5 decode steps
-# x trials) tractable while the verdict still aggregates over a set instead of one hand-written pair
-_PAIRS = DataRef("ioi_pairs", 12)
+# data is a named, swappable pair source; the MIB IOI snapshot (data/mib/README.md), sized at 12
+# to keep the generation regime (pair x 5 decode steps x trials) tractable while the verdict still
+# aggregates over a set instead of one hand-written pair
+_PAIRS = DataRef("mib/ioi", 12)
 
 _P = {"layer": 9, "residual": "plain"}
 

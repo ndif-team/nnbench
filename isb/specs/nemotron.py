@@ -36,8 +36,9 @@ specs need --pp/--tp to measure. dtype_control="bfloat16" (fp32 at this scale is
 from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload
 from ..data import DataRef
 
-# data is a named, swappable source, sized for the 4B/30B nemotron runs
-PROBE = DataRef("factual", 32)
+# data is a named, swappable source (CounterFact factual-recall prompts), sized for the
+# 4B/30B nemotron runs
+PROBE = DataRef("counterfact", 32)
 
 _REPO_30B = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 _REPO_4B = "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16"

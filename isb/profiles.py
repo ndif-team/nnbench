@@ -22,13 +22,23 @@ import torch
 
 
 def _untuple(x):
-    # PP cross-stage outputs are LazyRemoteTensor, which is NOT a tuple instance even when it wraps a
-    # (hidden, residual) tuple, so `isinstance(x, tuple)` is unreliable under pipeline parallelism and
-    # would pass the lazy-wrapped tuple straight into RMSNorm (-> empty_like(tuple) TypeError on Qwen/
-    # Llama, whose blocks return tuples). Probe tensor-ness first and index [0] on everything else:
-    # real tuples index cleanly, and LazyRemoteTensor[0] returns a deferred child that pulls element 0.
-    # Matches the codebase convention (nnsight tests/vllm/pp/manual run_equivalence_matrix._hidden).
-    return x if isinstance(x, torch.Tensor) else x[0]
+    # PP cross-stage outputs are LazyRemoteTensor regardless of what they wrap, so isinstance
+    # answers "is this a lazy", never "is the wrapped value a tensor or a tuple". Indexing [0] on
+    # every lazy (the 0.7-era convention this helper used to follow) is correct for tuple-output
+    # blocks (Qwen/Llama: element 0 is the hidden state) and wrong for tensor-output blocks
+    # (GPT-2: it selects ROW 0 of the (tokens, hidden) slab, a 1-D tensor that breaks every
+    # consumer downstream). Ask the lazy for the wrapped value's rank instead: `.ndim`
+    # materializes a wrapped tensor and answers; for a wrapped tuple the lazy deliberately
+    # raises its index-it-first AttributeError, which is the designed discriminator, not a hedge.
+    if isinstance(x, torch.Tensor):
+        return x
+    if isinstance(x, tuple):
+        return x[0]
+    try:
+        x.ndim
+        return x
+    except AttributeError:
+        return x[0]
 
 
 def _resid(out, how):

@@ -6,9 +6,11 @@ control (the per-mode non-vacuity guard, now declarative).
 from ..data import DataRef
 from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload
 
-# data is a named, swappable source — see logit_lens.py
-PROBE = DataRef("factual", 100)
-BATCHED = DataRef("factual", 16)
+# data is a named, swappable source — see logit_lens.py. Default: CounterFact factual-recall
+# prompts (data/counterfact/README.md); the snapshot's per-item target_new strings are the
+# hook for a later per-item steering-target upgrade (today `target` is one task param).
+PROBE = DataRef("counterfact", 100)
+BATCHED = DataRef("counterfact", 16)
 
 _S = {"layer": 8, "target": " Rome", "alpha": 6.0}
 

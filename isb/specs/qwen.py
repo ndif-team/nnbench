@@ -13,9 +13,11 @@ absolute correctness vs HF (the fused-residual subtlety) is not what's scored he
 from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload
 from ..data import DataRef
 
-# data is a named, swappable source, sized for a 14B two-GPU GT2 run
-PROBE = DataRef("factual", 32)
-_PAIRS = DataRef("ioi_pairs", 16)
+# data is a named, swappable source, sized for a 14B two-GPU GT2 run. CounterFact prompts +
+# MIB IOI pairs (all 1000 pairs verified BPE-length-matched under the Qwen2.5 tokenizer, which
+# the patch cell's shape check requires)
+PROBE = DataRef("counterfact", 32)
+_PAIRS = DataRef("mib/ioi", 16)
 
 _QWEN = "Qwen/Qwen2.5-14B-Instruct"
 _BF16 = "bfloat16"

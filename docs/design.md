@@ -1112,8 +1112,15 @@ A result's identity is (spec × data × run config), each axis independent:
   × client (interpreter -> env -> nnsight checkout). Backends are thin executors picked by
   (engine, mode, deployment); `vllm_pp` is gone as a concept (topology is engine params).
 - **Data** (`isb/data.py`): named, swappable sources (the six upstream lens-evals with their
-  readout rules as knobs; the generated sets, `isb/tracegen.py`). Specs bind a default by
-  DataRef; `--data` rebinds every workload, naming the run `<spec>@<source>`.
+  readout rules as knobs; the MIB IOI and CounterFact snapshots, `data/mib/` and
+  `data/counterfact/`; the generated sets, `isb/tracegen.py`). Specs bind a default by
+  DataRef; `--data` rebinds every workload, naming the run `<spec>@<source>`. Every method's
+  default feed is a published dataset where one exists for its task family: the jlens
+  lens-evals for the jacobian lens, MIB IOI pairs for activation patching / generation
+  patching (and their clean side for ablation), CounterFact factual-recall prompts for
+  logit lens, steering, generation steering, and the family probes. The single-trace
+  frontier markers (attention pattern, attribution patching) keep their fixed inputs
+  (`isb/specs/_prompts.py`), and the template banks remain as `--data` alternatives.
 - **execute** (`isb/sweep/execute.py`, `scripts/execute.py`): one run, one process, ALWAYS writes
   ONE self-contained run file `<name>.pt` (`isb/runfile.py`): cell outputs (per-prompt stacks for
   batched-reference duty; per-cell perf + the effect guard) together with the four-layer

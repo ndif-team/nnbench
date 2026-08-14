@@ -13,9 +13,9 @@ inside the generation regime; effect-size = TV(alpha=0, alpha=6) per step on the
 from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload
 from ..data import DataRef
 
-# data is a named, swappable source: 32 factual prompts, each greedily decoded with the per-step
-# steer; the verdict aggregates per-step logits over all of them
-PROBE = DataRef("factual", 32)
+# data is a named, swappable source: 32 CounterFact factual-recall prompts, each greedily decoded
+# with the per-step steer; the verdict aggregates per-step logits over all of them
+PROBE = DataRef("counterfact", 32)
 
 _S = {"layer": 8, "target": " Rome", "alpha": 6.0}
 
