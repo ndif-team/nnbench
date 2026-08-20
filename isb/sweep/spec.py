@@ -100,7 +100,9 @@ def spec_with_data(spec: CellConfig, ref) -> CellConfig:
     units, knobs = load_data(ref)
     rebound = []
     for w in spec.workloads:
-        current = "pair" if (w.prompts and isinstance(w.prompts[0], tuple)) else "prompt"
+        u0 = w.prompts[0] if w.prompts else None
+        current = ("pair_labeled" if isinstance(u0, tuple) and len(u0) == 3
+                   else "pair" if isinstance(u0, tuple) else "prompt")
         if unit_kind(ref.name) != current:
             raise ValueError(
                 f"data source {ref.name!r} yields {unit_kind(ref.name)!r} units but "

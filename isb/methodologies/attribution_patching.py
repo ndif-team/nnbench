@@ -9,7 +9,10 @@ corrupt forward+backward. For a residual activation `a` and metric `M`:
 so the per-layer attribution is `((a_clean - a_corrupt) * grad_corrupt).sum()`. Metric here is the
 logit difference `logit[clean_answer] - logit[corrupt_answer]` on the corrupt run (portable unembed,
 so the weight matmul sidesteps vLLM's guarded `lm_head.forward`); a high positive score at layer L means "patching L's clean
-residual would most raise the clean-vs-corrupt logit gap".
+residual would most raise the clean-vs-corrupt logit gap". The unit is a LABELED pair
+(clean, corrupted, (correct, incorrect)) — the per-item answers come from the data source
+(mib/ioi_labeled stores the MIB snapshot's indirect_object/subject strings), so the verdict
+aggregates the [n_layers] attribution over a real pair set instead of one hand-written pair.
 
 **Backend frontier — this cell exercises the `grad` primitive.** It needs autograd (a backward pass).
 HF supports it -> SUPPORTED. vLLM runs in inference mode; its activations are inference tensors, so
@@ -30,9 +33,6 @@ import torch.nn.functional as F
 from ..profiles import _resid
 from .registry import cell
 
-CLEAN_ANSWER = " Paris"      # answer for "...France..."
-CORRUPT_ANSWER = " Moscow"   # answer for "...Russia..."
-
 
 def _metric(blocks, norm, head, residual, clean_id, corrupt_id):
     """logit[clean] - logit[corrupt] at the last token, via the portable unembed. Runs in a trace."""
@@ -42,9 +42,9 @@ def _metric(blocks, norm, head, residual, clean_id, corrupt_id):
 
 
 def _attribution_cell(be, model, m, prompts, *, residual, grad):
-    clean, corrupt = prompts
-    clean_id = model.tokenizer.encode(CLEAN_ANSWER)[0]
-    corrupt_id = model.tokenizer.encode(CORRUPT_ANSWER)[0]
+    clean, corrupt, answers = prompts
+    clean_id = model.tokenizer.encode(answers[0])[0]     # correct answer for the clean prompt
+    corrupt_id = model.tokenizer.encode(answers[1])[0]   # the competing (incorrect) answer
     blocks, ln_f, head = m.blocks(model), m.norm(model), m.head(model)
 
     if not grad:   # baseline: forward-only metric on the corrupt run (no backward), both backends
