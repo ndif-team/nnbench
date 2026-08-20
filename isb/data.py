@@ -5,7 +5,8 @@ it runs over is a named, swappable source resolved here. One J-lens procedure ru
 upstream eval distributions; the binding is an invocation choice (`--data`), with each spec
 declaring a default so the standard sweep is unchanged.
 
-A source yields UNITS: prompt strings, or (clean, corrupted) pairs — the driver already treats
+A source yields UNITS: prompt strings, (clean, corrupted) pairs, or labeled pairs
+(clean, corrupted, (correct_answer, incorrect_answer)) — the driver already treats
 units polymorphically. A source also carries KNOBS: per-dataset cell-param defaults (e.g. the
 upstream readout-position rule), injected under any explicit task params. Unit kind is declared,
 so binding pair-data to a prompt-procedure fails loudly instead of feeding tuples into a trace.
@@ -40,7 +41,7 @@ class DataRef:
 
 @dataclass(frozen=True)
 class Source:
-    unit: str                    # "prompt" | "pair"
+    unit: str                    # "prompt" | "pair" | "pair_labeled"
     load: object                 # callable(n | None) -> list of units
     knobs: dict = field(default_factory=dict)   # per-dataset cell-param defaults
 
@@ -55,11 +56,17 @@ def _jlens_loader(slug: str):
 
 def _mib_ioi(field_):
     """MIB IOI snapshot (data/mib/README.md): 'pair' -> (clean, corrupted) tuples for
-    activation patching, 'prompt' -> clean prompts for ablation. Same file, two views."""
+    activation patching, 'prompt' -> clean prompts for ablation, 'pair_labeled' -> the pair
+    plus the stored (correct, incorrect) answer strings for answer-based metrics (attribution
+    patching's logit difference, DAS's counterfactual-label loss). Same file, three views."""
     def load(n=None):
         items = json.load(open(_DATA_DIR / "mib" / "ioi.json"))["items"]
-        units = ([(it["clean"], it["corrupted"]) for it in items] if field_ == "pair"
-                 else [it["clean"] for it in items])
+        if field_ == "pair":
+            units = [(it["clean"], it["corrupted"]) for it in items]
+        elif field_ == "pair_labeled":
+            units = [(it["clean"], it["corrupted"], tuple(it["answers"])) for it in items]
+        else:
+            units = [it["clean"] for it in items]
         return units[:n] if n else units
     return load
 
@@ -69,6 +76,14 @@ def _counterfact():
     per-item true/counterfactual targets stay in the file for answer-based metrics."""
     def load(n=None):
         items = json.load(open(_DATA_DIR / "counterfact" / "counterfact.json"))["items"]
+        prompts = [it["prompt"] for it in items]
+        return prompts[:n] if n else prompts
+    return load
+
+
+def _wikitext():
+    def load(n=None):
+        items = json.load(open(_DATA_DIR / "wikitext" / "wikitext.json"))["items"]
         prompts = [it["prompt"] for it in items]
         return prompts[:n] if n else prompts
     return load
@@ -94,8 +109,10 @@ def _sources() -> dict:
         short = slug.removeprefix("lens-eval-")
         out[f"jlens/{short}"] = Source("prompt", _jlens_loader(slug), knobs={"position": rule})
     out["mib/ioi"] = Source("pair", _mib_ioi("pair"))
+    out["mib/ioi_labeled"] = Source("pair_labeled", _mib_ioi("pair_labeled"))
     out["mib/ioi_prompts"] = Source("prompt", _mib_ioi("prompt"))
     out["counterfact"] = Source("prompt", _counterfact())
+    out["wikitext"] = Source("prompt", _wikitext())
     return out
 
 

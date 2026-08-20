@@ -504,3 +504,33 @@ hardcoded batched shape; barrier indexed and wrote through [0]): fixed by normal
 matches the traced shape; barrier patch equals the two-trace patch, top1=1.00 tv=0.000). The
 method cells were unaffected: their reads already normalize the wrapper.
 → `scripts/repro_output_wrapper.py` (repro), `isb/micro/probes.py` (probe fix).
+
+## Method tier — the gradient class: DAS training and jacobian collection, GPT-2, HF vs vLLM-async (2026-08-20)
+
+The `grad` frontier had one measured realization (attribution patching's single backward). This
+adds the other two shapes gradient-based interpretability takes, so the frontier is now a measured
+class, and it closes the loop on the train-on-HF / apply-on-serving split.
+
+| workload | hf | vllm_async | note |
+|---|---|---|---|
+| attribution patching, 20 labeled MIB pairs | SUPPORTED ([20, 12] stack, 63 ms) | **ERROR** | per-item answers from `mib/ioi_labeled` feed the logit-diff metric; `requires_grad_` raises on the inference-tensor residuals |
+| DAS apply (seeded orthogonal rotation, k=64, layer 6) | BASELINE | **SUPPORTED_DEGRADED** (top1=1.00, tv=0.056; fp32 control matches) | rotated interchange = COMPUTE + replacement WRITE: the DAS program shape ports wherever activation patching does |
+| DAS train (24 AdamW steps on the rotation) | SUPPORTED (5.2 s median) | **ERROR** | held-out interchange accuracy 0.0 (seeded) -> 1.0 (trained), loss 5.16 -> 0.006; vLLM raises "Inference tensors cannot be saved for backward" at the first grad-tracking op (the rotation matmul), before any backward |
+| jacobian collection (4 wikitext prompts x 8 batched VJPs) | SUPPORTED ([11, 768, 768], 26.6 s median; forward-only baseline 63 ms) | **ERROR** | the upstream fitting estimator (jlens/fitting.py): one-hot cotangents at all valid target positions, grads at all 11 source layers per backward |
+
+### The gradient loop reaches the trainable through the frozen model
+The DAS step's loss is measured at the model output, so its backward crosses the frozen downstream
+layers to reach the external rotation parameter. On HF that works inside a trace: the parameter is
+closed over by the trace body, `loss.backward()` runs in the trace frame, and the gradient lands on
+the parameter outside (`be.train_patch`; the optimizer stays with the caller). This is the whole
+mechanism DAS/DBM-class methods need, and it is exactly the part vLLM's inference mode removes:
+every realization dies at the first op that would record a graph on an inference tensor, not at
+`backward()` itself.
+
+### Collected maps apply cleanly across engines
+`scripts/export_jacobian.py` turns the collection run's [11, 768, 768] stack into the fitted-lens
+.pt layout, consumed by the jacobian_lens `transport="file:..."` scheme. Applying the collected J
+on both engines over 10 multihop prompts (per-prompt traces, the driver's regime): top1=1.00
+tv=0.001 at fp32; top1=0.95 tv=0.044 at the bf16 default (near-tie flips, the usual precision
+class). So the full pipeline — collect on HF, export, apply on vLLM — holds, which is the
+practical recipe for every gradient-trained artifact on a serving backend.

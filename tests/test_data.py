@@ -96,7 +96,26 @@ def test_spec_with_data_swaps_feed_not_procedure():
 
 def test_every_registered_source_declares_a_unit_kind():
     for name in SOURCES:
-        assert unit_kind(name) in ("prompt", "pair"), name
+        assert unit_kind(name) in ("prompt", "pair", "pair_labeled"), name
+
+
+def test_labeled_pair_source_and_kind_check():
+    units, _ = load_data(DataRef("mib/ioi_labeled", 5))
+    assert all(len(u) == 3 for u in units)
+    clean, corrupted, answers = units[0]
+    assert isinstance(answers, tuple) and len(answers) == 2
+    assert all(a.startswith(" ") for a in answers)        # leading-space token form
+    pairs, _ = load_data(DataRef("mib/ioi", 5))
+    assert [(u[0], u[1]) for u in units] == pairs          # same snapshot, answers appended
+    from isb.specs import attribution_patching as ap
+    spec = ap.attribution_patching_gpt2
+    try:                                                   # labeled procedure rejects plain pairs
+        spec_with_data(spec, DataRef("mib/ioi", 5))
+        raise AssertionError("pair data bound to a labeled-pair procedure must raise")
+    except ValueError:
+        pass
+    rebound = spec_with_data(spec, DataRef("mib/ioi_labeled", 5))
+    assert len(rebound.workloads[0].prompts) == 5
 
 
 def _run_all():
@@ -109,3 +128,16 @@ def _run_all():
 
 if __name__ == "__main__":
     _run_all()
+
+
+def test_wikitext_source_and_jacobian_valid_slice():
+    prompts, knobs = load_data(DataRef("wikitext"))
+    assert len(prompts) == 100 and knobs == {}
+    assert all(len(p) >= 150 for p in prompts)            # long enough to clear the sink skip
+    from isb.methodologies.jacobian_collect import valid_slice
+    assert valid_slice(50, 16) == slice(16, 49)           # sink prefix out, final position out
+    try:
+        valid_slice(17, 16)
+        raise AssertionError("too-short prompt must raise")
+    except ValueError:
+        pass

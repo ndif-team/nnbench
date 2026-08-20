@@ -22,6 +22,8 @@ transport matmul (meta-compute) + norm + portable unembed, HF vs vLLM, on the re
   - "hub:<repo>@<revision>:<filename>": the REAL fitted lens (the `trained` tag): downloads the
     upstream checkpoint (cached), whose `J` is one [d, d] matrix PER LAYER; resolved once per
     process (lru_cache), passed into the trace as a mapping.
+  - "file:<path>": a locally fitted lens in the same .pt layout — e.g. the maps a
+    jacobian_collect run produced, exported by scripts/export_jacobian.py.
   - a torch.Tensor (one shared map) or a Mapping {layer_index: tensor} (per-layer), directly.
 
 Variances (params): `layers` ("all" | list) — the read band; `position` ("last" | "last_newline",
@@ -62,8 +64,13 @@ def _parse_hub(spec: str) -> tuple[str, str, str]:
 
 @functools.lru_cache(maxsize=4)
 def _load_fitted(spec: str) -> Mapping:
-    """Download (cached) and load an upstream fitted lens; returns its per-layer {layer: [d, d]}
-    map. The upstream .pt layout: {"J": {layer_index: tensor}, "source_layers": [...], ...}."""
+    """Load a fitted lens; returns its per-layer {layer: [d, d]} map. Two schemes, one .pt
+    layout ({"J": {layer_index: tensor}, ...}): "hub:<repo>@<revision>:<filename>" downloads
+    (cached) an upstream checkpoint; "file:<path>" reads a local artifact, e.g. one exported
+    from a jacobian_collect run by scripts/export_jacobian.py."""
+    if spec.startswith("file:"):
+        return torch.load(spec.removeprefix("file:"), map_location="cpu",
+                          weights_only=False)["J"]
     from huggingface_hub import hf_hub_download
 
     repo, revision, filename = _parse_hub(spec)
