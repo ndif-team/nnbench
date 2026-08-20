@@ -30,6 +30,14 @@ class Backend:
         """
         raise NotImplementedError
 
+    def train_patch(self, model, source_prompt, base_prompt, capture, step):
+        """One gradient step over a (source, base) prompt pair: trace 1 captures the source
+        activation (materialized to CPU); trace 2 calls `step(src)` -> a scalar loss proxy inside
+        the trace and runs its backward. Gradients land on any external trainable tensors `step`
+        closes over (the DAS rotation); the CALLER owns the optimizer (step/zero outside).
+        Returns the loss as a CPU scalar tensor."""
+        raise NotImplementedError
+
     def attribute(self, model, clean_prompt, corrupt_prompt, acts_of, metric_of, n):
         """Attribution patching: a first-order linear approximation of activation patching over a
         clean/corrupt pair. `acts_of(model)` returns the `n` per-layer activation proxies to attribute

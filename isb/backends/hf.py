@@ -45,6 +45,17 @@ class HFBackend(Backend):
             res = patch(clean_act).save()
         return res.detach().float().cpu()
 
+    def train_patch(self, model, source_prompt, base_prompt, capture, step):
+        with model.trace(source_prompt):     # trace 1: source (counterfactual) activation, no grad
+            s = capture().save()
+        src = s.detach().float().cpu()
+        with model.trace(base_prompt):       # trace 2: intervened forward + backward on the loss
+            loss = step(src)
+            lv = loss.save()
+            with loss.backward():
+                pass                         # grads land on step's external trainables
+        return lv.detach().float().cpu()
+
     def attribute(self, model, clean_prompt, corrupt_prompt, acts_of, metric_of, n):
         import torch
 
