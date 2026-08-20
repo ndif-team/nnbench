@@ -81,6 +81,14 @@ def _counterfact():
     return load
 
 
+def _wikitext():
+    def load(n=None):
+        items = json.load(open(_DATA_DIR / "wikitext" / "wikitext.json"))["items"]
+        prompts = [it["prompt"] for it in items]
+        return prompts[:n] if n else prompts
+    return load
+
+
 def _generated(fn):
     def load(n=None):
         if n is None:
@@ -104,6 +112,7 @@ def _sources() -> dict:
     out["mib/ioi_labeled"] = Source("pair_labeled", _mib_ioi("pair_labeled"))
     out["mib/ioi_prompts"] = Source("prompt", _mib_ioi("prompt"))
     out["counterfact"] = Source("prompt", _counterfact())
+    out["wikitext"] = Source("prompt", _wikitext())
     return out
 
 

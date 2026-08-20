@@ -7,6 +7,7 @@ from .attribution_patching import attribution_patching_gpt2
 from .das import das_gpt2
 from .gen_patching import gen_patching_gpt2
 from .gen_steering import gen_steering_gpt2
+from .jacobian_collect import jacobian_collect_gpt2
 from .jacobian_lens import jacobian_lens_gpt2, jacobian_lens_qwen35
 from .logit_lens import logit_lens_gpt2, logit_lens_llama
 from .steering import steering_gpt2
@@ -40,6 +41,7 @@ SPECS = {
         attention_pattern_gpt2,
         attribution_patching_gpt2,
         das_gpt2,
+        jacobian_collect_gpt2,
         # Qwen3.5-4B (family=qwen3_5) — the fitted-J-lens spec; by name only, not in `all`
         jacobian_lens_qwen35,
         # Qwen2.5-14B (family=llama) — large-model TP/PP equivalence specs
@@ -64,7 +66,7 @@ SPECS = {
 _DEFAULT_SPECS = (
     logit_lens_gpt2, logit_lens_llama, jacobian_lens_gpt2, steering_gpt2, gen_steering_gpt2,
     gen_patching_gpt2, activation_patching_gpt2, ablation_gpt2, attention_pattern_gpt2,
-    attribution_patching_gpt2, das_gpt2,
+    attribution_patching_gpt2, das_gpt2, jacobian_collect_gpt2,
 )
 
 

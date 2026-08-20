@@ -128,3 +128,16 @@ def _run_all():
 
 if __name__ == "__main__":
     _run_all()
+
+
+def test_wikitext_source_and_jacobian_valid_slice():
+    prompts, knobs = load_data(DataRef("wikitext"))
+    assert len(prompts) == 100 and knobs == {}
+    assert all(len(p) >= 150 for p in prompts)            # long enough to clear the sink skip
+    from isb.methodologies.jacobian_collect import valid_slice
+    assert valid_slice(50, 16) == slice(16, 49)           # sink prefix out, final position out
+    try:
+        valid_slice(17, 16)
+        raise AssertionError("too-short prompt must raise")
+    except ValueError:
+        pass

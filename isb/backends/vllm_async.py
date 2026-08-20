@@ -192,6 +192,24 @@ class VLLMAsyncBackend(VLLMBackend):
             return self._extract(last2)       # surfaces the worker's requires_grad error
         return self._run_coro(_go())
 
+    def vjp_batch(self, model, prompts, acts_of, target_of, make_cotangent, n=None):
+        """vLLM activations are inference-mode tensors with no autograd; the VJP sweep cannot
+        run. Attempt `requires_grad_(True)` on the source activations — it raises in the worker
+        and surfaces as a clean per-cell ERROR. FORWARD-ONLY, no backward over the async path
+        (fail-fast, no hang risk); same design as `attribute`."""
+        prompt = prompts[0] if isinstance(prompts, (list, tuple)) else prompts
+        async def _go():
+            with model.trace(prompt, temperature=0.0, top_p=1, max_tokens=1) as tracer:
+                acts = acts_of(model)
+                for a in acts:
+                    a.requires_grad_(True)            # raises: inference tensor, no autograd
+                probe = acts[0].save()  # noqa: F841 — never meaningfully reached; the above raises
+            last = None
+            async for output in tracer.backend:
+                last = output
+            return self._extract(last)                # surfaces the worker's requires_grad error
+        return self._run_coro(_go())
+
     def attribute(self, model, clean_prompt, corrupt_prompt, acts_of, metric_of, n=None):
         """vLLM activations are inference-mode tensors with no autograd, so attribution patching
         cannot run. We attempt `requires_grad_(True)` on the corrupt run's residuals: it raises in the

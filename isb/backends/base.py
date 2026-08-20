@@ -38,6 +38,14 @@ class Backend:
         Returns the loss as a CPU scalar tensor."""
         raise NotImplementedError
 
+    def vjp_batch(self, model, prompts, acts_of, target_of, make_cotangent, n):
+        """One VJP sweep on a batched single-prompt trace: `target_of(model)` is the tensor the
+        cotangent contracts with, `make_cotangent(target)` builds the cotangent inside the trace
+        (one one-hot output dimension per batch row), and the backward of `(target * cot).sum()`
+        populates grads on the `n` activation proxies from `acts_of(model)`. Returns the `n`
+        per-layer gradients as CPU tensors."""
+        raise NotImplementedError
+
     def attribute(self, model, clean_prompt, corrupt_prompt, acts_of, metric_of, n):
         """Attribution patching: a first-order linear approximation of activation patching over a
         clean/corrupt pair. `acts_of(model)` returns the `n` per-layer activation proxies to attribute

@@ -56,6 +56,21 @@ class HFBackend(Backend):
                 pass                         # grads land on step's external trainables
         return lv.detach().float().cpu()
 
+    def vjp_batch(self, model, prompts, acts_of, target_of, make_cotangent, n):
+        grads = [None] * n
+        with model.trace(prompts):
+            a = acts_of(model)
+            for L in range(n):
+                a[L].requires_grad_(True)            # retain grad on the intermediate residuals
+            target = target_of(model)
+            cot = make_cotangent(target)
+            metric = (target * cot).sum()            # (target * one-hot cotangents) -> VJP
+            with metric.backward():
+                for L in range(n - 1, -1, -1):       # grads in REVERSE module order
+                    grads[L] = a[L].grad.save()
+        import torch  # noqa: F401 — keep symmetry with attribute; grads are proxies until here
+        return [g.detach().float().cpu() for g in grads]
+
     def attribute(self, model, clean_prompt, corrupt_prompt, acts_of, metric_of, n):
         import torch
 
