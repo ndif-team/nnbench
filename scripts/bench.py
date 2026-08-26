@@ -109,6 +109,9 @@ def main():
                     help="serious-measurement mode: every run process verifies its environment is "
                          "clean (visible GPUs free of other work, disk headroom) and REFUSES on "
                          "contamination, naming the offending processes. Never waits. Off = just run.")
+    ap.add_argument("--debug", action="store_true",
+                    help="each run also writes its instrumented debug companion "
+                         "(debug/<name>-debug.pt); diff companions with scripts/debug_compare.py")
     ap.add_argument("--data", default=None, metavar="SOURCE[:N]",
                     help="rebind every spec's workloads to a registered data source (isb/data.py), "
                          "e.g. jlens/poetry or factual:64 — same procedure, different data; runs "
@@ -143,7 +146,7 @@ def main():
             rows = backend_run_commands(execute, name, args.backends, args.out,
                                         python_map=python_map, serve=args.serve,
                                         data=args.data, release=args.release,
-                                        ctl_dtype=ctl_dtype)
+                                        ctl_dtype=ctl_dtype, debug=args.debug)
         done = _execute_runs(name, rows, failed_runs)
         if args.ctl_only:
             continue

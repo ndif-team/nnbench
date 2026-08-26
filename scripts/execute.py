@@ -54,6 +54,10 @@ def main():
     ap.add_argument("--out", default=INBOX, help="output dir; default is the inbox")
     ap.add_argument("--release", action="store_true",
                     help="verify the environment is clean first; refuse on contamination")
+    ap.add_argument("--debug", action="store_true",
+                    help="also write the instrumented debug companion (debug/<name>-debug.pt): "
+                         "token ids, per-layer residuals, final logits over the first prompts; "
+                         "diff two companions with scripts/debug_compare.py")
     args = ap.parse_args()
 
     if args.spec not in SPECS:
@@ -80,7 +84,7 @@ def main():
                                     (kv.split("=", 1) for kv in args.param)}),
         deployment=DeploymentConfig(kind=args.deployment, host=args.host),
     )
-    execute_run(spec, run, args.out, args.name, release_findings=findings)
+    execute_run(spec, run, args.out, args.name, release_findings=findings, debug=args.debug)
 
 
 if __name__ == "__main__":
