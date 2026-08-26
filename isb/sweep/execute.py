@@ -100,7 +100,7 @@ def _run_coordinates(spec, run: RunConfig) -> dict:
 
 
 def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
-                release_findings: list | None = None) -> str:
+                release_findings: list | None = None, debug: bool = False) -> str:
     """Run every (workload, task) cell of `spec` on `run`'s stack; write outputs + provenance.
     Returns the outputs path. Cell errors are isolated and recorded in meta, never fatal to the
     run (the engine survives; later cells still execute)."""
@@ -177,6 +177,17 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
                         b, p, tv_floor=spec.effect.tv_floor, top1_ceiling=spec.effect.top1_ceiling)
                 except Exception:
                     traceback.print_exc()
+
+        dbg_out = dbg_prov = None
+        if debug:       # the debug companion (isb/debugtrace.py) — never feeds the verdict
+            from ..debugtrace import collect_debug, debug_prompts
+            from ..profiles import PROFILES
+            try:
+                mprof = PROFILES[spec.family]
+                dbg_out, dbg_prov = collect_debug(be, model, mprof, debug_prompts(spec),
+                                                  mprof.default_residual(be.name))
+            except Exception:
+                traceback.print_exc()
     finally:
         if model is not None:
             be.teardown(model)
@@ -185,4 +196,9 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
     path = save_run(out_dir, run_name, outputs, prov)
     print(f"[execute] {run_name}: {sum(1 for k in outputs if k[0] not in ('__meta__',))} outputs "
           f"+ provenance -> {path}")
+    if dbg_out:
+        import os as _os
+        dpath = save_run(_os.path.join(out_dir, "debug"), f"{run_name}-debug",
+                         dbg_out, {**prov, **dbg_prov})
+        print(f"[execute] {run_name}: debug companion -> {dpath}")
     return path

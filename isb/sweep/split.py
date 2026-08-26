@@ -39,18 +39,19 @@ def ctl_run_name(spec_name: str, data: str | None, ctl_dtype: str) -> str:
 
 def ctl_run_command(script: str, spec_name: str, out_dir: str, ctl_dtype: str, *,
                     python: str | None = None, data: str | None = None,
-                    release: bool = False) -> list:
+                    release: bool = False, debug: bool = False) -> list:
     """The control-dtype vLLM run: the candidates' engine at the spec's control dtype. score.py
     uses its run file (--ctl) to tell a low-precision near-tie (SUPPORTED_DEGRADED) from a real
     mechanism bug."""
     argv = [python or sys.executable, script, "--spec", spec_name, "--engine", "vllm",
             "--param", f"dtype={ctl_dtype}",
             "--name", ctl_run_name(spec_name, data, ctl_dtype), "--out", out_dir]
-    return argv + (["--data", data] if data else []) + (["--release"] if release else [])
+    return (argv + (["--data", data] if data else []) + (["--release"] if release else [])
+            + (["--debug"] if debug else []))
 
 
 def backend_run_commands(script, spec_name, backends, out_dir, *, python_map=None,
-                         serve=None, data=None, release=False, ctl_dtype=None):
+                         serve=None, data=None, release=False, ctl_dtype=None, debug=False):
     """The per-backend execute.py argv lists for one spec, as (backend, run_name, argv) rows:
     the reference run first (hf when present, else the first backend), then one run per
     remaining backend, then — when `ctl_dtype` is given and the reference is hf — the
@@ -60,7 +61,8 @@ def backend_run_commands(script, spec_name, backends, out_dir, *, python_map=Non
     python_map = python_map or {}
     control = "hf" if "hf" in backends else backends[0]
     base = run_base(spec_name, data)
-    common = (["--data", data] if data else []) + (["--release"] if release else [])
+    common = ((["--data", data] if data else []) + (["--release"] if release else [])
+              + (["--debug"] if debug else []))
 
     def py(b):
         return python_map.get(b, sys.executable)
@@ -80,7 +82,7 @@ def backend_run_commands(script, spec_name, backends, out_dir, *, python_map=Non
         rows.append(("ctl", ctl_run_name(spec_name, data, ctl_dtype),
                      ctl_run_command(script, spec_name, out_dir, ctl_dtype,
                                      python=python_map.get(vllm_backend),
-                                     data=data, release=release)))
+                                     data=data, release=release, debug=debug)))
     return rows
 
 

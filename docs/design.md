@@ -1111,6 +1111,14 @@ A result's identity is (spec × data × run config), each axis independent:
   own host/commit/env — NDIF is a deployment, not an engine; transformers or vllm runs inside it)
   × client (interpreter -> env -> nnsight checkout). Backends are thin executors picked by
   (engine, mode, deployment); `vllm_pp` is gone as a concept (topology is engine params).
+- **Release vs debug runs** (`isb/debugtrace.py`): a run file is the RELEASE artifact — lean
+  cells, the regime perf is measured in, the only source of verdicts. `--debug` (bench or
+  execute) additionally writes `debug/<name>-debug.pt`: an instrumented forward over the first
+  workload prompts saving token ids, the per-layer residual at the readout position, and the
+  final logits. The companion never feeds a verdict (extra saves change what the engine
+  executes; certifying the instrumented run would certify a different program) — it exists to
+  localize a divergence the release file already shows. `scripts/debug_compare.py` diffs two
+  companions per layer and reports where the engines start to drift.
 - **Data** (`isb/data.py`): named, swappable sources (the six upstream lens-evals with their
   readout rules as knobs; the MIB IOI and CounterFact snapshots, `data/mib/` and
   `data/counterfact/`; the generated sets, `isb/tracegen.py`). Specs bind a default by

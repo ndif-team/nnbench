@@ -141,3 +141,24 @@ def test_wikitext_source_and_jacobian_valid_slice():
         raise AssertionError("too-short prompt must raise")
     except ValueError:
         pass
+
+
+def test_debug_companion_compare_and_prompts():
+    import torch
+    from isb.debugtrace import compare_debug, debug_prompts
+    from isb.specs import activation_patching, logit_lens
+    assert all(isinstance(p, str) for p in debug_prompts(activation_patching.activation_patching_gpt2))
+    assert all(isinstance(p, str) for p in debug_prompts(logit_lens.logit_lens_gpt2))
+
+    g = torch.Generator().manual_seed(0)
+    resid = torch.randn(4, 8, generator=g)
+    logits = torch.randn(50, generator=g)
+    ref = {("debug_resid", 0): resid, ("debug_logits", 0): logits}
+    drifted = resid.clone(); drifted[2:] += 0.1 * torch.randn(2, 8, generator=g)
+    cand = {("debug_resid", 0): drifted, ("debug_logits", 0): torch.cat([logits, torch.full((14,), -1e4)])}
+    (row,) = compare_debug(cand, ref)
+    assert row["first_drift_layer"] == 2                  # layers 0-1 identical, drift enters at 2
+    assert row["top1_match"] and row["logit_tv"] < 1e-6   # padded vocab columns are ignored
+    bad = {("debug_resid", 0): torch.randn(5, 8), ("debug_logits", 0): logits}
+    (row,) = compare_debug(bad, ref)
+    assert "error" in row                                 # shape mismatch reported, not crashed
