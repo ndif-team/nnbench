@@ -60,20 +60,24 @@ def _collect_cell(be, model, m, prompts, *, dim_batch, skip_first, grad, residua
         for start in range(0, d, dim_batch):
             B = min(dim_batch, d - start)
 
-            def make_cotangent(t):  # runs INSIDE the trace; t is the [B, seq, d] target residual
-                flat = t.reshape(B, -1, t.shape[-1])
+            def make_cotangent(t):  # runs INSIDE the trace; t is the target residual —
+                # [B, seq, d] on HF's replicated batch, [seq, d] on vLLM's single-prompt trace,
+                # so the probe-row count comes from the tensor (per-dim when there is no batch)
+                nb = t.shape[0] if t.dim() == 3 else 1
+                flat = t.reshape(nb, -1, t.shape[-1])
                 cot = torch.zeros_like(flat)
                 pos = valid_slice(flat.shape[1], skip_first)
-                for b in range(B):                       # copy b probes output dim start+b
+                for b in range(nb):                      # copy b probes output dim start+b
                     cot[b, pos, start + b] = 1.0
                 return cot.reshape(t.shape)
 
             grads = be.vjp_batch(model, [prompt] * B, acts_of, target_of,
                                  make_cotangent, len(sources))
-            for i, g in enumerate(grads):                # g: [B, seq, d] source-layer gradient
-                gb = g.reshape(B, -1, g.shape[-1])
+            for i, g in enumerate(grads):                # g: source-layer gradient, layout as above
+                nb = g.shape[0] if g.dim() == 3 else 1
+                gb = g.reshape(nb, -1, g.shape[-1])
                 pos = valid_slice(gb.shape[1], skip_first)
-                J[i, start:start + B, :] += gb[:, pos, :].mean(dim=1)  # mean over source positions
+                J[i, start:start + nb, :] += gb[:, pos, :].mean(dim=1)  # mean over source positions
     return J / len(prompts)
 
 

@@ -534,3 +534,38 @@ on both engines over 10 multihop prompts (per-prompt traces, the driver's regime
 tv=0.001 at fp32; top1=0.95 tv=0.044 at the bf16 default (near-tie flips, the usual precision
 class). So the full pipeline — collect on HF, export, apply on vLLM — holds, which is the
 practical recipe for every gradient-trained artifact on a serving backend.
+
+## Client tier — the nnsight 0.8 line vs the dev line, 12 specs x 3 backends (2026-08-26)
+
+The same sweep (all 12 specs; hf, vllm_async, vllm_sync; fp32 controls) on both client lines:
+runs/status = dev (pp-on-dev, 5166eb12/944c8056 era), runs/status08 = origin/0.8 (b8e00166).
+Setup note: a PYTHONPATH source checkout of 0.8 must build its C extension per python version
+(`setup.py build_ext --inplace`), or the `.save()` method form is missing and every cell dies
+with `'Tensor' object has no attribute 'save'`; with the extension built, the harness runs 0.8
+unmodified. 54 of 62 scored cells have the same state on both lines. The differences:
+
+| cell | dev line | 0.8 line |
+|---|---|---|
+| steering, in-place write (async interactive; sync both regimes) | ERROR (in-place write raises on inference tensors) | **SUPPORTED** (top1=1.00) — the in-place-write restriction is gone |
+| generation steering, unbounded `iter[:]` (both engines) | ERROR (all per-step saves dropped) | **SUPPORTED** (top1=1.00) |
+| generation patching, unbounded `iter[:]` (async) | ERROR (saves dropped) | **SUPPORTED_DEGRADED** (the same bf16 decode fork as the bounded form) |
+| async batched multi-prompt (logit lens, steering, ablation) | ERROR: finished output carried no saves (silent submission gap) | ERROR: explicit `NotImplementedError("Async tracing takes a single prompt...")` — same state, honest surface |
+| the gradient class (attribution, DAS train, jacobian collection) | ERROR at `requires_grad_` on the inference tensor | ERROR at the backward session: "This tensor does not require grad ... forward runs under torch.inference_mode" — same frontier, moved refusal |
+
+The unbounded-iteration flip is the flip-detector working as designed: the gen_steering spec's
+unbounded task was documented as "the flip-detector for the upstream saves fix", and on 0.8 it
+flipped to SUPPORTED.
+
+### The moved gradient refusal exposed a probe assumption (harness fix)
+The vLLM gradient backends were forward-only fail-fast probes that relied on `requires_grad_`
+raising. On 0.8 it is tolerated, so the probes fell through and returned raw activations: the
+first 0.8 sweep scored attribution patching SILENTLY_WRONG (top1=0.00, output [317, 768]
+activations instead of the [20, 12] attribution stack), and DAS train died in its own accuracy
+guard instead of at the engine. The backends (`attribute`, `train_patch`, `vjp_batch`, async and
+sync) now attempt the REAL gradient computation, so the recorded error is each engine's own
+first refusal on every client line, and a line that supports gradients would simply produce the
+result. Two portable-layout cell bugs fixed en route, both previously masked because dev raised
+before reaching them: the attribution metric sliced logits as `[:, -1, :]` (breaks on vLLM's
+flattened [tokens, vocab] layout), and the jacobian-collection cotangent hard-coded the
+replicated batch count (vLLM traces carry one prompt, so the probe-row count now comes from the
+traced tensor's shape).
