@@ -168,12 +168,12 @@ class VLLMAsyncBackend(VLLMBackend):
         return self._run_coro(_go())
 
     def train_patch(self, model, source_prompt, base_prompt, capture, step):
-        """vLLM activations are inference-mode tensors with no autograd, so a train step cannot
-        run. The source capture executes; the base trace computes the loss forward and then
-        attempts `requires_grad_(True)` on it — that raises in the worker (inference tensor) and
-        surfaces as a clean per-cell ERROR. Deliberately FORWARD-ONLY — no `.backward()` over the
-        async path — so it fails fast with no hang risk; the recorded ERROR is the `grad`
-        primitive's absence, same class as `attribute`."""
+        """The REAL train step, same flow as HF — on today's vLLM it dies at the engine's own
+        first refusal and that error is the recorded verdict: the dev line raises at the first
+        grad-tracking op on an inference tensor; the 0.8 line tolerates `requires_grad_` and
+        refuses at the backward session ("forward runs under torch.inference_mode"). Attempting
+        the real computation (not a probe) keeps the recorded error the engine's own words on
+        every client line, and a line that does support grad would simply work."""
         async def _go():
             with model.trace(source_prompt, temperature=0.0, top_p=1, max_tokens=1) as t1:
                 s = capture().save()  # noqa: F841 — var name IS the async .saves key
@@ -184,48 +184,87 @@ class VLLMAsyncBackend(VLLMBackend):
 
             with model.trace(base_prompt, temperature=0.0, top_p=1, max_tokens=1) as t2:
                 loss = step(src)
-                loss.requires_grad_(True)     # raises: inference tensor, no autograd
-                probe = loss.save()  # noqa: F841 — never meaningfully reached; the above raises
+                lv = loss.save()  # noqa: F841 — var name IS the async .saves key
+                with loss.backward():
+                    pass                      # grads land on step's external trainables
             last2 = None
             async for output in t2.backend:
                 last2 = output
-            return self._extract(last2)       # surfaces the worker's requires_grad error
+            return self._extract(last2)
         return self._run_coro(_go())
 
     def vjp_batch(self, model, prompts, acts_of, target_of, make_cotangent, n=None):
-        """vLLM activations are inference-mode tensors with no autograd; the VJP sweep cannot
-        run. Attempt `requires_grad_(True)` on the source activations — it raises in the worker
-        and surfaces as a clean per-cell ERROR. FORWARD-ONLY, no backward over the async path
-        (fail-fast, no hang risk); same design as `attribute`."""
+        """The REAL VJP sweep, same flow as HF — dies at the engine's own first grad refusal
+        (dev: `requires_grad_` on an inference tensor; 0.8: the backward session's
+        inference_mode refusal), which is the recorded verdict. See `train_patch`."""
         prompt = prompts[0] if isinstance(prompts, (list, tuple)) else prompts
+
         async def _go():
             with model.trace(prompt, temperature=0.0, top_p=1, max_tokens=1) as tracer:
+                grads = [None] * (n or 0)
+                grads = grads.save()  # noqa: F841 — parent-scope list; "grads" is the saves key
                 acts = acts_of(model)
                 for a in acts:
-                    a.requires_grad_(True)            # raises: inference tensor, no autograd
-                probe = acts[0].save()  # noqa: F841 — never meaningfully reached; the above raises
+                    a.requires_grad_(True)
+                target = target_of(model)
+                cot = make_cotangent(target)
+                metric = (target * cot).sum()
+                with metric.backward():
+                    for L in range(len(acts) - 1, -1, -1):
+                        grads[L] = acts[L].grad
             last = None
             async for output in tracer.backend:
                 last = output
-            return self._extract(last)                # surfaces the worker's requires_grad error
+            (out,) = self._extract_keys(last, ["grads"])
+            return [g.detach().float().cpu() for g in out]
         return self._run_coro(_go())
 
     def attribute(self, model, clean_prompt, corrupt_prompt, acts_of, metric_of, n=None):
-        """vLLM activations are inference-mode tensors with no autograd, so attribution patching
-        cannot run. We attempt `requires_grad_(True)` on the corrupt run's residuals: it raises in the
-        worker (`Setting requires_grad=True on inference tensor ...`) and surfaces as a clean per-cell
-        ERROR. Deliberately FORWARD-ONLY — no `.backward()` over the async path — so it fails fast
-        with no hang risk; the point is to record that the `grad` primitive is unavailable on vLLM."""
+        """The REAL attribution, same flow as HF's — on today's vLLM it dies at the engine's own
+        first grad refusal and that is the recorded verdict (dev: `requires_grad_` raises on the
+        inference tensor; 0.8: `requires_grad_` is tolerated and the backward session refuses
+        under inference_mode). A probe that only ran the forward mis-recorded the 0.8 line as
+        SILENTLY_WRONG: its `requires_grad_` doesn't raise, so the probe fell through and
+        returned raw activations that scored as a wrong attribution. Attempting the real
+        computation keeps every line's verdict the engine's own first error — and a line that
+        supports grad would simply produce the attribution."""
+        import torch
+
         async def _go():
-            with model.trace(corrupt_prompt, temperature=0.0, top_p=1, max_tokens=1) as tracer:
-                acts = acts_of(model)
-                for a in acts:
-                    a.requires_grad_(True)            # raises: inference tensor, no autograd
-                probe = acts[0].save()  # noqa: F841 — never meaningfully reached; the above raises
-            last = None
-            async for output in tracer.backend:
-                last = output
-            return self._extract(last)                # surfaces the worker's requires_grad error
+            with model.trace(clean_prompt, temperature=0.0, top_p=1, max_tokens=1) as t1:
+                clean = [None] * (n or 0)
+                clean = clean.save()  # noqa: F841 — parent-scope list; "clean" is the saves key
+                a = acts_of(model)
+                for L in range(len(a)):
+                    clean[L] = a[L]
+            last1 = None
+            async for output in t1.backend:
+                last1 = output
+            (clean_acts,) = self._extract_keys(last1, ["clean"])
+
+            with model.trace(corrupt_prompt, temperature=0.0, top_p=1, max_tokens=1) as t2:
+                corrupt = [None] * (n or 0)
+                corrupt = corrupt.save()  # noqa: F841
+                grads = [None] * (n or 0)
+                grads = grads.save()  # noqa: F841
+                a = acts_of(model)
+                for L in range(len(a)):
+                    a[L].requires_grad_(True)         # dev line: raises here (inference tensor)
+                for L in range(len(a)):
+                    corrupt[L] = a[L]
+                metric = metric_of(model)
+                with metric.sum().backward():         # 0.8 line: refuses here (inference_mode)
+                    for L in range(len(a) - 1, -1, -1):
+                        grads[L] = a[L].grad
+            last2 = None
+            async for output in t2.backend:
+                last2 = output
+            corrupt_acts, grad_acts = self._extract_keys(last2, ["corrupt", "grads"])
+            return torch.stack([
+                ((clean_acts[L].float() - corrupt_acts[L].float()) * grad_acts[L].float())
+                .sum().detach().cpu()
+                for L in range(n)
+            ])
         return self._run_coro(_go())
 
     def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
@@ -311,6 +350,24 @@ class VLLMAsyncBackend(VLLMBackend):
 
     def last(self, t):
         return t[-1:, :]                          # flat [tokens, vocab] -> [1, vocab]
+
+    def _extract_keys(self, out, keys):
+        """Unwrap `.saves` like `_extract` (same nesting + worker-error surfacing), then return
+        the values for `keys` (saves are keyed by the trace body's variable names)."""
+        saves = out.saves
+        while (
+            isinstance(saves, dict)
+            and len(saves) == 1
+            and isinstance(next(iter(saves.values())), dict)
+            and not {"type_name", "message", "traceback"} <= set(saves)
+        ):
+            saves = next(iter(saves.values()))
+        if isinstance(saves, dict) and {"type_name", "message", "traceback"} <= set(saves):
+            msg = (saves.get("message") or "").strip().splitlines()
+            raise RuntimeError(
+                f"worker intervention: {msg[-1] if msg else saves['type_name']}"
+            )
+        return [saves[k] for k in keys]
 
     def _extract(self, out):
         saves = out.saves

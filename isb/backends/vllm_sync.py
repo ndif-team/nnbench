@@ -83,16 +83,36 @@ class VLLMSyncBackend(VLLMBackend):
         return res.detach().float().cpu()
 
     def attribute(self, model, clean_prompt, corrupt_prompt, acts_of, metric_of, n=None):
-        """sync vLLM activations are inference-mode tensors with no autograd (same as async), so
-        attribution patching cannot run: `requires_grad_(True)` raises in the worker and surfaces
-        as a clean per-cell ERROR. Deliberately FORWARD-ONLY — no `.backward()` — so it fails fast
-        with no hang risk; the point is to record that the `grad` primitive is unavailable on vLLM."""
+        """The REAL attribution, same flow as HF's — dies at the engine's own first grad refusal
+        (dev: `requires_grad_` raises on the inference tensor; 0.8: the backward session refuses
+        under inference_mode), which is the recorded verdict. A forward-only probe mis-recorded
+        the 0.8 line as SILENTLY_WRONG (its `requires_grad_` is tolerated, so the probe fell
+        through and returned raw activations); see the async twin for the full rationale."""
+        import torch
+
+        clean = [None] * n
+        with model.trace(clean_prompt, **_SAMPLING):
+            a = acts_of(model)
+            for L in range(n):
+                clean[L] = a[L].save()
+
+        corrupt = [None] * n
+        grads = [None] * n
         with model.trace(corrupt_prompt, **_SAMPLING):
-            acts = acts_of(model)
-            for a in acts:
-                a.requires_grad_(True)            # raises: inference tensor, no autograd
-            probe = acts[0].save()  # noqa: F841 — never meaningfully reached; the above raises
-        return probe.detach().float().cpu()       # surfaces the worker's requires_grad error
+            a = acts_of(model)
+            for L in range(n):
+                a[L].requires_grad_(True)         # dev line: raises here (inference tensor)
+            for L in range(n):
+                corrupt[L] = a[L].save()
+            metric = metric_of(model)
+            with metric.sum().backward():         # 0.8 line: refuses here (inference_mode)
+                for L in range(n - 1, -1, -1):
+                    grads[L] = a[L].grad.save()
+
+        return torch.stack([
+            ((clean[L].float() - corrupt[L].float()) * grads[L].float()).sum().detach().cpu()
+            for L in range(n)
+        ])
 
     def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
         """Per-step decode reads/intervention. With the construct-gap fix, the UNBOUNDED form

@@ -35,10 +35,12 @@ from .registry import cell
 
 
 def _metric(blocks, norm, head, residual, clean_id, corrupt_id):
-    """logit[clean] - logit[corrupt] at the last token, via the portable unembed. Runs in a trace."""
+    """logit[clean] - logit[corrupt] at the last token, via the portable unembed. Runs in a trace.
+    Layout-agnostic last-position slice: HF is [1, seq, vocab], vLLM flattens to [tokens, vocab]."""
     normed = norm(_resid(blocks[-1].output, residual))
-    logits = F.linear(normed, head.weight)[:, -1, :]
-    return logits[:, clean_id] - logits[:, corrupt_id]
+    logits = F.linear(normed, head.weight)
+    last = logits.reshape(-1, logits.shape[-1])[-1]
+    return last[clean_id] - last[corrupt_id]
 
 
 def _attribution_cell(be, model, m, prompts, *, residual, grad):
