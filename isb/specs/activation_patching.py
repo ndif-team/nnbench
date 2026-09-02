@@ -7,7 +7,7 @@ caught — a benchmark, not a single-pair anecdote. Baseline = patch=False (corr
 transplant); effect-size = TV(unpatched, patched) aggregated over the pairs on the control.
 """
 from ..data import DataRef
-from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload
+from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime
 
 # data is a named, swappable pair source; each unit is one (clean, corrupted) trace.
 # Default: the MIB circuit-track IOI snapshot (data/mib/README.md) — clean prompt +
@@ -20,7 +20,7 @@ activation_patching_gpt2 = CellConfig(
     methodology="activation_patching", family="gpt2", repo="openai-community/gpt2",
     # each unit is a (clean, corrupted) pair; aggregate over the set (the driver runs each pair as its
     # own two-trace patch and stacks the verdict, exactly like per-prompt aggregation for reads).
-    workloads=[Workload("interactive", _PAIRS, aggregate=True)],
+    regimes=[ExecutionRegime("interactive", _PAIRS, aggregate=True)],
     tasks=[
         ({"layer": 3, "residual": "plain"}, "layer=3"),
         ({"layer": 9, "residual": "plain"}, "layer=9"),

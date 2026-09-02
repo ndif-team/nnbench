@@ -44,7 +44,7 @@ ROW_CFG_FIELDS = (
     "system", "op", "repo", "footprint", "token_mode", "phase", "destination",
     "tensor_parallel_size", "prompt_len", "batch", "new_tokens", "enforce_eager", "layer",
 )
-# Workload key that a cell shares with its pure_vllm baseline (op/footprint/token_mode/
+# ExecutionRegime key that a cell shares with its pure_vllm baseline (op/footprint/token_mode/
 # destination excluded: the baseline is op-agnostic, it is just the engine running the workload).
 BASE_KEYS = ("repo", "phase", "prompt_len", "batch", "tensor_parallel_size", "new_tokens")
 

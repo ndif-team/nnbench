@@ -25,7 +25,7 @@ from isb.methodologies.gen_patching import (  # noqa: E402
 )
 from isb.methodologies.registry import CELLS, get_cell  # noqa: E402
 from isb.states import AppState  # noqa: E402
-from isb.sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload  # noqa: E402
+from isb.sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime  # noqa: E402
 
 HID, VOCAB = 4, 8
 
@@ -214,7 +214,7 @@ def test_generation_pair_sweep_oracle_and_effect():
 
     spec = CellConfig(
         name="fake_gp", methodology="m", family="fam", repo="repo://x",
-        workloads=[Workload("generation", ["CLEAN", "CORRUPT"], new_tokens=5, aggregate=False)],
+        regimes=[ExecutionRegime("generation", ["CLEAN", "CORRUPT"], new_tokens=5, aggregate=False)],
         tasks=[({"bound": "bounded", "patch": True}, "bound=iter[0:N]"),
                ({"bound": "unbounded", "patch": True}, "bound=iter[:]")],
         baseline=BaselineSpec(params={"bound": "bounded", "patch": False}),

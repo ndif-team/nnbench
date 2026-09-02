@@ -1,7 +1,8 @@
 # Design — interp-serve-bench (living document)
 
 > Status: evolving. Captures decisions as they're made in the design conversation.
-> Last structural update: data-flow / control-flow split + cross-edge movement class (§3.1, §3.4).
+> Last structural update: CausaLab-aligned intervention semantics separated from execution regimes
+> and backend realizations (§5, §12).
 
 ## 1. Purpose & positioning
 
@@ -472,7 +473,7 @@ carries the edge-class ↔ pyvene-enum mapping (Collect=observation, Addition/Su
 Vanilla interchange=transplant, RotatedSpace=subspace rewiring, LoRA=staging); subspace addresses
 are derived-tier Level-1 citizens (§3.2).
 
-## 5. Context — workload regimes (how methodologies get run; the "dataset" distribution)
+## 5. Context — execution regimes (how methodologies get run; the "dataset" distribution)
 
 - **Interactive probe** — 1 trace, 1 prompt (notebook shape)
 - **Batched analysis** — 1 motif × N prompts (patching/probing over a dataset)
@@ -480,8 +481,8 @@ are derived-tier Level-1 citizens (§3.2).
 - **Bulk harvesting** — CACHE-many × large corpus, throughput-bound (SAE data collection)
 - **Multi-tenant / concurrent** — many independent traces vs one engine (nnsight-serve / NDIF)
 
-Regimes are context (§3.6), not levels — a regime can change *verdicts* (the batched
-absolute-position model-side law failure, formerly "regime effect"), which is why each workload
+Regimes are context (§3.6), not protocol semantics — a regime can change *verdicts* (the batched
+absolute-position model-side law failure, formerly "regime effect"), which is why each regime
 is oracle-checked in its own regime.
 The regime axis exercises the **engine axis** + concurrency — where vLLM should win and HF should
 struggle.
@@ -609,7 +610,8 @@ tolerance — the "same trace, same answer" claim, and the `SILENTLY_WRONG` dete
 | v1 scope | — | causal-LM, Method+some Macro; **backends = HF + vLLM-async only**; training & diffusion/VLM & vLLM-sync/NDIF additive later | **DECIDED** |
 | Resolver vocab resolution | (a)/(b)/(c) | **vocabulary spans all of (a/b/c)**; v1 *portable+perf* addressing = (a)+(b); (c) implemented **HF-eager-only as frontier markers** (run on vLLM expecting ERROR/UNSUPPORTED, verified) | **DECIDED** |
 | Correctness goal | coverage-only vs +equivalence | **+equivalence — LOAD-BEARING**: it's the only `SILENTLY_WRONG` detector (§8.1), not just the OSDI claim | **DECIDED** |
-| Adopt pyvene vocab + causalab harness shape | yes / build fresh | adopt: pyvene names→`FamilyProfile`; causalab Hydra config groups (§11.10) | **DECIDED** |
+| Adopt pyvene vocab + causalab harness shape | yes / build fresh | adopt: pyvene names→`FamilyProfile`; causalab Hydra config groups (§11.10) | **SUPERSEDED 2026-08-26** (never implemented; both were removed by causalab PR #20) |
+| Intervention description | ad hoc params / causalab vocabulary | **CausaLab-aligned `InterventionSpec` metadata**, separate from `ExecutionRegime` and `TaskSpec.realization`; it indexes and describes explicit cells but never constructs them. Metrics/artifacts/workflows and causalab's `Backend` stay out of nnbench | **IMPLEMENTED 2026-09-02** |
 | Repo name | provisional `interp-serve-bench` | finalize later (avoid "InterpBench") | open |
 
 ---
@@ -840,9 +842,10 @@ do not need a general addressing abstraction (no `Resolver`, no `FamilyProfile`,
 
 ### 12.1 The matrix
 
-The benchmark is a matrix of **cells**, one per `(methodology, family, backend [, variant])`. The
-cell IS the workload AND the unit of failure. A cell is a small, explicit function — readable
-top-to-bottom — that writes the real intervention code for that exact combination.
+The benchmark is a matrix of **cells**, one per `(methodology, family, backend [, variant])`. A
+benchmark case is indexed as `InterventionSpec × TaskSpec × ExecutionRegime × family × backend`;
+the cell remains the executable program and unit of failure. It is a small, explicit function —
+readable top-to-bottom — that writes the real intervention code for that exact combination.
 
 ```python
 @cell("logit_lens", family="gpt2", backend="hf")
@@ -862,6 +865,14 @@ def _(be, model, prompt):
   (`backend="hf"` vs `backend="vllm_async"`) — explicit, where you can read the `no_grad` /
   weight-matmul / flat-buffer specifics.
 - **Variants** (layers touched, overhead, idiomatic-vs-portable unembed) = params or sibling cells.
+- **Protocol semantics are metadata.** `isb/protocol.py` adopts the shared CausaLab names for data
+  roles, components, reads/writes, mechanisms, position frames, featurizers, and capabilities.
+  `TaskSpec.semantics` holds a case's values; `TaskSpec.realization` holds spelling choices such as
+  in-place vs replacement or bounded vs unbounded iteration. Their merged `params` mapping is
+  passed to the cell unchanged. No resolver or document executor is introduced.
+- **Execution regimes are orthogonal.** `ExecutionRegime` owns inputs, interactive/batched/
+  generation shape, decode length, and aggregation. It is not overloaded with intervention
+  semantics, so a protocol case can be exercised under multiple regimes.
 - **Reuse emerges bottom-up:** when two cells are structurally identical except module names,
   extract a `lens_core(be, blocks, norm, head, ...)` helper they both call with their *own*
   explicit modules. The helper never tries to be universal; the maintainer wires it per cell.
@@ -914,15 +925,18 @@ residual on a fused-residual family, §12.7), which IS a suite bug to fix in the
 ### 12.3 What is kept vs dropped from §11
 
 - **Dropped:** `isb/resolve/` (Resolver, FamilyProfile, Binding, read_value, predict), the heavy
-  `Workload`/`Selector` spec, `BackendCtx`.
+  executable `Workload`/`Selector` construction spec, `BackendCtx`.
 - **Kept:** the applicability-map output + states (§8.1), the **oracle** (§8.3, now grouped by
   family), the **runner** verify→score→report flow, and the genuinely backend-specific *infra*
   (`be`: open trace, save, collect, last/stack, teardown — HF handle vs vLLM async `output.saves`).
+- **Added back only as description:** `InterventionSpec` and `TaskSpec` index the explicit program
+  using CausaLab's vocabulary. They cannot resolve sites or generate trace code.
 
 ### 12.4 Layout
 
 ```
 isb/
+  protocol.py           # CausaLab-aligned, non-executable intervention semantics
   states.py             # AppState
   methodologies/
     registry.py         # @cell(methodology, family, backend, variant=...) -> fn ; lookup
@@ -930,6 +944,7 @@ isb/
   backends/
     hf.py vllm_async.py # `be` infra: trace/save/collect/last/stack/teardown + load
   oracle/equivalence.py # per-family reference comparison (unchanged)
+  sweep/spec.py         # InterventionSpec × TaskSpec × ExecutionRegime bindings
   runner/run.py         # enumerate cells, group by (methodology,family), HF=control, score
   report/applicability.py
 scripts/smoke.py        # enumerate the cells to run; print the map
@@ -939,10 +954,11 @@ scripts/smoke.py        # enumerate the cells to run; print the map
 
 | Add a… | What you write |
 |---|---|
-| methodology | new file of `@cell` functions |
+| methodology | new file of `@cell` functions + one `InterventionSpec` metadata entry |
 | (family,backend) cell | one explicit function for that combination |
 | backend | a `be` infra impl (trace/collect/teardown) + its cells per methodology |
-| variant | a param or a sibling `@cell` |
+| semantic variant | `TaskSpec.semantics` plus the same explicit cell param |
+| realization variant | `TaskSpec.realization` plus the same explicit cell param |
 
 ### 12.6 The primitive model as index (2026-06-11)
 
@@ -1162,7 +1178,8 @@ The replacement is the run layer, which already holds every axis the old field l
 - The **map reports measured states only**; whether a state is a known frontier or a regression
   is not a property of the spec. The documented status record stays single-copy in
   interp-methods-catalog.md and findings.md.
-- Specs are back to pure procedure: methodology × workloads × tasks × oracle knobs.
+- Specs bind four independent concerns: protocol semantics × execution regimes × task
+  realizations × oracle/performance knobs. The intervention code remains in explicit cells.
 
 ### 12.12 The run manager (2026-07-28; templated package 2026-07-31)
 

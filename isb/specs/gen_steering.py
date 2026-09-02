@@ -10,7 +10,7 @@ expected ERROR on vLLM until the upstream saves fix lands).
 Baseline = alpha=0 (no write, same decode loop) -> overhead× isolates the steering write's cost
 inside the generation regime; effect-size = TV(alpha=0, alpha=6) per step on the HF control.
 """
-from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload
+from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime
 from ..data import DataRef
 
 # data is a named, swappable source: 32 CounterFact factual-recall prompts, each greedily decoded
@@ -22,7 +22,7 @@ _S = {"layer": 8, "target": " Rome", "alpha": 6.0}
 gen_steering_gpt2 = CellConfig(
     name="gen_steering_gpt2",
     methodology="gen_steering", family="gpt2", repo="openai-community/gpt2",
-    workloads=[Workload("generation", PROBE, new_tokens=8)],
+    regimes=[ExecutionRegime("generation", PROBE, new_tokens=8)],
     tasks=[
         ({**_S, "bound": "bounded"}, "bound=iter[0:N]"),
         ({**_S, "bound": "unbounded"}, "bound=iter[:]"),

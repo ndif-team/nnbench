@@ -4,7 +4,7 @@ Baseline = target='none' (no knockout -> pure forward + readout); effect-size = 
 the control.
 """
 from ..data import DataRef
-from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload
+from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime
 
 # data is a named, swappable source — see logit_lens.py. Default: clean prompts from the
 # MIB circuit-track IOI snapshot (data/mib/README.md) — component knockout over the IOI
@@ -15,7 +15,7 @@ BATCHED = DataRef("mib/ioi_prompts", 16)
 ablation_gpt2 = CellConfig(
     name="ablation_gpt2",
     methodology="ablation", family="gpt2", repo="openai-community/gpt2",
-    workloads=[Workload("interactive", PROBE), Workload("batched", BATCHED)],
+    regimes=[ExecutionRegime("interactive", PROBE), ExecutionRegime("batched", BATCHED)],
     tasks=[
         ({"layer": 6, "target": "mlp"}, "target=mlp"),
         ({"layer": 6, "target": "attn"}, "target=attn"),

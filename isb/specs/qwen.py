@@ -3,14 +3,14 @@ runs (`bench.py --pp 2 --tp 2`).
 
 family="llama" reuses the model.model.layers / model.model.norm / model.lm_head cells (Qwen2.5 is a
 LlamaForCausalLM-shaped decoder). dtype_control="bfloat16" so the (1,1) control fits on ONE 40GB
-A100 — fp32 14B (~56GB) would not. Interactive/generation workloads only (batched is gated on the
+A100 — fp32 14B (~56GB) would not. Interactive/generation regimes only (batched is gated on the
 vLLM async path regardless of model). These exist to exercise the GT2 oracle — candidate (tp,pp) vs
 single-GPU (1,1), same dtype — on a real multi-billion-param model.
 
 Note: under GT2 both sides run the SAME cell, so a cell only needs to RUN and be deterministic;
 absolute correctness vs HF (the fused-residual subtlety) is not what's scored here.
 """
-from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload
+from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime
 from ..data import DataRef
 
 # data is a named, swappable source, sized for a 14B two-GPU GT2 run. CounterFact prompts +
@@ -26,7 +26,7 @@ _S = {"layer": 16, "target": " Rome", "alpha": 6.0}
 logit_lens_qwen = CellConfig(
     name="logit_lens_qwen",
     methodology="logit_lens", family="llama", repo=_QWEN,
-    workloads=[Workload("interactive", PROBE)],
+    regimes=[ExecutionRegime("interactive", PROBE)],
     # residual="plain" (read stream[0]) on BOTH sides: under PP some layers are LazyRemoteTensors and
     # the "fused" (hidden+residual) read isn't symmetric across the stage boundary, which would make
     # the candidate diverge from the control for reasons unrelated to PP correctness. GT2 only needs
@@ -43,7 +43,7 @@ logit_lens_qwen = CellConfig(
 steering_qwen = CellConfig(
     name="steering_qwen",
     methodology="steering", family="llama", repo=_QWEN,
-    workloads=[Workload("interactive", PROBE)],
+    regimes=[ExecutionRegime("interactive", PROBE)],
     tasks=[
         ({**_S, "mode": "inplace"}, "mode=inplace"),
         ({**_S, "mode": "replace"}, "mode=replace"),
@@ -59,7 +59,7 @@ steering_qwen = CellConfig(
 ablation_qwen = CellConfig(
     name="ablation_qwen",
     methodology="ablation", family="llama", repo=_QWEN,
-    workloads=[Workload("interactive", PROBE)],
+    regimes=[ExecutionRegime("interactive", PROBE)],
     tasks=[
         ({"layer": 16, "target": "mlp"}, "target=mlp"),
         ({"layer": 16, "target": "attn"}, "target=attn"),
@@ -77,7 +77,7 @@ activation_patching_qwen = CellConfig(
     methodology="activation_patching", family="llama", repo=_QWEN,
     # each unit is a (clean, corrupted) IOI pair; the driver runs each pair as its own two-trace
     # patch and aggregates the equivalence verdict over the set
-    workloads=[Workload("interactive", _PAIRS, aggregate=True)],
+    regimes=[ExecutionRegime("interactive", _PAIRS, aggregate=True)],
     tasks=[
         ({"layer": 8, "residual": "plain"}, "layer=8"),
         ({"layer": 24, "residual": "plain"}, "layer=24"),
@@ -93,7 +93,7 @@ activation_patching_qwen = CellConfig(
 gen_steering_qwen = CellConfig(
     name="gen_steering_qwen",
     methodology="gen_steering", family="llama", repo=_QWEN,
-    workloads=[Workload("generation", PROBE, new_tokens=8)],
+    regimes=[ExecutionRegime("generation", PROBE, new_tokens=8)],
     tasks=[
         ({**_S, "bound": "bounded"}, "bound=iter[0:N]"),
         ({**_S, "bound": "unbounded"}, "bound=iter[:]"),

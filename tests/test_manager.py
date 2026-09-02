@@ -107,7 +107,7 @@ def _construct_run(dirpath, name="micro-async", engine_kind="vllm"):
             "engine": {"kind": engine_kind, "mode": "async", "params": {}},
             "host": {"hostname": "testbox", "gpus": []},
             "coordinates": {"spec": "constructs", "methodology": "constructs", "family": "gpt2",
-                            "repo": "gpt2", "data": [], "workloads": [],
+                            "repo": "gpt2", "data": [], "regimes": [],
                             "tasks": ["input_boundary", "barrier"], "interface": iface}}
     save_run(str(dirpath), name, {("__meta__",): meta}, prov)
 
@@ -176,7 +176,7 @@ def _perf_run(dirpath, name="perf-read-q"):
             "engine": {"kind": "vllm", "mode": "async", "params": {}},
             "host": {"hostname": "t", "gpus": []},
             "coordinates": {"spec": name, "methodology": "perf_micro", "family": "-",
-                            "repo": "q", "data": [], "workloads": [], "tasks": [],
+                            "repo": "q", "data": [], "regimes": [], "tasks": [],
                             "interface": "perf"}}
     save_run(str(dirpath), name, {("perf_rows",): rows, ("__meta__",): {}}, prov)
 

@@ -5,7 +5,7 @@ a batched per-prompt reference (which would concat variable-length prompts on a 
 ill-defined here. The baseline reads a single layer (`layers=[0]`); the task reads all layers, so
 overhead-vs-baseline reflects the per-layer attention-read cost.
 """
-from ..sweep.spec import BaselineSpec, CellConfig, Workload
+from ..sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
 from ._prompts import ONE
 
 attention_pattern_gpt2 = CellConfig(
@@ -13,7 +13,7 @@ attention_pattern_gpt2 = CellConfig(
     methodology="attention_pattern", family="gpt2", repo="openai-community/gpt2",
     # output is [layers, heads, k_len] — variable k_len across prompts can't be stacked, so no
     # per-prompt aggregation (the verdict already spans layers×heads).
-    workloads=[Workload("interactive", ONE, aggregate=False)],
+    regimes=[ExecutionRegime("interactive", ONE, aggregate=False)],
     tasks=[({"layers": "all"}, "layers=all")],
     baseline=BaselineSpec(params={"layers": [0]}),
     effect=None,

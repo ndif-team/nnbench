@@ -37,26 +37,15 @@ complement**. Our system-under-test is nnsight; the others inform positioning an
 faithfulness / interchange-intervention-accuracy. We borrow their *workloads* and *harness shape*,
 not their metric.
 
-- **causalab** (goodfire-ai/causalab) — causal-abstraction framework; you write a high-level causal
-  model, then test via **interchange interventions** whether the LM implements it. Built on
-  **pyvene over HF eager** — `nnsight>=0.5.9` is declared in its pyproject but never imported
-  (verified 2026-06-12; the only model-access layer is `neural/`, pyvene hooks on
-  `AutoModelForCausalLM`, eager attention forced by default). Agent/skill-driven (`/setup-task`,
-  `/plan-experiment`, `/run-experiment`, `/interpret-experiment`). Hydra config-group sweep
-  (`task/ model/ analysis/ runners/`). Strict layering: `causal/ tasks/ neural/(pyvene surface)
-  methods/(DAS,DBM,PCA,SAE) io/ analyses/ runner/`. Eight analyses: baseline → locate → subspace
-  → activation_manifold / output_manifold → path_steering → pullback; attention_pattern. All
-  interventions are applied DURING generation (`intervenable_generate`). **Connection — the most
-  important reference:** (1) structural *blueprint* for our harness (config-group decouple +
-  analysis-DAG with artifact deps ≈ our spec→resolver→builder→runner→reporter); (2) source of
-  realistic intervention workloads; (3) a *consumer* of our work — if nnsight×vLLM gets fast,
-  causalab-style research runs at production scale (the OSDI story). (4) **agent connection** —
-  the leveled primitive model as the action space / capability map for causalab-style auto
-  agents: see `agents-and-the-primitive-model.md` (exploration notes) and
-  **`causalab-portability-audit.md`** (the audit, done: footprints × measured map → 6/8 analyses
-  predicted portable re-expressed in working idioms via their gradient-free methods; pullback
-  blocked by no-autograd, attention_pattern by site-absent, and every gradient-trained method
-  variant (DAS/DBM/boundless) blocked across the portable set).
+- **causalab** (goodfire-ai/causalab) — causal-abstraction framework. PR #20 replaced its old
+  pyvene/Hydra analysis stack with serializable **intervention-protocol documents**: named data
+  roles, positions, sites, reads, writes with a closed `do` algebra, intervened models,
+  featurizers, metrics, training, and saves. Documents execute through a generic `Backend` seam;
+  a workflow composes independently routed document steps. PR #40 adds greedy generation as a
+  position frame with prefill-only writes. **Connection:** nnbench adopts the intersection as
+  non-executable `InterventionSpec` metadata and keeps system context, realization, correctness
+  status, and performance as its own axes. It does not adopt causalab's document executor: that is
+  the construction layer nnbench measures. See `causalab-portability-audit.md`.
 - **CausalGym** (arXiv 2402.12560) — benchmarking causal interpretability methods on linguistic
   tasks. Faithfulness benchmark; method-comparison framing.
 - **InterpBench** (Gupta et al.) — semi-synthetic transformers with *known* circuits as ground

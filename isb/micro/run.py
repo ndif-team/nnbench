@@ -89,7 +89,7 @@ def micro_run_file(backend_name: str, repo: str, results: list,
     prov = resolve_provenance(RunConfig(engine=engine))
     prov["coordinates"] = {
         "spec": "constructs", "methodology": "constructs", "family": "gpt2", "repo": repo,
-        "data": [], "workloads": [], "tasks": [r.name for r in results],
+        "data": [], "regimes": [], "tasks": [r.name for r in results],
         "interface": backend_name,
     }
     meta = {("probe", r.name): {"state": r.state, "note": r.note, "latency_s": r.latency_s}

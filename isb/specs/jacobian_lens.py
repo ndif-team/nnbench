@@ -16,7 +16,7 @@ Read methodology -> no effect-size guard. Baseline = single-layer identity read 
 so overhead-vs-baseline reflects the full-band sweep + transport cost.
 """
 from ..data import DataRef
-from ..sweep.spec import BaselineSpec, CellConfig, Workload
+from ..sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
 
 # default binding: the upstream multi-hop eval; any other lens-eval source swaps in via --data
 MULTIHOP = DataRef("jlens/multihop")
@@ -24,7 +24,7 @@ MULTIHOP = DataRef("jlens/multihop")
 jacobian_lens_gpt2 = CellConfig(
     name="jacobian_lens_gpt2",
     methodology="jacobian_lens", family="gpt2", repo="openai-community/gpt2",
-    workloads=[Workload("interactive", MULTIHOP)],
+    regimes=[ExecutionRegime("interactive", MULTIHOP)],
     tasks=[
         ({"unembed": "weight", "transport": None}, "transport=identity (logit-lens readout)"),
         ({"unembed": "weight", "transport": 0}, "transport=seeded-orthogonal (the J-matmul path)"),
@@ -47,7 +47,7 @@ _QWEN35_BAND = list(range(31))          # the lens's source layers (0..30 of the
 jacobian_lens_qwen35 = CellConfig(
     name="jacobian_lens_qwen35",
     methodology="jacobian_lens", family="qwen3_5", repo="Qwen/Qwen3.5-4B",
-    workloads=[Workload("interactive", MULTIHOP)],
+    regimes=[ExecutionRegime("interactive", MULTIHOP)],
     tasks=[
         ({"unembed": "weight", "transport": None, "layers": _QWEN35_BAND},
          "transport=identity (logit-lens readout)"),

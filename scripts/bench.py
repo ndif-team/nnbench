@@ -113,7 +113,7 @@ def main():
                     help="each run also writes its instrumented debug companion "
                          "(debug/<name>-debug.pt); diff companions with scripts/debug_compare.py")
     ap.add_argument("--data", default=None, metavar="SOURCE[:N]",
-                    help="rebind every spec's workloads to a registered data source (isb/data.py), "
+                    help="rebind every spec's regimes to a registered data source (isb/data.py), "
                          "e.g. jlens/poetry or factual:64 — same procedure, different data; runs "
                          "are named <spec>@<source>-* so run files never collide")
     args = ap.parse_args()

@@ -5,7 +5,7 @@ across tasks (not per cell); an intervention error is isolated (the engine survi
 still run, no reload) and still appears as an ERROR row when scored; perf meta is populated for
 the cells that ran; batched candidates are scored against the reference's per-prompt stack (a
 padded batch is not its own valid reference); a control-dtype run file disambiguates precision
-near-ties; aggregate workloads score the verdict over ALL prompts (and pairs).
+near-ties; aggregate regimes score the verdict over ALL prompts (and pairs).
 """
 import sys
 from pathlib import Path
@@ -20,7 +20,7 @@ from isb.runs import EngineConfig, RunConfig  # noqa: E402
 from isb.states import AppState  # noqa: E402
 from isb.sweep.execute import execute_run  # noqa: E402
 from isb.sweep.score import score_runs  # noqa: E402
-from isb.sweep.spec import BaselineSpec, CellConfig, Workload  # noqa: E402
+from isb.sweep.spec import BaselineSpec, CellConfig, ExecutionRegime  # noqa: E402
 
 V = 8
 
@@ -82,7 +82,7 @@ def _fake_get_cell(methodology, family, backend):
 def _spec():
     return CellConfig(
         name="fake", methodology="m", family="fam", repo="repo://x",
-        workloads=[Workload("interactive", ["one prompt"])],
+        regimes=[ExecutionRegime("interactive", ["one prompt"])],
         tasks=[({"k": "a"}, "a"), ({"k": "b"}, "b")],   # task "a" errors on vLLM, "b" succeeds AFTER it
         baseline=BaselineSpec(params={"k": "base"}),
         effect=None, warmup=0, n_trials=1,
@@ -136,7 +136,7 @@ def test_batched_candidate_scored_against_perprompt_reference_not_padded_batch(t
 
     spec = CellConfig(
         name="b", methodology="m", family="fam", repo="r",
-        workloads=[Workload("batched", ["p1", "p2", "p3"])],
+        regimes=[ExecutionRegime("batched", ["p1", "p2", "p3"])],
         tasks=[({}, "t")], baseline=BaselineSpec(params={}), effect=None, warmup=0, n_trials=1)
 
     _execute(tmp_path, "ref", "transformers", spec, fake_get_cell)
@@ -250,7 +250,7 @@ def test_aggregate_interactive_scores_over_all_prompts(tmp_path):
 
     spec = CellConfig(
         name="agg", methodology="m", family="f", repo="r",
-        workloads=[Workload("interactive", ["p0", "p1", "p2", "p3"])],   # aggregate=True (default)
+        regimes=[ExecutionRegime("interactive", ["p0", "p1", "p2", "p3"])],   # aggregate=True (default)
         tasks=[({}, "t")], baseline=BaselineSpec(params={}), effect=None, warmup=0, n_trials=1)
 
     _execute(tmp_path, "ref", "transformers", spec, fake)
@@ -279,7 +279,7 @@ def test_pair_unit_workload_aggregates_over_pairs(tmp_path):
 
     spec = CellConfig(
         name="patch_agg", methodology="activation_patching", family="f", repo="r",
-        workloads=[Workload("interactive", pairs, aggregate=True)],
+        regimes=[ExecutionRegime("interactive", pairs, aggregate=True)],
         tasks=[({}, "t")], baseline=BaselineSpec(params={}), effect=None, warmup=0, n_trials=1)
 
     _execute(tmp_path, "ref", "transformers", spec, fake)

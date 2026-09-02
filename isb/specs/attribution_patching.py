@@ -8,7 +8,7 @@ overhead denominator, and the part that also runs on vLLM); the task does the fu
 forward+backward attribution.
 """
 from ..data import DataRef
-from ..sweep.spec import BaselineSpec, CellConfig, Workload
+from ..sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
 
 # labeled pairs: (clean, corrupted, (correct, incorrect)) — answers ride with the data
 _PAIRS = DataRef("mib/ioi_labeled", 20)
@@ -16,7 +16,7 @@ _PAIRS = DataRef("mib/ioi_labeled", 20)
 attribution_patching_gpt2 = CellConfig(
     name="attribution_patching_gpt2",
     methodology="attribution_patching", family="gpt2", repo="openai-community/gpt2",
-    workloads=[Workload("interactive", _PAIRS, aggregate=True)],
+    regimes=[ExecutionRegime("interactive", _PAIRS, aggregate=True)],
     tasks=[({"residual": "plain"}, "residual=plain")],
     baseline=BaselineSpec(params={"residual": "plain", "grad": False}),
     effect=None,

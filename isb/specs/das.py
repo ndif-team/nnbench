@@ -9,7 +9,7 @@ frontier's training-loop realization, guarded by held-out interchange accuracy).
 Baseline = apply, so overhead-vs-baseline prices the training loop itself.
 """
 from ..data import DataRef
-from ..sweep.spec import BaselineSpec, CellConfig, Workload
+from ..sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
 
 # labeled units: 16 train + 8 held-out (the cell's heldout default)
 _UNITS = DataRef("mib/ioi_labeled", 24)
@@ -17,7 +17,7 @@ _UNITS = DataRef("mib/ioi_labeled", 24)
 das_gpt2 = CellConfig(
     name="das_gpt2",
     methodology="das", family="gpt2", repo="openai-community/gpt2",
-    workloads=[Workload("interactive", _UNITS, aggregate=False)],
+    regimes=[ExecutionRegime("interactive", _UNITS, aggregate=False)],
     tasks=[
         ({"train": 0}, "apply (seeded orthogonal rotation)"),
         ({"train": 24}, "train (24 rotation steps + held-out accuracy guard)"),

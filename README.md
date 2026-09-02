@@ -13,7 +13,7 @@ vs an HF reference), and **runs fast** (latency / throughput / peak memory / ove
 
 ## What it produces
 
-For every cell `(methodology × family × backend × params × workload)`, the harness emits an
+For every cell `(protocol semantics × family × backend × realization × execution regime)`, the harness emits an
 **applicability map** state plus a **performance** measurement.
 
 The states (a crash-or-not check only sees the first two; the rest need the numerical oracle):
@@ -43,7 +43,7 @@ and reports latency, peak GPU memory, overhead vs a no-intervention baseline, an
 - **Backends:** HuggingFace `LanguageModel` (the per-family control) vs vLLM in both engine modes —
   `vllm_async` (continuous-batching server) and `vllm_sync` (in-process) — plus a `vllm_serve` client
   for a remote nnsight-vllm-serve server. Selectable with `--backend(s)` on `scripts/{bench,micro}.py`.
-- **Workloads:** `interactive` (single prompt), `batched` (N prompts; throughput + per-prompt
+- **Execution regimes:** `interactive` (single prompt), `batched` (N prompts; throughput + per-prompt
   oracle), and `generation` (greedy multi-token decode; per-step read/intervention). Batching is a
   coverage axis — it is oracle-checked, not timed blind.
 
@@ -92,12 +92,13 @@ conda run -n nnsight-serve-test python tests/test_sweep.py   # etc.
 
 ```
 isb/
+  protocol.py       CausaLab-aligned semantic metadata; never constructs intervention code
   methodologies/   @cell(methodology, family, backend) -> explicit per-cell intervention code
   backends/        `be` infra: HF (control) + vLLM async / sync / serve (run / patch / batched / teardown)
   oracle/          numerical-equivalence comparison (top-1 + total-variation)
   runner/          run_cell, evaluate (per-family control), dtype-control disambiguation
   perf/            time_cell (warmup + N trials, CUDA-synced, median±std, peak mem)
-  sweep/           CellConfig/Workload/EffectSpec + the one-pass run_sweep driver
+  sweep/           CellConfig/TaskSpec/ExecutionRegime/EffectSpec + execute/score layers
   specs/           one CellConfig per methodology (what bench.py --spec runs)
   report/          applicability map + performance table
 scripts/           bench.py (method specs) · micro.py (Level-0/1 primitive probes)

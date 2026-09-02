@@ -3,7 +3,7 @@
 A run is a fully described execution in its own process. It ALWAYS writes ONE self-contained
 file, <out_dir>/<run_name>.pt (isb/runfile.py), holding:
 
-    outputs      {(workload_kind, label): cpu tensor} — every cell's warm output, plus
+    outputs      {(regime_kind, label): cpu tensor} — every cell's warm output, plus
                  ("batched_perprompt", label): the per-prompt stack for each batched task, so ANY
                  run can later serve as the reference for a padded-batch comparison; plus
                  ("__meta__",): per-cell perf/errors.
@@ -34,13 +34,13 @@ def _call_cell(name, impl, model, prompts, methodology, family, params):
     return fn(impl, model, prompts, **params)
 
 
-def _task_params(workload, params):
+def _task_params(regime, params):
     """Per-call cell params = dataset knobs (per-source defaults, e.g. the upstream readout-position
     rule) UNDER the task's explicit params (a task param always wins), plus the generation regime's
-    decode-step count from the Workload (the regime axis lives there, not in every task dict)."""
-    merged = {**workload.data_knobs, **params} if workload.data_knobs else params
-    if workload.kind == "generation":
-        return {**merged, "new_tokens": workload.new_tokens}
+    decode-step count from the ExecutionRegime (the regime axis lives there, not in every task dict)."""
+    merged = {**regime.data_knobs, **params} if regime.data_knobs else params
+    if regime.kind == "generation":
+        return {**merged, "new_tokens": regime.new_tokens}
     return merged
 
 
@@ -74,38 +74,39 @@ def _per_prompt_stack(name, impl, model, prompts, methodology, family, params):
     return torch.cat(mats, dim=-2) if mats[0].dim() >= 2 else torch.stack(mats)
 
 
-def _throughput(workload, timing):
+def _throughput(regime, timing):
     if not timing.median_ms:
         return None
     s = timing.median_ms / 1000.0
-    if workload.kind == "batched":
-        return len(workload.prompts) / s     # prompts/s
-    if workload.kind == "generation":
-        return workload.new_tokens / s       # tokens/s (single-prompt greedy decode)
+    if regime.kind == "batched":
+        return len(regime.prompts) / s     # prompts/s
+    if regime.kind == "generation":
+        return regime.new_tokens / s       # tokens/s (single-prompt greedy decode)
     return None
 
 
 def _run_coordinates(spec, run: RunConfig) -> dict:
-    return {
+    coordinates = {
         "spec": spec.name,
         "methodology": spec.methodology,
         "family": spec.family,
         "repo": spec.repo,
-        "data": sorted({w.data_name for w in spec.workloads if w.data_name}),
-        "workloads": [{"kind": w.kind, "units": len(w.prompts), "data": w.data_name}
-                      for w in spec.workloads],
-        "tasks": [label for _, label in spec.tasks],
+        "data": sorted({w.data_name for w in spec.regimes if w.data_name}),
+        "regimes": [{"kind": w.kind, "units": len(w.prompts), "data": w.data_name}
+                      for w in spec.regimes],
+        "cases": [task.coordinate() for task in spec.tasks],
         "interface": cell_interface(run),
     }
+    if spec.protocol is not None:
+        coordinates["protocol"] = spec.protocol.coordinate()
+    return coordinates
 
 
 def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
                 release_findings: list | None = None, debug: bool = False) -> str:
-    """Run every (workload, task) cell of `spec` on `run`'s stack; write outputs + provenance.
+    """Run every (execution regime, task) cell of `spec` on `run`'s stack; write outputs + provenance.
     Returns the outputs path. Cell errors are isolated and recorded in meta, never fatal to the
     run (the engine survives; later cells still execute)."""
-    import torch
-
     prov = resolve_provenance(run)
     prov["coordinates"] = _run_coordinates(spec, run)
     if release_findings is not None:
@@ -117,63 +118,65 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
     model = None
     try:
         model = be.load(spec.repo)
-        for workload in spec.workloads:
-            timed_prompts = ([workload.prompts[0]] if workload.aggregate
-                             else workload.prompts)
-            if workload.aggregate and isinstance(workload.prompts[0], tuple):
-                timed_prompts = list(workload.prompts[0])
+        for regime in spec.regimes:
+            timed_prompts = ([regime.prompts[0]] if regime.aggregate
+                             else regime.prompts)
+            if regime.aggregate and isinstance(regime.prompts[0], tuple):
+                timed_prompts = list(regime.prompts[0])
             base_timing = None
             try:
                 base_timing, _ = time_cell(
                     lambda tp=timed_prompts: _call_cell(
                         iface, be, model, tp, spec.methodology, spec.family,
-                        _task_params(workload, spec.baseline.params)),
+                        _task_params(regime, spec.baseline.params)),
                     warmup=spec.warmup, n_trials=spec.n_trials)
             except Exception:
                 traceback.print_exc()
 
-            for params, label in spec.tasks:
-                key = (workload.kind, label)
+            for task in spec.tasks:
+                params, label = task.params, task.label
+                key = (regime.kind, label)
                 try:
                     timing, warm = time_cell(
-                        lambda tp=timed_prompts, p=_task_params(workload, params): _call_cell(
+                        lambda tp=timed_prompts, p=_task_params(regime, params): _call_cell(
                             iface, be, model, tp, spec.methodology, spec.family, p),
                         warmup=spec.warmup, n_trials=spec.n_trials)
-                    if workload.aggregate:
-                        warm = _per_prompt_stack(iface, be, model, workload.prompts,
+                    if regime.aggregate:
+                        warm = _per_prompt_stack(iface, be, model, regime.prompts,
                                                  spec.methodology, spec.family,
-                                                 _task_params(workload, params))
+                                                 _task_params(regime, params))
                     outputs[key] = warm
                     meta[key] = {
                         "median_latency_ms": timing.median_ms, "std_latency_ms": timing.std_ms,
                         "peak_mem_mb": timing.peak_mem_mb,
                         "overhead_vs_baseline": (timing.median_ms / base_timing.median_ms)
                         if (base_timing and base_timing.median_ms) else None,
-                        "throughput": _throughput(workload, timing), "error": None,
+                        "throughput": _throughput(regime, timing), "error": None,
                     }
                 except Exception as e:              # isolated: engine survives, later cells run
                     traceback.print_exc()
                     meta[key] = {"error": repr(e)[:300]}
 
-            if workload.kind == "batched":          # any run can reference a padded-batch compare
-                for params, label in spec.tasks:
+            if regime.kind == "batched":          # any run can reference a padded-batch compare
+                for task in spec.tasks:
+                    params, label = task.params, task.label
                     try:
                         outputs[("batched_perprompt", label)] = _per_prompt_stack(
-                            iface, be, model, workload.prompts,
-                            spec.methodology, spec.family, _task_params(workload, params))
+                            iface, be, model, regime.prompts,
+                            spec.methodology, spec.family, _task_params(regime, params))
                     except Exception:
                         traceback.print_exc()
 
             # the non-vacuity guard, recorded per run (score reads it off the reference side)
-            if spec.effect is not None and workload.kind in ("interactive", "generation"):
+            if spec.effect is not None and regime.kind in ("interactive", "generation"):
                 try:
-                    pairs = workload.prompts and isinstance(workload.prompts[0], tuple)
-                    call = (_per_prompt_stack if workload.aggregate and pairs else _call_cell)
-                    b = call(iface, be, model, workload.prompts, spec.methodology,
-                             spec.family, _task_params(workload, spec.effect.baseline_params))
-                    p = call(iface, be, model, workload.prompts, spec.methodology,
-                             spec.family, _task_params(workload, spec.effect.perturbed_params))
-                    meta[("__effect__", workload.kind)] = compute_effect_size(
+                    pairs = regime.prompts and isinstance(regime.prompts[0], tuple)
+                    call = (_per_prompt_stack if regime.aggregate and pairs else _call_cell)
+                    b = call(iface, be, model, regime.prompts, spec.methodology,
+                             spec.family, _task_params(regime, spec.effect.baseline_params))
+                    p = call(iface, be, model, regime.prompts, spec.methodology,
+                             spec.family, _task_params(regime, spec.effect.perturbed_params))
+                    meta[("__effect__", regime.kind)] = compute_effect_size(
                         b, p, tv_floor=spec.effect.tv_floor, top1_ceiling=spec.effect.top1_ceiling)
                 except Exception:
                     traceback.print_exc()
