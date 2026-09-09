@@ -174,29 +174,19 @@ backend column is reserved, no rows now), deprecated iteration forms, non-greedy
 
 ### Protocol index and nnbench execution details
 
-Method rows now use the same semantic coordinates as CausaLab documents: data roles, components,
-operations, write mechanisms, position frames, featurizers, and required capabilities. nnbench
-then adds **realization** (for example in-place vs replacement or bounded vs unbounded) and
-**extensions** for behavior outside CausaLab v1. The Level-0/1/1.5 terms above remain useful for
-diagnosing an engine failure, but they are no longer a second method-indexing vocabulary.
+The authoritative methodology templates, parameter classifications, and case specialization
+live in [isb/protocol.py](../isb/protocol.py): `PROTOCOLS` defines the templates and
+`describe_task()` derives concrete case requirements. The method summaries below explain the
+scientific procedures and their coverage; the Python definitions own the executable-spec inventory.
 
-The implemented templates and task specialization live in `isb/protocol.py`. This table lists
-methodology templates; concrete cases narrow these requirements (for example `grad=False` removes
-backward and `patch=False` removes the transplant). Capability unions are not per-case requirements.
+Semantic parameters specify the computation: ablation's `target` chooses the component being
+ablated, and DAS's `train` selects training or application. Realization parameters specify the
+implementation spelling, such as `residual` or bounded iteration. Extensions identify behavior
+outside CausaLab v1. The Level-0/1/1.5 vocabulary above supports engine-failure diagnosis.
 
-| nnbench methodology | data | components | operations / `do` | frame | capabilities | nnbench realization / extension |
-|---|---|---|---|---|---|---|
-| `logit_lens` | base | `block_output`, `lm_head` | read | prompt | `full_logits` | module-call vs weight-matmul unembed; plain vs fused residual |
-| `steering` | base | `block_output`, `lm_head` | read, write / `add_scaled` | prompt | `full_logits` | in-place vs replacement |
-| `ablation` | base | `attention_output`, `mlp_output`, `block_output`, `lm_head` | read, write / `swap` | prompt | `full_logits` | target component selected by the case |
-| `activation_patching` | base + counterfactual | `block_output`, `lm_head` | read, write / `swap` | prompt | `paired_forward`, `full_logits` | plain vs fused residual |
-| `gen_patching` | base + counterfactual | `block_output`, `lm_head` | read, write / `swap` | prompt + generated | `paired_forward`, `full_logits`, `generate` | bounded vs unbounded decode; residual spelling |
-| `gen_steering` | base | `block_output`, `lm_head` | read, write / `add_scaled` | prompt + generated | `full_logits`, `generate` | bounded vs unbounded; extension: decode-step write |
-| `attention_pattern` | base | `attention_probs` | read | prompt | — | — |
-| `attribution_patching` | base + counterfactual | `block_output`, `lm_head` | read, grad | prompt | `grad` | residual spelling; extension: activation gradient |
-| `das` | base + counterfactual | `block_output`, `lm_head` | read, write / `swap`; grad only when training; `subspace` featurizer | prompt | `paired_forward`, `full_logits`; `grad` only when training | apply vs training case; residual spelling |
-| `jacobian_collect` | base | `block_output` | read, grad | prompt | `grad` | VJP batch size and residual spelling; extensions: activation gradient, Jacobian export |
-| `jacobian_lens` | base | `block_output`, `lm_head` | read | prompt | `full_logits` | unembed spelling; extension: linear transport |
+Saved provenance contains each case's semantic and realization values and its effective protocol.
+For example, DAS application (`train=0`) requires forward execution, while training also requires
+gradients. `protocol_coverage` identifies described methods and explicitly opted-out experiments.
 
 Status: ✓ = already an nnbench cell. **frontier** = exercises a primitive where vLLM and HF diverge
 (the highest-signal additions).

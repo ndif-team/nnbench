@@ -82,11 +82,51 @@ def _fake_get_cell(methodology, family, backend):
 def _spec():
     return CellConfig(
         name="fake", methodology="m", family="fam", repo="repo://x",
+        protocol_absence_reason="Synthetic execution harness fixture",
         regimes=[ExecutionRegime("interactive", ["one prompt"])],
         tasks=[({"k": "a"}, "a"), ({"k": "b"}, "b")],   # task "a" errors on vLLM, "b" succeeds AFTER it
         baseline=BaselineSpec(params={"k": "base"}),
         effect=None, warmup=0, n_trials=1,
     )
+
+
+def test_mutating_cell_cannot_change_later_calls_or_saved_coordinates(tmp_path, monkeypatch):
+    from isb.perf import timing
+    from isb.sweep.spec import EffectSpec
+
+    monkeypatch.setattr(timing, "force_gc", lambda: None)
+    spec = _spec()
+    spec.warmup, spec.n_trials = 2, 3
+    spec.regimes = [ExecutionRegime("interactive", ["a", "b"],
+                                    data_knobs={"nested": {"values": [1]}}),
+                    ExecutionRegime("batched", ["a", "b"],
+                                    data_knobs={"nested": {"values": [1]}})]
+    spec.effect = EffectSpec({"k": "base"}, {"k": "a"})
+    for params in (spec.baseline.params, spec.effect.baseline_params,
+                   spec.effect.perturbed_params, spec.tasks[0].semantics):
+        params["nested"] = {"values": [1]}
+    seen = []
+
+    def registry(*args):
+        def cell(impl, model, prompts, **params):
+            seen.append(list(params["nested"]["values"]))
+            params["nested"]["values"].append(99)
+            return _onehot(0)
+        return cell
+
+    _execute(tmp_path, "owned", "transformers", spec, registry)
+    assert len(seen) > 20
+    assert all(values == [1] for values in seen)
+    assert all(w.data_knobs["nested"]["values"] == [1] for w in spec.regimes)
+    assert spec.baseline.params["nested"]["values"] == [1]
+    assert spec.effect.baseline_params["nested"]["values"] == [1]
+    assert spec.effect.perturbed_params["nested"]["values"] == [1]
+    assert spec.tasks[0].params["nested"]["values"] == [1]
+    _, provenance = load_run(str(tmp_path), "owned")
+    assert all(w["data_knobs"]["nested"]["values"] == [1]
+               for w in provenance["coordinates"]["regimes"])
+    assert all(c["semantics"]["nested"]["values"] == [1]
+               for w in provenance["coordinates"]["regimes"] for c in w["cases"])
 
 
 def test_model_loaded_once_per_run_not_per_cell(tmp_path):
@@ -136,6 +176,7 @@ def test_batched_candidate_scored_against_perprompt_reference_not_padded_batch(t
 
     spec = CellConfig(
         name="b", methodology="m", family="fam", repo="r",
+        protocol_absence_reason="Synthetic batched fixture",
         regimes=[ExecutionRegime("batched", ["p1", "p2", "p3"])],
         tasks=[({}, "t")], baseline=BaselineSpec(params={}), effect=None, warmup=0, n_trials=1)
 
@@ -250,6 +291,7 @@ def test_aggregate_interactive_scores_over_all_prompts(tmp_path):
 
     spec = CellConfig(
         name="agg", methodology="m", family="f", repo="r",
+        protocol_absence_reason="Synthetic aggregate fixture",
         regimes=[ExecutionRegime("interactive", ["p0", "p1", "p2", "p3"])],   # aggregate=True (default)
         tasks=[({}, "t")], baseline=BaselineSpec(params={}), effect=None, warmup=0, n_trials=1)
 

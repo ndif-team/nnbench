@@ -66,22 +66,29 @@ class TimingResult:
     times_ms: list = field(default_factory=list)
 
 
-def time_cell(fn: Callable[[], Any], *, warmup: int = 3, n_trials: int = 7):
+def time_cell(fn: Callable[[], Any] | None, *, warmup: int = 3, n_trials: int = 7,
+              prepare_call: Callable[[], Callable[[], Any]] | None = None):
     """Warm up `warmup` calls (discarded — they pay engine/trace/CUDA-graph init), then time
     `n_trials` calls of `fn`. Each call of `fn` is the timed unit and opens its own fresh trace
     (required: the vLLM async generator is single-shot). Returns `(TimingResult, last_warm_output)`.
+    ``prepare_call`` supplies a fresh invocation before each warmup/trial. Its configuration
+    setup runs outside the timed interval; existing callers can continue passing ``fn``.
     """
     if n_trials < 1:
         raise ValueError("n_trials must be >= 1")
+    if (fn is None) == (prepare_call is None):
+        raise ValueError("provide exactly one of fn or prepare_call")
     for _ in range(warmup):
-        fn()
+        call = prepare_call() if prepare_call is not None else fn
+        call()
         force_gc()
     reset_peak_mem()                       # measure peak over the TIMED trials, after warmup settles
     times, out = [], None
     for _ in range(n_trials):
+        call = prepare_call() if prepare_call is not None else fn
         sync_cuda()
         t0 = perf_counter()
-        out = fn()
+        out = call()
         sync_cuda()
         times.append((perf_counter() - t0) * 1000.0)
         force_gc()

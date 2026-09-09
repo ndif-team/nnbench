@@ -206,6 +206,7 @@ def test_generation_sweep_oracle_throughput_and_effect():
 
     spec = CellConfig(
         name="fake_gen", methodology="m", family="fam", repo="repo://x",
+        protocol_absence_reason="Synthetic generation steering fixture",
         regimes=[ExecutionRegime("generation", ["p1", "p2"], new_tokens=4)],
         tasks=[({"alpha": 6.0, "bound": "bounded"}, "bound=iter[0:N]"),
                ({"alpha": 6.0, "bound": "unbounded"}, "bound=iter[:]")],

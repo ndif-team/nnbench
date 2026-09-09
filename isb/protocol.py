@@ -1,9 +1,8 @@
 """CausaLab-aligned semantic indexing for nnbench cells.
 
-This module deliberately describes interventions; it does not construct them.  The executable
-program remains the explicit ``@cell(methodology, family, backend)`` function.  Keeping this layer
-non-executable preserves nnbench's central invariant: backend realizations are things the benchmark
-measures, not generated implementation details hidden behind a resolver.
+This module holds intervention descriptors, parameter classifications, and concrete case
+requirements. Explicit ``@cell(methodology, family, backend)`` functions implement the programs
+whose backend realizations nnbench measures.
 
 ``InterventionSpec`` is the intersection of CausaLab's intervention-protocol vocabulary and the
 coordinates nnbench needs to index a cell.  It is intentionally smaller than a runnable CausaLab
@@ -103,8 +102,8 @@ class InterventionSpec:
     def coordinate(self) -> dict[str, list[str]]:
         """JSON-safe protocol coordinates for provenance and catalog indexing.
 
-        This is deliberately not CausaLab's canonical document form. Digests and artifact identity
-        remain owned by CausaLab; nnbench only publishes the semantic coordinates it measured.
+        These coordinates describe the measured case. The Docker job contract owns nnbench's
+        experiment and artifact checksums; CausaLab owns its canonical document identities.
         """
         return {
             "data_roles": list(self.data_roles),

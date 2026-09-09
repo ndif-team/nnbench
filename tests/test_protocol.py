@@ -2,6 +2,7 @@
 import sys
 import inspect
 from dataclasses import replace
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,34 @@ from isb.runs import EngineConfig, RunConfig  # noqa: E402
 from isb.specs import SPECS  # noqa: E402
 from isb.sweep.execute import _run_coordinates  # noqa: E402
 from isb.sweep.spec import BaselineSpec, CellConfig, ExecutionRegime, TaskSpec  # noqa: E402
+
+
+def test_task_owns_nested_config_and_returns_independent_snapshots():
+    source = {"layers": [1, 2]}
+    task = TaskSpec("case", source, {"options": {"order": [3]}})
+    source["layers"].append(99)
+    params, coordinate = task.params, task.coordinate()
+    params["layers"].append(4)
+    params["options"]["order"].append(5)
+    task.semantics["layers"].append(6)
+    assert coordinate["semantics"]["layers"] == [1, 2]
+    assert coordinate["realization"]["options"]["order"] == [3]
+    assert task.params["layers"] == [1, 2, 6]
+    assert task.params["options"]["order"] == [3]
+
+
+def test_worker_coordinates_are_snapshots_of_frozen_experiment(tmp_path):
+    from isb.jobs.contract import prepare, read_experiment, restore_spec
+
+    spec = deepcopy(SPECS["jacobian_lens_qwen35"])
+    experiment = prepare(spec, tmp_path / "job")
+    worker, _ = restore_spec(tmp_path / "job")
+    coords = _run_coordinates(worker, RunConfig(engine=EngineConfig("transformers")))
+    before = deepcopy(coords)
+    for task in worker.tasks:
+        task.semantics["layers"].append(999)
+    assert coords == before
+    assert read_experiment(tmp_path / "job") == experiment
 
 
 def test_every_registered_spec_has_protocol_semantics():
@@ -176,9 +205,24 @@ def test_custom_method_keeps_explicit_realization_without_protocol():
     spec = CellConfig(
         "custom", "custom", "gpt2", "repo",
         [ExecutionRegime("interactive", ["p"], data_knobs={"scale": 2})],
-        [TaskSpec("case", {"layer": 1}, {"mode": "replace"})], BaselineSpec({}))
+        [TaskSpec("case", {"layer": 1}, {"mode": "replace"})], BaselineSpec({}),
+        protocol_absence_reason="Experimental method with author-supplied parameter split")
     coords = _run_coordinates(spec, RunConfig(engine=EngineConfig("transformers")))
     assert coords["cases"][0] == spec.tasks[0].coordinate()
     bound = coords["regimes"][0]["cases"][0]
     assert bound["semantics"] == {"layer": 1, "scale": 2}
     assert bound["realization"] == {"mode": "replace"}
+    assert coords["protocol_coverage"] == {
+        "status": "undescribed", "reason": spec.protocol_absence_reason}
+
+
+@pytest.mark.parametrize("reason", [None, "", "   "])
+def test_unknown_method_requires_descriptor_or_explicit_reason(reason):
+    with pytest.raises(ValueError, match="requires a protocol descriptor"):
+        CellConfig("custom", "typo", "gpt2", "repo", [], [], BaselineSpec({}),
+                   protocol_absence_reason=reason)
+
+
+def test_described_method_rejects_absence_reason():
+    with pytest.raises(ValueError, match="described methods"):
+        replace(SPECS["steering_gpt2"], protocol_absence_reason="skip metadata")

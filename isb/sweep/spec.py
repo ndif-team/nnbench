@@ -1,15 +1,13 @@
-"""Declarative benchmark spec (design.md §12) — one CellConfig per methodology.
+"""Declarative benchmark spec (design.md §12): one CellConfig per methodology.
 
-The 5 near-identical `scripts/smoke_*.py` collapse to one CellConfig each: the hardcoded
-METHOD/FAMILY/REPO/PROMPTS/TASKS plus the per-script effect-size baseline become data here, and the
-single execute layer (`isb/sweep/execute.py`) consumes them. No Resolver / YAML — the spec is Python next to
-the cells, matching the flat `@cell` registry idiom. ``InterventionSpec`` describes what the
-methodology means; ``ExecutionRegime`` describes how its inputs are presented; ``TaskSpec`` keeps
-semantic parameters separate from realization selectors. None of them generate intervention code.
+``InterventionSpec`` describes the methodology; ``ExecutionRegime`` describes its inputs;
+``TaskSpec`` separates semantic parameters from realization selectors. Python specs bind these
+descriptions to explicit cells, a model, and the execution settings consumed by the Docker worker.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
 from typing import Optional
 
 from ..protocol import InterventionSpec, protocol_for
@@ -78,8 +76,9 @@ class EffectSpec:
 class TaskSpec:
     """One benchmark case: protocol semantics × one backend realization.
 
-    ``params`` remains the exact mapping passed to the explicit cell, so this refactor cannot alter
-    execution. The split is descriptive and is persisted in run provenance for later cataloging.
+    ``params`` returns an independently owned copy of the values passed to the explicit cell.
+    The namespaces remain editable during spec authoring; coordinate snapshots own their values.
+    The split is persisted in run provenance for later cataloging.
     """
 
     label: str
@@ -90,16 +89,18 @@ class TaskSpec:
         overlap = set(self.semantics) & set(self.realization)
         if overlap:
             raise ValueError(f"task params cannot be both semantic and realization: {sorted(overlap)}")
+        object.__setattr__(self, "semantics", deepcopy(self.semantics))
+        object.__setattr__(self, "realization", deepcopy(self.realization))
 
     @property
     def params(self) -> dict:
-        return {**self.semantics, **self.realization}
+        return deepcopy({**self.semantics, **self.realization})
 
     def coordinate(self) -> dict:
         return {
             "label": self.label,
-            "semantics": dict(self.semantics),
-            "realization": dict(self.realization),
+            "semantics": deepcopy(self.semantics),
+            "realization": deepcopy(self.realization),
         }
 
     def __iter__(self):
@@ -124,10 +125,12 @@ class CellConfig:
     hf_kwargs: dict = field(default_factory=dict)
     vllm_kwargs: dict = field(default_factory=dict)
     protocol: InterventionSpec | None = None
+    protocol_absence_reason: str | None = None
 
     def __post_init__(self):
         if self.protocol is None:
             self.protocol = protocol_for(self.methodology)
+        self.protocol_coverage()
         normalized = []
         for task in self.tasks:
             if isinstance(task, TaskSpec):
@@ -145,6 +148,20 @@ class CellConfig:
                 semantics, realization = self.protocol.classify(params)
             normalized.append(TaskSpec(label=label, semantics=semantics, realization=realization))
         self.tasks = normalized
+
+    def protocol_coverage(self) -> dict:
+        """Validate and describe this spec's explicit metadata coverage policy."""
+        if self.protocol is not None:
+            if self.protocol_absence_reason is not None:
+                raise ValueError("described methods cannot supply protocol_absence_reason")
+            return {"status": "described"}
+        if protocol_for(self.methodology) is not None:
+            raise ValueError(f"built-in methodology {self.methodology!r} requires a protocol")
+        reason = self.protocol_absence_reason
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f"methodology {self.methodology!r} requires a protocol descriptor "
+                             "or an explicit protocol_absence_reason")
+        return {"status": "undescribed", "reason": reason}
 
     @property
     def workloads(self):

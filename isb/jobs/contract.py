@@ -57,10 +57,13 @@ def write_json(path, value):
 def prepare(spec, directory, *, seed=0):
     """Materialize the experiment once; containers never look up a spec or dataset."""
     directory = Path(directory)
+    coverage = spec.protocol_coverage()
     record = asdict(spec)
     # Keep the version-1 execution wire format understood by independent backend workers.
     # The richer Python types travel as optional, identity-covered description metadata.
-    description = {"protocol_template": record.pop("protocol"), "tasks": record.pop("tasks")}
+    description = {"protocol_template": record.pop("protocol"), "tasks": record.pop("tasks"),
+                   "protocol_coverage": coverage}
+    record.pop("protocol_absence_reason")
     record["workloads"] = record.pop("regimes")
     record["tasks"] = [(task.params, task.label) for task in spec.tasks]
     if not spec.regimes:
@@ -103,7 +106,7 @@ def read_experiment(directory):
 
 
 def restore_spec(directory):
-    from isb.protocol import InterventionSpec
+    from isb.protocol import InterventionSpec, protocol_for
     from isb.sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime, TaskSpec
 
     experiment = read_experiment(directory)
@@ -117,6 +120,7 @@ def restore_spec(directory):
         if workload.pop("units") != len(units[index]):
             raise ValueError("workload input count mismatch")
     record["regimes"] = [ExecutionRegime(prompts=u, **w) for w, u in zip(workloads, units)]
+    coverage = None
     if "description" in experiment:
         description = unpack(experiment["description"])
         template = description["protocol_template"]
@@ -125,10 +129,23 @@ def restore_spec(directory):
         if [(task.params, task.label) for task in tasks] != record["tasks"]:
             raise ValueError("task description does not match executable parameters")
         record["tasks"] = tasks
+        coverage = description.get("protocol_coverage")
+        if "protocol_coverage" in description:
+            if not isinstance(coverage, dict):
+                raise ValueError("invalid protocol coverage")
+            if coverage.get("status") == "undescribed":
+                record["protocol_absence_reason"] = coverage.get("reason")
+            elif coverage != {"status": "described"} or template is None:
+                raise ValueError("invalid protocol coverage")
+    if coverage is None and record.get("protocol") is None and protocol_for(record["methodology"]) is None:
+        record["protocol_absence_reason"] = "Legacy experiment predates explicit protocol coverage"
     record["baseline"] = BaselineSpec(**record["baseline"])
     if record["effect"] is not None:
         record["effect"] = EffectSpec(**record["effect"])
-    return CellConfig(**record), experiment
+    spec = CellConfig(**record)
+    if coverage is not None and spec.protocol_coverage() != coverage:
+        raise ValueError("protocol coverage does not match descriptor")
+    return spec, experiment
 
 
 def expected_cells(experiment):

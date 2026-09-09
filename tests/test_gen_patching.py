@@ -214,6 +214,7 @@ def test_generation_pair_sweep_oracle_and_effect():
 
     spec = CellConfig(
         name="fake_gp", methodology="m", family="fam", repo="repo://x",
+        protocol_absence_reason="Synthetic generation patching fixture",
         regimes=[ExecutionRegime("generation", ["CLEAN", "CORRUPT"], new_tokens=5, aggregate=False)],
         tasks=[({"bound": "bounded", "patch": True}, "bound=iter[0:N]"),
                ({"bound": "unbounded", "patch": True}, "bound=iter[:]")],

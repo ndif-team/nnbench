@@ -17,6 +17,7 @@ compares, so results can be re-scored, cross-compared, and audited without re-ru
 from __future__ import annotations
 
 import traceback
+from copy import deepcopy
 
 from ..methodologies.registry import get_cell
 from ..perf.timing import time_cell
@@ -29,10 +30,16 @@ from ..sweep.guards import compute_effect_size
 # ---- cell-call helpers (shared with tests; formerly the sweep driver's) -----------------------
 
 def _call_cell(name, impl, model, prompts, methodology, family, params):
+    return _prepare_cell(name, impl, model, prompts, methodology, family, params)()
+
+
+def _prepare_cell(name, impl, model, prompts, methodology, family, params):
+    """Give one invocation its own configuration before entering the timed region."""
     fn = get_cell(methodology, family, name)
     if fn is None:
         raise LookupError(f"no cell for {methodology}/{family}/{name}")
-    return fn(impl, model, prompts, **params)
+    owned = deepcopy(params)
+    return lambda: fn(impl, model, prompts, **owned)
 
 
 def _task_params(regime, params):
@@ -103,6 +110,7 @@ def _run_coordinates(spec, run: RunConfig) -> dict:
         "methodology": spec.methodology,
         "family": spec.family,
         "repo": spec.repo,
+        "protocol_coverage": spec.protocol_coverage(),
         "data": sorted({w.data_name for w in spec.regimes if w.data_name}),
         "regimes": [{"kind": w.kind, "units": len(w.prompts), "data": w.data_name,
                      "new_tokens": w.new_tokens, "aggregate": w.aggregate,
@@ -114,7 +122,7 @@ def _run_coordinates(spec, run: RunConfig) -> dict:
     }
     if spec.protocol is not None:
         coordinates["protocol_template"] = spec.protocol.coordinate()
-    return coordinates
+    return deepcopy(coordinates)
 
 
 def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
@@ -155,7 +163,7 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
             base_timing = None
             try:
                 base_timing, _ = time_cell(
-                    lambda tp=timed_prompts: _call_cell(
+                    None, prepare_call=lambda tp=timed_prompts: _prepare_cell(
                         iface, be, model, tp, spec.methodology, spec.family,
                         _task_params(regime, spec.baseline.params)),
                     warmup=spec.warmup, n_trials=spec.n_trials)
@@ -167,7 +175,7 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
                 key = (regime.kind, label)
                 try:
                     timing, warm = time_cell(
-                        lambda tp=timed_prompts, p=_task_params(regime, params): _call_cell(
+                        None, prepare_call=lambda tp=timed_prompts, p=_task_params(regime, params): _prepare_cell(
                             iface, be, model, tp, spec.methodology, spec.family, p),
                         warmup=spec.warmup, n_trials=spec.n_trials)
                     if regime.aggregate:

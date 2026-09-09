@@ -39,6 +39,7 @@ class _FakeBackend:
 def _spec():
     return CellConfig(
         name="xs", methodology="m", family="f", repo="r",
+        protocol_absence_reason="Synthetic execution and scoring fixture",
         regimes=[ExecutionRegime("interactive", ["p0", "p1"]),
                    ExecutionRegime("batched", ["p0", "p1"])],
         tasks=[({}, "t")], baseline=BaselineSpec(params={}), effect=None,

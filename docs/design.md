@@ -69,10 +69,8 @@ Adding work = adding rows/registry entries, never a harness redesign.
 > | SOURCE | Level 1 internal-tier sites |
 > | SAVE / transmit | Level 2 cross-edge movement (live-out of a region) |
 
-**This model is a vocabulary for declaring footprints and indexing measurements** — metadata and
-micro-cells. It is NOT a construction layer: cells stay flat and explicit (§12); nothing generates
-intervention code from these declarations. That distinction is the §11 lesson — the Resolver died
-because it *constructed* the experiments; the levels only *explain and index* them.
+**This model supplies vocabulary for declaring footprints and indexing measurements.**
+The levels explain measurements; explicit cells implement interventions (§12).
 
 Normative definitions live here; the maintained per-context **status inventory** lives in
 `interp-methods-catalog.md` (one copy, so the lists can't diverge again).
@@ -616,7 +614,7 @@ tolerance — the "same trace, same answer" claim, and the `SILENTLY_WRONG` dete
 | Resolver vocab resolution | (a)/(b)/(c) | **vocabulary spans all of (a/b/c)**; v1 *portable+perf* addressing = (a)+(b); (c) implemented **HF-eager-only as frontier markers** (run on vLLM expecting ERROR/UNSUPPORTED, verified) | **DECIDED** |
 | Correctness goal | coverage-only vs +equivalence | **+equivalence — LOAD-BEARING**: it's the only `SILENTLY_WRONG` detector (§8.1), not just the OSDI claim | **DECIDED** |
 | Adopt pyvene vocab + causalab harness shape | yes / build fresh | adopt: pyvene names→`FamilyProfile`; causalab Hydra config groups (§11.10) | **SUPERSEDED 2026-08-26** (never implemented; both were removed by causalab PR #20) |
-| Intervention description | ad hoc params / causalab vocabulary | **CausaLab-aligned `InterventionSpec` metadata**, separate from `ExecutionRegime` and `TaskSpec.realization`; it indexes and describes explicit cells but never constructs them. Metrics/artifacts/workflows and causalab's `Backend` stay out of nnbench | **IMPLEMENTED 2026-09-02** |
+| Intervention description | ad hoc params / causalab vocabulary | **CausaLab-aligned `InterventionSpec` metadata**, separate from `ExecutionRegime` and `TaskSpec.realization`; it indexes and describes explicit cells. CausaLab owns its scientific metrics, document/artifact identities, workflows, and `Backend` | **IMPLEMENTED 2026-09-02** |
 | Repo name | provisional `interp-serve-bench` | finalize later (avoid "InterpBench") | open |
 
 ---
@@ -874,16 +872,27 @@ def _(be, model, prompt):
   roles, components, reads/writes, mechanisms, position frames, featurizers, and capabilities.
   `TaskSpec.semantics` holds a case's values; `TaskSpec.realization` holds spelling choices such as
   in-place vs replacement or bounded vs unbounded iteration. Their merged `params` mapping is
-  passed to the cell unchanged. No resolver or document executor is introduced.
+  passed to the explicit cell with the same values.
 - **Requirements belong to the concrete case.** Methodology descriptors are templates.
   `describe_task` specializes operations and capabilities from task parameters: DAS apply
   (`train=0`) needs no gradients, while training does. Provenance calls the shared description
   `protocol_template`; each case has its own `protocol`. Each regime also records effective cases
   after dataset defaults and decode length are applied using the execution driver's precedence.
-  This metadata does not select a backend or skip a cell.
+  Backend selection belongs to the launcher; the cell records its observed execution outcome.
 - **Execution regimes are orthogonal.** `ExecutionRegime` owns inputs, interactive/batched/
-  generation shape, decode length, and aggregation. It is not overloaded with intervention
-  semantics, so a protocol case can be exercised under multiple regimes.
+  generation shape, decode length, and aggregation. A protocol case can be exercised under
+  multiple regimes.
+
+- **Configuration ownership is explicit.** Spec authoring uses editable namespaces. Task accessors
+  and provenance produce detached snapshots. The shared worker gives each invocation fresh nested
+  parameter values, including dataset defaults, baseline and effect parameters; timing prepares
+  those copies before the measured interval. The frozen Docker experiment is the submitted record.
+- **Metadata coverage is explicit.** Built-in methods require descriptors. Custom methods supply
+  an `InterventionSpec` or a nonempty `protocol_absence_reason`. The latter produces an
+  `undescribed` coverage record with its reason; described cases record `described` coverage.
+  This policy is checked at construction and job preparation. Older undescribed experiments
+  receive a legacy reason during restoration. Coverage and backend execution verdicts are
+  separate attributes.
 
 Migration: `CellConfig(workloads=...)` becomes `CellConfig(regimes=...)`. The `Workload` import
 alias and read-only `spec.workloads` property are transitional conveniences, not constructor
@@ -951,8 +960,8 @@ residual on a fused-residual family, §12.7), which IS a suite bug to fix in the
 - **Kept:** the applicability-map output + states (§8.1), the **oracle** (§8.3, now grouped by
   family), the **runner** verify→score→report flow, and the genuinely backend-specific *infra*
   (`be`: open trace, save, collect, last/stack, teardown — HF handle vs vLLM async `output.saves`).
-- **Added back only as description:** `InterventionSpec` and `TaskSpec` index the explicit program
-  using CausaLab's vocabulary. They cannot resolve sites or generate trace code.
+- **Descriptive index:** `InterventionSpec` and `TaskSpec` describe the explicit program using
+  CausaLab's vocabulary. Cell functions own site access and trace code.
 
 ### 12.4 Layout
 

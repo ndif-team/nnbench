@@ -87,11 +87,25 @@ DAS training; the host does not shard its inputs.
 
 Python specs use `ExecutionRegime` and `TaskSpec`, while the version-1 wire format deliberately
 retains `spec.workloads` and `(params, label)` tasks for independent workers. An optional
-`description` field carries the frozen protocol template and separated task semantics/realizations;
+`description` field carries the frozen protocol template, separated task semantics/realizations,
+and explicit `protocol_coverage`;
 it is covered by the experiment checksum. The nnsight worker restores these descriptions and
 records concrete per-case requirements and effective regime parameters in result provenance.
-Older version-1 experiments without descriptions remain readable. These hashes identify runner
-inputs and artifacts; they are not CausaLab document or artifact identities.
+Older version-1 experiments without descriptions remain readable. Undescribed legacy methods
+receive an explicit legacy-coverage reason on restoration. These hashes identify runner inputs
+and artifacts; CausaLab maintains its own document and artifact identities.
+
+Built-in methods require protocol descriptors. A custom method can supply an `InterventionSpec`
+directly or opt out with a nonempty `CellConfig.protocol_absence_reason`. The latter is recorded
+as `protocol_coverage: {"status": "undescribed", "reason": ...}` in the frozen description and
+shared worker provenance. Described methods record `{"status": "described"}`. Coverage describes
+metadata availability independently of execution verdicts. Independent workers may retain the
+version-1 execution fields and consume this optional description as needed.
+
+The shared worker snapshots provenance before execution and gives each cell invocation its own
+nested parameter values, including dataset defaults, baseline and effect parameters. Warmup and
+trial configuration copies are prepared outside the timed interval. Frozen experiment files
+remain the authoritative submitted configuration.
 
 The worker writes `result.pt` (the existing outputs/provenance dictionary) followed atomically by
 `result.json` (completion, experiment/backend identity, input/tensor checksums, one execution status

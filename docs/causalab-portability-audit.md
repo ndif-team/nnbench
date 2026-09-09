@@ -59,24 +59,21 @@ From that:
 
 - **The semantic part of an nnbench benchmark case is a causalab document** (the subset that
   describes what is intervened where: `data`, `positions`, `sites`, `reads`, `writes`,
-  `intervened_models`, `featurizers`). `ExecutionRegime` remains a separate context coordinate;
-  it is not renamed or overloaded into the document.
+  `intervened_models`, `featurizers`). `ExecutionRegime` supplies a separate context coordinate.
   nnbench keeps its own axes on top: context (family, backend, dtype, TP/PP layout, workload
   regime), realization (which spelling of each element a cell uses), status (the oracle's state
   label), and perf.
-- **causalab keeps its own axes** that nnbench does not adopt: `metrics`, `causal_model`,
+- **causalab owns its scientific document axes:** `metrics`, `causal_model`,
   `save`, canonical form and digests, `ArtifactIdentity`, the workflow layer, dataset resolution.
-- **nnbench does not adopt causalab's `Backend`.** A `Backend` is a resolver that turns documents
-  into hooks per engine (`SiteResolver`, mechanisms, planner). That is the construction layer
-  nnbench removed (design.md §11 to §12) and the object nnbench measures. Cells stay explicit
-  per backend; they are written from a document instead of from prose.
+- **Explicit nnbench cells implement each backend's intervention.** Protocol descriptions
+  specify the computation. CausaLab's `Backend`, `SiteResolver`, mechanisms, and planner own
+  its document-to-hook implementation.
 - **How a backend realizes a document is the backend's concern.** Two-trace transfer, bounded
   iteration, fused-residual reads, `no_grad` wrapping, snapshot saves: these live inside an
-  nnsight `Backend` and never surface in a document or a capability. causalab does not need a
-  realization axis. nnbench's realization axis exists because nnbench measures the spellings.
+  nnsight `Backend`. nnbench's realization axis records the spellings it measures.
 - **The interface between the projects is a published description, one direction.** nnbench
   reports, per (backend, context), which document tuples run and in what state. A causalab
-  backend author reads it; causalab's code does not change for it.
+  backend author uses it to guide implementation choices.
 
 ## 3. Vocabulary: intersection and differences
 
@@ -155,28 +152,30 @@ engine-tier and module-internal sites.
 
 ## 5. What changes in nnbench
 
-1. **Semantic index — implemented first slice.** `isb/protocol.py` defines a non-executing
+1. **Semantic index: implemented first slice.** `isb/protocol.py` defines an
    `InterventionSpec` using causalab's data-role/component/read/write/mechanism/position/
    featurizer/capability vocabulary. `TaskSpec` partitions concrete params into `semantics` and
-   `realization`; their merge is passed to the explicit cell unchanged. A later binding layer may
-   emit full causalab documents, but it must remain metadata and must never generate trace code.
-2. **Execution regime — implemented.** The old `Workload` class is now `ExecutionRegime` and owns
+   `realization`; their values enter the explicit cell. A later metadata exporter may emit full
+   causalab documents. Explicit cells retain ownership of trace code.
+2. **Execution regime: implemented.** The old `Workload` class is now `ExecutionRegime` and owns
    only input units, interactive/batched/generation shape, decode length, and aggregation. This
    corrects the earlier shorthand “workload = document”: semantic program and systems regime are
    orthogonal axes.
-3. **Cell indexing — implemented as metadata.** The executable registry remains centered on
+3. **Cell indexing: implemented as metadata.** The executable registry remains centered on
    `(methodology, family, backend)`. Its protocol metadata is indexed by component name
    (`block_output`, `attention_output`, `lm_head`, ...) and `do` mechanism; per-family module paths
    stay inside explicit cell bodies.
-4. **Catalog — implemented.** `interp-methods-catalog.md` method rows are keyed by protocol tuple
+4. **Catalog: implemented.** `interp-methods-catalog.md` method rows are keyed by protocol tuple
    (component × `do` × position frame × capability) with nnbench realization/extensions alongside,
    replacing footprint tags and the pyvene column as the method index. The primitive inventory
-   remains because it diagnoses execution failures.
-5. **Data — planned.** Paired feeds can be exposed as `base` + `counterfactual`; per-prompt labels
+   remains because it diagnoses execution failures. The authoritative template inventory and
+   parameter classifications live in `isb/protocol.py`; the catalog links to those definitions.
+5. **Data: planned.** Paired feeds can be exposed as `base` + `counterfactual`; per-prompt labels
    (target tokens, positions) become columns. Existing `DataRef` inputs are unchanged in this slice.
-6. **Macro tier — planned.** A Macro cell is one corpus document on one backend.
+6. **Macro tier: planned.** A Macro cell is one corpus document on one backend.
 
-Not adopted: `metrics`, digests, artifacts, workflow, `Backend`.
+CausaLab retains its scientific metrics, document/artifact identities, workflows, and `Backend`.
+nnbench's Docker runner owns its experiment and output checksums.
 
 ## 6. What nnbench publishes for causalab
 
@@ -185,14 +184,19 @@ realization coordinates. Per (backend, context), reports can therefore publish t
 list of document tuples, each with its state, and for every state
 other than SUPPORTED the element and realization coordinate that carries it. A causalab backend
 author uses it to set that backend's `capabilities` and to know which realization the
-`SiteResolver` and planner must use per site and mechanism. It is a description; nothing in
-causalab consumes it programmatically.
+`SiteResolver` and planner must use per site and mechanism. The current integration is a
+human-readable description for backend authors.
 
-Methodology metadata is stored as `protocol_template`, not a requirement imposed on every task.
+Methodology metadata is stored as `protocol_template` for case specialization.
 Each case's `protocol` reflects its parameters (for example DAS apply versus training). Regime
 records include decode length, aggregation, dataset knobs, and effective cases after those knobs
-are merged with task parameters. This is descriptive metadata; execution still calls the explicit
-cell regardless of the declared capabilities.
+are merged with task parameters. Explicit cells execute the requested computation and supply
+observed outcomes.
+
+The frozen Docker description and shared worker provenance record `protocol_coverage`.
+Built-in methods have descriptors; custom methods provide a descriptor or an explicit
+`protocol_absence_reason`. Undescribed legacy experiments receive a legacy reason on restoration.
+Provenance is a detached snapshot, and each cell invocation owns its nested parameter values.
 
 ## 7. Open points
 

@@ -70,6 +70,55 @@ def test_legacy_v1_experiment_without_description_still_restores(tmp_path):
     assert restored == specimen()
 
 
+def test_explicit_protocol_opt_out_roundtrips_and_is_identity_covered(tmp_path):
+    spec = replace(specimen(), methodology="custom", protocol=None,
+                   protocol_absence_reason="Experimental custom method")
+    experiment = contract.prepare(spec, tmp_path / "job")
+    assert "protocol_absence_reason" not in contract.unpack(experiment["spec"])
+    assert experiment["description"]["protocol_coverage"] == spec.protocol_coverage()
+    assert contract.restore_spec(tmp_path / "job")[0] == spec
+    changed = replace(spec, protocol_absence_reason="Revised explanation")
+    assert contract.prepare(changed, tmp_path / "changed")["id"] != experiment["id"]
+
+
+@pytest.mark.parametrize("has_description", [False, True])
+def test_legacy_unknown_method_records_missing_metadata_explicitly(tmp_path, has_description):
+    spec = replace(specimen(), methodology="custom", protocol=None,
+                   protocol_absence_reason="Experimental fixture")
+    experiment = contract.prepare(spec, tmp_path / "job")
+    if has_description:
+        experiment["description"].pop("protocol_coverage")
+    else:
+        experiment.pop("description")
+    experiment.pop("id")
+    experiment["id"] = contract.digest(contract.canonical(experiment))
+    contract.write_json(tmp_path / "job" / "experiment.json", experiment)
+    restored, _ = contract.restore_spec(tmp_path / "job")
+    assert restored.protocol is None
+    assert restored.protocol_coverage() == {
+        "status": "undescribed", "reason": "Legacy experiment predates explicit protocol coverage"}
+
+
+@pytest.mark.parametrize("coverage", [None, {}, {"status": "invalid"},
+                                     {"status": "undescribed", "reason": "skip"}])
+def test_inconsistent_protocol_coverage_is_rejected(tmp_path, coverage):
+    experiment = contract.prepare(specimen(), tmp_path / "job")
+    experiment["description"]["protocol_coverage"] = coverage
+    experiment.pop("id")
+    experiment["id"] = contract.digest(contract.canonical(experiment))
+    contract.write_json(tmp_path / "job" / "experiment.json", experiment)
+    with pytest.raises(ValueError):
+        contract.restore_spec(tmp_path / "job")
+
+
+def test_prepare_rechecks_protocol_coverage_after_spec_edit(tmp_path):
+    spec = specimen()
+    spec.protocol = None
+    with pytest.raises(ValueError, match="requires a protocol"):
+        contract.prepare(spec, tmp_path / "job")
+    assert not (tmp_path / "job").exists()
+
+
 def test_description_cannot_disagree_with_executable_tasks(tmp_path):
     experiment = contract.prepare(specimen(), tmp_path / "job")
     experiment["description"]["tasks"][0]["label"] = "different"

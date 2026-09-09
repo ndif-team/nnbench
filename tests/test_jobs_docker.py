@@ -38,7 +38,8 @@ def test_third_party_directory_with_real_docker(tmp_path, mode, status):
       - ${{ISB_OUTPUT_DIR}}:/output
 """)
     spec = CellConfig("fixture", "fixture", "fixture", "fixture",
-                      [Workload("interactive", ["a"])], [({}, "task")], BaselineSpec({}))
+                      [Workload("interactive", ["a"])], [({}, "task")], BaselineSpec({}),
+                      protocol_absence_reason="Independent Docker lifecycle fixture")
     job = tmp_path / "job"
     experiment = contract.prepare(spec, job)
     assert local.discover(tmp_path) == ["third-party"]
