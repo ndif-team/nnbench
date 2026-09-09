@@ -19,6 +19,7 @@ compared (the missing piece that turned a branch skew into a two-day hunt: two
 """
 from __future__ import annotations
 
+import json
 import os
 import platform
 import socket
@@ -26,6 +27,7 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, field
+from importlib import metadata
 
 
 @dataclass(frozen=True)
@@ -134,10 +136,21 @@ def _git_identity(path: str) -> dict:
 
 def _version_of(module_name: str) -> str | None:
     try:
-        mod = __import__(module_name)
-        return getattr(mod, "__version__", None)
-    except ImportError:
+        return metadata.version(module_name)
+    except metadata.PackageNotFoundError:
         return None
+
+
+def _installed_git_identity(package: str) -> dict:
+    """Pip retains the full commit for a Git-installed wheel even without a .git directory."""
+    try:
+        info = json.loads(metadata.distribution(package).read_text("direct_url.json") or "{}")
+        vcs = info.get("vcs_info", {})
+        if vcs.get("vcs") == "git" and vcs.get("commit_id"):
+            return {"commit": vcs["commit_id"], "remote": info.get("url")}
+    except (metadata.PackageNotFoundError, ValueError, OSError):
+        pass
+    return {}
 
 
 def _gpu_info() -> dict:
@@ -167,14 +180,15 @@ def _nvidia_driver() -> str | None:
 
 
 def resolve_provenance(run: RunConfig) -> dict:
-    """The four-layer provenance record, resolved IN the run's process (call this from the run
-    subprocess, not the orchestrator — the whole point is recording the stack that executed).
+    """The four-layer provenance record, resolved IN the run's container (not the orchestrator —
+    the whole point is recording the stack that executed).
     Purely DESCRIPTIVE: declared expectations (nnsight commit, gpu model) are recorded alongside
     what was actually resolved, so a mismatch is visible in the record — never a refusal."""
-    import nnsight
+    from importlib.util import find_spec
 
-    nnsight_path = os.path.dirname(nnsight.__file__)
-    nnsight_git = _git_identity(nnsight_path)
+    module = find_spec("nnsight")
+    nnsight_path = os.path.dirname(module.origin) if module and module.origin else None
+    nnsight_git = (_git_identity(nnsight_path) if nnsight_path else {}) or _installed_git_identity("nnsight")
     gpu = _gpu_info()
 
     return {
@@ -200,5 +214,3 @@ def resolve_provenance(run: RunConfig) -> dict:
             **gpu,
         },
     }
-
-

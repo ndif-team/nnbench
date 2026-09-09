@@ -3,6 +3,11 @@
 > Status: evolving. Captures decisions as they're made in the design conversation.
 > Last structural update: data-flow / control-flow split + cross-edge movement class (§3.1, §3.4).
 
+> Runner update (2026-09-08): the main CLI now uses independent `backends/NAME/compose.yml`
+> configurations, frozen input jobs, explicit references, and artifact-only scoring. See
+> [the runner contract](../backends/README.md). Historical CLI/shared-Compose examples below
+> describe the preceding runner and are not current launch instructions.
+
 ## 1. Purpose & positioning
 
 A **systems performance + coverage benchmark** for interpretability workloads on nnsight,
@@ -1081,18 +1086,17 @@ defined), the transformers version conflict (the control needs an arch newer tha
 pin — qwen3_5 made the integrated sweep impossible), shared-GPU teardown ordering, and CUDA init
 in the parent forcing vLLM's worker spawn. Every other tier already isolates per process (micro:
 one backend per process; perf-micro: one system per process; serve/VM: refs files across
-machines). The method tier now does the same by default: `bench.py` runs one subprocess
+machines). The method tier now does the same by default: `bench.py` runs one isolated execution
 per backend (`isb/sweep/split.py`); the control run writes per-(workload, label) refs, every
 other backend's run is scored against them — the serve/VM refs contract, promoted to the standard
-path. A per-backend interpreter map (`--backend-python hf=<env python>`) gives each backend its
-own conda env, which is what makes newer-than-the-pin models benchable. The fp32 precision
+path. The fp32 precision
 disambiguation is unchanged: a scored run reruns its own backend at the control dtype in-process
 (same stack, no co-residency), or uses `--ctl-refs` where a live rerun is impossible.
 
 **2026-08-01 — folded onto execute/score.** The refs handoff above was a second, weaker copy of
 the run-file contract §12.10 introduced (outputs without provenance, a live fp32 rerun instead of
 a control-dtype run, its own on-disk format). `bench.py` is now a thin orchestrator over that one
-contract: each backend runs as a `scripts/execute.py` subprocess writing a run file into `--out`
+contract: each backend runs `scripts/execute.py` in isolation and writes a run file into `--out`
 (default: the inbox), and scoring is `score_runs` — the pure-CPU step — over those files, with a
 control-dtype vLLM run (`<spec>-vllm-fp32`, skippable via `--no-ctl`) replacing the live fp32
 rerun. PP/TP equivalence mode is the same shape: the (1,1) control and the (tp,pp) candidate are
@@ -1101,6 +1105,21 @@ GPU-less serve client executes its over-HTTP run and scores with `--score-vs hf`
 reference run files produced earlier on a GPU host (`--ctl-only` stocks the control-dtype runs).
 `run_sweep`, the refs files, and the in-process fp32 rerun are deleted; every path — bench sweep,
 hand-run execute/score, the manager — now produces and consumes the same run files.
+
+**2026-08-29 — backend environments moved to Docker Compose.** The isolation boundary above is now
+one container per run rather than one locally selected interpreter. `bench.py` maps `hf`,
+`vllm_async`, `vllm_sync`, and `vllm_serve` directly to same-named services in
+`docker/docker-compose.yml`; the service's Dockerfile owns Python and dependency setup. The host
+mounts the selected run directory at `/outputs`, passes the existing `execute.py` arguments, then
+scores the resulting run files exactly as before. `--backend-python` and host Conda paths are
+removed. This changes environment provisioning, not the cell, spec, run-file, or oracle contracts.
+
+**2026-09-08 — container execution validated.** Engine and deployment arguments live in the Compose
+entrypoints. `--backends` accepts additional service names directly and repeated `--compose-file`
+arguments support standard Compose overrides. The launcher retains only the historical run-name
+tags and the bundled vLLM precision-control convention. Installing nnsight from pinned Git commits
+(rather than GitHub tarballs) preserves its build metadata and lets run provenance recover the full
+commit from pip's `direct_url.json` inside the container.
 
 ### 12.10 Runs, data bindings, execute/score, provenance (2026-07-24)
 

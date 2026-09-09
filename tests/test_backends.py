@@ -38,6 +38,27 @@ def test_engine_kwargs_built_only_from_set_config():
     assert VLLMSyncBackend(trust_remote_code=True)._engine_kwargs() == {"trust_remote_code": True}
 
 
+def test_async_teardown_drains_pending_handlers():
+    import asyncio
+    from types import SimpleNamespace
+
+    backend = VLLMAsyncBackend()
+    loop = backend._loop = asyncio.new_event_loop()
+    finished = []
+
+    async def handler():
+        try:
+            await asyncio.Future()
+        finally:
+            finished.append(True)
+
+    task = loop.create_task(handler())
+    loop.run_until_complete(asyncio.sleep(0))
+    backend.teardown(SimpleNamespace(vllm_entrypoint=SimpleNamespace(shutdown=lambda: None)))
+    assert task.done() and finished == [True]
+    assert loop.is_closed() and backend._loop is None
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

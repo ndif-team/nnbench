@@ -1,11 +1,12 @@
 """Execute ONE fully described run: (spec × data × engine/deployment config) -> outputs + provenance.
 
-    # the HF reference stack, in the transformers-testing env:
-    CUDA_VISIBLE_DEVICES=4 /path/envs/nnsight-tf/bin/python scripts/execute.py \
-        --spec jacobian_lens_gpt2 --engine transformers --name hf-ref
-    # the vLLM candidate, in the vllm env:
-    CUDA_VISIBLE_DEVICES=4 /path/envs/nnsight-vllm/bin/python scripts/execute.py \
-        --spec jacobian_lens_gpt2 --engine vllm --name vllm-cand
+Legacy standalone executor, directly callable inside the optional legacy backend containers.
+The main scripts/bench.py runner instead invokes backends/NAME/run.py using frozen job inputs:
+
+    python scripts/execute.py --spec jacobian_lens_gpt2 \
+        --engine transformers --name hf-ref
+    python scripts/execute.py --spec jacobian_lens_gpt2 \
+        --engine vllm --name vllm-cand
     # then compare (no GPU needed):  python scripts/score.py --spec jacobian_lens_gpt2 \
         --candidate vllm-cand --reference hf-ref
 
