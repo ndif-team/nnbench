@@ -188,6 +188,12 @@ author uses it to set that backend's `capabilities` and to know which realizatio
 `SiteResolver` and planner must use per site and mechanism. It is a description; nothing in
 causalab consumes it programmatically.
 
+Methodology metadata is stored as `protocol_template`, not a requirement imposed on every task.
+Each case's `protocol` reflects its parameters (for example DAS apply versus training). Regime
+records include decode length, aggregation, dataset knobs, and effective cases after those knobs
+are merged with task parameters. This is descriptive metadata; execution still calls the explicit
+cell regardless of the declared capabilities.
+
 ## 7. Open points
 
 - **Position resolution without padding.** #40's decode relies on left padding for a ragged

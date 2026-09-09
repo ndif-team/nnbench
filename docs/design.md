@@ -870,9 +870,19 @@ def _(be, model, prompt):
   `TaskSpec.semantics` holds a case's values; `TaskSpec.realization` holds spelling choices such as
   in-place vs replacement or bounded vs unbounded iteration. Their merged `params` mapping is
   passed to the cell unchanged. No resolver or document executor is introduced.
+- **Requirements belong to the concrete case.** Methodology descriptors are templates.
+  `describe_task` specializes operations and capabilities from task parameters: DAS apply
+  (`train=0`) needs no gradients, while training does. Provenance calls the shared description
+  `protocol_template`; each case has its own `protocol`. Each regime also records effective cases
+  after dataset defaults and decode length are applied using the execution driver's precedence.
+  This metadata does not select a backend or skip a cell.
 - **Execution regimes are orthogonal.** `ExecutionRegime` owns inputs, interactive/batched/
   generation shape, decode length, and aggregation. It is not overloaded with intervention
   semantics, so a protocol case can be exercised under multiple regimes.
+
+Migration: `CellConfig(workloads=...)` becomes `CellConfig(regimes=...)`. The `Workload` import
+alias and read-only `spec.workloads` property are transitional conveniences, not constructor
+compatibility. Regime provenance includes `new_tokens`, `aggregate`, and `data_knobs`.
 - **Reuse emerges bottom-up:** when two cells are structurally identical except module names,
   extract a `lens_core(be, blocks, norm, head, ...)` helper they both call with their *own*
   explicit modules. The helper never tries to be universal; the maintainer wires it per cell.

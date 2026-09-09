@@ -180,7 +180,9 @@ then adds **realization** (for example in-place vs replacement or bounded vs unb
 **extensions** for behavior outside CausaLab v1. The Level-0/1/1.5 terms above remain useful for
 diagnosing an engine failure, but they are no longer a second method-indexing vocabulary.
 
-The exact implemented index lives in `isb/protocol.py`; this table is its readable inventory.
+The implemented templates and task specialization live in `isb/protocol.py`. This table lists
+methodology templates; concrete cases narrow these requirements (for example `grad=False` removes
+backward and `patch=False` removes the transplant). Capability unions are not per-case requirements.
 
 | nnbench methodology | data | components | operations / `do` | frame | capabilities | nnbench realization / extension |
 |---|---|---|---|---|---|---|
@@ -192,8 +194,8 @@ The exact implemented index lives in `isb/protocol.py`; this table is its readab
 | `gen_steering` | base | `block_output`, `lm_head` | read, write / `add_scaled` | prompt + generated | `full_logits`, `generate` | bounded vs unbounded; extension: decode-step write |
 | `attention_pattern` | base | `attention_probs` | read | prompt | — | — |
 | `attribution_patching` | base + counterfactual | `block_output`, `lm_head` | read, grad | prompt | `grad` | residual spelling; extension: activation gradient |
-| `das` | base + counterfactual | `block_output`, `lm_head` | read, write, grad / `swap`; `subspace` featurizer | prompt | `grad`, `paired_forward`, `full_logits` | apply vs training case |
-| `jacobian_collect` | base | `block_output`, `lm_head` | read, grad | prompt | `grad` | extensions: activation gradient, Jacobian export |
+| `das` | base + counterfactual | `block_output`, `lm_head` | read, write / `swap`; grad only when training; `subspace` featurizer | prompt | `paired_forward`, `full_logits`; `grad` only when training | apply vs training case; residual spelling |
+| `jacobian_collect` | base | `block_output` | read, grad | prompt | `grad` | VJP batch size and residual spelling; extensions: activation gradient, Jacobian export |
 | `jacobian_lens` | base | `block_output`, `lm_head` | read | prompt | `full_logits` | unembed spelling; extension: linear transport |
 
 Status: ✓ = already an nnbench cell. **frontier** = exercises a primitive where vLLM and HF diverge

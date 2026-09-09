@@ -1,10 +1,14 @@
 """CausaLab-aligned protocol metadata — no model or GPU required."""
 import sys
+import inspect
+from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from isb.protocol import InterventionSpec  # noqa: E402
+from isb.protocol import InterventionSpec, PROTOCOLS, describe_task  # noqa: E402
 from isb.runs import EngineConfig, RunConfig  # noqa: E402
 from isb.specs import SPECS  # noqa: E402
 from isb.sweep.execute import _run_coordinates  # noqa: E402
@@ -44,8 +48,9 @@ def test_protocol_coordinate_is_family_independent_and_method_specific():
 def test_run_coordinates_persist_protocol_and_case_axes():
     spec = SPECS["steering_gpt2"]
     coords = _run_coordinates(spec, RunConfig(engine=EngineConfig("transformers")))
-    assert coords["protocol"]["mechanisms"] == ["add_scaled"]
-    assert coords["cases"][0] == spec.tasks[0].coordinate()
+    assert coords["protocol_template"]["mechanisms"] == ["add_scaled"]
+    assert coords["cases"][0]["protocol"]["mechanisms"] == ["add_scaled"]
+    assert {k: coords["cases"][0][k] for k in ("label", "semantics", "realization")} == spec.tasks[0].coordinate()
     assert coords["regimes"][0]["kind"] == "interactive"
 
 
@@ -89,3 +94,91 @@ def test_explicit_task_must_follow_methodology_parameter_split():
         raise AssertionError("misclassified explicit task accepted")
     except ValueError as exc:
         assert "protocol parameter split" in str(exc)
+
+
+def test_all_registered_cell_keyword_options_can_be_classified():
+    import isb.methodologies  # noqa: F401
+    from isb.methodologies.registry import CELLS
+
+    for (method, family, backend), fn in CELLS.items():
+        if method not in PROTOCOLS:
+            continue
+        options = {name: param.default for name, param in inspect.signature(fn).parameters.items()
+                   if param.kind == inspect.Parameter.KEYWORD_ONLY}
+        semantics, realization = PROTOCOLS[method].classify(options)
+        assert {**semantics, **realization} == options, (method, family, backend)
+
+
+@pytest.mark.parametrize("name,params", [
+    ("das_gpt2", {"train": 0, "layer": 9, "k": 32, "seed": 7}),
+    ("jacobian_lens_gpt2", {"position": "last", "residual": "plain"}),
+    ("jacobian_collect_gpt2", {"dim_batch": 32, "skip_first": 4}),
+])
+def test_supported_custom_cases_keep_exact_cell_parameters(name, params):
+    spec = replace(SPECS[name], tasks=[(params, "custom")])
+    assert spec.tasks[0].params == params
+
+
+@pytest.mark.parametrize("method,params,grad,write,paired", [
+    ("das", {}, False, True, True),
+    ("das", {"train": 0}, False, True, True),
+    ("das", {"train": 24}, True, True, True),
+    ("attribution_patching", {}, True, False, False),
+    ("attribution_patching", {"grad": False}, False, False, False),
+    ("jacobian_collect", {}, True, False, False),
+    ("jacobian_collect", {"grad": False}, False, False, False),
+    ("activation_patching", {"patch": False}, False, False, False),
+    ("activation_patching", {}, False, True, True),
+    ("gen_patching", {"patch": False}, False, False, False),
+    ("steering", {"alpha": 0}, False, False, False),
+    # This cell still assigns the output even when the numerical delta is zero.
+    ("gen_steering", {"alpha": 0}, False, True, False),
+    ("ablation", {"target": "none"}, False, False, False),
+])
+def test_task_requirements_follow_cell_branches(method, params, grad, write, paired):
+    template = PROTOCOLS[method]
+    before = template.coordinate()
+    desc = describe_task(method, params, template=template, family="gpt2")
+    assert ("grad" in desc.operations) == grad
+    assert ("grad" in desc.capabilities) == grad
+    assert ("write" in desc.operations) == write
+    assert bool(desc.mechanisms) == write
+    assert ("paired_forward" in desc.capabilities) == paired
+    assert template.coordinate() == before
+    if method.startswith("gen_"):
+        assert "generate" in desc.capabilities
+
+
+def test_regime_coordinates_capture_execution_and_effective_requirements():
+    run = RunConfig(engine=EngineConfig("transformers"))
+    spec = SPECS["gen_patching_gpt2"]
+    short = replace(spec, regimes=[replace(spec.regimes[0], new_tokens=2)])
+    long = replace(spec, regimes=[replace(spec.regimes[0], new_tokens=20)])
+    a, b = _run_coordinates(short, run), _run_coordinates(long, run)
+    assert a != b
+    assert a["regimes"][0]["new_tokens"] == 2
+    assert b["regimes"][0]["new_tokens"] == 20
+    assert a["regimes"][0]["cases"][0]["semantics"]["new_tokens"] == 2
+
+    das = SPECS["das_gpt2"]
+    bound = replace(das, tasks=[({}, "dataset default"), ({"train": 0}, "explicit apply")],
+                    regimes=[replace(das.regimes[0], data_knobs={"train": 3})])
+    coords = _run_coordinates(bound, run)
+    regime = coords["regimes"][0]
+    assert regime["aggregate"] is False
+    assert regime["data_knobs"] == {"train": 3}
+    assert "grad" in regime["cases"][0]["protocol"]["capabilities"]
+    assert "grad" not in regime["cases"][1]["protocol"]["capabilities"]
+    assert regime["cases"][1]["semantics"]["train"] == 0
+
+
+def test_custom_method_keeps_explicit_realization_without_protocol():
+    spec = CellConfig(
+        "custom", "custom", "gpt2", "repo",
+        [ExecutionRegime("interactive", ["p"], data_knobs={"scale": 2})],
+        [TaskSpec("case", {"layer": 1}, {"mode": "replace"})], BaselineSpec({}))
+    coords = _run_coordinates(spec, RunConfig(engine=EngineConfig("transformers")))
+    assert coords["cases"][0] == spec.tasks[0].coordinate()
+    bound = coords["regimes"][0]["cases"][0]
+    assert bound["semantics"] == {"layer": 1, "scale": 2}
+    assert bound["realization"] == {"mode": "replace"}

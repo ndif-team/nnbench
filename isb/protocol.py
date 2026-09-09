@@ -41,7 +41,7 @@ def _ordered(values) -> tuple[str, ...]:
 
 @dataclasses.dataclass(frozen=True)
 class InterventionSpec:
-    """Backend-agnostic semantics shared by every family/backend cell for one methodology.
+    """Semantic descriptor, used as a methodology template or a concrete task description.
 
     The first seven coordinates use CausaLab's vocabulary. ``extensions`` records semantics that
     its v1 documents cannot express (for example a write at every decode step). ``semantic_params``
@@ -134,12 +134,12 @@ PROTOCOLS: dict[str, InterventionSpec] = {
     "steering": _p(
         components=("block_output", "lm_head"), operations=("read", "write"),
         mechanisms=("add_scaled",), capabilities=("full_logits",),
-        semantic_params=("layer", "target", "alpha"), realization_params=("mode",),
+        semantic_params=("layer", "target", "alpha"), realization_params=("mode", "residual"),
     ),
     "ablation": _p(
         components=("attention_output", "mlp_output", "block_output", "lm_head"),
         operations=("read", "write"), mechanisms=("swap",), capabilities=("full_logits",),
-        semantic_params=("layer", "target"),
+        semantic_params=("layer", "target"), realization_params=("residual",),
     ),
     "activation_patching": _p(
         data_roles=("base", "counterfactual"), components=("block_output", "lm_head"),
@@ -151,13 +151,13 @@ PROTOCOLS: dict[str, InterventionSpec] = {
         data_roles=("base", "counterfactual"), components=("block_output", "lm_head"),
         operations=("read", "write"), mechanisms=("swap",), position_frames=("prompt", "generated"),
         capabilities=("paired_forward", "full_logits", "generate"),
-        semantic_params=("layer", "patch"), realization_params=("residual", "bound"),
+        semantic_params=("layer", "patch", "new_tokens"), realization_params=("residual", "bound"),
     ),
     "gen_steering": _p(
         components=("block_output", "lm_head"), operations=("read", "write"),
         mechanisms=("add_scaled",), position_frames=("prompt", "generated"),
         capabilities=("full_logits", "generate"), extensions=("decode_step_write",),
-        semantic_params=("layer", "target", "alpha"), realization_params=("bound",),
+        semantic_params=("layer", "target", "alpha", "new_tokens"), realization_params=("bound",),
     ),
     "attention_pattern": _p(
         components=("attention_probs",), operations=("read",), semantic_params=("layers",),
@@ -170,20 +170,67 @@ PROTOCOLS: dict[str, InterventionSpec] = {
     "das": _p(
         data_roles=("base", "counterfactual"), components=("block_output", "lm_head"),
         operations=("read", "write", "grad"), mechanisms=("swap",), featurizers=("subspace",),
-        capabilities=("grad", "paired_forward", "full_logits"), semantic_params=("train",),
+        capabilities=("grad", "paired_forward", "full_logits"),
+        semantic_params=("layer", "k", "train", "heldout", "lr", "seed"),
+        realization_params=("residual",),
     ),
     "jacobian_collect": _p(
-        components=("block_output", "lm_head"), operations=("read", "grad"),
+        components=("block_output",), operations=("read", "grad"),
         capabilities=("grad",), extensions=("activation_grad", "jacobian_export"),
-        semantic_params=("grad",),
+        semantic_params=("grad", "skip_first"), realization_params=("dim_batch", "residual"),
     ),
     "jacobian_lens": _p(
         components=("block_output", "lm_head"), operations=("read",),
         capabilities=("full_logits",), extensions=("linear_transport",),
-        semantic_params=("transport", "layers"), realization_params=("unembed",),
+        semantic_params=("transport", "layers", "position"), realization_params=("unembed", "residual"),
     ),
 }
 
 
 def protocol_for(methodology: str) -> InterventionSpec | None:
     return PROTOCOLS.get(methodology)
+
+
+def describe_task(methodology: str, params: Mapping[str, Any], *,
+                  template: InterventionSpec, family: str) -> InterventionSpec:
+    """Specialize metadata to the explicit cell's branches, without executing or routing it.
+
+    Defaults here mirror the cells; regression tests exercise their branch behavior. Data roles
+    describe the input contract even when a no-op case only executes one side of a paired feed.
+    Call with effective params (including dataset defaults) when describing a bound run.
+    """
+    operations = set(template.operations)
+    capabilities = set(template.capabilities)
+    mechanisms = template.mechanisms
+    extensions = set(template.extensions)
+    components = template.components
+    if ((methodology == "das" and not params.get("train", 0))
+            or (methodology in {"attribution_patching", "jacobian_collect"}
+                and not params.get("grad", True))):
+        operations.discard("grad")
+        capabilities.discard("grad")
+        extensions.difference_update({"activation_grad", "jacobian_export"})
+    no_write = (
+        methodology in {"activation_patching", "gen_patching"} and not params.get("patch", True)
+        or methodology == "steering" and params.get("alpha", 6.0) == 0
+        or methodology == "ablation" and params.get("target") == "none"
+    )
+    if no_write:
+        operations.discard("write")
+        capabilities.discard("paired_forward")
+        mechanisms = ()
+        # Unpatched generation reads engine logits only; ordinary forward readouts also read
+        # the final block residual. gen_steering still performs a write when alpha=0.
+        components = (("lm_head",) if methodology == "gen_patching"
+                      else ("block_output", "lm_head"))
+    elif methodology == "ablation":
+        target = params.get("target", "mixer" if family == "nemotron" else "mlp")
+        component = {"attn": "attention_output", "mlp": "mlp_output"}.get(target)
+        if component is not None:
+            components = (component, "block_output", "lm_head")
+        # Nemotron's mixer target is layer-dependent; retain the template's component union.
+    if methodology == "jacobian_lens" and params.get("transport") is None:
+        extensions.discard("linear_transport")
+    return dataclasses.replace(template, operations=tuple(operations),
+                               capabilities=tuple(capabilities), mechanisms=mechanisms,
+                               extensions=tuple(extensions), components=components)

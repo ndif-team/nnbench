@@ -20,6 +20,7 @@ import traceback
 
 from ..methodologies.registry import get_cell
 from ..perf.timing import time_cell
+from ..protocol import describe_task
 from ..runfile import save_run
 from ..runs import RunConfig, cell_interface, make_backend, resolve_provenance
 from ..sweep.guards import compute_effect_size
@@ -86,19 +87,33 @@ def _throughput(regime, timing):
 
 
 def _run_coordinates(spec, run: RunConfig) -> dict:
+    def case(task, params):
+        if spec.protocol is None:
+            return {"label": task.label,
+                    "semantics": {k: v for k, v in params.items() if k not in task.realization},
+                    "realization": {k: params[k] for k in task.realization}}
+        semantics, realization = spec.protocol.classify(params)
+        protocol = describe_task(spec.methodology, params, template=spec.protocol,
+                                 family=spec.family)
+        return {"label": task.label, "semantics": semantics, "realization": realization,
+                "protocol": protocol.coordinate()}
+
     coordinates = {
         "spec": spec.name,
         "methodology": spec.methodology,
         "family": spec.family,
         "repo": spec.repo,
         "data": sorted({w.data_name for w in spec.regimes if w.data_name}),
-        "regimes": [{"kind": w.kind, "units": len(w.prompts), "data": w.data_name}
-                      for w in spec.regimes],
-        "cases": [task.coordinate() for task in spec.tasks],
+        "regimes": [{"kind": w.kind, "units": len(w.prompts), "data": w.data_name,
+                     "new_tokens": w.new_tokens, "aggregate": w.aggregate,
+                     "data_knobs": dict(w.data_knobs),
+                     "cases": [case(task, _task_params(w, task.params)) for task in spec.tasks]}
+                    for w in spec.regimes],
+        "cases": [case(task, task.params) for task in spec.tasks],
         "interface": cell_interface(run),
     }
     if spec.protocol is not None:
-        coordinates["protocol"] = spec.protocol.coordinate()
+        coordinates["protocol_template"] = spec.protocol.coordinate()
     return coordinates
 
 
