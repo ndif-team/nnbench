@@ -4,6 +4,7 @@ exercised against real resolution, with impossible pins to trigger the refusals)
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+import json
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -73,9 +74,24 @@ def test_provenance_records_declared_next_to_resolved():
     assert set(prov) == {"executed", "declared", "client", "deployment", "engine", "host"}
     assert prov["declared"]["nnsight"] == "0000000dead"           # kept verbatim
     assert prov["declared"]["gpu_model"] == "X9000"
-    assert prov["client"]["nnsight"]["path"]                      # resolved, independently
+    from importlib.util import find_spec
+    # A lightweight host need not install any inference stack. Absence is provenance too.
+    installed = find_spec("nnsight")
+    assert bool(prov["client"]["nnsight"]["path"]) == bool(installed)
     assert prov["client"]["nnsight"].get("commit") != "0000000dead"
     assert prov["host"]["hostname"]
+
+
+def test_git_wheel_provenance_keeps_full_commit(monkeypatch):
+    import isb.runs as runs
+
+    info = {"url": "https://github.com/ndif-team/nnsight.git",
+            "vcs_info": {"vcs": "git", "commit_id": "a" * 40}}
+    monkeypatch.setattr(runs.metadata, "distribution", lambda _: SimpleNamespace(
+        read_text=lambda _: json.dumps(info)))
+    assert runs._installed_git_identity("nnsight")["commit"] == "a" * 40
+    info.pop("vcs_info")
+    assert runs._installed_git_identity("nnsight") == {}
 
 
 def _run_all():

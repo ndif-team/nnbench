@@ -1,0 +1,40 @@
+services:
+  runner:
+    image: isb-nnsight-vllm:local
+    build: .
+    working_dir: /workspace
+    entrypoint: [python3, /backend/run.py]
+    user: "${ISB_UID:-1000}:${ISB_GID:-1000}"
+    shm_size: 8gb
+    environment:
+      PYTHONPATH: /workspace
+      PYTHONDONTWRITEBYTECODE: "1"
+      USER: isb
+      XDG_CACHE_HOME: /tmp/cache
+      TORCHINDUCTOR_CACHE_DIR: /tmp/torchinductor
+      TRITON_CACHE_DIR: /tmp/triton
+      FLASHINFER_WORKSPACE_BASE: /tmp
+      HF_HOME: /models
+      HF_HUB_CACHE: /models/hub
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+      TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-0}
+      VLLM_CACHE_ROOT: /tmp/vllm
+      ISB_BACKEND: ${ISB_BACKEND:-nnsight-vllm}
+      ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","gpu_memory_utilization":0.2}'
+    volumes:
+      - ../..:/workspace:ro
+      - .:/backend:ro
+      - ${ISB_JOB_DIR:-../../runs/manual/job}:/job:ro
+      - ${ISB_OUTPUT_DIR:-../../runs/manual/output}:/output
+      - model-cache:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${ISB_GPU:-0}"]
+              capabilities: [gpu]
+volumes:
+  model-cache:
+    name: ${ISB_MODEL_CACHE:-isb-model-cache}

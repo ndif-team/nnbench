@@ -40,9 +40,8 @@ and reports latency, peak GPU memory, overhead vs a no-intervention baseline, an
   tracing) · ablation (zero-knockout) · attention-pattern read · attribution patching ·
   generation-time steering.
 - **Families:** GPT-2 · Llama (SmolLM2-135M, a `LlamaForCausalLM`, as the Llama-arch stand-in).
-- **Backends:** HuggingFace `LanguageModel` (the per-family control) vs vLLM in both engine modes —
-  `vllm_async` (continuous-batching server) and `vllm_sync` (in-process) — plus a `vllm_serve` client
-  for a remote nnsight-vllm-serve server. Selectable with `--backend(s)` on `scripts/{bench,micro}.py`.
+- **Docker backends:** `nnsight-hf` and `nnsight-vllm`, discovered from independent directories
+  under `backends/`. Legacy micro/serve tools also expose other engine modes.
 - **Execution regimes:** `interactive` (single prompt), `batched` (N prompts; throughput + per-prompt
   oracle), and `generation` (greedy multi-token decode; per-step read/intervention). Batching is a
   coverage axis — it is oracle-checked, not timed blind.
@@ -54,39 +53,57 @@ crash-or-not check would mislabel that `SUPPORTED`.
 
 ## Running it
 
-Environment: `nnsight-serve-test` (nnsight editable from `/disk/u/zikai/nnsight/src`, the `dev`
-branch, + vLLM **0.15.1**). Note the skew: the nnsight `dev` branch targets vLLM **0.19.1** —
-running the benchmark in this env is correct, but nnsight-side vLLM behavior must be verified
-under `ndif-dev` (vLLM 0.19.1) with `PYTHONPATH=/disk/u/zikai/nnsight/src`, not characterized
-from 0.15.1 alone.
-
-GPU runs use the env's python directly (`conda run` mishandles signals on long vLLM runs — false
-timeouts, swallowed SIGABRT) and always go under `timeout`:
+Backend names match directories under `backends/`. Each has an independent Dockerfile, Compose
+configuration and entrypoint. Build them once, then run named experiments:
 
 ```bash
-PY=/disk/u/zikai/anaconda3/envs/nnsight-serve-test/bin/python
+python scripts/bench.py build nnsight-hf nnsight-vllm
 
-# one methodology (default backends: HF + vLLM-async)
-CUDA_VISIBLE_DEVICES=0 timeout 1800 $PY scripts/bench.py --spec steering_gpt2
+# HF reference and vLLM candidate; no implicit control runs
+python scripts/bench.py run --spec logit_lens_gpt2 --data factual:2 \
+  --backends nnsight-hf nnsight-vllm --reference nnsight-hf --gpu 0
 
-# all methodologies / families
-CUDA_VISIBLE_DEVICES=0 timeout 1800 $PY scripts/bench.py --spec all
+# one methodology
+python scripts/bench.py run --spec steering_gpt2 \
+  --backends nnsight-hf nnsight-vllm --reference nnsight-hf --gpu 0
 
-# pick backends explicitly: HF only, or the vLLM sync engine instead of async
-CUDA_VISIBLE_DEVICES=0 timeout 1800 $PY scripts/bench.py --spec ablation_gpt2 --backends hf
-CUDA_VISIBLE_DEVICES=0 timeout 1800 $PY scripts/bench.py --spec steering_gpt2 --backends hf vllm_sync
+# collect the small default corpus on HF
+python scripts/bench.py run --spec all --backends nnsight-hf --gpu 0
+
+python scripts/bench.py list backends
+python scripts/bench.py score runs/REPLACE_WITH_RUN_ID
 ```
+
+Docker owns Python and inference dependencies. The host launcher prepares identical inputs for
+each backend; a separate CPU scorer reads the saved artifacts (host CPU PyTorch is sufficient).
+Every invocation creates a unique directory under `--out` (default `runs/`). Errors are retained
+per cell; crashes and incomplete artifacts fail the job. Use `--strict` for cell-verdict exit codes.
+See [`backends/README.md`](backends/README.md) for the contract, configuration, and extension guide.
 
 Specs: `logit_lens_gpt2`, `logit_lens_llama`, `steering_gpt2`, `gen_steering_gpt2`,
 `activation_patching_gpt2`, `ablation_gpt2`, `attention_pattern_gpt2`, `attribution_patching_gpt2`.
 The llama spec needs `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`. The Level-0/1 primitive probes run
 via `scripts/micro.py --backend {hf,vllm_async,vllm_sync}`.
 
-No-GPU unit tests (cell logic, oracle, timing, driver) run without a model:
+No-GPU unit tests exercise cell logic, oracle, timing, and command construction without a model:
 
 ```bash
-conda run -n nnsight-serve-test python tests/test_sweep.py   # etc.
+python -m pytest tests/ -q
 ```
+
+## Browsing results
+
+The result site reads saved JSON reports from a run directory or a collection of run directories:
+
+```bash
+python scripts/manager.py --dir runs --port 6688
+python scripts/manager.py --dir runs --export results.html
+```
+
+Open `http://127.0.0.1:6688` for the local site, or share the self-contained HTML export.
+Backend names and experiment histories stay separate. Browsing never loads tensor artifacts or
+recomputes verdicts. See [the result-site guide](docs/result-site.md) for legacy imports and safe
+inbox/archive operations.
 
 ## Layout
 
@@ -98,10 +115,12 @@ isb/
   oracle/          numerical-equivalence comparison (top-1 + total-variation)
   runner/          run_cell, evaluate (per-family control), dtype-control disambiguation
   perf/            time_cell (warmup + N trials, CUDA-synced, median±std, peak mem)
-  sweep/           CellConfig/TaskSpec/ExecutionRegime/EffectSpec + execute/score layers
+  jobs/            frozen experiments, name-based Docker lifecycle, artifact scoring
+  sweep/           CellConfig/TaskSpec/ExecutionRegime + shared execution; legacy artifact scorer
   specs/           one CellConfig per methodology (what bench.py --spec runs)
   report/          applicability map + performance table
-scripts/           bench.py (method specs) · micro.py (Level-0/1 primitive probes)
+backends/          independent NAME/{compose.yml,Dockerfile,run.py} packages
+scripts/           bench.py (name-based CLI) · legacy execute/score · micro/perf tools
 docs/              design.md (living design) · references.md · findings.md (measured results)
 ```
 

@@ -118,21 +118,35 @@ def _run_coordinates(spec, run: RunConfig) -> dict:
 
 
 def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
-                release_findings: list | None = None, debug: bool = False) -> str:
+                release_findings: list | None = None, debug: bool = False,
+                backend=None, interface=None, provenance=None) -> str:
     """Run every (execution regime, task) cell of `spec` on `run`'s stack; write outputs + provenance.
     Returns the outputs path. Cell errors are isolated and recorded in meta, never fatal to the
     run (the engine survives; later cells still execute)."""
-    prov = resolve_provenance(run)
+    prov = resolve_provenance(run) if provenance is None else dict(provenance)
     prov["coordinates"] = _run_coordinates(spec, run)
     if release_findings is not None:
         prov["release_check"] = {"clean": not release_findings, "findings": release_findings}
 
-    be = make_backend(run, spec)
-    iface = cell_interface(run)
+    be = make_backend(run, spec) if backend is None else backend
+    iface = cell_interface(run) if interface is None else interface
+    prov["coordinates"]["interface"] = iface
     outputs, meta = {}, {}
     model = None
     try:
         model = be.load(spec.repo)
+        if provenance is not None:
+            import hashlib
+            import json
+            tokenizer = model.tokenizer
+            vocab = tokenizer.get_vocab()
+            revision = getattr(getattr(model, "config", None), "_commit_hash", None)
+            prov["model_identity"] = {
+                "repo": spec.repo,
+                "revision": revision if isinstance(revision, str) else None,
+                "vocab_sha256": hashlib.sha256(json.dumps(vocab, sort_keys=True).encode()).hexdigest(),
+                "vocab_size": len(vocab),
+            }
         for regime in spec.regimes:
             timed_prompts = ([regime.prompts[0]] if regime.aggregate
                              else regime.prompts)

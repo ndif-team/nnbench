@@ -6,17 +6,48 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_execute_score import _execute, _spec  # noqa: E402  (shared no-GPU run fixtures)
+from test_execute_score import _execute as execute_fixture, _spec  # noqa: E402
 
 import isb.manager as manager  # noqa: E402
 from isb.specs import SPECS  # noqa: E402
+
+
+def _execute(path, name, engine, **kwargs):
+    execute_fixture(path, name, engine, **kwargs)
+
+
+def _import(path):
+    from isb.manager.model import import_legacy
+    import_legacy(str(path))
 
 
 def _collection(tmp_path):
     """A directory with one transformers baseline and one vllm run that is wrong on one prompt."""
     _execute(tmp_path, "base", "transformers")
     _execute(tmp_path, "cand", "vllm", wrong_on="p1")
+    _import(tmp_path)
     return manager.load_dir(str(tmp_path))
+
+
+def test_legacy_import_never_guesses_precision_control(tmp_path):
+    from unittest.mock import patch
+    _execute(tmp_path, "base", "transformers")
+    _execute(tmp_path, "candidate", "vllm")
+    _execute(tmp_path, "unrelated-fp32", "vllm")
+    with patch.dict(SPECS, {"xs": _spec()}), patch("isb.sweep.score.score_runs", return_value=[]) as score:
+        _import(tmp_path)
+    assert score.call_count == 3
+    for call in score.call_args_list:
+        assert len(call.args) == 4 and "ctl" not in call.kwargs
+
+
+def test_changed_legacy_artifact_requires_explicit_reimport(tmp_path):
+    _collection(tmp_path)
+    with (tmp_path / "cand.pt").open("ab") as stream:
+        stream.write(b"changed")
+    col = manager.Collection(str(tmp_path))
+    assert "cand" not in col.entries
+    assert any("changed after import" in warning for warning in col.warnings)
 
 
 def test_baseline_single_transformers_run_and_marker_override(tmp_path):
@@ -32,6 +63,7 @@ def test_overview_cards_carry_rollup_of_the_scored_run(tmp_path):
     _collection(tmp_path)
     SPECS["xs"] = _spec()
     try:
+        _import(tmp_path)
         page = manager.render_overview(str(tmp_path), inbox=str(tmp_path / "inbox"))
     finally:
         del SPECS["xs"]
@@ -46,6 +78,7 @@ def test_method_page_is_the_model_x_backend_matrix(tmp_path):
     _collection(tmp_path)
     SPECS["xs"] = _spec()
     try:
+        _import(tmp_path)
         page = manager.render_method(str(tmp_path), "m", inbox=str(tmp_path / "inbox"))
     finally:
         del SPECS["xs"]
@@ -58,6 +91,7 @@ def test_spec_page_shows_states_metrics_and_stack(tmp_path):
     _collection(tmp_path)
     SPECS["xs"] = _spec()
     try:
+        _import(tmp_path)
         page = manager.render_spec(str(tmp_path), "xs", inbox=str(tmp_path / "inbox"))
     finally:
         del SPECS["xs"]
@@ -73,6 +107,7 @@ def test_spec_page_has_operating_point_figure(tmp_path):
     _collection(tmp_path)
     SPECS["xs"] = _spec()
     try:
+        _import(tmp_path)
         page = manager.render_spec(str(tmp_path), "xs", inbox=str(tmp_path / "inbox"))
     finally:
         del SPECS["xs"]
@@ -110,6 +145,7 @@ def _construct_run(dirpath, name="micro-async", engine_kind="vllm"):
                             "repo": "gpt2", "data": [], "regimes": [],
                             "tasks": ["input_boundary", "barrier"], "interface": iface}}
     save_run(str(dirpath), name, {("__meta__",): meta}, prov)
+    _import(dirpath)
 
 
 def test_lone_construct_run_is_never_the_fallback_baseline(tmp_path):
@@ -122,12 +158,13 @@ def test_overview_matches_the_reviewed_design(tmp_path):
     _collection(tmp_path)
     SPECS["xs"] = _spec()
     try:
+        _import(tmp_path)
         page = manager.render_overview(str(tmp_path), inbox=str(tmp_path / "inbox"))
     finally:
         del SPECS["xs"]
     assert "How to read the map" in page                           # legend panel
     assert "setup of the runs in this directory" in page           # backends table
-    assert "HF-nnsight" in page and "vLLM-nnsight" in page         # labeled chips
+    assert "HF-nnsight" in page and "vllm-nnsight" in page
 
 
 def test_backend_page_shows_construct_support_from_construct_run(tmp_path):
@@ -179,6 +216,7 @@ def _perf_run(dirpath, name="perf-read-q"):
                             "repo": "q", "data": [], "regimes": [], "tasks": [],
                             "interface": "perf"}}
     save_run(str(dirpath), name, {("perf_rows",): rows, ("__meta__",): {}}, prov)
+    _import(dirpath)
 
 
 def test_perf_micro_runs_render_op_cost_tables(tmp_path):
@@ -242,7 +280,7 @@ def test_repo_pages_render(tmp_path=None):
     model = manager.render_model("llama")
     assert "residual denotation" in model and "fused" in model
     backends = manager.render_backends()
-    assert "vllm_async" in backends
+    assert "nnsight-vllm" in backends
     backend = manager.render_backend("vllm_async")
     assert "vLLM async engine, in-process" in backend              # the setup line
     assert "micro.py --backend vllm_async" in backend              # no micro run in this dir
@@ -255,6 +293,7 @@ def test_export_is_selfcontained_and_link_rewritten(tmp_path):
     _collection(tmp_path)
     SPECS["xs"] = _spec()
     try:
+        _import(tmp_path)
         page = manager.export_html(str(tmp_path), inbox=str(tmp_path / "inbox"))
     finally:
         del SPECS["xs"]

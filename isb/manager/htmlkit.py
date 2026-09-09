@@ -79,8 +79,8 @@ tr:last-child td{{border-bottom:none}}
 .s-SUPPORTED,.s-EQUIVALENT,.s-SUPPORTED_DEGRADED,.s-EQUIVALENT_DEGRADED{{
   color:var(--ok);background:var(--ok-bg)}}
 .s-SILENTLY_WRONG,.s-DIVERGENT{{color:var(--bad);background:var(--bad-bg)}}
-.s-ERROR{{color:var(--err);background:var(--err-bg)}}
-.s-RAN,.s-NO_REFERENCE,.s-UNTESTED{{color:var(--un);background:var(--un-bg)}}
+.s-ERROR,.s-JOB_FAILED,.s-INCOMPATIBLE,.s-INVALID_REFERENCE{{color:var(--err);background:var(--err-bg)}}
+.s-RAN,.s-NO_REFERENCE,.s-UNTESTED,.s-NOT_RUN,.s-CANCELLED,.s-PENDING,.s-RUNNING{{color:var(--un);background:var(--un-bg)}}
 .s-LIMITED,.s-BASELINE{{color:var(--lim);background:var(--lim-bg)}}
 .note{{font-size:12.5px;color:var(--mut);max-width:72ch}}
 .berow{{display:flex;gap:8px 22px;flex-wrap:wrap;align-items:center;margin-top:12px;
@@ -207,5 +207,5 @@ def header_bar(crumb: str, dir_label: str | None, inbox_html: str | None) -> str
 
 
 def page(title: str, header_html: str, *blocks: str) -> str:
-    return (f"<!doctype html><meta charset='utf-8'><title>{esc(title)}</title>"
+    return (f"<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>{esc(title)}</title>"
             f"{STYLE}{header_html}<main>{''.join(blocks)}</main>")

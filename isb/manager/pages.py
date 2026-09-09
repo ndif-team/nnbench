@@ -88,22 +88,24 @@ def _page(col: Collection | None, crumb: str, title: str, *blocks: str) -> str:
                             link("/inbox", f"inbox ({len(col.inbox_runs())})"))
     else:
         header = header_bar(crumb, None, link("/inbox", "inbox"))
-    return page(title, header, *blocks)
+    warnings = [note(message) for message in col.warnings] if col is not None else []
+    return page(title, header, *warnings, *blocks)
 
 
 def _stack(prov: dict) -> str:
-    c = prov["client"]
-    nn = c.get("nnsight", {})
-    e = prov["engine"]
+    c = prov.get("client", {})
+    nn = c.get("nnsight") or {}
+    e = prov.get("engine", {"kind": "unknown"})
     commit = str(nn.get("commit"))[:9]
-    if nn.get("remote") and "github.com" in str(nn.get("remote")):
-        url = str(nn["remote"]).removesuffix(".git").replace(
-            "git@github.com:", "https://github.com/")
+    url = str(nn.get("remote", "")).removesuffix(".git")
+    if url.startswith("git@github.com:"):
+        url = "https://github.com/" + url.removeprefix("git@github.com:")
+    if url.startswith("https://github.com/"):
         commit = f'<a href="{esc(url)}/commit/{esc(str(nn.get("commit")))}">{esc(commit)}</a>'
     else:
         commit = esc(commit)
-    ver = f"vllm {c.get('vllm')}" if e["kind"] == "vllm" else f"tf {c.get('transformers')}"
-    return (f"<span class='mono'>{esc(e['kind'])}({esc(str(e.get('mode')))}) · nnsight {commit}"
+    ver = f"vllm {c.get('vllm')}" if e.get("kind") == "vllm" else f"tf {c.get('transformers')}"
+    return (f"<span class='mono'>{esc(e.get('kind', 'unknown'))}({esc(str(e.get('mode')))}) · nnsight {commit}"
             f"{'*' if nn.get('dirty') else ''} · {esc(ver)}</span>")
 
 
@@ -191,10 +193,10 @@ def _cell_rows(col: Collection, name: str, cells) -> list[list[str]]:
         m = c.metrics or {}
         metric = (f"top1={m.get('top1_agree', 0):.2f} tv={m.get('tv', float('nan')):.3f} "
                   f"maxabs={m.get('max_abs', float('nan')):.2f}" if m else (c.error or ""))
-        state = _BASELINE_CHIP if is_baseline and not c.error else chip(c.state)
+        state = _BASELINE_CHIP if is_baseline and c.state == "RAN" else chip(c.state)
         lat = fmt_ms(c.latency_s * 1000 if c.latency_s is not None else None)
         rows.append([esc(c.label), esc(c.workload), state, mono(lat), mono(metric)])
-    meta = col.entries[name][0].get(("__meta__",), {})
+    meta = col.load(name)[0].get(("__meta__",), {})
     rows += [[esc("effect guard"), esc(k[1]), "", mono("-"),
               mono(f"the intervention moves the control: top1={e['top1_agree']:.2f}, "
                    f"tv={e['tv']:.3f}{', weak' if not e.get('strong') else ''}")]
@@ -235,7 +237,7 @@ def overview(col: Collection) -> str:
         label, setup = model.backend_label(prov)
         setups[label] = setup
     backends = table(["backend", "setup of the runs in this directory"],
-                     [[esc(l), note(s)] for l, s in sorted(setups.items())])
+                     [[esc(label), note(setup)] for label, setup in sorted(setups.items())])
 
     cards = []
     for method, spec_names in sorted(_by_method(col).items()):
@@ -246,7 +248,7 @@ def overview(col: Collection) -> str:
         baseline_labels: set[str] = set()
         for name in run_names:
             label, _ = model.backend_label(col.entries[name][1])
-            if name in col.baselines.values():
+            if name in col.baselines.values() and all(c.state == "RAN" for c in col.results.get(name) or []):
                 baseline_labels.add(label)
                 continue
             cells = col.results.get(name)
@@ -270,9 +272,9 @@ def overview(col: Collection) -> str:
             code_block(snippet) if snippet else "",
             chip_row(chips)))
 
-    baselines_line = (esc(f"{len(col.baselines)} baseline runs, one per method "
+    baselines_line = (esc(f"{len(col.baselines)} reference jobs, one per experiment "
                           f"(marked on the runs index)") if col.baselines else
-                      esc("none (add a BASELINE file listing one run per method)"))
+                      esc("none (reference selection is recorded by the benchmark)"))
     dir_panel = card(kv_table([
         ("directory", f"{esc(col.dir_path)} · {link('/runs', f'{len(col.entries)} runs')}"),
         ("baselines", baselines_line),
@@ -283,9 +285,9 @@ def overview(col: Collection) -> str:
         eyebrow("Applicability map"),
         heading(1, "nnbench"),
         lede_html(f"Which interpretability methods run, run correctly, and run fast on each "
-                  f"serving backend. A directory is a collection of archived runs, each method "
-                  f"scored against its baseline run; the pages below show the rendered "
-                  f"directory. New runs wait in the {link('/inbox', 'inbox')} until archived."),
+                  f"serving backend. These are saved benchmark reports, not comparisons "
+                  f"recomputed by the site. Browse a run directory or a collection of runs. "
+                  f"The {link('/inbox', 'inbox')} can archive complete runs."),
         dir_panel,
         heading(2, "Backends"),
         backends,
@@ -295,8 +297,8 @@ def overview(col: Collection) -> str:
         _legend(),
         heading(2, "Methodologies"),
         note("One card per method: what it does, the trace of its recommended form (abridged; "
-             "the measured cell source is on the method page), and the latest state per backend "
-             "in this directory."),
+             "current checkout source is on the method page), and an aggregate of all recorded "
+             "results per named backend in this directory. This is not a latest-run selector."),
         *cards)
 
 
@@ -372,12 +374,13 @@ def method(col: Collection, name: str) -> str:
         cells_by_label: dict[str, list[str]] = {}
         for rn in run_names:
             cells = col.results.get(rn)
-            if cells is None or rn in col.baselines.values():
+            if cells is None or (rn in col.baselines.values() and all(c.state == "RAN" for c in cells)):
                 continue
             cells_by_label.setdefault(
                 model.backend_label(col.entries[rn][1])[0], []).extend(c.state for c in cells)
         row = [f"{link(f'/spec/{spec_name}', coords['repo'])} "
-               f"<span class='note'>data {esc(', '.join(coords['data']) or '-')}</span>"]
+               f"<span class='note'>data {esc(', '.join(coords['data']) or '-')} · "
+               f"experiment {esc(spec_name)}</span>"]
         row += [chip(model.rollup(cells_by_label[lb])) if lb in cells_by_label
                 else "<span class='note'>-</span>" for lb in labels]
         rows.append(row)
@@ -391,8 +394,8 @@ def method(col: Collection, name: str) -> str:
         heading(1, esc(name)),
         lede(METHOD_INTROS.get(name, "")),
         heading(2, "Procedure") if src else "",
-        note("The measured cell source, as executed; the overview card shows the idealized "
-             "user-facing trace.") if src else "",
+        note("Source from the current checkout, not a historical snapshot of the executed code. "
+             "The run details record source identity.") if src else "",
         code_block(src) if src else "",
         heading(2, "Model × backend"),
         _legend(),
@@ -410,13 +413,15 @@ def spec(col: Collection, spec_name: str) -> str:
     sections = []
     for name in names:
         outputs, prov = col.entries[name]
-        head = [heading(2, link(f"/run/{name}", name)), note_html(_stack(prov))]
+        head = [heading(2, link(f"/run/{name}", name)), note_html(_stack(prov)),
+                note(f"comparison: {prov.get('view', {}).get('comparison', 'legacy import')} · "
+                     f"reference: {prov.get('view', {}).get('reference', baseline)}")]
         probes = model.probe_results(outputs)
         cells = col.results.get(name)
         if probes:
             sections += head + [table(_RUN_TABLE_HEADERS, _probe_rows(probes))]
         elif cells is None:
-            sections += head + [note("no verdict (spec or data differ from the baseline)")]
+            sections += head + [note("no saved verdict (legacy spec/data may differ from the reference)")]
         else:
             sections += head + [table(_RUN_TABLE_HEADERS, _cell_rows(col, name, cells))]
 
@@ -443,6 +448,7 @@ def run(col: Collection, name: str) -> str:
         ("deployment", esc(str(prov.get("deployment")))),
         ("host", esc(str(prov.get("host", {}).get("hostname")))),
         ("gpus", esc(str([g.get("name") for g in prov.get("host", {}).get("gpus") or []]))),
+        ("job", esc(str(prov.get("view", {})))),
     ])
     rows = []
     for k, m in meta.items():
@@ -464,27 +470,34 @@ def run(col: Collection, name: str) -> str:
         heading(1, esc(name)),
         facts,
         heading(2, "Cells"),
-        table(["cell", "latency / error"], rows),
+        table(_RUN_TABLE_HEADERS, _cell_rows(col, name, col.cells_for(name)))
+        if col.cells_for(name) is not None else table(["cell", "latency / error"], rows),
         note_html(link("/", "back")))
 
 
 def inbox(col: Collection) -> str:
     rows = []
     for name in col.inbox_runs():
-        _, prov = model._load_cached(col.inbox, name)
+        from pathlib import Path
+        is_bundle = (Path(col.inbox) / name / "plan.json").is_file()
+        title = link(f"/inbox-run/{name}", name) if is_bundle else link(f"/run/inbox/{name}", name)
+        description = "complete benchmark run" if is_bundle else "legacy artifact (import summary before viewing)"
+        token = f"<input type='hidden' name='csrf' value='{esc(col.csrf_token)}'>"
         actions = (f"<form method='post' action='/archive'>"
+                   f"{token}"
                    f"<input type='hidden' name='name' value='{esc(name)}'>"
                    f"<button>archive to {esc(col.dir_path)}</button></form> "
                    f"<form method='post' action='/discard'>"
+                   f"{token}"
                    f"<input type='hidden' name='name' value='{esc(name)}'>"
-                   f"<button>discard</button></form>")
-        rows.append([link(f"/run/{name}", name), _stack(prov), actions])
+                   f"<button>move to trash</button></form>")
+        rows.append([title, note(description), actions])
     return _page(
         col, "inbox", "inbox",
         eyebrow("Inbox"),
         heading(1, "Inbox"),
-        lede_html(f"Runs land here when the benchmark finishes; they appear in no map until "
-                  f"archived. A plain file move does the same. {link('/', 'back')}"),
+        lede_html(f"Complete runs can be archived without splitting their artifacts. Discard "
+                  f"moves them into the inbox's .trash directory for recovery. {link('/', 'back')}"),
         table(["run", "stack", ""], rows))
 
 
@@ -496,7 +509,7 @@ def runs(col: Collection) -> str:
         mark = f" {_BASELINE_CHIP}" if name in baselines else ""
         rows.append([
             link(f"/run/{name}", name) + mark,
-            mono(model.executed(prov, model.run_path(col.dir_path, name))),
+            mono(prov.get("executed") or "unknown"),
             _stack(prov),
             mono(f"{c['spec']} · {', '.join(c['data']) or '-'}"),
         ])
@@ -590,16 +603,20 @@ def model_page(col: Collection, family: str) -> str:
         ("attn / mlp names", esc(str((p.attn_name, p.mlp_name)))),
         ("vLLM tree prefix", esc(p.vllm_prefix or "-")),
     ])
-    specs = "".join(f"<li>{link(f'/spec/{s.name}', s.name)} "
+    specs = "".join(f"<li>{esc(s.name)} "
                     f"<span class='note'>{esc(s.repo)}</span></li>"
                     for s in SPECS.values() if s.family == family) or "<li>none</li>"
+    recorded = "".join(f"<li>{link(f'/spec/{group}', group)}</li>"
+                       for group, names in col.by_spec().items()
+                       if col.entries[names[0]][1]["coordinates"]["family"] == family) if col else ""
     return _page(
         col, f"model / {family}", family,
         eyebrow("Model family"),
         heading(1, esc(family)),
         facts,
         heading(2, "Specs on this family"),
-        f"<ul>{specs}</ul>")
+        f"<ul>{specs}</ul>", heading(2, "Recorded experiments"),
+        f"<ul>{recorded or '<li>none</li>'}</ul>")
 
 
 _BACKEND_SETUPS = {
@@ -611,21 +628,27 @@ _BACKEND_SETUPS = {
 
 
 def backends(col: Collection) -> str:
-    from ..backends import IMPLS
-
-    rows = [[link(f"/backend/{name}", name), mono(cls.__name__)]
-            for name, cls in sorted(IMPLS.items())]
+    from ..jobs.local import discover
+    packaged = set(discover())
+    names = col.backend_names() if col is not None else sorted(packaged)
+    rows = [[link(f"/backend/{name}", name), mono(f"backends/{name}/compose.yml" if name in packaged
+                                                 else "recorded backend/interface")]
+            for name in names]
     return _page(col, "backends", "backends",
                  eyebrow("Backends"), heading(1, "Backends"),
-                 table(["backend", "class"], rows))
+                 table(["backend", "configuration"], rows))
 
 
 def backend(col: Collection, name: str) -> str:
     from ..backends import IMPLS
-
-    cls = IMPLS[name]
+    if name not in col.backend_names() and name not in IMPLS:
+        raise KeyError(name)
     sections = []
     for rn, (out, prov) in sorted(col.entries.items()):
+        if prov.get("view", {}).get("backend") == name:
+            sections += [heading(2, link(f"/run/{rn}", rn)), note_html(_stack(prov)),
+                         table(_RUN_TABLE_HEADERS, _cell_rows(col, rn, col.results[rn]))]
+            continue
         if prov["coordinates"]["interface"] != name:
             continue
         probes = model.probe_results(out)
@@ -636,14 +659,14 @@ def backend(col: Collection, name: str) -> str:
                                 f"{link(f'/run/{rn}', rn)}</span>"),
                      table(["construct", "state", "check / note"], rows)]
     if not sections:
-        sections = [note_html(f"No construct-probe run for this backend in the directory; run "
-                              f"<code>scripts/micro.py --backend {esc(name)}</code> and archive "
-                              f"it here for per-construct states.")]
+        sections = [note_html("No recorded jobs for this backend in the directory. "
+                              + (f"Legacy probes: <code>scripts/micro.py --backend {esc(name)}</code>."
+                                 if name in IMPLS else f"Configuration: <code>backends/{esc(name)}/compose.yml</code>."))]
     return _page(
         col, f"backend / {name}", name,
         eyebrow("Backend"),
         heading(1, esc(name)),
-        lede_html(f"{esc(_BACKEND_SETUPS.get(name, cls.__name__))} · documented gaps in the "
+        lede_html(f"{esc(_BACKEND_SETUPS.get(name, name))} · documented gaps in the "
                   f"{link('/catalog', 'methods catalog')}"),
         *sections)
 
@@ -716,11 +739,27 @@ def _data_router(col: Collection, rest: str) -> str:
     return data_item(col, src, int(idx))
 
 
+def inbox_run(col: Collection, name: str):
+    from pathlib import Path
+    from .records import child
+    if name not in col.inbox_runs():
+        raise FileNotFoundError(name)
+    directory = child(Path(col.inbox), name)
+    if not (directory / "plan.json").is_file():
+        raise FileNotFoundError(name)
+    incoming = col.inbox_collection()
+    rows = [[link(f"/run/inbox/{key}", key),
+             chip(model.rollup([c.state for c in incoming.results[key] or []]))]
+            for key in incoming.entries if key.startswith(name + "/")]
+    return _page(col, f"inbox / {name}", name, heading(1, esc(name)), table(["job", "state"], rows))
+
+
 ROUTES = [
     (re.compile(r"^/$"), lambda col, m: overview(col)),
     (re.compile(r"^/micro$"), lambda col, m: micro(col)),
     (re.compile(r"^/runs$"), lambda col, m: runs(col)),
     (re.compile(r"^/inbox$"), lambda col, m: inbox(col)),
+    (re.compile(r"^/inbox-run/([^/]+)$"), lambda col, m: inbox_run(col, m.group(1))),
     (re.compile(r"^/run/(.+)$"), lambda col, m: run(col, m.group(1))),
     (re.compile(r"^/method/(.+)$"), lambda col, m: method(col, m.group(1))),
     (re.compile(r"^/spec/(.+)$"), lambda col, m: spec(col, m.group(1))),
@@ -740,14 +779,16 @@ def dispatch(col: Collection, path: str) -> str | None:
     for pattern, handler in ROUTES:
         m = pattern.match(path)
         if m:
-            return handler(col, m)
+            try:
+                return handler(col, m)
+            except (KeyError, IndexError, FileNotFoundError, ValueError):
+                return None
     return None
 
 
 def enumerate_paths(col: Collection, items_per_source: int = 20) -> list[str]:
     """Every concrete path the ROUTES serve for this collection: the export and the crawl tests
     walk exactly this list, so a new page is exported the moment it is routed here."""
-    from ..backends import IMPLS
     from ..data import SOURCES
     from ..profiles import PROFILES
 
@@ -755,9 +796,12 @@ def enumerate_paths(col: Collection, items_per_source: int = 20) -> list[str]:
              "/findings", "/catalog"]
     paths += [f"/method/{m}" for m in sorted(_by_method(col))]
     paths += [f"/spec/{s}" for s in sorted(col.by_spec())]
-    paths += [f"/run/{n}" for n in sorted(set(col.entries) | set(col.inbox_runs()))]
+    paths += [f"/run/{n}" for n in sorted(col.entries)]
+    paths += [f"/run/inbox/{n}" for n in sorted(col.inbox_collection().entries)]
+    from pathlib import Path
+    paths += [f"/inbox-run/{n}" for n in col.inbox_runs() if (Path(col.inbox) / n / "plan.json").is_file()]
     paths += [f"/model/{f}" for f in sorted(PROFILES)]
-    paths += [f"/backend/{b}" for b in sorted(IMPLS)]
+    paths += [f"/backend/{b}" for b in col.backend_names()]
     for src in sorted(SOURCES):
         paths.append(f"/data/{src}")
         units, _ = _units_of(src)
@@ -785,7 +829,7 @@ def export_html(dir_path: str, inbox: str | None = None, items_per_source: int =
     payload = json.dumps(pages).replace("</", "<\\/")
     header = header_bar("", dir_path, link("/inbox", f"inbox ({len(col.inbox_runs())})"))
     header = header.replace("href='/", "href='#/")
-    return (f"<!doctype html><meta charset='utf-8'>"
+    return (f"<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
             f"<title>nnbench · {esc(dir_path)}</title>{STYLE}"
             f"{header}<main id='app'></main><script>const PAGES={payload};\n"
             "const go = () => {\n"

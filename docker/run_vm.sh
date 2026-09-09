@@ -2,8 +2,8 @@
 # Run the VM-style nnbench split. The serve server hosts ONE model, so specs are grouped by model:
 # for each model we bring the GPU server up ONCE, run the GPU-less client per spec against it, then
 # tear down. Stock the reference run files first (GPU runs) — see the README:
-#   CUDA_VISIBLE_DEVICES=N python scripts/bench.py --spec all --backends hf --out results/runs
-#   CUDA_VISIBLE_DEVICES=N python scripts/bench.py --spec all --ctl-only --out results/runs
+# Legacy standalone serve tool. For the main runner use backends/README.md instead.
+# This writes legacy .pt artifacts; score them with scripts/score.py, not the new job scorer.
 #
 #   ./run_vm.sh                          # every spec below
 #   GPU=5 ./run_vm.sh steering_gpt2 ablation_gpt2   # selected specs on GPU 5
@@ -39,17 +39,19 @@ done
 
 for model in "${!BY_MODEL[@]}"; do
   echo "==================== server model=$model ===================="
-  if ! MODEL="$model" docker compose up -d --wait server; then
+  if ! MODEL="$model" CUDA_VISIBLE_DEVICES="${GPU:-0}" docker compose up -d --wait server; then
     echo "!! server failed to become healthy for $model — logs:" >&2
     MODEL="$model" docker compose logs --tail 40 server >&2 || true
-    MODEL="$model" docker compose down -v || true
+    MODEL="$model" docker compose down || true
     continue
   fi
   for spec in ${BY_MODEL[$model]}; do
     echo "-------------------- spec=$spec --------------------"
-    # one-shot client against the already-running server (its command is overridden here)
-    MODEL="$model" timeout "${CLIENT_TIMEOUT:-360}" docker compose run --rm --no-deps client \
-      --spec "$spec" --backends vllm_serve --serve http://server:6677 --out /refs --score-vs hf || true
+    # The main name-based runner does not accept this legacy interface.
+    mkdir -p ../results/runs
+    timeout "${CLIENT_TIMEOUT:-360}" docker compose run --rm -T \
+      --volume "$PWD/../results/runs:/outputs" vllm_serve \
+      --spec "$spec" --host http://server:6677 --out /outputs --name "$spec-serve" || true
   done
-  MODEL="$model" docker compose down -v
+  MODEL="$model" docker compose down
 done
