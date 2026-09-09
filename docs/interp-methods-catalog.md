@@ -1,9 +1,10 @@
 # Interpretability methods — catalog & nnbench roadmap
 
-A catalog of well-recognized interpretability methods, tagged by **what models they apply to** and
-**which primitives they need** — their Level-3 *footprint* (design.md §3.5). The point is to decide
-which become nnbench methodologies: a method is a cheap deterministic cell, a new backend frontier,
-or a heavyweight needing a trained artifact *based on the primitives it touches*.
+A catalog of well-recognized interpretability methods, indexed by the shared CausaLab protocol
+vocabulary for **what is intervened where** and by nnbench's separate execution details. The point
+is to decide which become nnbench methodologies: a method is a cheap deterministic cell, a new
+backend frontier, or a heavyweight needing a trained artifact based on the protocol elements and
+realizations it touches.
 
 All methods below are **deterministic** (greedy / argmax, no sampling) → oracle-checkable, which is
 the inclusion criterion for an nnbench cell. The sampling-based verifier/oracle direction (BOA /
@@ -132,7 +133,7 @@ below imply nothing about writability — write statuses live in the data-op and
 | internal `.source` — other ops | ✓ — `mlp.source.self_c_fc_0` == `c_fc.output`, exact | ✓ — same check, exact (the vLLM MLP forward is plain Python, so `.source` rewrites it fine) | micro tier; the portable-sites result |
 | internal — nested/recursive `.source` (`module.source.<op>.source.<inner>`) | UNTESTED | UNTESTED | traverse row; same op class as `.source`, low priority |
 | derived (head *h* / neuron *j*) | ✓ — head view validated by c_proj reconstruction; neuron by `gelu_new(c_fc)` | ✓ — same checks; weight-using reconstruction must run INSIDE the trace (the client-side envoy is the meta model) | micro tier; the portable-sites result |
-| derived — subspace / direction-valued addresses (DAS rotations, steering directions; adopted as derived-tier citizens, design.md §3.2) | UNTESTED | UNTESTED — no probe until a DAS-class cell exists | traverse row; pyvene alignment |
+| derived — subspace / direction-valued addresses (DAS rotations, steering directions; adopted as derived-tier citizens, design.md §3.2) | UNTESTED | UNTESTED — no probe until a DAS-class cell exists | traverse row; subspace-featurizer alignment |
 | gradient space (`.grad`) | ✓ | absent (no grad — the no-autograd-on-vLLM result) | the no-autograd-on-vLLM result |
 
 Level-1 notes: name collisions remount under `.nns_output` (address-space quirk, not a row);
@@ -171,35 +172,21 @@ bundling, non-blocking jobs, `tracer.local()`, code shipping — deferred by the
 backend column is reserved, no rows now), deprecated iteration forms, non-greedy sampling
 (breaks the determinism criterion), multi-backward, and extension/harness plumbing.
 
-### Tag shorthand (used in the method tables below)
+### Protocol index and nnbench execution details
 
-The tags are L2 entry references (extended 2026-06-12 with quantifier / edge / staging /
-realization tags, so footprints can express *where methods fail*; realizations attach as
-suffixes, e.g. `write/boundary/step/replacement`). The pyvene column maps edge classes to
-pyvene's intervention-type enum for cross-framework legibility (design.md §4 borrow).
+The authoritative methodology templates, parameter classifications, and case specialization
+live in [isb/protocol.py](../isb/protocol.py): `PROTOCOLS` defines the templates and
+`describe_task()` derives concrete case requirements. The method summaries below explain the
+scientific procedures and their coverage; the Python definitions own the executable-spec inventory.
 
-| tag | decomposition | pyvene |
-|---|---|---|
-| `read` | read × boundary site | Collect (observation) |
-| `write` | write × boundary site (replacement realization unless noted) | Vanilla / Zero |
-| `xprompt` | cross-prompt transplant edge: read (run A) → write (run B) | Vanilla interchange (transplant) |
-| `grad` | grad × gradient space (derivative edge) | — |
-| `attn-weights` | read × internal × attention (HF eager only; site absent on vLLM) | — |
-| `.source` | read/write × internal site | — |
-| `ext-module` | meta-compute with an external `nn.Module` (probe / SAE / transcoder); its observability half is `hook=True` (UNTESTED) | — |
-| `trained` | needs a pretrained artifact — structurally, the **accumulation** edge's stored meta-state | — |
-| `step/bounded`, `step/unbounded`, `step/next` | step-quantifier realizations | — |
-| `dataset/batched`, `dataset/sequential` | dataset-quantifier realizations | — |
-| `sweep` | host-side address quantifier (free; breadth is its measure) | — |
-| `run-dag` | session / two ordered traces | — |
-| `sync` | barrier (fork sync) | — |
-| `live-out` | save edge, region → caller (realizations: in-process / streaming / wire) | — |
-| `loop-carried` | step → region accumulation edge | — |
-| `injection` | meta-constant → write edge | Addition / Subtraction |
-| `rewiring` | same-run read → compute → write downstream | RotatedSpace = subspace rewiring (DAS) |
-| `accumulation` | reads → meta-state → later write/analysis | — |
-| `derivative` | grad → emit/compute | — |
-| `edit-replay`, `edit-persist` | staging edges (replay; export/import persistence) | LoRA (staging) |
+Semantic parameters specify the computation: ablation's `target` chooses the component being
+ablated, and DAS's `train` selects training or application. Realization parameters specify the
+implementation spelling, such as `residual` or bounded iteration. Extensions identify behavior
+outside CausaLab v1. The Level-0/1/1.5 vocabulary above supports engine-failure diagnosis.
+
+Saved provenance contains each case's semantic and realization values and its effective protocol.
+For example, DAS application (`train=0`) requires forward execution, while training also requires
+gradients. `protocol_coverage` identifies described methods and explicitly opted-out experiments.
 
 Status: ✓ = already an nnbench cell. **frontier** = exercises a primitive where vLLM and HF diverge
 (the highest-signal additions).
@@ -208,47 +195,47 @@ Status: ✓ = already an nnbench cell. **frontier** = exercises a primitive wher
 
 ## 1. Reading what a layer represents (observational lenses & probes)
 
-| method | idea | footprint (tags) · base × transformation | models / generality | status |
+| method | idea | protocol tuple · nnbench details | models / generality | status |
 |---|---|---|---|---|
-| **Logit lens** | project an intermediate residual through final-norm + unembed → a next-token dist | `read` × `sweep` + `live-out` · base: observation | any decoder-only LM; the "fused residual" detail is arch-specific (GPT-2 single tensor vs Llama hidden+residual) | ✓ |
-| **Tuned lens** | logit lens with a *trained* affine probe per layer (better-calibrated early layers) | `read` `ext-module` `trained` · logit lens ∘ amortization | needs a tuned-lens checkpoint per model | TODO |
-| **Linear probing** | train a linear classifier on activations to test if a concept is linearly decodable | `read` `dataset/sequential` `accumulation` `ext-module` `trained` · observation ∘ dataset-lift ∘ amortization | any model; probe is per-model/per-concept (cheap to train) | TODO |
-| **Direct logit attribution (DLA)** | decompose the final logit into additive per-component contributions | `read` `.source` (per-head) × `sweep` · base: observation × internal site | decoder-only; per-head needs access to head outputs before `W_O` | TODO (read-only, exact) |
+| **Logit lens** | project an intermediate residual through final-norm + unembed → a next-token dist | base · `block_output` + `lm_head` · read · prompt · `full_logits`; unembed/residual realizations | any decoder-only LM; the "fused residual" detail is arch-specific (GPT-2 single tensor vs Llama hidden+residual) | ✓ |
+| **Tuned lens** | logit lens with a *trained* affine probe per layer (better-calibrated early layers) | base · `block_output` + `lm_head` · read · prompt; trained affine artifact | needs a tuned-lens checkpoint per model | TODO |
+| **Linear probing** | train a linear classifier on activations to test if a concept is linearly decodable | base · `block_output` · read, grad · prompt · `grad`; trained probe artifact | any model; probe is per-model/per-concept (cheap to train) | TODO |
+| **Direct logit attribution (DLA)** | decompose the final logit into additive per-component contributions | base · `attention_output` + `mlp_output` + `lm_head` · read · prompt | decoder-only; per-head needs access to head outputs before `W_O` | TODO (read-only, exact) |
 
 ## 2. Causal interventions (change something, watch the output)
 
-| method | idea | footprint (tags) · base × transformation | models / generality | status |
+| method | idea | protocol tuple · nnbench details | models / generality | status |
 |---|---|---|---|---|
-| **Activation patching / causal tracing** | copy an activation from a clean run into a corrupted run; measure restoration | `read` `write` `xprompt` × `sweep` · base: transplant | any transformer | ✓ |
-| **Ablation / knockout** | zero- or mean-out a component, measure the damage | `read` `write` `injection` · base: injection (mean variant adds `accumulation` ∘ aggregation) | any transformer | ✓ (zero); mean = the accumulation roadmap cell |
-| **Steering / ActAdd** | add a direction into the residual at run time to push behavior | `read` `write` `injection` · base: injection | any decoder-only LM | ✓ |
-| **Generation-time steering** | the steering write applied at EVERY decode step of a greedy generation, per-step logits read | `write/boundary/step/replacement` + `step/bounded` + `injection` + `loop-carried` + `live-out` · steering ∘ step-lift | any decoder-only LM; vLLM needs the bounded `iter[0:N]` realization | ✓ — **composition confirmed** (write × bounded-iter SUPPORTED on vLLM, top1=1.00 tv=0.000; unbounded = the unbounded-iteration saves-drop frontier marker; a direct step-lift law test — base vs lifted on one backend — is queued) |
-| **Generation-time cross-prompt patching** | the cross-prompt transplant injected at prefill, scored on the generated tokens (the causalab `locate` footprint) | `read` + `write/boundary/replacement` + `transplant` + `step/bounded` + `live-out` · activation patching ∘ step-lift | any transformer; length-matched pair; vLLM needs bounded `iter[0:N]` | ✓ — **composition confirmed at fp32** (transplant step-lifts correctly); bf16 forks the whole greedy trajectory (top1=0.00 tv=0.711, SUPPORTED_DEGRADED) — precision compounding, NOT a mechanism bug |
-| **Attribution patching** | gradient linear-approx of patching for *every* component in one fwd+bwd | `read` `grad` `derivative` · activation patching ∘ linearization (a scientific approximation, not an equivalence) | any differentiable model | ✓ — **frontier confirmed** (`grad`: vLLM ERROR — the no-autograd-on-vLLM result) |
-| **Path patching** | patch specific component→component *edges* (not whole activations) | `read` `write` `xprompt` `.source` `rewiring` · base: rewiring | any transformer; more plumbing | TODO (composite; the rewiring edge has no measuring cell) |
+| **Activation patching / causal tracing** | copy an activation from a clean run into a corrupted run; measure restoration | base + counterfactual · `block_output` + `lm_head` · read, write / `swap` · prompt · `paired_forward`, `full_logits`; residual realization | any transformer | ✓ |
+| **Ablation / knockout** | zero- or mean-out a component, measure the damage | base · component selected by case · read, write / `swap` · prompt · `full_logits`; mean variant adds stored aggregate state | any transformer | ✓ (zero); mean = the accumulation roadmap cell |
+| **Steering / ActAdd** | add a direction into the residual at run time to push behavior | base · `block_output` + `lm_head` · read, write / `add_scaled` · prompt · `full_logits`; write realization | any decoder-only LM | ✓ |
+| **Generation-time steering** | the steering write applied at EVERY decode step of a greedy generation, per-step logits read | base · `block_output` + `lm_head` · read, write / `add_scaled` · prompt + generated · `generate`, `full_logits`; bounded/unbounded and decode-step-write extension | any decoder-only LM; vLLM needs the bounded `iter[0:N]` realization | ✓ — **composition confirmed** (write × bounded-iter SUPPORTED on vLLM, top1=1.00 tv=0.000; unbounded = the unbounded-iteration saves-drop frontier marker; a direct step-lift law test — base vs lifted on one backend — is queued) |
+| **Generation-time cross-prompt patching** | the cross-prompt transplant injected at prefill, scored on the generated tokens (the causalab `locate` footprint) | base + counterfactual · `block_output` + `lm_head` · read, write / `swap` · prompt + generated · `paired_forward`, `generate`, `full_logits`; bounded/unbounded realization | any transformer; length-matched pair; vLLM needs bounded `iter[0:N]` | ✓ — **composition confirmed at fp32** (transplant step-lifts correctly); bf16 forks the whole greedy trajectory (top1=0.00 tv=0.711, SUPPORTED_DEGRADED) — precision compounding, NOT a mechanism bug |
+| **Attribution patching** | gradient linear-approx of patching for *every* component in one fwd+bwd | base + counterfactual · `block_output` + `lm_head` · read, grad · prompt · `grad`; activation-gradient extension | any differentiable model | ✓ — **frontier confirmed** (`grad`: vLLM ERROR — the no-autograd-on-vLLM result) |
+| **Path patching** | patch specific component→component *edges* (not whole activations) | base + counterfactual · `attention_value` + `block_input` + `attention_output` + `lm_head` · read, write / `swap` · prompt · `paired_forward` | any transformer; more plumbing | TODO (composite; the rewiring edge has no measuring cell) |
 
 ## 3. Decomposing representations into features
 
-| method | idea | footprint (tags) · base × transformation | models / generality | status |
+| method | idea | protocol tuple · nnbench details | models / generality | status |
 |---|---|---|---|---|
-| **Sparse autoencoders (SAEs)** | sparse overcomplete dict over a layer's activations → monosemantic features | `read` `ext-module` `trained` (+ `write` `rewiring` to splice/steer) · observation ∘ amortization; splice = rewiring | needs trained SAEs (available: GPT-2, Gemma-2, Llama, …); latent read needs `hook=True` (UNTESTED) | TODO |
-| **Transcoders** | SAE that approximates an MLP's *computation* (read input → write output) | `read` `write` `ext-module` `trained` `rewiring` · base: rewiring ∘ amortization; natural form = input-write (UNTESTED) | needs trained transcoders | TODO |
+| **Sparse autoencoders (SAEs)** | sparse overcomplete dict over a layer's activations → monosemantic features | base · `block_output` · read (plus write / `pytorch_fn` for splice) · prompt · `pytorch_fn_local`; trained artifact | needs trained SAEs (available: GPT-2, Gemma-2, Llama, …); latent read needs `hook=True` (UNTESTED) | TODO |
+| **Transcoders** | SAE that approximates an MLP's *computation* (read input → write output) | base · `mlp_input` + `mlp_output` · read, write / `pytorch_fn` · prompt · `pytorch_fn_local`; trained artifact and input-write realization | needs trained transcoders | TODO |
 
 ## 4. Attention & circuits
 
-| method | idea | footprint (tags) · base × transformation | models / generality | status |
+| method | idea | protocol tuple · nnbench details | models / generality | status |
 |---|---|---|---|---|
-| **Attention-pattern read** | read the attention weights (who attends to whom) | `read` `attn-weights` `.source` · base: observation × internal | any transformer (HF eager); — | ✓ — **frontier confirmed** (`attn-weights`: site absent on vLLM — the attention-weights site-absence) |
-| **Per-head ablation / read** | zero or read an individual attention head's output | `read` `write` × derived address (head index; access path = reshape-slice realization) + `injection` | any transformer; needs head-dim reshape | TODO |
-| **Induction heads** | identify head pairs implementing "A→B … A→?B" (in-context copying) | `read` `attn-weights` (+ per-head `injection`) · observation + injection, composite | emergent in most transformers | TODO (analysis, composite) |
-| **Automated circuit discovery (ACDC / EAP)** | iteratively patch/prune edges to find a task's minimal subgraph | `read` `write` `rewiring` (`grad` `derivative` for EAP) × adaptive quantifier | any transformer; many runs | TODO (heavyweight) |
+| **Attention-pattern read** | read the attention weights (who attends to whom) | base · `attention_probs` · read · prompt | any transformer (HF eager); — | ✓ — **frontier confirmed** (`attention_probs`: site absent on vLLM — the attention-weights site-absence) |
+| **Per-head ablation / read** | zero or read an individual attention head's output | base · `attention_output` with head coordinate · read, write / `swap` · prompt; reshape-slice realization | any transformer; needs head-dim reshape | TODO |
+| **Induction heads** | identify head pairs implementing "A→B … A→?B" (in-context copying) | base · `attention_probs` + `attention_output` · read (optional write / `swap`) · prompt | emergent in most transformers | TODO (analysis, composite) |
+| **Automated circuit discovery (ACDC / EAP)** | iteratively patch/prune edges to find a task's minimal subgraph | base + counterfactual · component graph · read, write / `swap` (plus grad for EAP) · prompt · `paired_forward` (plus `grad`) | any transformer; many runs | TODO (heavyweight) |
 
 ## 5. Concept-direction control & full pipelines
 
-| method | idea | footprint (tags) · base × transformation | models / generality | status |
+| method | idea | protocol tuple · nnbench details | models / generality | status |
 |---|---|---|---|---|
-| **Representation engineering (RepE)** | derive a concept "reading vector" from contrastive activations, monitor/steer | `read` `dataset/sequential` `accumulation` → `write` `injection` · accumulation feeding injection | any decoder-only LM (vector derived from data, light) | TODO |
-| **Circuit Tracer (attribution graphs)** | replace MLPs with cross-layer transcoders → build & intervene on an attribution graph | `read` `write` `rewiring` `grad` `derivative` `ext-module` `trained` | only models with trained transcoders (Gemma-2-2B, small Llama, Qwen3-4B) | TODO (heavyweight; full pipeline, not a unit cell) |
+| **Representation engineering (RepE)** | derive a concept "reading vector" from contrastive activations, monitor/steer | base + counterfactual · `block_output` · read, write / `add_scaled` · prompt; direction-estimation artifact | any decoder-only LM (vector derived from data, light) | TODO |
+| **Circuit Tracer (attribution graphs)** | replace MLPs with cross-layer transcoders → build & intervene on an attribution graph | base · `mlp_input` + `mlp_output` + `lm_head` · read, write, grad / `pytorch_fn` · prompt · `grad`, `pytorch_fn_local`; trained artifacts | only models with trained transcoders (Gemma-2-2B, small Llama, Qwen3-4B) | TODO (heavyweight; full pipeline, not a unit cell) |
 
 ---
 

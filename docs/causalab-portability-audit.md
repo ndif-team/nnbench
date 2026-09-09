@@ -1,164 +1,119 @@
-# causalab portability audit — footprint × measured map
+# CausaLab and nnbench: protocol alignment
 
-> Status: written 2026-06-12. This is the "portability audit" proposed in
-> `agents-and-the-primitive-model.md` — a **static join**: each causalab analysis is decomposed
-> into its primitive footprint (citing causalab source), and each footprint line is looked up in
-> the measured per-context status inventory (`interp-methods-catalog.md`; the findings themselves
-> are described in `findings.md`). Nothing here was executed; predictions are inferences from measured rows, to be
-> validated by Macro-tier runs. Source audited: `goodfire-ai/causalab` @ `bf15b353` (read-only
-> clone at `/disk/u/zikai/causalab`).
+## 1. Reference revision
 
-## 1. As-shipped verdict: 0% on vLLM, by construction
+Reviewed against CausaLab main at
+[`8696e04bfb06a169defe1bf563d8aeef992f85cd`](https://github.com/goodfire-ai/causalab/tree/8696e04bfb06a169defe1bf563d8aeef992f85cd).
+The current `can/protocol-refactor` tip, `f0b714c`, has the same application code;
+the differences are two GitHub workflow files. GitHub reported no open CausaLab PRs at this check.
+Closed, unmerged proposals such as #80–#82 are outside this baseline.
 
-causalab's only model-access layer is `neural/`, which wraps a HuggingFace
-`AutoModelForCausalLM` in a pyvene `IntervenableModel` (`neural/activations/intervenable_model.py:15-86`,
-`neural/pipeline.py:205`). pyvene plants hooks on in-process HF `nn.Module`s; a vLLM model lives
-inside an engine worker and is not hookable from the caller's process. Two corroborating facts:
+PR #20 merged into the parent branch on August 31, 2026, and PR #19 then merged the
+accumulated protocol work into main. The parent branch's historical name, `nnterp-rebase`,
+does not identify its final runtime. The current dependency graph contains neither pyvene
+nor nnterp. The nnsight extra pins raw nnsight to `8c480727`.
 
-- `nnsight>=0.5.9` is **declared in `pyproject.toml` but never imported** — zero nnsight (or vllm)
-  references anywhere in the code. The execution path is pyvene-on-HF-eager exclusively.
-- The pipeline **forces eager attention by default** (`neural/pipeline.py:210-212`,
-  `eager_attn: True` → `_attn_implementation = "eager"`) — the suite is built on
-  eager-substrate assumptions end to end.
+[isb/causalab_vocabulary.json](../isb/causalab_vocabulary.json) records the source revision,
+source-file checksums, canonical vocabulary, and deprecated aliases. Verify it with:
 
-So the as-shipped number is trivial. The non-trivial question the rest of this audit answers:
-**re-expressed in nnsight primitives, what fraction of the suite runs on a production engine,
-and with which failure kind for the rest?**
+```sh
+python scripts/check_causalab_alignment.py /path/to/causalab --check
+```
 
-## 2. One structural fact that shapes every footprint
+For a future update, check out the intended upstream commit and run the command without
+`--check` to print a candidate snapshot. Review the vocabulary and engine-policy changes,
+update the snapshot and tests together, and record any relevant pending PR separately.
+The checker reads Python declarations through the AST, keeping host validation independent
+of CausaLab's model/runtime dependencies.
 
-Every causalab intervention is applied **during multi-token generation**, not on a single
-forward: interchange scoring and steering both go through `pipeline.intervenable_generate(...)`
-(`neural/activations/interchange_mode.py:161`, `methods/steer/steer.py:278`;
-`max_new_tokens` defaults to 3, `neural/pipeline.py:157`). pyvene's intervenable-generate runs
-the source forward, collects, then re-applies the intervention at each decode step of the base
-generation.
+## 2. The current execution architecture
 
-In nnsight terms every interventional footprint therefore composes with the **iteration
-construct**. On vLLM the bounded realization `iter[0:N]` is measured SUPPORTED and the unbounded
-`iter[:]` drops all saves (the unbounded-iteration saves-drop) — so the bounded form is the mandatory idiom for every
-re-expressed analysis below.
+CausaLab executes serializable intervention documents. Its current structure is:
 
-## 3. Footprints (ops × sites × idioms, with citations)
+```text
+protocol document (or method + application)
+  -> validation, expansion, planning, derived requirements
+  -> protocol/engine.py: Engine.execute(ExecutionRequest)
+     -> neural/shared/: site semantics, shapes, positions, write math, outputs
+     -> neural/engines/pytorch_hooks/: reference hook execution and training
+     -> neural/engines/nnsight_tracing/: envoy and source-operation tracing
+```
 
-| analysis | footprint (Level 0/1/1.5 terms) | causalab evidence |
-|---|---|---|
-| baseline | batched generation + engine-site READ (logits); no internals | `analyses/baseline/main.py:192-225` |
-| locate (`method: interchange`) | READ × boundary residual → cross-prompt WRITE (replacement) × generation, scanned over (layer × position) | `analyses/locate/run_interchange.py:66`, `configs/analysis/locate.yaml` (`component: residual_stream`) |
-| locate (`method: dbm_binary`) | the above + BACKWARD (mask training) | `configs/analysis/locate.yaml` (`dbm:`), `methods/trained_subspace/train.py:417,536-538` |
-| subspace (`method: pca`) | READ+SAVE (collect) × boundary site; PCA offline | `methods/pca.py`, collect intervention `neural/featurizer.py:554` |
-| subspace (`method: das/dbm/boundless`) | BACKWARD through a feature-space interchange (AdamW over rotation/mask params) | `methods/trained_subspace/train.py:417` (optimizer), `:536-538` (`loss.backward()`) |
-| activation_manifold | post-hoc geometry on cached features; loads a weights-free "lite" pipeline by default | `analyses/activation_manifold/main.py`, `io/pipelines.py` |
-| output_manifold | multi-token generation + per-step engine-site READ (logits) | `analyses/output_manifold/main.py` |
-| path_steering | COMPUTE (featurizer chain: rotation ∘ standardize ∘ manifold) + WRITE (steering add in feature space, write-back via inverse) × generation | `analyses/path_steering/main.py:169` (chain), `neural/featurizer.py:582` (steering intervention) |
-| pullback | BACKWARD through forward passes (LBFGS/Adam trajectory optimization) | `methods/pullback/optimization.py:127,140` |
-| attention_pattern | READ × internal attention-weights site (`output_attentions=True`, eager) | `methods/attention_pattern_analysis.py:136` |
+The authoritative contracts are
+[schema.py](https://github.com/goodfire-ai/causalab/blob/8696e04bfb06a169defe1bf563d8aeef992f85cd/causalab/protocol/schema.py),
+[engine.py](https://github.com/goodfire-ai/causalab/blob/8696e04bfb06a169defe1bf563d8aeef992f85cd/causalab/protocol/engine.py),
+and [the intervention protocol](https://github.com/goodfire-ai/causalab/blob/8696e04bfb06a169defe1bf563d8aeef992f85cd/docs/intervention_protocol.md).
 
-Featurizer-space interventions (rotated interchange, masked interchange, steering add) decompose
-as COMPUTE (the chain is plain torch) ∘ WRITE (replacement write-back); on vLLM the COMPUTE runs
-under `torch.no_grad()` and the WRITE must be the replacement realization (the inference-tensor no_grad requirement, the in-place-write restriction).
+The N-stack (#56, #58, #59, #63–#68) renamed Backend to Engine, extracted shared services,
+introduced component-aware routing, and implemented nnsight module boundaries, attention,
+MoE and DeltaNet interiors, and generated-frame reads. Nnsight loads a `TransformersModel`;
+shared site resolution addresses its envoy tree, and engine-specific address tables reach
+interior operations through `.source`.
 
-## 4. The join — predicted applicability per backend
+The nnsight engine declares generation and writable attention probabilities, alongside
+paired forwards, full logits and local Python write functions. Training (`grad`) and
+quantized weights remain reference-engine capabilities. These are CausaLab engine
+declarations; nnbench's direct nnsight cells have their own measured outcomes.
 
-HF column: everything is ✓ (causalab's native substrate; our HF control measured every needed
-row SUPPORTED). The vLLM column is the audit's content. "Working idiom" = the rewrite that
-rescues the analysis; failure kinds per design.md §3.6.
+Engine requirements combine coarse capabilities with `component:<name>` and
+`component:<name>:write`. Shape, stream, layer and write-policy constraints remain additional
+checks. Component vocabulary membership alone establishes a valid name, rather than a
+measurement of support on a particular engine and model.
 
-| analysis | vLLM (re-expressed) | failure kind / working idiom | measured rows it rests on |
-|---|---|---|---|
-| baseline | ✓ predicted | engine sites measured (`model.logits`, `model.samples`); batched regime currently per-prompt only (async multi-prompt gated) | the portable-sites result; invoke row |
-| locate (interchange) | ✓ **measured** (fp32; bf16 DEGRADED) | two-trace idiom for the cross-prompt transplant (barrier broken: the barrier sync/async split); replacement WRITE; bounded `iter[0:N]`; fused-residual read on Llama-family | the in-place-write restriction, the fused-residual denotation mismatch, the unbounded-iteration saves-drop, the barrier sync/async split, and the generation-time cross-prompt patching result; patching + gen_patching cells |
-| locate (dbm_binary) | ✗ | **operation-unsupported**: no autograd in inference mode (the no-autograd-on-vLLM result); no working idiom — fall back to `method: interchange` | gradients are unavailable on vLLM (inference mode, no autograd) |
-| subspace (pca) | ✓ predicted | collect = READ+SAVE, measured; PCA is offline | logit-lens cells; micro READ rows |
-| subspace (das/dbm/boundless) | ✗ | **operation-unsupported** (gradients are unavailable on vLLM (inference mode, no autograd)); HF-only — train on HF, *apply* the trained rotation on vLLM (apply is COMPUTE∘WRITE, supported) | gradients are unavailable on vLLM (inference mode, no autograd), the inference-tensor no_grad requirement, the in-place-write restriction |
-| activation_manifold | ✓ (substrate-independent) | touches no engine; optional decoding eval inherits the generation rows | — |
-| output_manifold | ✓ predicted | per-step logits via bounded iteration; the unbounded idiom would silently drop every step | the portable-sites result, the unbounded-iteration saves-drop |
-| path_steering | ✓ predicted — **composition unmeasured** | replacement steering write + featurizer COMPUTE under no_grad + bounded iteration — this is exactly the roadmap's "generation-time steering" cell | the inference-tensor no_grad requirement, the in-place-write restriction, the unbounded-iteration saves-drop |
-| pullback | ✗ | **operation-unsupported** (gradients are unavailable on vLLM (inference mode, no autograd)); no working idiom (optimization *is* the method) | gradients are unavailable on vLLM (inference mode, no autograd) |
-| attention_pattern | ✗ | **site-absent**: paged/flash attention never materializes the matrix (the attention-weights site-absence); no working idiom | attention weights have no denotation under vLLM's paged attention |
+## 3. What nnbench shares
 
-**Headline:** of the eight analyses, **6 are predicted portable** to a production engine once
-re-expressed in the working idioms — baseline, locate, subspace, activation_manifold,
-output_manifold, path_steering (counting locate and subspace by their gradient-free methods) —
-and **2 are blocked outright**: pullback by operation-unsupported (no autograd) and
-attention_pattern by site-absent. A third blocker cuts *across* the portable set: every
-gradient-trained method variant (DAS, DBM, boundless, locate's `dbm_binary`) is
-operation-unsupported, leaving those analyses their gradient-free methods only. All blockers are
-*loud* — clean errors, not traps. The traps are in the portable six (next section).
+nnbench uses CausaLab's component, mechanism, featurizer and capability vocabulary to describe
+explicit benchmark cells. `TaskSpec` holds semantic values and realization selectors;
+`ExecutionRegime` holds input presentation, generation length and aggregation. Backend
+selection, oracle comparisons and timing belong to nnbench.
 
-Both "composition" flags above are now **measured** (the generation-time steering and
-generation-time cross-prompt patching results): the WRITE (injection) and the cross-prompt
-transplant each compose correctly with the bounded-iteration construct on vLLM at matched precision. That composition is causalab's *default* execution mode (§2), so confirming it
-de-risks the whole generative half of the suite — the remaining gap to a real causalab verdict is
-the Macro-tier end-to-end run, not another primitive.
+[isb/protocol.py](../isb/protocol.py) owns methodology templates and case specialization.
+Its `components` describe the touched surface; `write_components` identify the write targets.
+Concrete cases publish component requirements in CausaLab's spelling, plus nnbench extensions.
+Older/custom write descriptors with unspecified targets publish incomplete requirements
+(`required_capabilities: null`); their executable parameters remain available.
 
-## 5. The silently-wrong census — why this audit matters
+The canonical replacement for `attention_value` is `attention_premix`, the o-projection input.
+`attention_value_states` names the actual value vectors. Old descriptors normalize through
+upstream's deprecated-alias mapping so the retired spelling retains its original meaning.
 
-causalab's primary tested model is **Llama-3.1-8B** (README; ≥24 GB VRAM) — a fused-residual
-family. On vLLM, every `component: residual_stream` read in a naive port returns only `out[0]`
-of `(hidden, residual)` — **half the stream, no error** (the fused-residual denotation mismatch: top-1 agreement 0.13 on the same
-mistake in our logit-lens cell). That poisons locate's entire (layer × position) heatmap, every
-subspace fit on those activations, and every manifold built downstream — and causalab's own
-pipeline has no numerical oracle that could notice: scores stay plausible, the faithfulness
-conclusion is just wrong. The other documented trap it would inherit: the unbounded-iteration
-idiom silently losing all per-step saves on the generation analyses (the unbounded-iteration saves-drop).
+The shared vocabulary is larger than nnbench's implemented methodology inventory. Validating
+a descriptor against it does not create a cell or claim backend coverage. The local operation
+labels (`read`, `write`, `grad`) summarize nnbench execution. Full CausaLab document validation,
+metric lowering, engine routing, training and artifact handling remain CausaLab responsibilities.
 
-This is the division of labor stated in `agents-and-the-primitive-model.md`: causalab verifies
-the science *assuming the substrate*; the substrate assumption is precisely what this map
-measures.
+## 4. Generation and scientific scope
 
-## 6. Vocabulary coverage — what causalab forces on the leveled model
+CausaLab's generated frame addresses a continuation with a decode budget. The nnsight engine
+executes one generate trace and walks decode occurrences with `tracer.iter`; document writes
+remain prefill-only. nnbench's generation patching also injects during prefill and observes the
+continuation. Generation steering writes on decode steps and therefore retains the
+`decode_step_write` extension.
 
-The audit doubles as the empirical test of design.md §3's vocabulary (open question 1 of the
-agents notes). Verdict: the Level-0/1/1.5 terms covered every footprint line above without
-strain, with three findings at the edges:
+The current
+[protocol corpus](https://github.com/goodfire-ai/causalab/tree/8696e04bfb06a169defe1bf563d8aeef992f85cd/tests/protocols)
+contains documents 01–14, including variable-anchor generation, random-subspace controls, and
+multi-position patching. The
+[demos](https://github.com/goodfire-ai/causalab/tree/8696e04bfb06a169defe1bf563d8aeef992f85cd/demos)
+provide method/application and workflow examples. These are sources for future explicit
+benchmark cases. This alignment change does not run that corpus or establish numerical
+equivalence between nnbench and CausaLab.
 
-1. **Cross-model patching is outside the vocabulary.** locate accepts a `source_pipeline` —
-   activations collected from a *different model* and patched into the primary
-   (`run_interchange.py:69-73`). Our context axis is a single (family × backend × config);
-   a footprint spanning two models has no representation. New context-axis entry needed if we
-   ever cover it (deliberately out of scope for now: it is not oracle-checkable against a single
-   HF control).
-2. **Feature-space realization deserves a named idiom row.** "Intervene in f(x)-space, write
-   back via f⁻¹" (rotation/PCA/manifold chains) decomposes cleanly as COMPUTE∘WRITE, but it is
-   a *recurring* realization with its own failure surface (the chain must run inside the trace,
-   under no_grad, on the worker — the meta-model gotcha from the result that Level-1 sites are portable on vLLM, with weight-using checks run in the worker, applies to its weights). Worth
-   a Level-1.5 row rather than re-deriving per methodology.
-3. **Generation-time intervention is a composition, not a primitive — and it is unmeasured.**
-   The vocabulary expresses it (WRITE × iteration), the inventory has both rows measured
-   separately, but no cell measures the composition. §3.6's "statuses compose upward" claim is
-   exactly what the two flagged predictions in §4 will test.
+The former Python analysis/method stack and Hydra harness are historical. Active nnbench design
+uses the protocol/engine seam. Pyvene remains related work only.
 
-No new Level-0 op was needed — the closed-core claim survived contact with a real external suite.
+## 5. Ownership, provenance and verification
 
-## 7. What to do with this
+The frozen experiment and shared worker provenance record metadata coverage. Built-in methods
+have descriptors; custom methods supply one or a nonempty `protocol_absence_reason`.
+Legacy undescribed experiments receive a legacy reason on restoration.
 
-> **Addendum (2026-06-12, same day):** the first flagged composition is now MEASURED. The
-> generation-time steering cell (`isb/methodologies/gen_steering.py`, the generation-time steering composition result) runs the
-> replacement write inside `iter[0:N]` at every decode step: **SUPPORTED on vLLM, exactly**
-> (top1=1.00, tv=0.000 vs the HF control over 8 prompts × 8 steps, at default bf16); the
-> unbounded realization errors as predicted (the unbounded-iteration saves-drop). The path_steering row in §4 is no longer a
-> prediction — and it is the first method-tier confirmation of §3.6's composes-upward claim.
->
-> **Addendum (2026-06-15):** the SECOND flagged composition is now MEASURED too. The
-> generation-time cross-prompt patching cell (`isb/methodologies/gen_patching.py`)
-> is locate's footprint — the clean residual captured from the source prompt, injected at the base
-> prompt's prefill, scored on the generated tokens. The transplant step-lifts correctly: at matched
-> precision (fp32) the vLLM patched generation reproduces HF, so the cross-prompt interchange
-> survives the decode loop on a production engine. (At the bf16 default the greedy trajectory forks
-> on precision compounding — top1=0.00, tv=0.711 — a SUPPORTED_DEGRADED, not a mechanism failure.)
-> **Both of the audit's flagged locate/path_steering compositions are now measured**, so the
-> §4 predictions for those rows are confirmed, not inferred. The remaining gap to a real causalab
-> verdict is the Macro-tier port (running locate end-to-end with a task's counterfactual pairs and
-> its flip-rate scoring), not another primitive.
+Protocol coordinates carry the vocabulary reference used to describe them. Methodology
+templates are specialized after effective dataset defaults and task values are combined.
+Provenance is a detached snapshot; each invocation owns its nested parameter values, with
+trial setup outside the measured interval.
 
-- **Macro-tier candidates, in order:** path_steering (= the generation-time steering cell the
-  roadmap already ranks first; now doubly motivated), then locate-via-interchange (generation-time
-  cross-prompt patching). Together they validate the two unmeasured compositions and turn the §4
-  predictions into measurements.
-- **The agent-conditioning story is now concrete:** a causalab-style planner that consulted this
-  map would (a) route DAS/DBM/pullback to HF automatically, (b) skip attention_pattern on vLLM
-  with a clean explanation, (c) rewrite residual reads on Llama-family, (d) bound every
-  generation loop. Items (c) and (d) are the two it would otherwise get *silently* wrong.
-- **Bookkeeping:** `references.md`'s causalab entry corrected (nnsight declared-but-unused);
-  the two composite cells, once built, graduate this doc's predictions into catalog rows.
+Verification has two distinct parts: the source checker establishes the pinned upstream
+vocabulary, while no-GPU tests exercise canonical aliases, component read/write requirements,
+case specialization, serialization and configuration ownership. Model execution and
+cross-engine parity require separate benchmark runs.

@@ -8,14 +8,14 @@ overhead denominator, and the part that also runs on vLLM). The produced [11, 76
 exports to a fitted-lens artifact via scripts/export_jacobian.py ("file:" transport).
 """
 from ..data import DataRef
-from ..sweep.spec import BaselineSpec, CellConfig, Workload
+from ..sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
 
 _PROMPTS = DataRef("wikitext", 4)
 
 jacobian_collect_gpt2 = CellConfig(
     name="jacobian_collect_gpt2",
     methodology="jacobian_collect", family="gpt2", repo="openai-community/gpt2",
-    workloads=[Workload("interactive", _PROMPTS, aggregate=False)],
+    regimes=[ExecutionRegime("interactive", _PROMPTS, aggregate=False)],
     tasks=[({"grad": True}, "collect (8 batched VJPs per prompt)")],
     baseline=BaselineSpec(params={"grad": False}),
     effect=None,

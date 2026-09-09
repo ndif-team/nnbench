@@ -16,7 +16,7 @@ import isb.sweep.execute as execute_mod  # noqa: E402
 from isb.runs import EngineConfig, RunConfig  # noqa: E402
 from isb.sweep.execute import execute_run  # noqa: E402
 from isb.sweep.score import score_runs  # noqa: E402
-from isb.sweep.spec import BaselineSpec, CellConfig, Workload  # noqa: E402
+from isb.sweep.spec import BaselineSpec, CellConfig, ExecutionRegime  # noqa: E402
 
 
 def _onehot(i, vocab=8):
@@ -39,8 +39,9 @@ class _FakeBackend:
 def _spec():
     return CellConfig(
         name="xs", methodology="m", family="f", repo="r",
-        workloads=[Workload("interactive", ["p0", "p1"]),
-                   Workload("batched", ["p0", "p1"])],
+        protocol_absence_reason="Synthetic execution and scoring fixture",
+        regimes=[ExecutionRegime("interactive", ["p0", "p1"]),
+                   ExecutionRegime("batched", ["p0", "p1"])],
         tasks=[({}, "t")], baseline=BaselineSpec(params={}), effect=None,
         warmup=0, n_trials=1)
 
@@ -89,7 +90,7 @@ def test_execute_writes_one_selfcontained_run_file(tmp_path):
     assert meta[("interactive", "t")]["median_latency_ms"] is not None
     coords = prov["coordinates"]
     assert coords["spec"] == "xs" and coords["interface"] == "hf"
-    assert {w["kind"] for w in coords["workloads"]} == {"interactive", "batched"}
+    assert {w["kind"] for w in coords["regimes"]} == {"interactive", "batched"}
 
 
 def test_errored_cells_appear_as_error_rows(tmp_path):

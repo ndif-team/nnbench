@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from isb.data import SOURCES, DataRef, load_data, unit_kind  # noqa: E402
 from isb.sweep.execute import _task_params  # noqa: E402
-from isb.sweep.spec import Workload, spec_with_data  # noqa: E402
+from isb.sweep.spec import ExecutionRegime, spec_with_data  # noqa: E402
 
 
 def test_sources_resolve_with_counts_and_knobs():
@@ -62,16 +62,16 @@ def test_unknown_source_and_missing_size_are_loud():
 
 
 def test_workload_binds_a_dataref_and_carries_its_knobs():
-    w = Workload("interactive", DataRef("jlens/poetry", n=4))
+    w = ExecutionRegime("interactive", DataRef("jlens/poetry", n=4))
     assert len(w.prompts) == 4 and w.data_name == "jlens/poetry"
     assert w.data_knobs == {"position": "last_newline"}
     # literal lists keep working untouched (the bespoke single-trace specs)
-    w2 = Workload("interactive", ["p1", "p2"])
+    w2 = ExecutionRegime("interactive", ["p1", "p2"])
     assert w2.prompts == ["p1", "p2"] and w2.data_knobs == {} and w2.data_name is None
 
 
 def test_driver_injects_knobs_under_task_params():
-    w = Workload("interactive", DataRef("jlens/poetry", n=2))
+    w = ExecutionRegime("interactive", DataRef("jlens/poetry", n=2))
     assert _task_params(w, {"unembed": "weight"}) == {"position": "last_newline", "unembed": "weight"}
     # an explicit task param always wins over the dataset default
     assert _task_params(w, {"position": "last"})["position"] == "last"
@@ -82,10 +82,10 @@ def test_spec_with_data_swaps_feed_not_procedure():
     spec = SPECS["jacobian_lens_gpt2"]
     rebound = spec_with_data(spec, DataRef("jlens/poetry"))
     assert rebound.name == "jacobian_lens_gpt2@jlens-poetry"      # refs/banners never collide
-    assert len(rebound.workloads[0].prompts) == 98
-    assert rebound.workloads[0].data_knobs == {"position": "last_newline"}
+    assert len(rebound.regimes[0].prompts) == 98
+    assert rebound.regimes[0].data_knobs == {"position": "last_newline"}
     assert rebound.tasks == spec.tasks                            # procedure untouched
-    assert len(SPECS["jacobian_lens_gpt2"].workloads[0].prompts) == 93        # original untouched
+    assert len(SPECS["jacobian_lens_gpt2"].regimes[0].prompts) == 93        # original untouched
     # unit-kind mismatch is loud: pair data cannot feed a prompt procedure
     try:
         spec_with_data(spec, DataRef("ioi_pairs", 8))
@@ -115,7 +115,7 @@ def test_labeled_pair_source_and_kind_check():
     except ValueError:
         pass
     rebound = spec_with_data(spec, DataRef("mib/ioi_labeled", 5))
-    assert len(rebound.workloads[0].prompts) == 5
+    assert len(rebound.regimes[0].prompts) == 5
 
 
 def _run_all():

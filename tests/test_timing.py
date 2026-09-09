@@ -83,3 +83,31 @@ def _run_all():
 
 if __name__ == "__main__":
     _run_all()
+
+
+def test_prepare_call_runs_before_timer_for_every_invocation(monkeypatch):
+    events = []
+    for name in ("force_gc", "reset_peak_mem", "sync_cuda"):
+        monkeypatch.setattr(timing, name, lambda: None)
+    monkeypatch.setattr(timing, "peak_mem_mb", lambda: 0)
+
+    def clock():
+        events.append("clock")
+        return len(events)
+
+    def prepare():
+        events.append("prepare")
+        values = [1]
+
+        def call():
+            events.append("call")
+            assert values == [1]
+            values.append(2)
+            return 42
+        return call
+
+    monkeypatch.setattr(timing, "perf_counter", clock)
+    result, output = timing.time_cell(None, prepare_call=prepare, warmup=1, n_trials=2)
+    assert events == ["prepare", "call"] + ["prepare", "clock", "call", "clock"] * 2
+    assert output == 42
+    assert result.n_trials == 2

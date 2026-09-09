@@ -85,8 +85,8 @@ class Backend:
         This is a COMPOSITION cell: it exercises no new primitive — the boundary read, the
         replacement write, the two-trace transplant edge, and bounded iteration are each already
         measured. Its job is to check the step-lift LAW for the transplant edge (does a transplant
-        stay valid run during a decode loop), and to be the recipe a causalab `locate`-style
-        analysis needs (cross-prompt interchange scored on generated tokens). Returns the stacked
+        stay valid run during a decode loop), combining cross-prompt interchange with generated
+        token observations. Returns the stacked
         per-step CPU tensor `[new_tokens, ...]`.
 
         Note on the patch persisting across decode steps: the injection lands at PREFILL; decode

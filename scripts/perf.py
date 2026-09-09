@@ -119,7 +119,7 @@ def _write_run_file(plan: list[Config], rows: list[dict], run_dir: str, name: st
     prov["coordinates"] = {
         "spec": name, "methodology": "perf_micro", "family": "-",
         "repo": ", ".join(sorted({c.repo for c in plan})),
-        "data": [], "workloads": [],
+        "data": [], "regimes": [],
         "tasks": [r["cell"] for r in rows],
         "interface": "perf",
     }

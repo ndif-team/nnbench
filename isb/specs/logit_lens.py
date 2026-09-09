@@ -5,7 +5,7 @@ Read methodology -> no effect-size guard. The no-intervention baseline is a sing
 baseline reflects the per-layer lens cost.
 """
 from ..data import DataRef
-from ..sweep.spec import BaselineSpec, CellConfig, Workload
+from ..sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
 
 # Data is a named, swappable source (isb/data.py; override at the CLI with --data). The default:
 # CounterFact factual-recall prompts (data/counterfact/README.md) — interactive scores over 100
@@ -17,7 +17,7 @@ BATCHED = DataRef("counterfact", 16)
 logit_lens_gpt2 = CellConfig(
     name="logit_lens_gpt2",
     methodology="logit_lens", family="gpt2", repo="openai-community/gpt2",
-    workloads=[Workload("interactive", PROBE), Workload("batched", BATCHED)],
+    regimes=[ExecutionRegime("interactive", PROBE), ExecutionRegime("batched", BATCHED)],
     tasks=[
         ({"unembed": "module"}, "unembed=module"),
         ({"unembed": "weight"}, "unembed=weight"),
@@ -30,7 +30,7 @@ logit_lens_llama = CellConfig(
     name="logit_lens_llama",
     methodology="logit_lens", family="llama",
     repo="HuggingFaceTB/SmolLM2-135M-Instruct",   # a LlamaForCausalLM; meta-llama is gated + uncached
-    workloads=[Workload("interactive", PROBE), Workload("batched", BATCHED)],
+    regimes=[ExecutionRegime("interactive", PROBE), ExecutionRegime("batched", BATCHED)],
     tasks=[
         ({"unembed": "module"}, "unembed=module"),
         ({"unembed": "weight"}, "unembed=weight (backend-aware)"),

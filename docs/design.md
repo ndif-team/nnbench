@@ -1,7 +1,8 @@
 # Design — interp-serve-bench (living document)
 
 > Status: evolving. Captures decisions as they're made in the design conversation.
-> Last structural update: data-flow / control-flow split + cross-edge movement class (§3.1, §3.4).
+> Last structural update: CausaLab-aligned intervention semantics separated from execution regimes
+> and backend realizations (§5, §12).
 
 > Runner update (2026-09-08): the main CLI now uses independent `backends/NAME/compose.yml`
 > configurations, frozen input jobs, explicit references, and artifact-only scoring. See
@@ -68,10 +69,8 @@ Adding work = adding rows/registry entries, never a harness redesign.
 > | SOURCE | Level 1 internal-tier sites |
 > | SAVE / transmit | Level 2 cross-edge movement (live-out of a region) |
 
-**This model is a vocabulary for declaring footprints and indexing measurements** — metadata and
-micro-cells. It is NOT a construction layer: cells stay flat and explicit (§12); nothing generates
-intervention code from these declarations. That distinction is the §11 lesson — the Resolver died
-because it *constructed* the experiments; the levels only *explain and index* them.
+**This model supplies vocabulary for declaring footprints and indexing measurements.**
+The levels explain measurements; explicit cells implement interventions (§12).
 
 Normative definitions live here; the maintained per-context **status inventory** lives in
 `interp-methods-catalog.md` (one copy, so the lists can't diverge again).
@@ -470,14 +469,12 @@ Backlog (literature, additive later): path/edge patching · attention knockout �
 patchscopes · future lens · SAE family (gated/JumpReLU/top-k/transcoders/crosscoders) · steering
 family (CAA/ITI/RepE) · sparse probing / CCS · integrated gradients.
 
-**Borrow:** align methodology footprints (§3.5) with **pyvene's intervention-type enum** (Vanilla /
-Addition / Subtraction / Zero / Collect / RotatedSpace=DAS / LoRA) where they map, for shared
-vocabulary and cross-framework portability. Made concrete 2026-06-12: the catalog's tag table
-carries the edge-class ↔ pyvene-enum mapping (Collect=observation, Addition/Subtraction=injection,
-Vanilla interchange=transplant, RotatedSpace=subspace rewiring, LoRA=staging); subspace addresses
-are derived-tier Level-1 citizens (§3.2).
+**Shared vocabulary:** methodology descriptions use the pinned CausaLab protocol vocabulary in
+`isb/causalab_vocabulary.json`. `isb/protocol.py` binds it to explicit cells and specializes their
+requirements. Subspace addresses remain derived-tier Level-1 citizens (§3.2). See
+`causalab-portability-audit.md` for the current protocol/engine alignment and source-check command.
 
-## 5. Context — workload regimes (how methodologies get run; the "dataset" distribution)
+## 5. Context — execution regimes (how methodologies get run; the "dataset" distribution)
 
 - **Interactive probe** — 1 trace, 1 prompt (notebook shape)
 - **Batched analysis** — 1 motif × N prompts (patching/probing over a dataset)
@@ -485,8 +482,8 @@ are derived-tier Level-1 citizens (§3.2).
 - **Bulk harvesting** — CACHE-many × large corpus, throughput-bound (SAE data collection)
 - **Multi-tenant / concurrent** — many independent traces vs one engine (nnsight-serve / NDIF)
 
-Regimes are context (§3.6), not levels — a regime can change *verdicts* (the batched
-absolute-position model-side law failure, formerly "regime effect"), which is why each workload
+Regimes are context (§3.6), not protocol semantics — a regime can change *verdicts* (the batched
+absolute-position model-side law failure, formerly "regime effect"), which is why each regime
 is oracle-checked in its own regime.
 The regime axis exercises the **engine axis** + concurrency — where vLLM should win and HF should
 struggle.
@@ -614,7 +611,8 @@ tolerance — the "same trace, same answer" claim, and the `SILENTLY_WRONG` dete
 | v1 scope | — | causal-LM, Method+some Macro; **backends = HF + vLLM-async only**; training & diffusion/VLM & vLLM-sync/NDIF additive later | **DECIDED** |
 | Resolver vocab resolution | (a)/(b)/(c) | **vocabulary spans all of (a/b/c)**; v1 *portable+perf* addressing = (a)+(b); (c) implemented **HF-eager-only as frontier markers** (run on vLLM expecting ERROR/UNSUPPORTED, verified) | **DECIDED** |
 | Correctness goal | coverage-only vs +equivalence | **+equivalence — LOAD-BEARING**: it's the only `SILENTLY_WRONG` detector (§8.1), not just the OSDI claim | **DECIDED** |
-| Adopt pyvene vocab + causalab harness shape | yes / build fresh | adopt: pyvene names→`FamilyProfile`; causalab Hydra config groups (§11.10) | **DECIDED** |
+| Adopt pyvene vocab + causalab harness shape | yes / build fresh | adopt: pyvene names→`FamilyProfile`; causalab Hydra config groups (§11.10) | **SUPERSEDED 2026-08-26** (never implemented; both were removed by causalab PR #20) |
+| Intervention description | ad hoc params / causalab vocabulary | **CausaLab-aligned `InterventionSpec` metadata**, separate from `ExecutionRegime` and `TaskSpec.realization`; it indexes and describes explicit cells. CausaLab owns its scientific metrics, document/artifact identities, workflows, and `Backend` | **IMPLEMENTED 2026-09-02** |
 | Repo name | provisional `interp-serve-bench` | finalize later (avoid "InterpBench") | open |
 
 ---
@@ -845,9 +843,10 @@ do not need a general addressing abstraction (no `Resolver`, no `FamilyProfile`,
 
 ### 12.1 The matrix
 
-The benchmark is a matrix of **cells**, one per `(methodology, family, backend [, variant])`. The
-cell IS the workload AND the unit of failure. A cell is a small, explicit function — readable
-top-to-bottom — that writes the real intervention code for that exact combination.
+The benchmark is a matrix of **cells**, one per `(methodology, family, backend [, variant])`. A
+benchmark case is indexed as `InterventionSpec × TaskSpec × ExecutionRegime × family × backend`;
+the cell remains the executable program and unit of failure. It is a small, explicit function —
+readable top-to-bottom — that writes the real intervention code for that exact combination.
 
 ```python
 @cell("logit_lens", family="gpt2", backend="hf")
@@ -867,6 +866,46 @@ def _(be, model, prompt):
   (`backend="hf"` vs `backend="vllm_async"`) — explicit, where you can read the `no_grad` /
   weight-matmul / flat-buffer specifics.
 - **Variants** (layers touched, overhead, idiomatic-vs-portable unembed) = params or sibling cells.
+- **Protocol semantics are metadata.** `isb/protocol.py` adopts the shared CausaLab names for data
+  roles, components, reads/writes, mechanisms, position frames, featurizers, and capabilities.
+  `TaskSpec.semantics` holds a case's values; `TaskSpec.realization` holds spelling choices such as
+  in-place vs replacement or bounded vs unbounded iteration. Their merged `params` mapping is
+  passed to the explicit cell with the same values.
+  `isb/causalab_vocabulary.json` pins the current upstream vocabulary and source checksums;
+  `scripts/check_causalab_alignment.py` verifies them against an upstream checkout. Component
+  requirements distinguish touched components from write targets, using CausaLab's engine
+  capability spelling. The vocabulary covers more sites than the implemented benchmark cells.
+- **Requirements belong to the concrete case.** Methodology descriptors are templates.
+  `describe_task` specializes operations and capabilities from task parameters: DAS apply
+  (`train=0`) needs no gradients, while training does. Provenance calls the shared description
+  `protocol_template`; each case has its own `protocol`. Each regime also records effective cases
+  after dataset defaults and decode length are applied using the execution driver's precedence.
+  Backend selection belongs to the launcher; the cell records its observed execution outcome.
+- **Execution regimes are orthogonal.** `ExecutionRegime` owns inputs, interactive/batched/
+  generation shape, decode length, and aggregation. A protocol case can be exercised under
+  multiple regimes.
+
+- **Configuration ownership is explicit.** Spec authoring uses editable namespaces. Task accessors
+  and provenance produce detached snapshots. The shared worker gives each invocation fresh nested
+  parameter values, including dataset defaults, baseline and effect parameters; timing prepares
+  those copies before the measured interval. The frozen Docker experiment is the submitted record.
+- **Metadata coverage is explicit.** Built-in methods require descriptors. Custom methods supply
+  an `InterventionSpec` or a nonempty `protocol_absence_reason`. The latter produces an
+  `undescribed` coverage record with its reason; described cases record `described` coverage.
+  This policy is checked at construction and job preparation. Older undescribed experiments
+  receive a legacy reason during restoration. Coverage and backend execution verdicts are
+  separate attributes.
+
+Migration: `CellConfig(workloads=...)` becomes `CellConfig(regimes=...)`. The `Workload` import
+alias and read-only `spec.workloads` property are transitional conveniences, not constructor
+compatibility. Regime provenance includes `new_tokens`, `aggregate`, and `data_knobs`.
+
+Docker integration: the host freezes resolved specs and inputs through `isb/jobs/contract.py`.
+Its version-1 file contract retains `workloads` and `(params, label)` tasks, with the protocol
+template and `TaskSpec` namespaces in optional, checksum-covered `description` metadata.
+Container workers restore that frozen metadata instead of relying on current template defaults.
+The shared executor accepts a backend, interface, and provenance supplied by the container's
+entrypoint; lazy sweep exports keep host spec loading independent of torch/nnsight imports.
 - **Reuse emerges bottom-up:** when two cells are structurally identical except module names,
   extract a `lens_core(be, blocks, norm, head, ...)` helper they both call with their *own*
   explicit modules. The helper never tries to be universal; the maintainer wires it per cell.
@@ -919,15 +958,18 @@ residual on a fused-residual family, §12.7), which IS a suite bug to fix in the
 ### 12.3 What is kept vs dropped from §11
 
 - **Dropped:** `isb/resolve/` (Resolver, FamilyProfile, Binding, read_value, predict), the heavy
-  `Workload`/`Selector` spec, `BackendCtx`.
+  executable `Workload`/`Selector` construction spec, `BackendCtx`.
 - **Kept:** the applicability-map output + states (§8.1), the **oracle** (§8.3, now grouped by
   family), the **runner** verify→score→report flow, and the genuinely backend-specific *infra*
   (`be`: open trace, save, collect, last/stack, teardown — HF handle vs vLLM async `output.saves`).
+- **Descriptive index:** `InterventionSpec` and `TaskSpec` describe the explicit program using
+  CausaLab's vocabulary. Cell functions own site access and trace code.
 
 ### 12.4 Layout
 
 ```
 isb/
+  protocol.py           # CausaLab-aligned, non-executable intervention semantics
   states.py             # AppState
   methodologies/
     registry.py         # @cell(methodology, family, backend, variant=...) -> fn ; lookup
@@ -935,6 +977,7 @@ isb/
   backends/
     hf.py vllm_async.py # `be` infra: trace/save/collect/last/stack/teardown + load
   oracle/equivalence.py # per-family reference comparison (unchanged)
+  sweep/spec.py         # InterventionSpec × TaskSpec × ExecutionRegime bindings
   runner/run.py         # enumerate cells, group by (methodology,family), HF=control, score
   report/applicability.py
 scripts/smoke.py        # enumerate the cells to run; print the map
@@ -944,10 +987,11 @@ scripts/smoke.py        # enumerate the cells to run; print the map
 
 | Add a… | What you write |
 |---|---|
-| methodology | new file of `@cell` functions |
+| methodology | new file of `@cell` functions + one `InterventionSpec` metadata entry |
 | (family,backend) cell | one explicit function for that combination |
 | backend | a `be` infra impl (trace/collect/teardown) + its cells per methodology |
-| variant | a param or a sibling `@cell` |
+| semantic variant | `TaskSpec.semantics` plus the same explicit cell param |
+| realization variant | `TaskSpec.realization` plus the same explicit cell param |
 
 ### 12.6 The primitive model as index (2026-06-11)
 
@@ -1181,7 +1225,8 @@ The replacement is the run layer, which already holds every axis the old field l
 - The **map reports measured states only**; whether a state is a known frontier or a regression
   is not a property of the spec. The documented status record stays single-copy in
   interp-methods-catalog.md and findings.md.
-- Specs are back to pure procedure: methodology × workloads × tasks × oracle knobs.
+- Specs bind four independent concerns: protocol semantics × execution regimes × task
+  realizations × oracle/performance knobs. The intervention code remains in explicit cells.
 
 ### 12.12 The run manager (2026-07-28; templated package 2026-07-31)
 

@@ -2,8 +2,8 @@
 plumbing) — no GPU; torch + fakes only.
 
 Pins (1) the per-step replacement-write semantics (the part whose vLLM divergence the GPU sweep
-measures), (2) the generation Workload validation + the execute layer's new_tokens injection (the regime
-axis lives on the Workload, cells must still receive it), and (3) a fake-backend sweep over a
+measures), (2) the generation ExecutionRegime validation + the execute layer's new_tokens injection (the regime
+axis lives on the ExecutionRegime, cells must still receive it), and (3) a fake-backend sweep over a
 generation workload: oracle on [steps, vocab] stacks, tokens/s throughput, effect-size in the
 generation regime. The bounded-vs-unbounded iteration REALIZATION itself is backend behavior —
 exercised by the GPU run, not fakeable here.
@@ -24,7 +24,7 @@ from isb.runs import EngineConfig, RunConfig  # noqa: E402
 from isb.states import AppState  # noqa: E402
 from isb.sweep.execute import _task_params, _throughput, execute_run  # noqa: E402
 from isb.sweep.score import score_runs  # noqa: E402
-from isb.sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload  # noqa: E402
+from isb.sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime  # noqa: E402
 
 VOCAB, HID = 11, 4
 
@@ -50,32 +50,32 @@ def test_cells_registered_and_serve_falls_back():
 
 
 def test_generation_workload_validates():
-    w = Workload("generation", ["p"], new_tokens=8)
+    w = ExecutionRegime("generation", ["p"], new_tokens=8)
     assert w.aggregate                                   # per-prompt traces, stacked verdict
     try:
-        Workload("generation", ["p"])                    # new_tokens defaults to 0
+        ExecutionRegime("generation", ["p"])                    # new_tokens defaults to 0
         raise AssertionError("generation with new_tokens=0 must raise")
     except ValueError:
         pass
     try:
-        Workload("streaming", ["p"])
+        ExecutionRegime("streaming", ["p"])
         raise AssertionError("unknown kind must raise")
     except ValueError:
         pass
 
 
 def test_execute_layer_injects_new_tokens_from_workload():
-    gen = Workload("generation", ["p"], new_tokens=5)
+    gen = ExecutionRegime("generation", ["p"], new_tokens=5)
     assert _task_params(gen, {"alpha": 1.0}) == {"alpha": 1.0, "new_tokens": 5}
-    inter = Workload("interactive", ["p"])
+    inter = ExecutionRegime("interactive", ["p"])
     assert _task_params(inter, {"alpha": 1.0}) == {"alpha": 1.0}   # untouched off-generation
 
 
 def test_generation_throughput_is_tokens_per_second():
     class _T:
         median_ms = 500.0
-    assert _throughput(Workload("generation", ["p"], new_tokens=8), _T()) == 16.0  # 8 tok / 0.5 s
-    assert _throughput(Workload("interactive", ["p"]), _T()) is None
+    assert _throughput(ExecutionRegime("generation", ["p"], new_tokens=8), _T()) == 16.0  # 8 tok / 0.5 s
+    assert _throughput(ExecutionRegime("interactive", ["p"]), _T()) is None
 
 
 def test_steer_step_replacement_write_semantics():
@@ -206,7 +206,8 @@ def test_generation_sweep_oracle_throughput_and_effect():
 
     spec = CellConfig(
         name="fake_gen", methodology="m", family="fam", repo="repo://x",
-        workloads=[Workload("generation", ["p1", "p2"], new_tokens=4)],
+        protocol_absence_reason="Synthetic generation steering fixture",
+        regimes=[ExecutionRegime("generation", ["p1", "p2"], new_tokens=4)],
         tasks=[({"alpha": 6.0, "bound": "bounded"}, "bound=iter[0:N]"),
                ({"alpha": 6.0, "bound": "unbounded"}, "bound=iter[:]")],
         baseline=BaselineSpec(params={"alpha": 0.0, "bound": "bounded"}),

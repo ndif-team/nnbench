@@ -36,7 +36,7 @@ vLLM EngineCore uses spawn: every entrypoint must run under an `if __name__ == "
 
 ## Architecture
 
-The core unit is a **cell**: one explicit function per `(methodology, family, backend)`, registered with `@cell(...)` in `isb/methodologies/` (registry in `isb/methodologies/registry.py`). Variances (prompts, layers, idiomatic-vs-portable formulation) are runtime **params** to the cell, not separate registrations. This flatness is deliberate — an earlier "Resolver" abstraction that *generated* intervention code from declarations was killed (design.md §11–12); the leveled primitive model in design.md §3 only *indexes* cells, never constructs them. Do not reintroduce a construction layer. Every `vllm_*` variant cell (`vllm_serve`, `vllm_sync`, `vllm_pp`, …) falls back to the `vllm_async` cell automatically (same intervention code; the variant difference — over-HTTP, in-process-sync, pipeline/tensor-parallel — lives entirely in the backend object).
+The core unit is a **cell**: one explicit function per `(methodology, family, backend)`, registered with `@cell(...)` in `isb/methodologies/` (registry in `isb/methodologies/registry.py`). `InterventionSpec` supplies CausaLab-aligned semantic metadata, `TaskSpec` separates semantic params from realization selectors, and `ExecutionRegime` owns interactive/batched/generation input shape. Their merged runtime params still enter the explicit cell unchanged. This flatness is deliberate — an earlier "Resolver" abstraction that *generated* intervention code from declarations was killed (design.md §11–12); protocol metadata only indexes cells and provenance. Do not turn it into a construction layer. Every `vllm_*` variant cell (`vllm_serve`, `vllm_sync`, `vllm_pp`, …) falls back to the `vllm_async` cell automatically (same intervention code; the variant difference — over-HTTP, in-process-sync, pipeline/tensor-parallel — lives entirely in the backend object).
 
 Main data flow: `scripts/bench.py` → frozen experiment/inputs → `backends/NAME/run.py` in its
 own Compose project → validated artifacts → `isb/jobs/score.py`. The shared nnsight worker reuses
@@ -44,7 +44,7 @@ the scientific execution routines below. Legacy standalone execute/score tools r
 older `.pt` interface; their orchestration conventions do not define the new runner. The manager
 reads saved job reports; legacy `.pt` browsing requires explicit `--import-legacy` summaries.
 
-1. **Spec** (`isb/specs/`): a `CellConfig` + `Workload`s (interactive / batched) per methodology. Batching is a *coverage axis* — each workload is oracle-checked in its own regime, not just timed.
+1. **Spec** (`isb/specs/`): `InterventionSpec × TaskSpec × ExecutionRegime` per methodology. Batching is a *coverage axis* — each case is oracle-checked in its own regime, not just timed.
 2. **Backend** (`isb/backends/`): `be` objects — `hf` (the per-family control), `vllm_async` (in-process system under test), `vllm_serve` (over-HTTP). One model load per backend, amortized across all tasks; an intervention error is isolated (engine survives, later tasks still run).
 3. **Oracle** (`isb/oracle/equivalence.py`): compares outputs via top-1 agreement and softmax TV. The main runner takes an explicit reference and comparison axis, with no implicit precision-control jobs. The legacy `scripts/score.py --ctl` can still disambiguate precision using old-format artifacts.
 4. **Perf** (`isb/perf/`): warm timing (warmup + N trials, CUDA-synced, median±std, peak mem) — correctness is verified in the same warm/batched regime perf is measured in.

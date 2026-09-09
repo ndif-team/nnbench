@@ -2,8 +2,8 @@
 
 A normal run file is the RELEASE artifact: the lean cells users actually run, in the regime
 perf is measured in. Verdicts and perf numbers come only from it. `--debug` additionally
-writes a companion file `debug/<name>-debug.pt` holding an instrumented forward over the
-first few workload prompts: token ids, the residual stream at every layer (readout position),
+    writes a companion file `debug/<name>-debug.pt` holding an instrumented forward over the
+first few regime inputs: token ids, the residual stream at every layer (readout position),
 and the final logits.
 
 The companion never feeds a verdict: extra saves change what the engine executes, so an
@@ -23,9 +23,9 @@ DRIFT_FLOOR = 1e-3          # relative difference below this reads as kernel noi
 
 
 def debug_prompts(spec, k: int = N_DEBUG_PROMPTS) -> list[str]:
-    """The companion's inputs: the first k prompts of the spec's first workload. Pair and
+    """The companion's inputs: the first k prompts of the spec's first execution regime. Pair and
     labeled-pair units contribute their first (clean) prompt."""
-    return [u[0] if isinstance(u, tuple) else u for u in spec.workloads[0].prompts[:k]]
+    return [u[0] if isinstance(u, tuple) else u for u in spec.regimes[0].prompts[:k]]
 
 
 def collect_debug(be, model, m, prompts, residual: str) -> tuple[dict, dict]:

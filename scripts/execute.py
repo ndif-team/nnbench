@@ -43,7 +43,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--spec", required=True)
     ap.add_argument("--data", default=None, metavar="SOURCE[:N]",
-                    help="rebind the spec's workloads to a registered data source")
+                    help="rebind the spec's regimes to a registered data source")
     ap.add_argument("--engine", required=True, choices=["transformers", "vllm"])
     ap.add_argument("--engine-mode", default="async", choices=["async", "sync"])
     ap.add_argument("--deployment", default="local", choices=["local", "serve", "ndif"])

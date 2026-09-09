@@ -10,8 +10,8 @@ measured. Its two jobs:
      loop? `∧(footprint)` predicts SUPPORTED-degraded (every entry is SUPPORTED, bf16 a near-tie
      like the single-forward patch); the cell tests whether the composition actually holds. This is
      the transplant-edge analogue of what generation-time steering confirmed for the injection edge.
-  2. **The causalab `locate` recipe.** locate scores a cross-prompt interchange on *generated*
-     tokens; this cell is that footprint, the recipe the Macro-tier port needs.
+  2. **Protocol composition.** Cross-prompt interchange followed by generated-frame observation
+     combines CausaLab's paired-input and continuation semantics in one explicit benchmark cell.
 
 It is NOT a novel KV-cache frontier. The patch is injected at the base prompt's PREFILL; decode
 steps don't recompute prompt positions, so the patched residual is simply part of the forward that

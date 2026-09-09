@@ -18,11 +18,9 @@ complement**. Our system-under-test is nnsight; the others inform positioning an
   LoRA. Component vocabulary: `block_input/output`, `mlp_input/output/activation`,
   `attention_input/output`, `query/key/value_output`, `head_attention_value_output`. Addresses
   components across architectures via `type_to_module_mapping` / `type_to_dimension_mapping`
-  (GPT-2, Llama, Pythia, Mistral, Mixtral, OPT, BLIP, Mamba, …). **Connection:** (1) direct prior
-  art for our *workload spec schema* — its declarative config IS "spec-as-data"; (2) its
-  component-name vocabulary + type→module mapping is a battle-tested, cross-architecture solution
-  to our **Resolver** problem — adopt/align rather than reinvent; (3) a possible cross-framework
-  baseline.
+  (GPT-2, Llama, Pythia, Mistral, Mixtral, OPT, BLIP, Mamba, …). **Connection:** related work on
+  declarative interventions and a possible cross-framework baseline. Current nnbench metadata
+  follows CausaLab's protocol vocabulary; explicit cells own model access.
 - **TransformerLens** — hook-based, transformers-only, exploratory analysis. Related work.
 - **baukit** (David Bau) — low-level hooks/edits. Related work / ancestor patterns.
 - **vllm-lens** (UK AISI) — vLLM plugin for probes/steering/oracles, "residual stream only."
@@ -37,26 +35,15 @@ complement**. Our system-under-test is nnsight; the others inform positioning an
 faithfulness / interchange-intervention-accuracy. We borrow their *workloads* and *harness shape*,
 not their metric.
 
-- **causalab** (goodfire-ai/causalab) — causal-abstraction framework; you write a high-level causal
-  model, then test via **interchange interventions** whether the LM implements it. Built on
-  **pyvene over HF eager** — `nnsight>=0.5.9` is declared in its pyproject but never imported
-  (verified 2026-06-12; the only model-access layer is `neural/`, pyvene hooks on
-  `AutoModelForCausalLM`, eager attention forced by default). Agent/skill-driven (`/setup-task`,
-  `/plan-experiment`, `/run-experiment`, `/interpret-experiment`). Hydra config-group sweep
-  (`task/ model/ analysis/ runners/`). Strict layering: `causal/ tasks/ neural/(pyvene surface)
-  methods/(DAS,DBM,PCA,SAE) io/ analyses/ runner/`. Eight analyses: baseline → locate → subspace
-  → activation_manifold / output_manifold → path_steering → pullback; attention_pattern. All
-  interventions are applied DURING generation (`intervenable_generate`). **Connection — the most
-  important reference:** (1) structural *blueprint* for our harness (config-group decouple +
-  analysis-DAG with artifact deps ≈ our spec→resolver→builder→runner→reporter); (2) source of
-  realistic intervention workloads; (3) a *consumer* of our work — if nnsight×vLLM gets fast,
-  causalab-style research runs at production scale (the OSDI story). (4) **agent connection** —
-  the leveled primitive model as the action space / capability map for causalab-style auto
-  agents: see `agents-and-the-primitive-model.md` (exploration notes) and
-  **`causalab-portability-audit.md`** (the audit, done: footprints × measured map → 6/8 analyses
-  predicted portable re-expressed in working idioms via their gradient-free methods; pullback
-  blocked by no-autograd, attention_pattern by site-absent, and every gradient-trained method
-  variant (DAS/DBM/boundless) blocked across the portable set).
+- **causalab** (goodfire-ai/causalab) — causal-abstraction framework. PR #20 replaced its old
+  pyvene/Hydra analysis stack with serializable **intervention-protocol documents**: named data
+  roles, positions, sites, reads, writes with a closed `do` algebra, intervened models,
+  featurizers, metrics, training, and saves. The merged protocol stack uses an `Engine` seam with
+  shared execution services and native-hooks/nnsight-tracing implementations. Component-level
+  read/write requirements participate in routing. Generated-frame reads use prefill-only writes.
+  **Connection:** nnbench uses the current vocabulary for descriptive metadata and retains its
+  explicit cells, system context, realization, oracle and timing. The exact upstream commit and
+  verification procedure live in `causalab-portability-audit.md`.
 - **CausalGym** (arXiv 2402.12560) — benchmarking causal interpretability methods on linguistic
   tasks. Faithfulness benchmark; method-comparison framing.
 - **InterpBench** (Gupta et al.) — semi-synthetic transformers with *known* circuits as ground
@@ -111,7 +98,7 @@ The seed for our **methodology registry** (design.md §4; seed, not ceiling).
         │ built on
         ▼
  (2) METHOD LIBRARIES    what technique (DAS, SAE, logit lens, patching, probing)
-     nnsightful · pyvene intervention types · causalab/methods/
+     nnsightful · CausaLab protocol methods and applications
         │ used by
         ▼
  (3) BENCHMARKS          split by WHAT IS MEASURED:

@@ -1,8 +1,10 @@
 """Spec definitions do not import an inference stack."""
-from .spec import BaselineSpec, CellConfig, EffectSpec, Workload
+from .spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime, TaskSpec, Workload
 
 __all__ = [
     "CellConfig",
+    "ExecutionRegime",
+    "TaskSpec",
     "Workload",
     "BaselineSpec",
     "EffectSpec",

@@ -33,7 +33,7 @@ the documented gaps (interp-methods-catalog.md): guarded lm_head.forward, in-pla
 restriction, fused-residual read. NemotronH adds none of its own. The `*_nemotron` (30B-A3B MoE)
 specs need --pp/--tp to measure. dtype_control="bfloat16" (fp32 at this scale is impractical).
 """
-from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, Workload
+from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime
 from ..data import DataRef
 
 # data is a named, swappable source (CounterFact factual-recall prompts), sized for the
@@ -56,7 +56,7 @@ def _nemotron_specs(suffix: str, repo: str):
     logit_lens = CellConfig(
         name=f"logit_lens_nemotron{suffix}",
         methodology="logit_lens", family="nemotron", repo=repo,
-        workloads=[Workload("interactive", PROBE)],
+        regimes=[ExecutionRegime("interactive", PROBE)],
         tasks=[
             ({"unembed": "weight", "residual": "plain"}, "unembed=weight, residual=plain"),
             ({"unembed": "weight", "residual": "fused"}, "unembed=weight, residual=fused"),
@@ -70,7 +70,7 @@ def _nemotron_specs(suffix: str, repo: str):
     steering = CellConfig(
         name=f"steering_nemotron{suffix}",
         methodology="steering", family="nemotron", repo=repo,
-        workloads=[Workload("interactive", PROBE)],
+        regimes=[ExecutionRegime("interactive", PROBE)],
         tasks=[
             ({**_S, "mode": "inplace"}, "mode=inplace"),
             ({**_S, "mode": "replace"}, "mode=replace"),
@@ -86,7 +86,7 @@ def _nemotron_specs(suffix: str, repo: str):
     ablation = CellConfig(
         name=f"ablation_nemotron{suffix}",
         methodology="ablation", family="nemotron", repo=repo,
-        workloads=[Workload("interactive", PROBE)],
+        regimes=[ExecutionRegime("interactive", PROBE)],
         # target="mixer" zeroes the block's single op -> that layer becomes identity. Pick `layer` to
         # choose WHICH op type to knock out (the pattern says which indices are Mamba/attention/MoE).
         tasks=[

@@ -110,11 +110,12 @@ def test_hub_transport_spec_parses_and_rejects_malformed():
 def test_spec_workload_is_the_upstream_multihop_dataset():
     spec = SPECS["jacobian_lens_gpt2"]
     assert spec.name in default_specs()                          # gpt2-scale -> in the default sweep
-    prompts = spec.workloads[0].prompts
+    prompts = spec.regimes[0].prompts
     assert len(prompts) == 93                                    # the shipped multihop item count
     assert any("Carnival" in p for p in prompts)                 # really the upstream data
-    labels = [label for _, label in spec.tasks]
-    assert any("identity" in l for l in labels) and any("orthogonal" in l for l in labels)
+    labels = [task.label for task in spec.tasks]
+    assert any("identity" in label for label in labels)
+    assert any("orthogonal" in label for label in labels)
 
 
 def _run_all():

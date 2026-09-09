@@ -1,4 +1,4 @@
-"""Effect-size guard + Workload-validation tests (isb/sweep/) — no GPU; torch only."""
+"""Effect-size guard + ExecutionRegime-validation tests (isb/sweep/) — no GPU; torch only."""
 import sys
 from pathlib import Path
 
@@ -7,7 +7,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from isb.sweep.guards import compute_effect_size  # noqa: E402
-from isb.sweep.spec import Workload  # noqa: E402
+from isb.sweep.spec import ExecutionRegime  # noqa: E402
 
 V = 8
 
@@ -37,10 +37,10 @@ def test_strong_via_distribution_shift_same_argmax():
 
 
 def test_workload_validation():
-    Workload("interactive", ["x"])                 # ok
-    Workload("batched", ["a", "b"])                # ok
-    for bad in (lambda: Workload("generation", ["x"]),            # new_tokens==0 stub
-                lambda: Workload("bogus", ["x"])):
+    ExecutionRegime("interactive", ["x"])                 # ok
+    ExecutionRegime("batched", ["a", "b"])                # ok
+    for bad in (lambda: ExecutionRegime("generation", ["x"]),            # new_tokens==0 stub
+                lambda: ExecutionRegime("bogus", ["x"])):
         raised = False
         try:
             bad()

@@ -1,19 +1,21 @@
-"""Declarative sweep spec (design.md §12) — one CellConfig per methodology.
+"""Declarative benchmark spec (design.md §12): one CellConfig per methodology.
 
-The 5 near-identical `scripts/smoke_*.py` collapse to one CellConfig each: the hardcoded
-METHOD/FAMILY/REPO/PROMPTS/TASKS plus the per-script effect-size baseline become data here, and the
-single execute layer (`isb/sweep/execute.py`) consumes them. No Resolver / YAML — the spec is Python next to
-the cells, matching the flat `@cell` registry idiom.
+``InterventionSpec`` describes the methodology; ``ExecutionRegime`` describes its inputs;
+``TaskSpec`` separates semantic parameters from realization selectors. Python specs bind these
+descriptions to explicit cells, a model, and the execution settings consumed by the Docker worker.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
 from typing import Optional
+
+from ..protocol import InterventionSpec, protocol_for
 
 
 @dataclass
-class Workload:
-    """An input regime. Batching is a coverage axis (it can change correctness), so each workload is
+class ExecutionRegime:
+    """An input regime. Batching is a coverage axis (it can change correctness), so each regime is
     oracle-checked in its own regime, not just timed.
 
     `prompts` is either a literal unit list (the bespoke single-trace specs) or a `DataRef` naming a
@@ -25,7 +27,7 @@ class Workload:
                               # "generation" (greedy multi-token decode; cells read/intervene per step)
     prompts: object           # list of units, or a DataRef
     new_tokens: int = 0       # generation: decode steps per prompt; injected into cell params by the
-                              # driver (the regime axis lives on the Workload, not in every task dict)
+                              # driver (the regime axis lives here, not in every task dict)
     aggregate: bool = True    # interactive/generation: run each prompt as its OWN trace and score the
                               # verdict aggregated over all of them (top-1 fraction + mean TV) — robust,
                               # not a single-token anecdote. Set False for cells that consume their
@@ -43,9 +45,9 @@ class Workload:
             self.data_knobs = {**knobs, **self.data_knobs}
             self.data_name = ref.name
         if self.kind == "generation" and self.new_tokens <= 0:
-            raise ValueError("generation workload needs new_tokens>0")
+            raise ValueError("generation regime needs new_tokens>0")
         if self.kind not in ("interactive", "batched", "generation"):
-            raise ValueError(f"workload kind {self.kind!r} not implemented in v1")
+            raise ValueError(f"execution regime {self.kind!r} not implemented in v1")
         if self.aggregate and self.kind == "batched":
             self.aggregate = False    # batched runs ONE padded trace by definition; never per-prompt
 
@@ -70,14 +72,51 @@ class EffectSpec:
     top1_ceiling: float = 0.5
 
 
+@dataclass(frozen=True)
+class TaskSpec:
+    """One benchmark case: protocol semantics × one backend realization.
+
+    ``params`` returns an independently owned copy of the values passed to the explicit cell.
+    The namespaces remain editable during spec authoring; coordinate snapshots own their values.
+    The split is persisted in run provenance for later cataloging.
+    """
+
+    label: str
+    semantics: dict = field(default_factory=dict)
+    realization: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        overlap = set(self.semantics) & set(self.realization)
+        if overlap:
+            raise ValueError(f"task params cannot be both semantic and realization: {sorted(overlap)}")
+        object.__setattr__(self, "semantics", deepcopy(self.semantics))
+        object.__setattr__(self, "realization", deepcopy(self.realization))
+
+    @property
+    def params(self) -> dict:
+        return deepcopy({**self.semantics, **self.realization})
+
+    def coordinate(self) -> dict:
+        return {
+            "label": self.label,
+            "semantics": deepcopy(self.semantics),
+            "realization": deepcopy(self.realization),
+        }
+
+    def __iter__(self):
+        """Compatibility with the former ``(params, label)`` task tuple."""
+        yield self.params
+        yield self.label
+
+
 @dataclass
 class CellConfig:
     name: str                                   # spec id for the CLI: `bench.py --spec <name>`
     methodology: str
     family: str
     repo: str
-    workloads: list                             # [Workload(...)]
-    tasks: list                                 # [(params: dict, label: str), ...]
+    regimes: list[ExecutionRegime]
+    tasks: list[TaskSpec | tuple]
     baseline: BaselineSpec
     effect: Optional[EffectSpec] = None         # None for read methodologies (no write to guard)
     dtype_control: str = "float32"              # control precision for the SILENTLY_WRONG-vs-DEGRADED re-check
@@ -85,11 +124,54 @@ class CellConfig:
     n_trials: int = 7
     hf_kwargs: dict = field(default_factory=dict)
     vllm_kwargs: dict = field(default_factory=dict)
+    protocol: InterventionSpec | None = None
+    protocol_absence_reason: str | None = None
+
+    def __post_init__(self):
+        if self.protocol is None:
+            self.protocol = protocol_for(self.methodology)
+        self.protocol_coverage()
+        normalized = []
+        for task in self.tasks:
+            if isinstance(task, TaskSpec):
+                if self.protocol is not None:
+                    semantics, realization = self.protocol.classify(task.params)
+                    if semantics != task.semantics or realization != task.realization:
+                        raise ValueError(
+                            f"task {task.label!r} does not follow the protocol parameter split")
+                normalized.append(task)
+                continue
+            params, label = task
+            if self.protocol is None:
+                semantics, realization = dict(params), {}
+            else:
+                semantics, realization = self.protocol.classify(params)
+            normalized.append(TaskSpec(label=label, semantics=semantics, realization=realization))
+        self.tasks = normalized
+
+    def protocol_coverage(self) -> dict:
+        """Validate and describe this spec's explicit metadata coverage policy."""
+        if self.protocol is not None:
+            if self.protocol_absence_reason is not None:
+                raise ValueError("described methods cannot supply protocol_absence_reason")
+            return {"status": "described"}
+        if protocol_for(self.methodology) is not None:
+            raise ValueError(f"built-in methodology {self.methodology!r} requires a protocol")
+        reason = self.protocol_absence_reason
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f"methodology {self.methodology!r} requires a protocol descriptor "
+                             "or an explicit protocol_absence_reason")
+        return {"status": "undescribed", "reason": reason}
+
+    @property
+    def workloads(self):
+        """Compatibility view for downstream notebooks; new code should say ``regimes``."""
+        return self.regimes
 
 
 def spec_with_data(spec: CellConfig, ref) -> CellConfig:
     """The same procedure over a different data source (`bench.py --data`): interactive/generation
-    workloads rebind to `ref`'s units; a batched workload rebuilds from the first 16 units of the
+    regimes rebind to `ref`'s units; a batched regime rebuilds from the first 16 units of the
     same source (the padded-batch REGIME is the point there, not volume). Unit kinds must match —
     binding pair-data to a prompt-procedure (or vice versa) is a loud error. The copy's name gains
     an `@source` suffix so refs, outputs, and banners never collide with the default binding."""
@@ -99,20 +181,25 @@ def spec_with_data(spec: CellConfig, ref) -> CellConfig:
 
     units, knobs = load_data(ref)
     rebound = []
-    for w in spec.workloads:
+    for w in spec.regimes:
         u0 = w.prompts[0] if w.prompts else None
         current = ("pair_labeled" if isinstance(u0, tuple) and len(u0) == 3
                    else "pair" if isinstance(u0, tuple) else "prompt")
         if unit_kind(ref.name) != current:
             raise ValueError(
                 f"data source {ref.name!r} yields {unit_kind(ref.name)!r} units but "
-                f"{spec.name!r}'s {w.kind} workload consumes {current!r} units")
+                f"{spec.name!r}'s {w.kind} regime consumes {current!r} units")
         if w.kind == "batched":
-            rebound.append(Workload("batched", units[:16],
-                                    data_knobs=dict(knobs), data_name=ref.name))
+            rebound.append(ExecutionRegime("batched", units[:16],
+                                           data_knobs=dict(knobs), data_name=ref.name))
         else:
-            rebound.append(Workload(w.kind, list(units), new_tokens=w.new_tokens,
-                                    aggregate=w.aggregate,
-                                    data_knobs=dict(knobs), data_name=ref.name))
+            rebound.append(ExecutionRegime(w.kind, list(units), new_tokens=w.new_tokens,
+                                           aggregate=w.aggregate,
+                                           data_knobs=dict(knobs), data_name=ref.name))
     return dataclasses.replace(
-        spec, name=f"{spec.name}@{ref.name.replace('/', '-')}", workloads=rebound)
+        spec, name=f"{spec.name}@{ref.name.replace('/', '-')}", regimes=rebound)
+
+
+# Transitional import compatibility for code that imports the former class name. New CellConfig
+# declarations use the deliberately separate ``regimes`` field.
+Workload = ExecutionRegime
