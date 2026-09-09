@@ -12,26 +12,21 @@ artifacts, and workflows remain CausaLab concerns.
 from __future__ import annotations
 
 import dataclasses
+import json
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 
-COMPONENTS = frozenset({
-    "embeddings", "block_input", "block_output", "attention_output", "attention_value",
-    "attention_probs", "mlp_input", "mlp_output", "mlp_activation", "router_logits",
-    "expert_output", "ln_final", "lm_head",
-})
+_VOCABULARY = json.loads(Path(__file__).with_name("causalab_vocabulary.json").read_text())
+CAUSALAB_REFERENCE = {key: _VOCABULARY[key] for key in ("repository", "revision")}
+COMPONENTS = frozenset(_VOCABULARY["components"])
+DEPRECATED_COMPONENTS = _VOCABULARY["deprecated_components"]
 OPERATIONS = frozenset({"read", "write", "grad"})
-MECHANISMS = frozenset({
-    "swap", "add_scaled", "lerp", "affine", "gaussian", "renormalize", "clamp",
-    "pytorch_fn",
-})
+MECHANISMS = frozenset(_VOCABULARY["mechanisms"])
 POSITION_FRAMES = frozenset({"prompt", "generated"})
-FEATURIZERS = frozenset({"subspace", "gate"})
-CAPABILITIES = frozenset({
-    "grad", "paired_forward", "full_logits", "writable_attention_probs",
-    "pytorch_fn_local", "generate",
-})
+FEATURIZERS = frozenset(_VOCABULARY["featurizers"])
+CAPABILITIES = frozenset(_VOCABULARY["capabilities"])
 
 
 def _ordered(values) -> tuple[str, ...]:
@@ -42,8 +37,9 @@ def _ordered(values) -> tuple[str, ...]:
 class InterventionSpec:
     """Semantic descriptor, used as a methodology template or a concrete task description.
 
-    The first seven coordinates use CausaLab's vocabulary. ``extensions`` records semantics that
-    its v1 documents cannot express (for example a write at every decode step). ``semantic_params``
+    Component, mechanism, featurizer and capability names use the pinned CausaLab vocabulary.
+    Operations and frames summarize nnbench execution. ``extensions`` records semantics that
+    upstream documents cannot express (for example a write at every decode step). ``semantic_params``
     and ``realization_params`` partition nnbench task parameters without changing the cell call.
     """
 
@@ -57,8 +53,19 @@ class InterventionSpec:
     extensions: tuple[str, ...] = ()
     semantic_params: tuple[str, ...] = ()
     realization_params: tuple[str, ...] = ()
+    # None preserves older/custom descriptors whose write targets were unspecified.
+    write_components: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "components", tuple(
+            DEPRECATED_COMPONENTS.get(c, c) for c in self.components))
+        if self.write_components is not None:
+            object.__setattr__(self, "write_components", _ordered(
+                DEPRECATED_COMPONENTS.get(c, c) for c in self.write_components))
+            if set(self.write_components) - set(self.components):
+                raise ValueError("write components must belong to the descriptor's components")
+            if self.write_components and "write" not in self.operations:
+                raise ValueError("write components require the write operation")
         # Canonical ordering makes descriptors stable regardless of authoring order.
         for name in (
             "data_roles", "components", "operations", "mechanisms", "position_frames",
@@ -99,7 +106,7 @@ class InterventionSpec:
         realization = {k: v for k, v in params.items() if k in realization_keys}
         return semantics, realization
 
-    def coordinate(self) -> dict[str, list[str]]:
+    def coordinate(self) -> dict[str, Any]:
         """JSON-safe protocol coordinates for provenance and catalog indexing.
 
         These coordinates describe the measured case. The Docker job contract owns nnbench's
@@ -115,7 +122,24 @@ class InterventionSpec:
             "capabilities": list(self.capabilities),
             "extensions": list(self.extensions),
             "semantic_params": list(self.semantic_params),
+            "write_components": (list(self.write_components)
+                                 if self.write_components is not None else None),
+            "required_capabilities": self.required_capabilities(),
+            "vocabulary": dict(CAUSALAB_REFERENCE),
         }
+
+    def required_capabilities(self) -> list[str] | None:
+        """Describe component requirements in CausaLab's engine vocabulary.
+
+        Legacy write descriptors with unspecified targets have incomplete requirements.
+        These requirements describe nnbench cells; backend selection remains explicit.
+        """
+        if "write" in self.operations and self.write_components is None:
+            return None
+        required = set(self.capabilities)
+        required.update(f"component:{c}" for c in self.components)
+        required.update(f"component:{c}:write" for c in self.write_components or ())
+        return sorted(required)
 
 
 def _p(**kwargs) -> InterventionSpec:
@@ -131,28 +155,33 @@ PROTOCOLS: dict[str, InterventionSpec] = {
         realization_params=("unembed", "residual"),
     ),
     "steering": _p(
+        write_components=("block_output",),
         components=("block_output", "lm_head"), operations=("read", "write"),
         mechanisms=("add_scaled",), capabilities=("full_logits",),
         semantic_params=("layer", "target", "alpha"), realization_params=("mode", "residual"),
     ),
     "ablation": _p(
+        write_components=("attention_output", "mlp_output"),
         components=("attention_output", "mlp_output", "block_output", "lm_head"),
         operations=("read", "write"), mechanisms=("swap",), capabilities=("full_logits",),
         semantic_params=("layer", "target"), realization_params=("residual",),
     ),
     "activation_patching": _p(
+        write_components=("block_output",),
         data_roles=("base", "counterfactual"), components=("block_output", "lm_head"),
         operations=("read", "write"), mechanisms=("swap",),
         capabilities=("paired_forward", "full_logits"), semantic_params=("layer", "patch"),
         realization_params=("residual",),
     ),
     "gen_patching": _p(
+        write_components=("block_output",),
         data_roles=("base", "counterfactual"), components=("block_output", "lm_head"),
         operations=("read", "write"), mechanisms=("swap",), position_frames=("prompt", "generated"),
         capabilities=("paired_forward", "full_logits", "generate"),
         semantic_params=("layer", "patch", "new_tokens"), realization_params=("residual", "bound"),
     ),
     "gen_steering": _p(
+        write_components=("block_output",),
         components=("block_output", "lm_head"), operations=("read", "write"),
         mechanisms=("add_scaled",), position_frames=("prompt", "generated"),
         capabilities=("full_logits", "generate"), extensions=("decode_step_write",),
@@ -167,6 +196,7 @@ PROTOCOLS: dict[str, InterventionSpec] = {
         semantic_params=("grad",), realization_params=("residual",),
     ),
     "das": _p(
+        write_components=("block_output",),
         data_roles=("base", "counterfactual"), components=("block_output", "lm_head"),
         operations=("read", "write", "grad"), mechanisms=("swap",), featurizers=("subspace",),
         capabilities=("grad", "paired_forward", "full_logits"),
@@ -203,6 +233,7 @@ def describe_task(methodology: str, params: Mapping[str, Any], *,
     mechanisms = template.mechanisms
     extensions = set(template.extensions)
     components = template.components
+    write_components = template.write_components
     if ((methodology == "das" and not params.get("train", 0))
             or (methodology in {"attribution_patching", "jacobian_collect"}
                 and not params.get("grad", True))):
@@ -215,6 +246,7 @@ def describe_task(methodology: str, params: Mapping[str, Any], *,
         or methodology == "ablation" and params.get("target") == "none"
     )
     if no_write:
+        write_components = ()
         operations.discard("write")
         capabilities.discard("paired_forward")
         mechanisms = ()
@@ -227,9 +259,14 @@ def describe_task(methodology: str, params: Mapping[str, Any], *,
         component = {"attn": "attention_output", "mlp": "mlp_output"}.get(target)
         if component is not None:
             components = (component, "block_output", "lm_head")
-        # Nemotron's mixer target is layer-dependent; retain the template's component union.
+            if write_components is not None:
+                write_components = (component,)
+        else:
+            # Hybrid mixer targets need layer/model binding before their component is known.
+            write_components = None
     if methodology == "jacobian_lens" and params.get("transport") is None:
         extensions.discard("linear_transport")
     return dataclasses.replace(template, operations=tuple(operations),
                                capabilities=tuple(capabilities), mechanisms=mechanisms,
-                               extensions=tuple(extensions), components=components)
+                               extensions=tuple(extensions), components=components,
+                               write_components=write_components)

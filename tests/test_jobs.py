@@ -60,6 +60,25 @@ def test_protocol_metadata_roundtrips_without_changing_v1_execution_fields(tmp_p
     assert contract.prepare(changed, tmp_path / "changed")["id"] != experiment["id"]
 
 
+def test_legacy_descriptor_without_write_targets_restores_without_guessing(tmp_path):
+    from isb.protocol import InterventionSpec
+
+    template = InterventionSpec(components=("attention_premix",), operations=("read", "write"),
+                                write_components=("attention_premix",), semantic_params=("layers",))
+    spec = replace(specimen(), protocol=template)
+    experiment = contract.prepare(spec, tmp_path / "job")
+    old_template = experiment["description"]["protocol_template"]
+    old_template.pop("write_components")
+    old_template["components"] = contract.pack(("attention_value",))
+    experiment.pop("id")
+    experiment["id"] = contract.digest(contract.canonical(experiment))
+    contract.write_json(tmp_path / "job" / "experiment.json", experiment)
+    restored, original = contract.restore_spec(tmp_path / "job")
+    assert restored.protocol.components == ("attention_premix",)
+    assert restored.protocol.required_capabilities() is None
+    assert original == experiment
+
+
 def test_legacy_v1_experiment_without_description_still_restores(tmp_path):
     experiment = contract.prepare(specimen(), tmp_path / "job")
     experiment.pop("description")

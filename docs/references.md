@@ -18,11 +18,9 @@ complement**. Our system-under-test is nnsight; the others inform positioning an
   LoRA. Component vocabulary: `block_input/output`, `mlp_input/output/activation`,
   `attention_input/output`, `query/key/value_output`, `head_attention_value_output`. Addresses
   components across architectures via `type_to_module_mapping` / `type_to_dimension_mapping`
-  (GPT-2, Llama, Pythia, Mistral, Mixtral, OPT, BLIP, Mamba, …). **Connection:** (1) direct prior
-  art for our *workload spec schema* — its declarative config IS "spec-as-data"; (2) its
-  component-name vocabulary + type→module mapping is a battle-tested, cross-architecture solution
-  to our **Resolver** problem — adopt/align rather than reinvent; (3) a possible cross-framework
-  baseline.
+  (GPT-2, Llama, Pythia, Mistral, Mixtral, OPT, BLIP, Mamba, …). **Connection:** related work on
+  declarative interventions and a possible cross-framework baseline. Current nnbench metadata
+  follows CausaLab's protocol vocabulary; explicit cells own model access.
 - **TransformerLens** — hook-based, transformers-only, exploratory analysis. Related work.
 - **baukit** (David Bau) — low-level hooks/edits. Related work / ancestor patterns.
 - **vllm-lens** (UK AISI) — vLLM plugin for probes/steering/oracles, "residual stream only."
@@ -40,12 +38,12 @@ not their metric.
 - **causalab** (goodfire-ai/causalab) — causal-abstraction framework. PR #20 replaced its old
   pyvene/Hydra analysis stack with serializable **intervention-protocol documents**: named data
   roles, positions, sites, reads, writes with a closed `do` algebra, intervened models,
-  featurizers, metrics, training, and saves. Documents execute through a generic `Backend` seam;
-  a workflow composes independently routed document steps. PR #40 adds greedy generation as a
-  position frame with prefill-only writes. **Connection:** nnbench adopts the intersection as
-  non-executable `InterventionSpec` metadata and keeps system context, realization, correctness
-  status, and performance as its own axes. It does not adopt causalab's document executor: that is
-  the construction layer nnbench measures. See `causalab-portability-audit.md`.
+  featurizers, metrics, training, and saves. The merged protocol stack uses an `Engine` seam with
+  shared execution services and native-hooks/nnsight-tracing implementations. Component-level
+  read/write requirements participate in routing. Generated-frame reads use prefill-only writes.
+  **Connection:** nnbench uses the current vocabulary for descriptive metadata and retains its
+  explicit cells, system context, realization, oracle and timing. The exact upstream commit and
+  verification procedure live in `causalab-portability-audit.md`.
 - **CausalGym** (arXiv 2402.12560) — benchmarking causal interpretability methods on linguistic
   tasks. Faithfulness benchmark; method-comparison framing.
 - **InterpBench** (Gupta et al.) — semi-synthetic transformers with *known* circuits as ground
@@ -100,7 +98,7 @@ The seed for our **methodology registry** (design.md §4; seed, not ceiling).
         │ built on
         ▼
  (2) METHOD LIBRARIES    what technique (DAS, SAE, logit lens, patching, probing)
-     nnsightful · pyvene intervention types · causalab/methods/
+     nnsightful · CausaLab protocol methods and applications
         │ used by
         ▼
  (3) BENCHMARKS          split by WHAT IS MEASURED:

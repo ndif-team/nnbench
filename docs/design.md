@@ -469,12 +469,10 @@ Backlog (literature, additive later): path/edge patching · attention knockout �
 patchscopes · future lens · SAE family (gated/JumpReLU/top-k/transcoders/crosscoders) · steering
 family (CAA/ITI/RepE) · sparse probing / CCS · integrated gradients.
 
-**Borrow:** align methodology footprints (§3.5) with **pyvene's intervention-type enum** (Vanilla /
-Addition / Subtraction / Zero / Collect / RotatedSpace=DAS / LoRA) where they map, for shared
-vocabulary and cross-framework portability. Made concrete 2026-06-12: the catalog's tag table
-carries the edge-class ↔ pyvene-enum mapping (Collect=observation, Addition/Subtraction=injection,
-Vanilla interchange=transplant, RotatedSpace=subspace rewiring, LoRA=staging); subspace addresses
-are derived-tier Level-1 citizens (§3.2).
+**Shared vocabulary:** methodology descriptions use the pinned CausaLab protocol vocabulary in
+`isb/causalab_vocabulary.json`. `isb/protocol.py` binds it to explicit cells and specializes their
+requirements. Subspace addresses remain derived-tier Level-1 citizens (§3.2). See
+`causalab-portability-audit.md` for the current protocol/engine alignment and source-check command.
 
 ## 5. Context — execution regimes (how methodologies get run; the "dataset" distribution)
 
@@ -873,6 +871,10 @@ def _(be, model, prompt):
   `TaskSpec.semantics` holds a case's values; `TaskSpec.realization` holds spelling choices such as
   in-place vs replacement or bounded vs unbounded iteration. Their merged `params` mapping is
   passed to the explicit cell with the same values.
+  `isb/causalab_vocabulary.json` pins the current upstream vocabulary and source checksums;
+  `scripts/check_causalab_alignment.py` verifies them against an upstream checkout. Component
+  requirements distinguish touched components from write targets, using CausaLab's engine
+  capability spelling. The vocabulary covers more sites than the implemented benchmark cells.
 - **Requirements belong to the concrete case.** Methodology descriptors are templates.
   `describe_task` specializes operations and capabilities from task parameters: DAS apply
   (`train=0`) needs no gradients, while training does. Provenance calls the shared description

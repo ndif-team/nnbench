@@ -7,8 +7,8 @@ COMPOSITION of two separately-measured rows — replacement WRITE (in-place writ
 replacement works) inside the iteration construct (unbounded tracer.iter[:] drops all per-step
 saves on vLLM, bounded iter[0:N] works) — i.e. the "statuses compose upward" claim (design.md
 §3.6) at method tier.
-Externally it is the footprint of causalab's path_steering analysis, flagged "composition
-unmeasured" in `docs/causalab-portability-audit.md` §4.
+Its decode-step writes are an nnbench extension to CausaLab's current prefill-only protocol
+write contract; see `docs/causalab-portability-audit.md` §4.
 
 The realization axis here is the iteration BOUND (Level 1.5), not the write form (in-place vs
 replace is already measured by the steering methodology — this cell writes replacement-only):

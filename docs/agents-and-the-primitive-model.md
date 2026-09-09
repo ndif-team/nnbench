@@ -1,10 +1,9 @@
 # Agents and the primitive model — connection notes (exploration, not decided design)
 
-> Status: direction-exploration written 2026-06-11. **Artifact 1 (the portability audit) is done
-> — see `causalab-portability-audit.md` (2026-06-12)**; it also answered open questions 1
-> (vocabulary covers the suite; three edge findings) and 5 (as-shipped 0% — nnsight is declared
-> but never imported; pyvene-on-HF-eager only). Nothing else here is committed design; design.md
-> §3 (the leveled primitive model) and §12 (flat per-cell architecture) remain the decided ground.
+> Historical exploration from 2026-06-11, superseded for CausaLab architecture and coverage.
+> The pyvene-era observations and analysis paths below describe the retired tree.
+> Current protocol/engine alignment and its exact source revision are in
+> `causalab-portability-audit.md`; decided nnbench architecture lives in design.md §3 and §12.
 > References: `references.md` §B (causalab), nnsight `docs/developing/agent-evals.md`,
 > `docs/developing/vllm-construct-gaps.md`.
 

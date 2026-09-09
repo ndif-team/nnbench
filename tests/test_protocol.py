@@ -16,6 +16,51 @@ from isb.sweep.execute import _run_coordinates  # noqa: E402
 from isb.sweep.spec import BaselineSpec, CellConfig, ExecutionRegime, TaskSpec  # noqa: E402
 
 
+def test_current_upstream_vocabulary_and_deprecated_alias():
+    from isb.protocol import CAUSALAB_REFERENCE, COMPONENTS
+
+    assert CAUSALAB_REFERENCE["revision"] == "8696e04bfb06a169defe1bf563d8aeef992f85cd"
+    assert "attention_value" not in COMPONENTS
+    old = InterventionSpec(components=("attention_value",), operations=("read", "write"),
+                           write_components=("attention_value",))
+    assert old.components == ("attention_premix",)
+    assert old.write_components == ("attention_premix",)
+    desc = InterventionSpec(components=("attention_value_states", "deltanet_state", "expert_activation"),
+                            featurizers=("identity", "pca", "sae", "standardize"),
+                            capabilities=("quantized_weights",))
+    assert "component:attention_value_states" in desc.required_capabilities()
+    assert desc.coordinate()["vocabulary"] == CAUSALAB_REFERENCE
+
+
+def test_component_requirements_identify_only_actual_write_targets():
+    spec = describe_task("ablation", {"target": "mlp"}, template=PROTOCOLS["ablation"], family="gpt2")
+    required = spec.required_capabilities()
+    assert "component:mlp_output:write" in required
+    assert "component:block_output" in required
+    assert "component:block_output:write" not in required
+    assert "component:lm_head:write" not in required
+    assert "component:attention_output" not in required
+    noop = describe_task("ablation", {"target": "none"}, template=PROTOCOLS["ablation"], family="gpt2")
+    assert not any(c.endswith(":write") for c in noop.required_capabilities())
+    hybrid = describe_task("ablation", {"target": "mixer"}, template=PROTOCOLS["ablation"], family="nemotron")
+    assert hybrid.required_capabilities() is None
+
+
+def test_legacy_write_descriptor_keeps_requirements_explicitly_incomplete():
+    old = InterventionSpec(components=("block_output", "lm_head"), operations=("read", "write"))
+    assert old.coordinate()["required_capabilities"] is None
+    assert old.coordinate()["write_components"] is None
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"components": ("lm_head",), "operations": ("read", "write"), "write_components": ("block_output",)},
+    {"components": ("block_output",), "write_components": ("block_output",)},
+])
+def test_invalid_write_component_descriptions_are_rejected(kwargs):
+    with pytest.raises(ValueError, match="write components"):
+        InterventionSpec(**kwargs)
+
+
 def test_task_owns_nested_config_and_returns_independent_snapshots():
     source = {"layers": [1, 2]}
     task = TaskSpec("case", source, {"options": {"order": [3]}})
