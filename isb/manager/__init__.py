@@ -1,6 +1,6 @@
-"""Run manager (design.md §12.12): render one collection directory; inbox; archive = file move.
+"""Run manager: render saved reports; inbox; archive complete runs without overwriting.
 
-Layout: model.py (the directory model: Collection, baselines, the one scoring path, caches),
+Layout: records.py (JSON job adapter), model.py (Collection, explicit legacy import, safe moves),
 htmlkit.py (every tag and format rule), figure.py (the operating-point scatter), pages.py
 (page composition + ROUTES, the single registry the server, the export, and the tests share).
 

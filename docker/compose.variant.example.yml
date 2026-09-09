@@ -1,0 +1,14 @@
+# Add a candidate using only Compose. Pass this AFTER docker-compose.yml via --compose-file.
+# Replace image/build here to test another nnsight checkout or packaged implementation.
+services:
+  vllm_candidate:
+    extends:
+      file: docker-compose.yml
+      service: vllm_async
+    entrypoint:
+      - python3
+      - /workspace/scripts/execute.py
+      - --engine
+      - vllm
+      - --param
+      - dtype=float32

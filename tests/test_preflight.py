@@ -1,15 +1,10 @@
-"""Release-mode preflight tests (isb/preflight.py); no GPU dependence in the logic checks.
-
-Pins the contract: release mode REFUSES on contamination and names the offender; it never waits;
-casual mode never invokes it (pinned at the CLI wiring level by the flag's absence from default
-argv construction, checked here via the split passthrough)."""
+"""Environment-check logic for the legacy standalone executor; no GPU required."""
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from isb.preflight import check_environment, parse_compute_apps  # noqa: E402
-from isb.sweep.split import backend_run_commands  # noqa: E402
 
 
 def test_compute_app_rows_parse_with_process_names():
@@ -30,15 +25,6 @@ def test_disk_headroom_finding_fires_on_a_full_volume(tmp_path, monkeypatch):
     # GPU checks may or may not fire on this host; the disk finding must be present regardless
     findings = check_environment(str(tmp_path))
     assert any("GB free" in x for x in findings)
-
-
-def test_release_flag_reaches_split_children_and_only_when_set():
-    runs = backend_run_commands("e.py", "s", ["hf", "vllm_async"], "d", release=True)
-    for _, _, argv in runs:
-        assert "--release" in argv                      # every run process gates itself
-    runs = backend_run_commands("e.py", "s", ["hf", "vllm_async"], "d")
-    for _, _, argv in runs:
-        assert "--release" not in argv                  # casual mode: the checker never appears
 
 
 def _run_all():

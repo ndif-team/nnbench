@@ -8,34 +8,29 @@ nnbench: a **systems performance + coverage benchmark** for interpretability wor
 
 ## Environment & commands
 
-Everything runs in the `nnsight-serve-test` conda env: **vLLM 0.15.1** + nnsight editable from `/disk/u/zikai/nnsight/src` (the `dev` branch). Two caveats:
-
-- **Version skew**: the nnsight `dev` branch targets vLLM **0.19.1**, while this env pins **0.15.1**. Running the benchmark here is correct, but never characterize *nnsight-side* vLLM behavior from this env alone — verify under the `ndif-dev` env (vLLM 0.19.1) with `PYTHONPATH=/disk/u/zikai/nnsight/src` prepended (its editable nnsight points at a different worktree; PYTHONPATH wins). Confirm with `python -c "import nnsight,os; print(os.path.dirname(nnsight.__file__))"`.
-- **`conda run` mishandles signals** on long vLLM runs (false timeouts, swallowed SIGABRT). For anything GPU/vLLM, prefer the env's python directly: `/disk/u/zikai/anaconda3/envs/nnsight-serve-test/bin/python`. Always wrap nnsight/vLLM runs in `timeout`, and afterwards verify no orphan processes remain and GPU memory is freed (an unguarded HF run once hung 80 min holding the GPU).
+The main benchmark discovers independent `backends/NAME/compose.yml` configurations. Every one
+defines a `runner` service; its Dockerfile and entrypoint own dependencies and execution settings.
+The host runner in `isb/jobs/` is backend-agnostic: do not add engine switches, backend registries,
+Conda paths, or shared-Compose override selection. See `backends/README.md` for the file contract.
 
 ```bash
 # Unit tests — all no-GPU (fake backends, torch-only logic)
-conda run -n nnsight-serve-test python -m pytest tests/ -q
-conda run -n nnsight-serve-test python -m pytest tests/test_sweep.py -q     # one file
-conda run -n nnsight-serve-test python tests/test_sweep.py                  # files also self-run via _run_all()
+python -m pytest tests/ -q
+python -m pytest tests/test_sweep.py -q
 
-# Benchmark (needs GPU) — env python directly + timeout, not conda run (see caveats above)
-PY=/disk/u/zikai/anaconda3/envs/nnsight-serve-test/bin/python
-CUDA_VISIBLE_DEVICES=0 timeout 1800 $PY scripts/bench.py --spec steering_gpt2
-CUDA_VISIBLE_DEVICES=0 timeout 1800 $PY scripts/bench.py --spec all --backends hf
+# Benchmark (needs GPU): build images, then the host script launches one container per run
+python scripts/bench.py build nnsight-hf nnsight-vllm
+python scripts/bench.py run --spec steering_gpt2 --backends nnsight-hf nnsight-vllm --reference nnsight-hf --gpu 0
+python scripts/bench.py run --spec all --backends nnsight-hf --gpu 0
 # Specs live in isb/specs/ (logit_lens_gpt2, logit_lens_llama, steering_gpt2, activation_patching_gpt2,
-# ablation_gpt2, ...). Llama specs need HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1.
+# ablation_gpt2, ...).
 
-# Micro tier (Level 0/1 primitive map) — ONE backend per process, always under `timeout`
-CUDA_VISIBLE_DEVICES=0 timeout 1800 $PY scripts/micro.py --backend hf
-
-# Perf micro (op cost across systems; docs/perf-micro-design.md) — one subprocess per cell,
-# each system in its own conda env; writes ONE perf_micro run file into the inbox
-CUDA_VISIBLE_DEVICES=0 timeout 3600 $PY scripts/perf.py sweep --plan plans/read_footprint_qwen.json
-
-# Client/server (vllm_serve) split — see docker/README.md
-GPU=5 docker/run_vm.sh                      # after stocking reference run files with bench.py --backends hf / --ctl-only
+# Client/server (vllm_serve) split — after stocking HF and control run files
+GPU=0 docker/run_vm.sh
 ```
+
+The standalone micro/perf entrypoints have not yet been moved to the Compose launcher; that is a
+separate follow-up to this main benchmark conversion.
 
 vLLM EngineCore uses spawn: every entrypoint must run under an `if __name__ == "__main__"` guard.
 
@@ -43,11 +38,15 @@ vLLM EngineCore uses spawn: every entrypoint must run under an `if __name__ == "
 
 The core unit is a **cell**: one explicit function per `(methodology, family, backend)`, registered with `@cell(...)` in `isb/methodologies/` (registry in `isb/methodologies/registry.py`). Variances (prompts, layers, idiomatic-vs-portable formulation) are runtime **params** to the cell, not separate registrations. This flatness is deliberate — an earlier "Resolver" abstraction that *generated* intervention code from declarations was killed (design.md §11–12); the leveled primitive model in design.md §3 only *indexes* cells, never constructs them. Do not reintroduce a construction layer. Every `vllm_*` variant cell (`vllm_serve`, `vllm_sync`, `vllm_pp`, …) falls back to the `vllm_async` cell automatically (same intervention code; the variant difference — over-HTTP, in-process-sync, pipeline/tensor-parallel — lives entirely in the backend object).
 
-Data flow for one spec (`scripts/bench.py` → per-run `scripts/execute.py` subprocesses → `isb/sweep/score.py`; run files in between):
+Main data flow: `scripts/bench.py` → frozen experiment/inputs → `backends/NAME/run.py` in its
+own Compose project → validated artifacts → `isb/jobs/score.py`. The shared nnsight worker reuses
+the scientific execution routines below. Legacy standalone execute/score tools retain their
+older `.pt` interface; their orchestration conventions do not define the new runner. The manager
+reads saved job reports; legacy `.pt` browsing requires explicit `--import-legacy` summaries.
 
 1. **Spec** (`isb/specs/`): a `CellConfig` + `Workload`s (interactive / batched) per methodology. Batching is a *coverage axis* — each workload is oracle-checked in its own regime, not just timed.
 2. **Backend** (`isb/backends/`): `be` objects — `hf` (the per-family control), `vllm_async` (in-process system under test), `vllm_serve` (over-HTTP). One model load per backend, amortized across all tasks; an intervention error is isolated (engine survives, later tasks still run).
-3. **Oracle** (`isb/oracle/equivalence.py`): each non-HF cell is scored against the HF cell of the same family via top-1 token agreement + softmax total-variation distance. Precision divergence is disambiguated by a control-dtype vLLM run file (`<spec>-vllm-fp32`, executed alongside the sweep; `score.py --ctl`) → `SUPPORTED_DEGRADED` vs `SILENTLY_WRONG`.
+3. **Oracle** (`isb/oracle/equivalence.py`): compares outputs via top-1 agreement and softmax TV. The main runner takes an explicit reference and comparison axis, with no implicit precision-control jobs. The legacy `scripts/score.py --ctl` can still disambiguate precision using old-format artifacts.
 4. **Perf** (`isb/perf/`): warm timing (warmup + N trials, CUDA-synced, median±std, peak mem) — correctness is verified in the same warm/batched regime perf is measured in.
 5. **Report** (`isb/report/`): applicability map (`AppState` in `isb/states.py`) + performance table.
 

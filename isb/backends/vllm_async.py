@@ -415,6 +415,7 @@ class VLLMAsyncBackend(VLLMBackend):
         return list(v) if isinstance(v, (list, tuple)) else [v]
 
     def teardown(self, model) -> None:
+        import asyncio
         import gc
 
         import torch
@@ -422,6 +423,17 @@ class VLLMAsyncBackend(VLLMBackend):
         with contextlib.suppress(Exception):
             model.vllm_entrypoint.shutdown()
         if self._loop is not None and not self._loop.is_closed():   # close the loop AFTER engine shutdown
+            # shutdown cancels engine handlers; let their finally blocks run before closing
+            # the loop (otherwise vLLM reports "Event loop is closed" during container exit).
+            async def drain():
+                pending = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                await self._loop.shutdown_asyncgens()
+
+            with contextlib.suppress(Exception):
+                self._loop.run_until_complete(drain())
             with contextlib.suppress(Exception):
                 self._loop.close()
             self._loop = None
