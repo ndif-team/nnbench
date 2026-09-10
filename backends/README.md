@@ -66,7 +66,7 @@ its own executable, provided it satisfies the file contract below. The shared nn
 optional. A text-generation-only provider cannot claim support for inaccessible hidden states,
 interventions, or gradients.
 
-## Container contract (version 1)
+## Container contract (version 2)
 
 Each Compose configuration defines a service called `runner`. Its entrypoint consumes `/job` and
 writes `/output`. The host supplies these environment variables for Compose interpolation:
@@ -85,33 +85,58 @@ units/parameters are encoded as `{"$tuple": [...]}` so paired/labeled data round
 becoming independent prompts. A job is a whole experiment, including dataset-level work such as
 DAS training; the host does not shard its inputs.
 
-Python specs use `ExecutionRegime` and `TaskSpec`, while the version-1 wire format deliberately
-retains `spec.workloads` and `(params, label)` tasks for independent workers. An optional
-`description` field carries the frozen protocol template, separated task semantics/realizations,
-and explicit `protocol_coverage`;
-it is covered by the experiment checksum. The nnsight worker restores these descriptions and
-records concrete per-case requirements and effective regime parameters in result provenance.
-Older version-1 experiments without descriptions remain readable. Undescribed legacy methods
-receive an explicit legacy-coverage reason on restoration. These hashes identify runner inputs
-and artifacts; CausaLab maintains its own document and artifact identities.
+The spec record is the Python dataclass as written: `regimes` (units replaced by their count),
+tasks as `{label, params}`, the methodology's protocol template, and, for a methodology without
+one, its `protocol_absence_reason`. All of it is covered by the experiment id. Readers support
+both historical version-1 forms, which use `workloads` and `(params, label)` tasks:
+
+- Files with an optional `description` retain their frozen protocol template, task parameters,
+  and recorded coverage reason. Duplicate task descriptions must match the executable parameters.
+- Files without a description retain unknown protocol coverage, including for a methodology
+  that has a descriptor in today's code. Restoring them preserves their executable parameters.
+
+Re-saving a historically undescribed spec as version 2 adds `protocol_source: "legacy"` to
+preserve that distinction from an explicitly authored opt-out.
+
+Migration keeps the original experiment id and bytes. These hashes identify runner inputs and
+artifacts; CausaLab maintains its own document and artifact identities. Newly authored methods
+remain subject to strict protocol validation; saved calls are checked against their frozen
+descriptor at execution, where errors are recorded with the affected call.
+
+Independent executables implement this versioned file contract. A pinned version-1-only reader
+must reject version-2 jobs clearly; update the executable before submitting new jobs to it. The
+bundled entrypoints use mounted repository code, so a reader update reaches them through the
+source mount. Dependency changes still require rebuilding the images.
 
 Built-in methods require protocol descriptors. A custom method can supply an `InterventionSpec`
-directly or opt out with a nonempty `CellConfig.protocol_absence_reason`. The latter is recorded
-as `protocol_coverage: {"status": "undescribed", "reason": ...}` in the frozen description and
-shared worker provenance. Described methods record `{"status": "described"}`. Coverage describes
-metadata availability independently of execution verdicts. Independent workers may retain the
-version-1 execution fields and consume this optional description as needed.
+directly or opt out with a nonempty `CellConfig.protocol_absence_reason`. Coverage is recorded
+as `protocol_coverage` in the shared worker's provenance: `{"status": "described"}` or
+`{"status": "undescribed", "reason": ...}`. Historically missing descriptions use
+`{"status": "legacy", "reason": ...}`. Coverage describes metadata availability independently
+of execution verdicts.
 
-The shared worker snapshots provenance before execution and gives each cell invocation its own
-nested parameter values, including dataset defaults, baseline and effect parameters. Warmup and
-trial configuration copies are prepared outside the timed interval. Frozen experiment files
-remain the authoritative submitted configuration.
+What is frozen: the experiment pins the spec and its inputs, and the launcher pins the executed
+image and source commit. The shared worker binds each case's params to its cell's signature at
+run time and records the effective params, split by the protocol, in `result.json` next to the
+cell's timing, together with the baseline, effect-guard, and batched-reference call settings.
+Reproduction uses the frozen experiment, source, and image together. Binding, metadata
+description, and fresh invocation-parameter copies happen outside the measured interval.
 
 The worker writes `result.pt` (the existing outputs/provenance dictionary) followed atomically by
 `result.json` (completion, experiment/backend identity, input/tensor checksums, one execution status
 for every requested cell, timings and provenance). See `isb/jobs/contract.py` and `worker.py` for
 the precise fields. Tensor artifacts are trusted local Python/PyTorch artifacts, not an untrusted
 network interchange format.
+
+The shared worker also writes optional `auxiliary_calls` entries as
+`{"key": [role, label], "record": {...}}`. Roles are `__baseline__`, `__effect__`, and
+`batched_perprompt`; the second key is the regime for the first two and case label for the last.
+These records preserve supporting-call settings and errors independently of task verdicts.
+Independent workers may omit this field or supply an empty list.
+
+Malformed input and spec-restoration failures also produce an atomic `result.json` with
+`status: "failed"` and an error. Experiment identity is included only after its checksum has
+been verified. These failures publish no successful tensor artifact and exit nonzero.
 
 The launcher records actual image ID, source content checksum/commit, exit status and isolated
 Compose project in `execution.json`, and captures `execution.log` and `cleanup.log`. Source changes

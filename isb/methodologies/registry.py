@@ -21,6 +21,7 @@ intervention code genuinely differs (the case worth keeping explicit).
 from __future__ import annotations
 
 import functools
+import inspect
 
 from ..profiles import PROFILES
 
@@ -57,8 +58,11 @@ def get_cell(methodology: str, family: str, backend: str):
             view = profile.for_backend(backend)         # engine view (e.g. a vLLM wrapper prefix)
 
             @functools.wraps(generic)                   # callers can reach the shared underlying fn
-            def bound(be, model, prompts, **params):    # bind the family's profile as `m`
-                return generic(be, model, view, prompts, **params)
+            def bound(be, model, prompts, *args, **params):    # bind the family's profile as `m`
+                return generic(be, model, view, prompts, *args, **params)
+            signature = inspect.signature(generic)
+            bound.__signature__ = signature.replace(
+                parameters=[p for i, p in enumerate(signature.parameters.values()) if i != 2])
             fn = bound
     return fn
 

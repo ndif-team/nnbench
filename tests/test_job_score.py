@@ -6,12 +6,12 @@ import torch
 
 from isb.jobs import contract
 from isb.jobs.score import score_experiment
-from isb.sweep.spec import BaselineSpec, CellConfig, Workload
+from isb.sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
 
 
 def artifacts(tmp_path, *, batched=False):
     spec = CellConfig("tiny", "logit_lens", "gpt2", "test/model",
-                      [Workload("batched" if batched else "interactive", ["a"])],
+                      [ExecutionRegime("batched" if batched else "interactive", ["a"])],
                       [({}, "task")], BaselineSpec({}), warmup=0, n_trials=1)
     directory = tmp_path / "experiment"
     experiment = contract.prepare(spec, directory)

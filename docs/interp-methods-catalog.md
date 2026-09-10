@@ -174,19 +174,22 @@ backend column is reserved, no rows now), deprecated iteration forms, non-greedy
 
 ### Protocol index and nnbench execution details
 
-The authoritative methodology templates, parameter classifications, and case specialization
-live in [isb/protocol.py](../isb/protocol.py): `PROTOCOLS` defines the templates and
-`describe_task()` derives concrete case requirements. The method summaries below explain the
-scientific procedures and their coverage; the Python definitions own the executable-spec inventory.
+The authoritative methodology templates and parameter classifications live in
+[isb/protocol.py](../isb/protocol.py): `PROTOCOLS` holds one `InterventionSpec` per methodology.
+Case-description hooks live beside the implementations in
+[isb/methodologies/requirements.py](../isb/methodologies/requirements.py).
+The method summaries below explain the scientific procedures and their coverage; the Python
+definitions own the executable-spec inventory.
 
 Semantic parameters specify the computation: ablation's `target` chooses the component being
 ablated, and DAS's `train` selects training or application. Realization parameters specify the
 implementation spelling, such as `residual` or bounded iteration. Extensions identify behavior
 outside CausaLab v1. The Level-0/1/1.5 vocabulary above supports engine-failure diagnosis.
 
-Saved provenance contains each case's semantic and realization values and its effective protocol.
-For example, DAS application (`train=0`) requires forward execution, while training also requires
-gradients. `protocol_coverage` identifies described methods and explicitly opted-out experiments.
+Saved call records contain effective parameters, semantic/realization values, and the described
+requirements. For example, DAS application (`train=0`) is gradient-free while training requires
+gradients. `protocol_scope` distinguishes concrete cases from template-only descriptions;
+`protocol_coverage` distinguishes described, explicitly opted-out, and legacy-unknown metadata.
 
 Status: ✓ = already an nnbench cell. **frontier** = exercises a primitive where vLLM and HF diverge
 (the highest-signal additions).
@@ -212,7 +215,7 @@ Status: ✓ = already an nnbench cell. **frontier** = exercises a primitive wher
 | **Generation-time steering** | the steering write applied at EVERY decode step of a greedy generation, per-step logits read | base · `block_output` + `lm_head` · read, write / `add_scaled` · prompt + generated · `generate`, `full_logits`; bounded/unbounded and decode-step-write extension | any decoder-only LM; vLLM needs the bounded `iter[0:N]` realization | ✓ — **composition confirmed** (write × bounded-iter SUPPORTED on vLLM, top1=1.00 tv=0.000; unbounded = the unbounded-iteration saves-drop frontier marker; a direct step-lift law test — base vs lifted on one backend — is queued) |
 | **Generation-time cross-prompt patching** | the cross-prompt transplant injected at prefill, scored on the generated tokens (the causalab `locate` footprint) | base + counterfactual · `block_output` + `lm_head` · read, write / `swap` · prompt + generated · `paired_forward`, `generate`, `full_logits`; bounded/unbounded realization | any transformer; length-matched pair; vLLM needs bounded `iter[0:N]` | ✓ — **composition confirmed at fp32** (transplant step-lifts correctly); bf16 forks the whole greedy trajectory (top1=0.00 tv=0.711, SUPPORTED_DEGRADED) — precision compounding, NOT a mechanism bug |
 | **Attribution patching** | gradient linear-approx of patching for *every* component in one fwd+bwd | base + counterfactual · `block_output` + `lm_head` · read, grad · prompt · `grad`; activation-gradient extension | any differentiable model | ✓ — **frontier confirmed** (`grad`: vLLM ERROR — the no-autograd-on-vLLM result) |
-| **Path patching** | patch specific component→component *edges* (not whole activations) | base + counterfactual · `attention_value` + `block_input` + `attention_output` + `lm_head` · read, write / `swap` · prompt · `paired_forward` | any transformer; more plumbing | TODO (composite; the rewiring edge has no measuring cell) |
+| **Path patching** | patch specific component→component *edges* (not whole activations) | base + counterfactual · `attention_premix` + `block_input` + `attention_output` + `lm_head` · read, write / `swap` · prompt · `paired_forward` | any transformer; more plumbing | TODO (composite; the rewiring edge has no measuring cell) |
 
 ## 3. Decomposing representations into features
 

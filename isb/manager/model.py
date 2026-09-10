@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 
 from ..runfile import INBOX, load_run
+from ..runs import procedure, spec_coordinates, upgrade_coordinates
 
 _PASS = {"SUPPORTED", "SUPPORTED_DEGRADED", "EQUIVALENT", "EQUIVALENT_DEGRADED"}
 
@@ -29,7 +30,10 @@ def _load_cached(dir_path: str, name: str):
     if summary.get("artifact_stat") != [artifact.st_size, artifact.st_mtime_ns]:
         raise ValueError("legacy artifact changed after import")
     meta = {tuple(key): value for key, value in summary["metadata"]}
-    return {("__meta__",): meta, ("perf_rows",): summary.get("perf_rows", [])}, summary["provenance"]
+    provenance = summary["provenance"]
+    if "coordinates" in provenance:
+        provenance["coordinates"] = upgrade_coordinates(provenance["coordinates"])
+    return {("__meta__",): meta, ("perf_rows",): summary.get("perf_rows", [])}, provenance
 
 
 def load_dir(dir_path: str) -> dict[str, tuple[dict, dict]]:
@@ -67,10 +71,9 @@ def baselines_of(dir_path: str, entries: dict) -> dict[str, str]:
 
 
 def comparable(prov: dict, base_prov: dict) -> bool:
-    """A run gets verdicts only when it ran the baseline's spec on the baseline's data."""
-    c, b = prov["coordinates"], base_prov["coordinates"]
-    return all(c.get(k) == b.get(k) for k in
-               ("spec", "data", "repo", "family", "methodology", "workloads", "tasks"))
+    """Both records must establish complete matching procedure identity."""
+    candidate = procedure(prov["coordinates"])
+    return candidate is not None and candidate == procedure(base_prov["coordinates"])
 
 
 def dir_results(dir_path: str, entries: dict, baselines: dict[str, str]):
@@ -98,8 +101,18 @@ def import_legacy(dir_path: str):
     for name, (out, prov) in entries.items():
         base = baselines.get(spec_of(prov))
         spec = SPECS.get(prov["coordinates"]["spec"].split("@")[0])
-        rows = None
-        if spec is not None and base and comparable(prov, entries[base][1]):
+        rows, comparison_error = None, None
+        recorded = procedure(prov["coordinates"])
+        current = procedure(spec_coordinates(spec, "unknown")) if spec is not None else None
+        if probe_results(out) or out.get(("perf_rows",)):
+            pass  # Primitive self-checks and performance rows already carry their measured states.
+        elif recorded is None:
+            comparison_error = "Historical procedure identity is incomplete; no automatic comparison was made."
+        elif current != recorded:
+            comparison_error = "The current spec does not match the saved procedure; no automatic comparison was made."
+        elif base and not comparable(prov, entries[base][1]):
+            comparison_error = "The reference procedure is incomplete or different; no automatic comparison was made."
+        elif base:
             scored = score_runs(spec, dir_path, name, None if name == base else base, quiet=True)
             rows = [{"label": c.label, "workload": c.workload, "state": c.state,
                      "error": c.error, "metrics": c.metrics,
@@ -107,6 +120,7 @@ def import_legacy(dir_path: str):
                     for c in scored]
         write_json(Path(dir_path) / f"{name}.summary.json", {
             "version": 1, "provenance": prov, "reference": base, "cells": rows,
+            "comparison_error": comparison_error,
             "metadata": [[list(k), v] for k, v in out[("__meta__",)].items()],
             "perf_rows": out[("perf_rows",)], "legacy": True,
             "artifact_stat": [(Path(dir_path) / f"{name}.pt").stat().st_size,
@@ -206,6 +220,8 @@ def perf_points(entries: dict, run_names: list[str]) -> list[dict]:
         for k, m in meta.items():
             if not (isinstance(k, tuple) and len(k) == 2) or m.get("error"):
                 continue
+            if k[0] in {"__baseline__", "__effect__", "batched_perprompt"}:
+                continue
             if m.get("median_latency_ms") is None or m.get("overhead_vs_baseline") is None:
                 continue
             pts.append({"run": name, "regime": k[0], "label": k[1],
@@ -294,6 +310,8 @@ class Collection:
                 summary = read_json(root / f"{name}.summary.json")
                 result = cells(summary["cells"]) if summary.get("cells") is not None else None
                 self.entries[name], self.results[name] = entry, result
+                if summary.get("comparison_error"):
+                    self.warnings.append(f"{name}: {summary['comparison_error']}")
                 if summary.get("reference") == name:
                     self.baselines[spec_of(self.entries[name][1])] = name
             except (OSError, ValueError, KeyError, TypeError) as error:

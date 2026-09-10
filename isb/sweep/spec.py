@@ -1,13 +1,12 @@
 """Declarative benchmark spec (design.md §12): one CellConfig per methodology.
 
 ``InterventionSpec`` describes the methodology; ``ExecutionRegime`` describes its inputs;
-``TaskSpec`` separates semantic parameters from realization selectors. Python specs bind these
-descriptions to explicit cells, a model, and the execution settings consumed by the Docker worker.
+``TaskSpec`` names one case and the params its cell receives. Python specs bind these to explicit
+cells, a model, and the execution settings the Docker worker consumes.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from copy import deepcopy
 from typing import Optional
 
 from ..protocol import InterventionSpec, protocol_for
@@ -15,7 +14,7 @@ from ..protocol import InterventionSpec, protocol_for
 
 @dataclass
 class ExecutionRegime:
-    """An input regime. Batching is a coverage axis (it can change correctness), so each regime is
+    """An input regime. Batching is a coverage axis (it can change correctness), so each workload is
     oracle-checked in its own regime, not just timed.
 
     `prompts` is either a literal unit list (the bespoke single-trace specs) or a `DataRef` naming a
@@ -72,41 +71,13 @@ class EffectSpec:
     top1_ceiling: float = 0.5
 
 
-@dataclass(frozen=True)
+@dataclass
 class TaskSpec:
-    """One benchmark case: protocol semantics × one backend realization.
-
-    ``params`` returns an independently owned copy of the values passed to the explicit cell.
-    The namespaces remain editable during spec authoring; coordinate snapshots own their values.
-    The split is persisted in run provenance for later cataloging.
-    """
-
+    """One benchmark case: a label and the params its cell receives. The run records the params a
+    call actually ran with, split by the methodology's protocol into semantics and realization
+    spelling (isb/sweep/execute.py); the spec stores only what the author wrote."""
     label: str
-    semantics: dict = field(default_factory=dict)
-    realization: dict = field(default_factory=dict)
-
-    def __post_init__(self):
-        overlap = set(self.semantics) & set(self.realization)
-        if overlap:
-            raise ValueError(f"task params cannot be both semantic and realization: {sorted(overlap)}")
-        object.__setattr__(self, "semantics", deepcopy(self.semantics))
-        object.__setattr__(self, "realization", deepcopy(self.realization))
-
-    @property
-    def params(self) -> dict:
-        return deepcopy({**self.semantics, **self.realization})
-
-    def coordinate(self) -> dict:
-        return {
-            "label": self.label,
-            "semantics": deepcopy(self.semantics),
-            "realization": deepcopy(self.realization),
-        }
-
-    def __iter__(self):
-        """Compatibility with the former ``(params, label)`` task tuple."""
-        yield self.params
-        yield self.label
+    params: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -116,7 +87,7 @@ class CellConfig:
     family: str
     repo: str
     regimes: list[ExecutionRegime]
-    tasks: list[TaskSpec | tuple]
+    tasks: list                                 # [TaskSpec] or [(params, label)]; normalized to TaskSpec
     baseline: BaselineSpec
     effect: Optional[EffectSpec] = None         # None for read methodologies (no write to guard)
     dtype_control: str = "float32"              # control precision for the SILENTLY_WRONG-vs-DEGRADED re-check
@@ -124,30 +95,28 @@ class CellConfig:
     n_trials: int = 7
     hf_kwargs: dict = field(default_factory=dict)
     vllm_kwargs: dict = field(default_factory=dict)
-    protocol: InterventionSpec | None = None
-    protocol_absence_reason: str | None = None
+    protocol: InterventionSpec | None = None    # defaults to the methodology's PROTOCOLS entry
+    protocol_absence_reason: str | None = None  # required when no protocol describes the methodology
+    protocol_source: str = field(default="authored", compare=False, repr=False)
 
     def __post_init__(self):
-        if self.protocol is None:
+        if self.protocol_source not in {"authored", "restored", "legacy"}:
+            raise ValueError(f"unknown protocol source {self.protocol_source!r}")
+        if self.protocol_source == "legacy" and self.protocol is not None:
+            raise ValueError("legacy protocol coverage must have no descriptor")
+        if self.protocol_source == "authored" and self.protocol is None:
             self.protocol = protocol_for(self.methodology)
         self.protocol_coverage()
-        normalized = []
-        for task in self.tasks:
-            if isinstance(task, TaskSpec):
-                if self.protocol is not None:
-                    semantics, realization = self.protocol.classify(task.params)
-                    if semantics != task.semantics or realization != task.realization:
-                        raise ValueError(
-                            f"task {task.label!r} does not follow the protocol parameter split")
-                normalized.append(task)
-                continue
-            params, label = task
-            if self.protocol is None:
-                semantics, realization = dict(params), {}
-            else:
-                semantics, realization = self.protocol.classify(params)
-            normalized.append(TaskSpec(label=label, semantics=semantics, realization=realization))
-        self.tasks = normalized
+        self.tasks = [t if isinstance(t, TaskSpec) else TaskSpec(label=t[1], params=t[0])
+                      for t in self.tasks]
+        if self.protocol is not None and self.protocol_source == "authored":
+            # Every param a spec passes must be one the protocol names, loud at import; baseline
+            # and effect params are cell calls too.
+            declared = [t.params for t in self.tasks] + [self.baseline.params]
+            if self.effect is not None:
+                declared += [self.effect.baseline_params, self.effect.perturbed_params]
+            for params in declared:
+                self.protocol.classify(params)
 
     def protocol_coverage(self) -> dict:
         """Validate and describe this spec's explicit metadata coverage policy."""
@@ -155,18 +124,14 @@ class CellConfig:
             if self.protocol_absence_reason is not None:
                 raise ValueError("described methods cannot supply protocol_absence_reason")
             return {"status": "described"}
-        if protocol_for(self.methodology) is not None:
+        if self.protocol_source == "authored" and protocol_for(self.methodology) is not None:
             raise ValueError(f"built-in methodology {self.methodology!r} requires a protocol")
         reason = self.protocol_absence_reason
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError(f"methodology {self.methodology!r} requires a protocol descriptor "
                              "or an explicit protocol_absence_reason")
-        return {"status": "undescribed", "reason": reason}
-
-    @property
-    def workloads(self):
-        """Compatibility view for downstream notebooks; new code should say ``regimes``."""
-        return self.regimes
+        return {"status": "legacy" if self.protocol_source == "legacy" else "undescribed",
+                "reason": reason}
 
 
 def spec_with_data(spec: CellConfig, ref) -> CellConfig:
@@ -198,8 +163,3 @@ def spec_with_data(spec: CellConfig, ref) -> CellConfig:
                                            data_knobs=dict(knobs), data_name=ref.name))
     return dataclasses.replace(
         spec, name=f"{spec.name}@{ref.name.replace('/', '-')}", regimes=rebound)
-
-
-# Transitional import compatibility for code that imports the former class name. New CellConfig
-# declarations use the deliberately separate ``regimes`` field.
-Workload = ExecutionRegime

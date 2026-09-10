@@ -113,16 +113,13 @@ def _write_run_file(plan: list[Config], rows: list[dict], run_dir: str, name: st
     """One run file per sweep (methodology "perf_micro"): the rows as outputs, the launcher's
     resolved provenance, and the per-system env pythons the cells actually ran under."""
     from isb.runfile import save_run
-    from isb.runs import EngineConfig, RunConfig, resolve_provenance
+    from isb.runs import EngineConfig, RunConfig, resolve_provenance, run_coordinates
 
     prov = resolve_provenance(RunConfig(engine=EngineConfig("vllm")))
-    prov["coordinates"] = {
-        "spec": name, "methodology": "perf_micro", "family": "-",
-        "repo": ", ".join(sorted({c.repo for c in plan})),
-        "data": [], "regimes": [],
-        "tasks": [r["cell"] for r in rows],
-        "interface": "perf",
-    }
+    prov["coordinates"] = run_coordinates(
+        spec=name, methodology="perf_micro", family="-",
+        repo=", ".join(sorted({c.repo for c in plan})), interface="perf",
+        cases=[{"label": r["cell"]} for r in rows])
     prov["perf_envs"] = {s: _env_for(s)[0] for s in sorted({c.system for c in plan})}
     return save_run(run_dir, name, {("perf_rows",): rows, ("__meta__",): {}}, prov)
 

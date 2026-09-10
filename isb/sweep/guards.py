@@ -9,6 +9,8 @@ control outputs.
 """
 from __future__ import annotations
 
+import math
+
 from ..oracle.equivalence import compare
 
 
@@ -17,6 +19,14 @@ def compute_effect_size(baseline_value, perturbed_value, *, tv_floor: float = 0.
     """Strong iff the perturbation flips the control's top-1 (top1_agree < top1_ceiling) OR shifts
     the distribution well past the oracle tolerance (tv > tv_floor). A weak result means a backend
     that silently dropped the write could pass the oracle vacuously — flag it."""
+    import torch
+
+    for side, value in (("baseline", baseline_value), ("perturbed", perturbed_value)):
+        if (not isinstance(value, torch.Tensor) or value.numel() == 0
+                or not torch.isfinite(value).all().item()):
+            raise ValueError(f"effect {side} must be a nonempty finite tensor")
     m = compare(baseline_value, perturbed_value)
+    if not m["shape_match"] or not all(math.isfinite(m[k]) for k in ("top1_agree", "tv")):
+        raise ValueError("effect outputs must have comparable shapes and finite metrics")
     strong = m["top1_agree"] < top1_ceiling or m["tv"] > tv_floor
     return {"top1_agree": m["top1_agree"], "tv": m["tv"], "strong": strong}

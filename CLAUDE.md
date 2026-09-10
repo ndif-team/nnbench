@@ -36,7 +36,15 @@ vLLM EngineCore uses spawn: every entrypoint must run under an `if __name__ == "
 
 ## Architecture
 
-The core unit is a **cell**: one explicit function per `(methodology, family, backend)`, registered with `@cell(...)` in `isb/methodologies/` (registry in `isb/methodologies/registry.py`). `InterventionSpec` supplies CausaLab-aligned semantic metadata, `TaskSpec` separates semantic params from realization selectors, and `ExecutionRegime` owns interactive/batched/generation input shape. Their merged runtime params still enter the explicit cell unchanged. This flatness is deliberate — an earlier "Resolver" abstraction that *generated* intervention code from declarations was killed (design.md §11–12); protocol metadata only indexes cells and provenance. Do not turn it into a construction layer. Every `vllm_*` variant cell (`vllm_serve`, `vllm_sync`, `vllm_pp`, …) falls back to the `vllm_async` cell automatically (same intervention code; the variant difference — over-HTTP, in-process-sync, pipeline/tensor-parallel — lives entirely in the backend object).
+The core unit is a **cell**: an explicit function for `(methodology, family, backend)`, registered
+with `@cell(...)` in `isb/methodologies/`. `TaskSpec` holds a case label and params;
+`ExecutionRegime` owns the input shape; the torch-free `InterventionSpec` template classifies
+semantic values and realization selectors. The worker binds effective params to the resolved
+cell signature, records case requirements through `methodologies/requirements.py`, and gives
+each invocation fresh nested values prepared outside the timer. Protocol metadata indexes cells
+and provenance. Backend selection belongs to the independent Compose launcher. A `vllm_*`
+variant falls back to the `vllm_async` cell when no exact registration exists. Current contracts
+and acceptance checks live in `docs/design.md` §12.13.
 
 Main data flow: `scripts/bench.py` → frozen experiment/inputs → `backends/NAME/run.py` in its
 own Compose project → validated artifacts → `isb/jobs/score.py`. The shared nnsight worker reuses

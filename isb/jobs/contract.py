@@ -7,7 +7,10 @@ import os
 from dataclasses import asdict
 from pathlib import Path
 
-VERSION = 1
+VERSION = 2            # experiment/result files this code writes
+VERSIONS = (1, 2)      # experiment/result files this code reads (1: `workloads` + task tuples)
+PLAN_VERSION = 1       # the launcher's plan.json / report.json
+LEGACY_PROTOCOL_REASON = "Legacy experiment predates explicit protocol coverage"
 
 
 def pack(value):
@@ -55,38 +58,37 @@ def write_json(path, value):
 
 
 def prepare(spec, directory, *, seed=0):
-    """Materialize the experiment once; containers never look up a spec or dataset."""
+    """Materialize the experiment once; containers never look up a spec or dataset. The spec
+    record is the dataclass as written: regimes, tasks as {label, params}, the protocol template
+    and, for an undescribed methodology, its absence reason. All of it is covered by the id."""
     directory = Path(directory)
-    coverage = spec.protocol_coverage()
+    spec.protocol_coverage()                       # re-validate: specs are editable after construction
     record = asdict(spec)
-    # Keep the version-1 execution wire format understood by independent backend workers.
-    # The richer Python types travel as optional, identity-covered description metadata.
-    description = {"protocol_template": record.pop("protocol"), "tasks": record.pop("tasks"),
-                   "protocol_coverage": coverage}
-    record.pop("protocol_absence_reason")
-    record["workloads"] = record.pop("regimes")
-    record["tasks"] = [(task.params, task.label) for task in spec.tasks]
+    # Authored/restored validation policy is in-memory. The legacy marker preserves genuinely
+    # missing historical metadata when an old recipe is submitted as a new v2 job.
+    if record.get("protocol_source") != "legacy":
+        record.pop("protocol_source", None)
     if not spec.regimes:
         raise ValueError("experiment must contain a workload")
     records = []
     kinds = set()
-    labels = [task.label for task in spec.tasks]
+    labels = [task["label"] for task in record["tasks"]]
     if not labels or not all(isinstance(label, str) and label for label in labels) or len(set(labels)) != len(labels):
         raise ValueError("task labels must be nonempty and unique")
-    for index, workload in enumerate(record["workloads"]):
-        if workload["kind"] in kinds:
+    for index, regime in enumerate(record["regimes"]):
+        if regime["kind"] in kinds:
             raise ValueError("duplicate workload kinds would collide in output cell keys")
-        kinds.add(workload["kind"])
-        units = workload.pop("prompts")
+        kinds.add(regime["kind"])
+        units = regime.pop("prompts")
         if not units:
             raise ValueError("empty workload")
-        workload["units"] = len(units)
+        regime["units"] = len(units)
         records.extend({"workload": index, "unit": pack(unit)} for unit in units)
     if spec.n_trials < 1 or spec.warmup < 0:
         raise ValueError("n_trials must be positive and warmup nonnegative")
     inputs = b"".join(canonical(row) + b"\n" for row in records)
     experiment = {"version": VERSION, "spec": pack(record), "seed": seed,
-                  "inputs_sha256": digest(inputs), "description": pack(description)}
+                  "inputs_sha256": digest(inputs)}
     experiment["id"] = digest(canonical(experiment))
     directory.mkdir(parents=True, exist_ok=False)
     (directory / "inputs.jsonl").write_bytes(inputs)
@@ -94,69 +96,129 @@ def prepare(spec, directory, *, seed=0):
     return experiment
 
 
+def check_experiment(experiment):
+    """Identity check shared by every reader of an experiment.json."""
+    if not isinstance(experiment, dict):
+        raise ValueError("experiment must be a JSON object")
+    body = {k: v for k, v in experiment.items() if k != "id"}
+    if (type(experiment.get("version")) is not int or experiment["version"] not in VERSIONS
+            or digest(canonical(body)) != experiment.get("id")):
+        raise ValueError("invalid experiment version or checksum")
+
+
 def read_experiment(directory):
     directory = Path(directory)
     experiment = json.loads((directory / "experiment.json").read_text())
-    body = {k: v for k, v in experiment.items() if k != "id"}
-    if experiment.get("version") != VERSION or digest(canonical(body)) != experiment.get("id"):
-        raise ValueError("invalid experiment version or checksum")
+    check_experiment(experiment)
     if file_digest(directory / "inputs.jsonl") != experiment["inputs_sha256"]:
         raise ValueError("input checksum mismatch")
     return experiment
 
 
+def wire_spec(experiment):
+    """Return the frozen spec in the current shape without changing experiment identity.
+
+    Version one has two historical forms: executable tuples alone, and those same tuples plus
+    identity-covered protocol/task descriptions. The saved description owns the latter's
+    metadata. A description-free record keeps its missing metadata visible, including when
+    today's protocol table happens to contain its methodology.
+    """
+    if type(experiment.get("version")) is not int or experiment["version"] not in VERSIONS:
+        raise ValueError("unsupported experiment version")
+    record = unpack(experiment["spec"])
+    if not isinstance(record, dict):
+        raise ValueError("experiment spec must be an object")
+    source = record.get("protocol_source", "restored")
+    if source not in {"authored", "restored", "legacy"}:
+        raise ValueError("invalid saved protocol source")
+    record["protocol_source"] = "legacy" if source == "legacy" else "restored"
+    if experiment["version"] == 1:
+        record["regimes"] = record.pop("workloads")
+        record["tasks"] = [{"label": label, "params": params} for params, label in record["tasks"]]
+        if "description" in experiment:
+            description = unpack(experiment["description"])
+            if not isinstance(description, dict):
+                raise ValueError("invalid experiment description")
+            template = description["protocol_template"]
+            described_tasks = []
+            for task in description["tasks"]:
+                semantics, realization = task.get("semantics", {}), task.get("realization", {})
+                if not isinstance(semantics, dict) or not isinstance(realization, dict):
+                    raise ValueError("invalid task description parameters")
+                if semantics.keys() & realization.keys():
+                    raise ValueError("task description parameters overlap")
+                described_tasks.append({"label": task["label"], "params": {**semantics, **realization}})
+            if described_tasks != record["tasks"]:
+                raise ValueError("task description does not match executable parameters")
+            record["protocol"] = template
+            coverage = description.get("protocol_coverage")
+            if "protocol_coverage" not in description:
+                # The earliest descriptions predate explicit coverage. A saved template still
+                # describes the method; absent templates carry no known opt-out policy.
+                record["protocol_absence_reason"] = None if template is not None else LEGACY_PROTOCOL_REASON
+                if template is None:
+                    record["protocol_source"] = "legacy"
+            elif coverage == {"status": "described"} and template is not None:
+                record["protocol_absence_reason"] = None
+            elif (isinstance(coverage, dict) and coverage.get("status") == "undescribed"
+                  and set(coverage) == {"status", "reason"} and template is None
+                  and isinstance(coverage["reason"], str) and coverage["reason"].strip()):
+                record["protocol_absence_reason"] = coverage["reason"]
+            else:
+                raise ValueError("protocol coverage does not match descriptor")
+        else:
+            record["protocol"] = None
+            record["protocol_absence_reason"] = LEGACY_PROTOCOL_REASON
+            record["protocol_source"] = "legacy"
+    if not isinstance(record.get("tasks"), list) or not isinstance(record.get("regimes"), list):
+        raise ValueError("experiment requires task and regime lists")
+    labels = [task["label"] for task in record["tasks"]]
+    if not labels or not all(isinstance(label, str) and label for label in labels) or len(set(labels)) != len(labels):
+        raise ValueError("task labels must be nonempty and unique")
+    if any(not isinstance(task.get("params"), dict) for task in record["tasks"]):
+        raise ValueError("task parameters must be objects")
+    kinds = [regime["kind"] for regime in record["regimes"]]
+    if not kinds or len(kinds) != len(set(kinds)):
+        raise ValueError("experiment requires unique nonempty regimes")
+    return record
+
+
 def restore_spec(directory):
-    from isb.protocol import InterventionSpec, protocol_for
+    from isb.protocol import InterventionSpec
     from isb.sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime, TaskSpec
 
     experiment = read_experiment(directory)
-    record = unpack(experiment["spec"])
-    workloads = record.pop("workloads")
-    units = [[] for _ in workloads]
+    record = wire_spec(experiment)
+    regimes = record.pop("regimes")
+    units = [[] for _ in regimes]
     for line in (Path(directory) / "inputs.jsonl").read_text().splitlines():
         row = json.loads(line)
-        units[row["workload"]].append(unpack(row["unit"]))
-    for index, workload in enumerate(workloads):
-        if workload.pop("units") != len(units[index]):
+        index = row["workload"]
+        if type(index) is not int or not 0 <= index < len(regimes):
+            raise ValueError("input workload index is out of range")
+        units[index].append(unpack(row["unit"]))
+    for index, regime in enumerate(regimes):
+        if regime.pop("units") != len(units[index]):
             raise ValueError("workload input count mismatch")
-    record["regimes"] = [ExecutionRegime(prompts=u, **w) for w, u in zip(workloads, units)]
-    coverage = None
-    if "description" in experiment:
-        description = unpack(experiment["description"])
-        template = description["protocol_template"]
-        record["protocol"] = InterventionSpec(**template) if template is not None else None
-        tasks = [TaskSpec(**task) for task in description["tasks"]]
-        if [(task.params, task.label) for task in tasks] != record["tasks"]:
-            raise ValueError("task description does not match executable parameters")
-        record["tasks"] = tasks
-        coverage = description.get("protocol_coverage")
-        if "protocol_coverage" in description:
-            if not isinstance(coverage, dict):
-                raise ValueError("invalid protocol coverage")
-            if coverage.get("status") == "undescribed":
-                record["protocol_absence_reason"] = coverage.get("reason")
-            elif coverage != {"status": "described"} or template is None:
-                raise ValueError("invalid protocol coverage")
-    if coverage is None and record.get("protocol") is None and protocol_for(record["methodology"]) is None:
-        record["protocol_absence_reason"] = "Legacy experiment predates explicit protocol coverage"
+    record["regimes"] = [ExecutionRegime(prompts=u, **w) for w, u in zip(regimes, units)]
+    record["tasks"] = [TaskSpec(**task) for task in record["tasks"]]
+    if record["protocol"] is not None:
+        record["protocol"] = InterventionSpec(**record["protocol"])
     record["baseline"] = BaselineSpec(**record["baseline"])
     if record["effect"] is not None:
         record["effect"] = EffectSpec(**record["effect"])
-    spec = CellConfig(**record)
-    if coverage is not None and spec.protocol_coverage() != coverage:
-        raise ValueError("protocol coverage does not match descriptor")
-    return spec, experiment
+    return CellConfig(**record), experiment
 
 
 def expected_cells(experiment):
-    spec = unpack(experiment["spec"])
-    return {(w["kind"], label) for w in spec["workloads"] for _, label in spec["tasks"]}
+    spec = wire_spec(experiment)
+    return {(w["kind"], task["label"]) for w in spec["regimes"] for task in spec["tasks"]}
 
 
 def validate_result(directory, experiment, backend):
     directory = Path(directory)
     result = json.loads((directory / "result.json").read_text())
-    if (result.get("version") != VERSION or result.get("status") != "completed"
+    if (result.get("version") not in VERSIONS or result.get("status") != "completed"
             or result.get("experiment_id") != experiment["id"]
             or result.get("backend") != backend
             or result.get("inputs_sha256") != experiment["inputs_sha256"]):

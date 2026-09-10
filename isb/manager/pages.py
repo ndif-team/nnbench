@@ -5,6 +5,7 @@ forget."""
 from __future__ import annotations
 
 import json
+import math
 import re
 import textwrap
 
@@ -184,6 +185,23 @@ def _abridge(src: str, max_lines: int = 12) -> str:
     return "\n".join(body)
 
 
+def _effect_summary(effect: dict) -> str:
+    """A supporting call can fail before effect metrics exist, including in historical files."""
+    if not isinstance(effect, dict):
+        return "effect metrics unavailable"
+    failed_sides = [f"{side}: {effect[side]['error']}" for side in ("baseline", "perturbed")
+                    if isinstance(effect.get(side), dict) and effect[side].get("error")]
+    errors = ([str(effect["error"])] if effect.get("error") else []) + failed_sides
+    if errors:
+        return "effect check failed: " + "; ".join(errors)
+    metrics = [effect.get(key) for key in ("top1_agree", "tv")]
+    if not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+               and math.isfinite(value) for value in metrics):
+        return "effect metrics unavailable"
+    status = ", strong" if effect.get("strong") is True else ", weak" if effect.get("strong") is False else ""
+    return f"effect size: top1={metrics[0]:.2f}, tv={metrics[1]:.3f}{status}"
+
+
 def _cell_rows(col: Collection, name: str, cells) -> list[list[str]]:
     """The uniform variant x regime rows for one run. The baseline's rows carry a BASELINE mark
     where a verdict would sit: nothing exists to compare the reference against."""
@@ -197,9 +215,7 @@ def _cell_rows(col: Collection, name: str, cells) -> list[list[str]]:
         lat = fmt_ms(c.latency_s * 1000 if c.latency_s is not None else None)
         rows.append([esc(c.label), esc(c.workload), state, mono(lat), mono(metric)])
     meta = col.load(name)[0].get(("__meta__",), {})
-    rows += [[esc("effect guard"), esc(k[1]), "", mono("-"),
-              mono(f"the intervention moves the control: top1={e['top1_agree']:.2f}, "
-                   f"tv={e['tv']:.3f}{', weak' if not e.get('strong') else ''}")]
+    rows += [[esc("effect guard"), esc(k[1]), "", mono("-"), mono(_effect_summary(e))]
              for k, e in sorted(meta.items(), key=str)
              if isinstance(k, tuple) and len(k) == 2 and k[0] == "__effect__"]
     return rows

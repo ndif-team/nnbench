@@ -5,7 +5,7 @@ import json
 import math
 from pathlib import Path
 
-from .contract import read_experiment, unpack, validate_result, write_json
+from .contract import PLAN_VERSION, read_experiment, unpack, validate_result, write_json
 
 
 def _load(directory, experiment, backend):
@@ -114,7 +114,7 @@ def score_run(directory):
     reports = [score_experiment(directory / "experiments" / name, plan["backends"],
                                 plan["reference"], plan["comparison"])
                for name in plan["experiments"]]
-    report = {"version": 1, "run": directory.name, "experiments": reports}
+    report = {"version": PLAN_VERSION, "run": directory.name, "experiments": reports}
     write_json(directory / "report.json", report)
     for experiment in reports:
         for row in experiment["cells"]:

@@ -14,8 +14,9 @@ separate question studied by frameworks and benchmarks such as CausaLab, CausalG
 Each benchmark case separates three concerns:
 
 - `InterventionSpec`: intervention semantics and component-level requirements.
-- `TaskSpec`: semantic parameter values and realization selectors, such as residual spelling or
-  bounded iteration.
+- `TaskSpec`: a case label and the params its cell receives; the methodology's `InterventionSpec`
+  names which of them are semantic values and which are realization selectors, such as residual
+  spelling or bounded iteration.
 - `ExecutionRegime`: input units, interactive/batched/generation shape, decode length and aggregation.
 
 These descriptions index explicit cell implementations and their results. CausaLab's current
@@ -25,14 +26,23 @@ protocol/engine stack supplies the shared vocabulary. The checked-in
 including canonical component names and deprecated aliases. Pyvene and nnterp are historical
 context; neither is a runtime dependency of this alignment.
 
-Concrete cases record effective semantic and realization values, component read/write
-requirements, and the vocabulary reference in provenance. Vocabulary membership establishes a
+The worker binds the final settings to each cell's Python signature, including its defaults.
+Case-description hooks beside the method code record concrete read/write/gradient requirements;
+custom or historical descriptions without a matching hook retain explicit template-level scope.
+Cases record these descriptions, effective semantic and realization values, and the vocabulary
+reference with their results. Vocabulary membership establishes a
 valid name; measured backend coverage comes from benchmark runs. nnbench extensions identify
 behavior beyond CausaLab's document contract, such as writes at every decode step.
 
 Custom methods supply an `InterventionSpec` or an explicit `protocol_absence_reason`. The worker
 isolates nested execution parameters and provenance snapshots, preparing trial configuration
 outside the timed interval. Legacy experiment descriptions remain readable.
+
+The version-2 job format stores one recipe. Readers preserve both earlier version-1 forms,
+including their saved descriptions and coverage reasons. Historical results with incomplete
+procedure identity remain viewable; automatic comparisons require matching input content and
+settings. The [current design and acceptance plan](docs/design.md#1213-current-execution-and-compatibility-contract)
+defines these boundaries and the extension points for methods and independent backend workers.
 
 See [the alignment audit](docs/causalab-portability-audit.md) for the current engine architecture,
 scope and update procedure. Verify the pinned source against a checkout at that revision:
@@ -138,9 +148,9 @@ cross-project numerical parity require separate runs.
 
 ```text
 isb/
-  protocol.py              methodology descriptions and concrete case requirements
+  protocol.py              torch-free methodology templates and parameter classifications
   causalab_vocabulary.json pinned upstream vocabulary and source checksums
-  methodologies/           explicit intervention cells
+  methodologies/           explicit cells and case-requirement description hooks
   backends/                model-access and execution infrastructure
   specs/                   benchmark case definitions
   sweep/                   spec types and shared cell execution; legacy scoring

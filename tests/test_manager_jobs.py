@@ -8,12 +8,12 @@ import pytest
 from isb.jobs.contract import prepare, write_json
 from isb.manager import Collection, dispatch, export_html
 from isb.manager.model import archive, discard, _rename_exclusive
-from isb.sweep.spec import BaselineSpec, CellConfig, Workload
+from isb.sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
 
 
 def bundle(parent, name="attempt", backends=("nnsight-hf", "custom-backend"), with_report=True):
     root = parent / name
-    spec = CellConfig("lens", "logit_lens", "gpt2", "model", [Workload("interactive", ["a"])],
+    spec = CellConfig("lens", "logit_lens", "gpt2", "model", [ExecutionRegime("interactive", ["a"])],
                       [({}, "task")], BaselineSpec({}))
     experiment = prepare(spec, root / "experiments" / "exp")
     plan = {"version": 1, "experiments": ["exp"], "backends": list(backends), "reference": backends[0],
@@ -54,6 +54,109 @@ def test_new_results_use_saved_verdicts_without_torch_load_or_scoring(tmp_path):
         page = export_html(str(root), str(tmp_path / "inbox"), items_per_source=1)
         assert "SILENTLY_WRONG" in page and "custom-backend" in page
         assert "<form" not in page
+
+
+def test_manager_preserves_executed_coordinates_and_call_records(tmp_path):
+    from isb.jobs.contract import wire_spec
+    from isb.runs import coordinate_config, run_coordinates
+
+    root = bundle(tmp_path)
+    experiment = json.loads((root / "experiments/exp/experiment.json").read_text())
+    spec = wire_spec(experiment)
+    path = root / "experiments/exp/custom-backend/result.json"
+    result = json.loads(path.read_text())
+    coords = run_coordinates(
+        spec=spec["name"], methodology=spec["methodology"], family=spec["family"], repo=spec["repo"],
+        interface="custom-interface", regimes=[{**r, "data": r.get("data_name")} for r in spec["regimes"]],
+        cases=spec["tasks"], protocol={"components": ["block_output"]},
+        protocol_coverage={"status": "described"}, inputs_sha256=experiment["inputs_sha256"],
+        config=coordinate_config(spec))
+    coords["extension"] = {"worker_detail": [1, 2]}
+    coords["regimes"][0]["cases"] = [{"label": "task", "protocol": {"operations": ["read"]}}]
+    call = {"params": {"layers": [1]}, "protocol": {"operations": ["read"]}}
+    result["provenance"]["coordinates"] = coords
+    result["cells"][0].update(call)
+    write_json(path, result)
+    col = Collection(str(root))
+    outputs, prov = col.entries["attempt/exp/custom-backend"]
+    assert prov["coordinates"] == coords
+    assert prov["submitted_coordinates"]["inputs_sha256"] == experiment["inputs_sha256"]
+    assert prov["submitted_coordinates"]["cases"] == spec["tasks"]
+    assert outputs[("__meta__",)][("interactive", "task")]["params"] == call["params"]
+    assert outputs[("__meta__",)][("interactive", "task")]["protocol"] == call["protocol"]
+
+
+def test_pending_job_has_frozen_submitted_identity(tmp_path):
+    from isb.jobs.contract import wire_spec
+    from isb.protocol import InterventionSpec
+
+    root = bundle(tmp_path, with_report=False)
+    directory = root / "experiments/exp/custom-backend"
+    (directory / "execution.json").unlink()
+    (directory / "result.json").unlink()
+    plan_path = root / "plan.json"
+    plan = json.loads(plan_path.read_text())
+    plan["status"] = "running"
+    write_json(plan_path, plan)
+    col = Collection(str(root))
+    _, prov = col.entries["attempt/exp/custom-backend"]
+    assert prov["coordinates"]["identity_complete"]
+    assert prov["coordinates"] == prov["submitted_coordinates"]
+    experiment = json.loads((root / "experiments/exp/experiment.json").read_text())
+    expected_protocol = InterventionSpec(**wire_spec(experiment)["protocol"]).coordinate()
+    assert prov["coordinates"]["protocol"] == expected_protocol
+    assert "vocabulary" in prov["coordinates"]["protocol"]
+    assert "required_capabilities" in prov["coordinates"]["protocol"]
+    assert col.results["attempt/exp/custom-backend"][0].state == "PENDING"
+
+
+def test_manager_rejects_unknown_worker_coordinate_schema(tmp_path):
+    root = bundle(tmp_path)
+    path = root / "experiments/exp/custom-backend/result.json"
+    result = json.loads(path.read_text())
+    result["provenance"]["coordinates"] = {"schema": 999}
+    write_json(path, result)
+    cell = Collection(str(root)).results["attempt/exp/custom-backend"][0]
+    assert cell.state == "JOB_FAILED" and "schema" in cell.error
+
+
+def test_manager_preserves_auxiliary_calls_without_adding_task_results(tmp_path):
+    from isb.manager.model import perf_points
+
+    root = bundle(tmp_path)
+    path = root / "experiments/exp/custom-backend/result.json"
+    result = json.loads(path.read_text())
+    supporting = [
+        {"key": ["__baseline__", "interactive"],
+         "record": {"params": {"layers": [1]}, "median_latency_ms": 1, "overhead_vs_baseline": 1}},
+        {"key": ["__effect__", "interactive"],
+         "record": {"strong": True, "baseline": {"params": {"alpha": 0}},
+                    "perturbed": {"params": {"alpha": 6}, "protocol": {"operations": ["write"]}}}},
+        {"key": ["batched_perprompt", "task"], "record": {"params": {"layers": [1]}}},
+    ]
+    result["auxiliary_calls"] = supporting
+    write_json(path, result)
+    col = Collection(str(root))
+    name = "attempt/exp/custom-backend"
+    outputs, prov = col.entries[name]
+    assert prov["auxiliary_calls"] == supporting
+    assert outputs[("__meta__",)][("__effect__", "interactive")] == supporting[1]["record"]
+    assert len(col.results[name]) == 1 and col.results[name][0].label == "task"
+    assert not perf_points(col.entries, [name])
+
+
+@pytest.mark.parametrize("auxiliary", [None, {}, [{"key": ["interactive", "task"], "record": {}}],
+                                      [{"key": ["__baseline__", "interactive"], "record": []}],
+                                      [{"key": ["__baseline__"], "record": {}}],
+                                      [{"key": ["__baseline__", "interactive"], "record": {}}] * 2])
+def test_manager_rejects_invalid_auxiliary_calls(tmp_path, auxiliary):
+    root = bundle(tmp_path)
+    path = root / "experiments/exp/custom-backend/result.json"
+    result = json.loads(path.read_text())
+    result["auxiliary_calls"] = auxiliary
+    write_json(path, result)
+    cell = Collection(str(root)).results["attempt/exp/custom-backend"][0]
+    assert cell.state == "JOB_FAILED" and "auxiliary" in cell.error
 
 
 def test_history_preserves_experiment_and_backend_identities(tmp_path):

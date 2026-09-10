@@ -6,40 +6,102 @@ file, <out_dir>/<run_name>.pt (isb/runfile.py), holding:
     outputs      {(regime_kind, label): cpu tensor} — every cell's warm output, plus
                  ("batched_perprompt", label): the per-prompt stack for each batched task, so ANY
                  run can later serve as the reference for a padded-batch comparison; plus
-                 ("__meta__",): per-cell perf/errors.
+                 ("__meta__",): per-cell perf/errors and the params each case ran with.
     provenance   the four-layer record (client/deployment/engine/host) plus the run's coordinates
-                 (spec, data sources, tasks) and, in release mode, the clean-environment findings
-                 the numbers were certified under.
+                 (isb/runs.py `run_coordinates`: spec, data sources, regimes, cases, protocol) and,
+                 in release mode, the clean-environment findings the numbers were certified under.
 
 Scoring is a SEPARATE, pure step (score.py) over any two such run files: execution never
 compares, so results can be re-scored, cross-compared, and audited without re-running.
 """
 from __future__ import annotations
 
+import inspect
 import traceback
 from copy import deepcopy
+from dataclasses import dataclass
 
 from ..methodologies.registry import get_cell
 from ..perf.timing import time_cell
-from ..protocol import describe_task
 from ..runfile import save_run
-from ..runs import RunConfig, cell_interface, make_backend, resolve_provenance
+from ..runs import RunConfig, cell_interface, make_backend, resolve_provenance, spec_coordinates
 from ..sweep.guards import compute_effect_size
 
 
 # ---- cell-call helpers (shared with tests; formerly the sweep driver's) -----------------------
 
-def _call_cell(name, impl, model, prompts, methodology, family, params):
-    return _prepare_cell(name, impl, model, prompts, methodology, family, params)()
-
-
-def _prepare_cell(name, impl, model, prompts, methodology, family, params):
-    """Give one invocation its own configuration before entering the timed region."""
+def _cell(name, methodology, family):
     fn = get_cell(methodology, family, name)
     if fn is None:
         raise LookupError(f"no cell for {methodology}/{family}/{name}")
-    owned = deepcopy(params)
-    return lambda: fn(impl, model, prompts, **owned)
+    return fn
+
+
+def _effective_params(fn, params):
+    """Bind the standard cell arguments and apply Python defaults, including named **kwargs."""
+    signature = inspect.signature(fn)
+    positional = (object(), object(), object())
+    leading = signature.bind_partial(*positional).arguments
+    bound = signature.bind(*positional, **params)
+    bound.apply_defaults()
+    effective = {}
+    for name, value in bound.arguments.items():
+        if name in leading:
+            continue
+        kind = signature.parameters[name].kind
+        if kind is inspect.Parameter.VAR_KEYWORD:
+            effective.update(value)
+        elif kind is not inspect.Parameter.VAR_POSITIONAL:
+            effective[name] = value
+    return deepcopy(effective)
+
+
+@dataclass
+class BoundCell:
+    """One resolved call with owned settings; each invocation prepares fresh parameter values."""
+    fn: object
+    params: dict
+
+    def prepare(self, impl, model, prompts):
+        owned = deepcopy(self.params)
+        parameters = list(inspect.signature(self.fn).parameters.values())
+        positional = [owned.pop(p.name) for p in parameters[3:]
+                      if p.kind is inspect.Parameter.POSITIONAL_ONLY]
+
+        def invoke():
+            return self.fn(impl, model, prompts, *positional, **owned)
+
+        return invoke
+
+
+def _bind_case(spec, name, params, record):
+    """Populate the attempted/effective record before each fallible stage of call preparation."""
+    from ..methodologies.requirements import describe_case
+
+    record.update(attempted_params=deepcopy(params), error_stage="resolve",
+                  protocol_coverage=deepcopy(spec.protocol_coverage()))
+    fn = _cell(name, spec.methodology, spec.family)
+    record["error_stage"] = "bind"
+    effective = _effective_params(fn, params)
+    record["params"] = deepcopy(effective)
+    record["error_stage"] = "classify"
+    if spec.protocol is not None:
+        semantics, realization = spec.protocol.classify(effective)
+        record.update(semantics=deepcopy(semantics), realization=deepcopy(realization))
+    record["error_stage"] = "describe"
+    record.update(deepcopy(describe_case(spec.methodology, deepcopy(effective),
+                                        template=spec.protocol, family=spec.family)))
+    record["error_stage"] = "execute"
+    return BoundCell(fn, effective)
+
+
+def _failure(record, error):
+    traceback.print_exc()
+    record["error"] = repr(error)[:1000]
+
+
+def _success(record):
+    record.update(error=None, error_stage=None)
 
 
 def _task_params(regime, params):
@@ -60,7 +122,7 @@ def _unit(u):
     return list(u) if isinstance(u, tuple) else [u]
 
 
-def _per_prompt_stack(name, impl, model, prompts, methodology, family, params):
+def _per_prompt_stack(call, impl, model, prompts):
     """Run the cell on each UNIT alone (its own trace, no padding) and stack the per-unit outputs
     along the sample dim. A unit is a prompt string or a (clean, corrupted) pair (`_unit`). Two uses:
       - aggregate-interactive verdict: N independent single-unit traces so the oracle scores top-1
@@ -73,7 +135,7 @@ def _per_prompt_stack(name, impl, model, prompts, methodology, family, params):
     import torch
 
     mats = [
-        _call_cell(name, impl, model, _unit(p), methodology, family, params)
+        call.prepare(impl, model, _unit(p))()
         for p in prompts
     ]
     mats = [m for m in mats if m is not None]
@@ -93,36 +155,8 @@ def _throughput(regime, timing):
     return None
 
 
-def _run_coordinates(spec, run: RunConfig) -> dict:
-    def case(task, params):
-        if spec.protocol is None:
-            return {"label": task.label,
-                    "semantics": {k: v for k, v in params.items() if k not in task.realization},
-                    "realization": {k: params[k] for k in task.realization}}
-        semantics, realization = spec.protocol.classify(params)
-        protocol = describe_task(spec.methodology, params, template=spec.protocol,
-                                 family=spec.family)
-        return {"label": task.label, "semantics": semantics, "realization": realization,
-                "protocol": protocol.coordinate()}
-
-    coordinates = {
-        "spec": spec.name,
-        "methodology": spec.methodology,
-        "family": spec.family,
-        "repo": spec.repo,
-        "protocol_coverage": spec.protocol_coverage(),
-        "data": sorted({w.data_name for w in spec.regimes if w.data_name}),
-        "regimes": [{"kind": w.kind, "units": len(w.prompts), "data": w.data_name,
-                     "new_tokens": w.new_tokens, "aggregate": w.aggregate,
-                     "data_knobs": dict(w.data_knobs),
-                     "cases": [case(task, _task_params(w, task.params)) for task in spec.tasks]}
-                    for w in spec.regimes],
-        "cases": [case(task, task.params) for task in spec.tasks],
-        "interface": cell_interface(run),
-    }
-    if spec.protocol is not None:
-        coordinates["protocol_template"] = spec.protocol.coordinate()
-    return deepcopy(coordinates)
+def _run_coordinates(spec, interface: str) -> dict:
+    return spec_coordinates(spec, interface)
 
 
 def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
@@ -131,14 +165,13 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
     """Run every (execution regime, task) cell of `spec` on `run`'s stack; write outputs + provenance.
     Returns the outputs path. Cell errors are isolated and recorded in meta, never fatal to the
     run (the engine survives; later cells still execute)."""
-    prov = resolve_provenance(run) if provenance is None else dict(provenance)
-    prov["coordinates"] = _run_coordinates(spec, run)
+    prov = resolve_provenance(run) if provenance is None else deepcopy(provenance)
+    be = make_backend(run, spec) if backend is None else backend
+    iface = cell_interface(run) if interface is None else interface
+    prov["coordinates"] = _run_coordinates(spec, iface)
     if release_findings is not None:
         prov["release_check"] = {"clean": not release_findings, "findings": release_findings}
 
-    be = make_backend(run, spec) if backend is None else backend
-    iface = cell_interface(run) if interface is None else interface
-    prov["coordinates"]["interface"] = iface
     outputs, meta = {}, {}
     model = None
     try:
@@ -161,62 +194,77 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
             if regime.aggregate and isinstance(regime.prompts[0], tuple):
                 timed_prompts = list(regime.prompts[0])
             base_timing = None
+            baseline = meta[("__baseline__", regime.kind)] = {}
             try:
+                call = _bind_case(spec, iface, _task_params(regime, spec.baseline.params), baseline)
                 base_timing, _ = time_cell(
-                    None, prepare_call=lambda tp=timed_prompts: _prepare_cell(
-                        iface, be, model, tp, spec.methodology, spec.family,
-                        _task_params(regime, spec.baseline.params)),
+                    None, prepare_call=lambda: call.prepare(be, model, timed_prompts),
                     warmup=spec.warmup, n_trials=spec.n_trials)
-            except Exception:
-                traceback.print_exc()
+                baseline["median_latency_ms"] = base_timing.median_ms
+                _success(baseline)
+            except Exception as e:
+                _failure(baseline, e)
 
             for task in spec.tasks:
-                params, label = task.params, task.label
-                key = (regime.kind, label)
+                key = (regime.kind, task.label)
+                case = meta[key] = {}
                 try:
+                    call = _bind_case(spec, iface, _task_params(regime, task.params), case)
                     timing, warm = time_cell(
-                        None, prepare_call=lambda tp=timed_prompts, p=_task_params(regime, params): _prepare_cell(
-                            iface, be, model, tp, spec.methodology, spec.family, p),
+                        None, prepare_call=lambda: call.prepare(be, model, timed_prompts),
                         warmup=spec.warmup, n_trials=spec.n_trials)
                     if regime.aggregate:
-                        warm = _per_prompt_stack(iface, be, model, regime.prompts,
-                                                 spec.methodology, spec.family,
-                                                 _task_params(regime, params))
+                        case["error_stage"] = "aggregate"
+                        warm = _per_prompt_stack(call, be, model, regime.prompts)
                     outputs[key] = warm
-                    meta[key] = {
+                    case.update({
                         "median_latency_ms": timing.median_ms, "std_latency_ms": timing.std_ms,
                         "peak_mem_mb": timing.peak_mem_mb,
                         "overhead_vs_baseline": (timing.median_ms / base_timing.median_ms)
                         if (base_timing and base_timing.median_ms) else None,
-                        "throughput": _throughput(regime, timing), "error": None,
-                    }
+                        "throughput": _throughput(regime, timing),
+                    })
+                    _success(case)
                 except Exception as e:              # isolated: engine survives, later cells run
-                    traceback.print_exc()
-                    meta[key] = {"error": repr(e)[:300]}
+                    _failure(case, e)
 
             if regime.kind == "batched":          # any run can reference a padded-batch compare
                 for task in spec.tasks:
-                    params, label = task.params, task.label
+                    key = ("batched_perprompt", task.label)
+                    record = meta[key] = {}
                     try:
-                        outputs[("batched_perprompt", label)] = _per_prompt_stack(
-                            iface, be, model, regime.prompts,
-                            spec.methodology, spec.family, _task_params(regime, params))
-                    except Exception:
-                        traceback.print_exc()
+                        call = _bind_case(spec, iface, _task_params(regime, task.params), record)
+                        outputs[key] = _per_prompt_stack(call, be, model, regime.prompts)
+                        _success(record)
+                    except Exception as e:
+                        _failure(record, e)
 
             # the non-vacuity guard, recorded per run (score reads it off the reference side)
             if spec.effect is not None and regime.kind in ("interactive", "generation"):
-                try:
-                    pairs = regime.prompts and isinstance(regime.prompts[0], tuple)
-                    call = (_per_prompt_stack if regime.aggregate and pairs else _call_cell)
-                    b = call(iface, be, model, regime.prompts, spec.methodology,
-                             spec.family, _task_params(regime, spec.effect.baseline_params))
-                    p = call(iface, be, model, regime.prompts, spec.methodology,
-                             spec.family, _task_params(regime, spec.effect.perturbed_params))
-                    meta[("__effect__", regime.kind)] = compute_effect_size(
-                        b, p, tv_floor=spec.effect.tv_floor, top1_ceiling=spec.effect.top1_ceiling)
-                except Exception:
-                    traceback.print_exc()
+                effect = meta[("__effect__", regime.kind)] = {}
+                values = {}
+                for side, params in (("baseline", spec.effect.baseline_params),
+                                     ("perturbed", spec.effect.perturbed_params)):
+                    record = effect[side] = {}
+                    try:
+                        call = _bind_case(spec, iface, _task_params(regime, params), record)
+                        values[side] = (_per_prompt_stack(call, be, model, regime.prompts)
+                                        if regime.aggregate
+                                        else call.prepare(be, model, regime.prompts)())
+                        _success(record)
+                    except Exception as e:
+                        _failure(record, e)
+                effect.update(error_stage="effect", strong=False)
+                if len(values) == 2:
+                    try:
+                        effect.update(compute_effect_size(
+                            values["baseline"], values["perturbed"],
+                            tv_floor=spec.effect.tv_floor, top1_ceiling=spec.effect.top1_ceiling))
+                        _success(effect)
+                    except Exception as e:
+                        _failure(effect, e)
+                else:
+                    effect["error"] = "Effect check failed; see baseline and perturbed call records"
 
         dbg_out = dbg_prov = None
         if debug:       # the debug companion (isb/debugtrace.py) — never feeds the verdict

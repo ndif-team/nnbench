@@ -63,15 +63,19 @@ measurement of support on a particular engine and model.
 ## 3. What nnbench shares
 
 nnbench uses CausaLab's component, mechanism, featurizer and capability vocabulary to describe
-explicit benchmark cells. `TaskSpec` holds semantic values and realization selectors;
+explicit benchmark cells. One `InterventionSpec` per methodology names its coordinates and which
+cell params are semantics versus realization spelling; `TaskSpec` is a label and the params;
 `ExecutionRegime` holds input presentation, generation length and aggregation. Backend
 selection, oracle comparisons and timing belong to nnbench.
 
-[isb/protocol.py](../isb/protocol.py) owns methodology templates and case specialization.
-Its `components` describe the touched surface; `write_components` identify the write targets.
-Concrete cases publish component requirements in CausaLab's spelling, plus nnbench extensions.
-Older/custom write descriptors with unspecified targets publish incomplete requirements
-(`required_capabilities: null`); their executable parameters remain available.
+[isb/protocol.py](../isb/protocol.py) owns the methodology templates. Their `components`
+describe the touched surface; `write_components` identify the write targets, published as
+component requirements in CausaLab's spelling plus nnbench extensions. Older/custom write
+descriptors with unspecified targets publish incomplete requirements
+(`required_capabilities: null`). [Case-description hooks](../isb/methodologies/requirements.py)
+specialize supported templates using already-bound parameters. Each call records its effective
+parameters, semantic/realization split, and `protocol_scope` (`case` or `template`). Custom and
+historical templates retain template scope when no applicable hook can specialize them.
 
 The canonical replacement for `attention_value` is `attention_premix`, the o-projection input.
 `attention_value_states` names the actual value vectors. Old descriptors normalize through
@@ -108,12 +112,12 @@ The frozen experiment and shared worker provenance record metadata coverage. Bui
 have descriptors; custom methods supply one or a nonempty `protocol_absence_reason`.
 Legacy undescribed experiments receive a legacy reason on restoration.
 
-Protocol coordinates carry the vocabulary reference used to describe them. Methodology
-templates are specialized after effective dataset defaults and task values are combined.
-Provenance is a detached snapshot; each invocation owns its nested parameter values, with
-trial setup outside the measured interval.
+Protocol coordinates carry the vocabulary reference used to describe them. Each case's record
+is the effective call: dataset defaults under task values, the cell's own keyword defaults
+applied, split by the template. Saved coordinates and call metadata are detached snapshots.
+Each invocation receives fresh nested parameter values prepared outside the measured interval.
 
 Verification has two distinct parts: the source checker establishes the pinned upstream
 vocabulary, while no-GPU tests exercise canonical aliases, component read/write requirements,
-case specialization, serialization and configuration ownership. Model execution and
-cross-engine parity require separate benchmark runs.
+case specialization, parameter binding and classification, serialization, and coordinate migration. Model
+execution and cross-engine parity require separate benchmark runs.

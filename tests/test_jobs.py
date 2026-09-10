@@ -22,7 +22,7 @@ def specimen():
 def completed(output, experiment, backend):
     (output / "result.pt").write_bytes(b"a tensor artifact")
     contract.write_json(output / "result.json", {
-        "version": 1, "status": "completed", "backend": backend,
+        "version": contract.VERSION, "status": "completed", "backend": backend,
         "experiment_id": experiment["id"], "inputs_sha256": experiment["inputs_sha256"],
         "outputs_sha256": contract.file_digest(output / "result.pt"),
         "cells": [{"workload": w, "label": label, "state": "RAN"}
@@ -40,19 +40,19 @@ def test_inputs_roundtrip_preserves_pairs_and_dataset_level_work(tmp_path):
     assert not restored.regimes[0].aggregate
 
 
-def test_protocol_metadata_roundtrips_without_changing_v1_execution_fields(tmp_path):
+def test_wire_record_is_the_spec_as_written(tmp_path):
     from isb.protocol import InterventionSpec
 
     template = InterventionSpec(semantic_params=("layer",), realization_params=("mode",))
     spec = CellConfig("custom", "custom", "gpt2", "repo",
                       [ExecutionRegime("generation", [("clean", "corrupt")], new_tokens=5,
                                        aggregate=False, data_knobs={"layer": 3})],
-                      [TaskSpec("case", {"layer": 4}, {"mode": "replace"})], BaselineSpec({}),
+                      [TaskSpec("case", {"layer": 4, "mode": "replace"})], BaselineSpec({}),
                       protocol=template)
     experiment = contract.prepare(spec, tmp_path / "job")
-    wire = contract.unpack(experiment["spec"])
-    assert "regimes" not in wire and "protocol" not in wire
-    assert wire["tasks"] == [({"layer": 4, "mode": "replace"}, "case")]
+    wire = contract.wire_spec(experiment)
+    assert wire["tasks"] == [{"label": "case", "params": {"layer": 4, "mode": "replace"}}]
+    assert wire["protocol"]["semantic_params"] == ("layer",)
     assert contract.expected_cells(experiment) == {("generation", "case")}
     restored, _ = contract.restore_spec(tmp_path / "job")
     assert restored == spec
@@ -67,7 +67,7 @@ def test_legacy_descriptor_without_write_targets_restores_without_guessing(tmp_p
                                 write_components=("attention_premix",), semantic_params=("layers",))
     spec = replace(specimen(), protocol=template)
     experiment = contract.prepare(spec, tmp_path / "job")
-    old_template = experiment["description"]["protocol_template"]
+    old_template = experiment["spec"]["protocol"]
     old_template.pop("write_components")
     old_template["components"] = contract.pack(("attention_value",))
     experiment.pop("id")
@@ -79,54 +79,63 @@ def test_legacy_descriptor_without_write_targets_restores_without_guessing(tmp_p
     assert original == experiment
 
 
-def test_legacy_v1_experiment_without_description_still_restores(tmp_path):
+def _as_version_one(experiment):
+    """Rewrite a prepared experiment into the version-one wire shape: `workloads`, task tuples, no
+    protocol fields."""
+    record = contract.unpack(experiment["spec"])
+    record["workloads"] = record.pop("regimes")
+    record["tasks"] = [(task["params"], task["label"]) for task in record["tasks"]]
+    record.pop("protocol")
+    record.pop("protocol_absence_reason")
+    record.pop("protocol_source", None)
+    legacy = {**experiment, "version": 1, "spec": contract.pack(record)}
+    legacy.pop("id")
+    legacy["id"] = contract.digest(contract.canonical(legacy))
+    return legacy
+
+
+def test_version_one_experiment_restores(tmp_path):
     experiment = contract.prepare(specimen(), tmp_path / "job")
-    experiment.pop("description")
-    experiment.pop("id")
-    experiment["id"] = contract.digest(contract.canonical(experiment))
-    contract.write_json(tmp_path / "job" / "experiment.json", experiment)
-    restored, _ = contract.restore_spec(tmp_path / "job")
-    assert restored == specimen()
+    contract.write_json(tmp_path / "job" / "experiment.json", _as_version_one(experiment))
+    restored, reread = contract.restore_spec(tmp_path / "job")
+    assert restored.tasks == specimen().tasks
+    assert restored.protocol is None
+    assert restored.protocol_source == "legacy"
+    assert restored.protocol_coverage()["status"] == "legacy"
+    assert reread["version"] == 1
+    assert contract.expected_cells(reread) == {("interactive", "layers")}
 
 
 def test_explicit_protocol_opt_out_roundtrips_and_is_identity_covered(tmp_path):
     spec = replace(specimen(), methodology="custom", protocol=None,
                    protocol_absence_reason="Experimental custom method")
     experiment = contract.prepare(spec, tmp_path / "job")
-    assert "protocol_absence_reason" not in contract.unpack(experiment["spec"])
-    assert experiment["description"]["protocol_coverage"] == spec.protocol_coverage()
+    assert contract.wire_spec(experiment)["protocol_absence_reason"] == "Experimental custom method"
     assert contract.restore_spec(tmp_path / "job")[0] == spec
     changed = replace(spec, protocol_absence_reason="Revised explanation")
     assert contract.prepare(changed, tmp_path / "changed")["id"] != experiment["id"]
 
 
-@pytest.mark.parametrize("has_description", [False, True])
-def test_legacy_unknown_method_records_missing_metadata_explicitly(tmp_path, has_description):
+def test_version_one_custom_method_is_marked_legacy_undescribed(tmp_path):
     spec = replace(specimen(), methodology="custom", protocol=None,
                    protocol_absence_reason="Experimental fixture")
     experiment = contract.prepare(spec, tmp_path / "job")
-    if has_description:
-        experiment["description"].pop("protocol_coverage")
-    else:
-        experiment.pop("description")
-    experiment.pop("id")
-    experiment["id"] = contract.digest(contract.canonical(experiment))
-    contract.write_json(tmp_path / "job" / "experiment.json", experiment)
+    contract.write_json(tmp_path / "job" / "experiment.json", _as_version_one(experiment))
     restored, _ = contract.restore_spec(tmp_path / "job")
     assert restored.protocol is None
     assert restored.protocol_coverage() == {
-        "status": "undescribed", "reason": "Legacy experiment predates explicit protocol coverage"}
+        "status": "legacy", "reason": "Legacy experiment predates explicit protocol coverage"}
 
 
-@pytest.mark.parametrize("coverage", [None, {}, {"status": "invalid"},
-                                     {"status": "undescribed", "reason": "skip"}])
-def test_inconsistent_protocol_coverage_is_rejected(tmp_path, coverage):
-    experiment = contract.prepare(specimen(), tmp_path / "job")
-    experiment["description"]["protocol_coverage"] = coverage
+def test_undescribed_custom_method_without_reason_is_rejected_on_restore(tmp_path):
+    spec = replace(specimen(), methodology="custom", protocol=None,
+                   protocol_absence_reason="fixture")
+    experiment = contract.prepare(spec, tmp_path / "job")
+    experiment["spec"]["protocol_absence_reason"] = None
     experiment.pop("id")
     experiment["id"] = contract.digest(contract.canonical(experiment))
     contract.write_json(tmp_path / "job" / "experiment.json", experiment)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="requires a protocol descriptor"):
         contract.restore_spec(tmp_path / "job")
 
 
@@ -136,16 +145,6 @@ def test_prepare_rechecks_protocol_coverage_after_spec_edit(tmp_path):
     with pytest.raises(ValueError, match="requires a protocol"):
         contract.prepare(spec, tmp_path / "job")
     assert not (tmp_path / "job").exists()
-
-
-def test_description_cannot_disagree_with_executable_tasks(tmp_path):
-    experiment = contract.prepare(specimen(), tmp_path / "job")
-    experiment["description"]["tasks"][0]["label"] = "different"
-    experiment.pop("id")
-    experiment["id"] = contract.digest(contract.canonical(experiment))
-    contract.write_json(tmp_path / "job" / "experiment.json", experiment)
-    with pytest.raises(ValueError, match="description does not match"):
-        contract.restore_spec(tmp_path / "job")
 
 
 def test_container_worker_preserves_case_requirements_and_backend_identity(tmp_path, monkeypatch):
@@ -191,14 +190,16 @@ def test_container_worker_preserves_case_requirements_and_backend_identity(tmp_p
                 job=tmp_path / "job", output=tmp_path / "output")
     result = contract.validate_result(tmp_path / "output", experiment, "independent-package")
     assert 0 in seen and 24 in seen and seen[-1] == "teardown"
-    assert all(cell["state"] == "RAN" for cell in result["cells"])
+    cells = {cell["label"]: cell for cell in result["cells"]}
+    assert all(cell["state"] == "RAN" for cell in cells.values())
+    assert cells["apply"]["semantics"] == {"train": 0}
+    assert cells["train"]["semantics"] == {"train": 24}
     prov = result["provenance"]
     assert prov["model_identity"]["revision"] == "revision"
     coords = prov["coordinates"]
     assert coords["interface"] == "custom-interface"
-    cases = coords["regimes"][0]["cases"]
-    assert "grad" not in cases[0]["protocol"]["capabilities"]
-    assert "grad" in cases[1]["protocol"]["capabilities"]
+    assert coords["protocol"]["mechanisms"] == ["swap"]
+    assert [case["label"] for case in coords["cases"]] == ["apply", "train"]
 
 
 def test_identity_changes_with_count_params_and_seed(tmp_path):

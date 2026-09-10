@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
-from ..jobs.contract import VERSION, canonical, digest, expected_cells, unpack
+from ..jobs.contract import PLAN_VERSION, VERSIONS, check_experiment, expected_cells, wire_spec
+from ..protocol import InterventionSpec
+from ..runs import coordinate_config, run_coordinates, upgrade_coordinates
 
 
 def read_json(path):
@@ -50,6 +52,25 @@ def cells(rows):
             for r in rows]
 
 
+def auxiliary_calls(rows):
+    """Optional supporting-call metadata supplied by workers; task statuses stay separate."""
+    if not isinstance(rows, list):
+        raise ValueError("auxiliary_calls must be a list")
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("auxiliary call must be an object")
+        key = row.get("key")
+        if (not isinstance(key, list) or len(key) != 2 or not all(isinstance(k, str) for k in key)
+                or key[0] not in {"__baseline__", "__effect__", "batched_perprompt"}
+                or not isinstance(row.get("record"), dict)):
+            raise ValueError("invalid auxiliary call key or record")
+        if tuple(key) in seen:
+            raise ValueError("duplicate auxiliary call")
+        seen.add(tuple(key))
+    return copy.deepcopy(rows)
+
+
 def bundle_paths(root):
     """Find run bundles below a collection; do not descend inside runs, trash or symlinks."""
     root = Path(root)
@@ -67,7 +88,7 @@ def load_bundle(directory, prefix):
     """Return (entries, results, baselines, warnings) for a single recorded invocation."""
     entries, results, baselines, warnings = {}, {}, {}, []
     plan = read_json(directory / "plan.json")
-    if plan.get("version") != VERSION:
+    if plan.get("version") != PLAN_VERSION:
         raise ValueError("unknown plan version")
     names = plan["backends"]
     experiments = plan["experiments"]
@@ -84,7 +105,7 @@ def load_bundle(directory, prefix):
     if (directory / "report.json").exists():
         try:
             saved = read_json(directory / "report.json")
-            if saved.get("version") != VERSION or saved.get("run") != directory.name:
+            if saved.get("version") != PLAN_VERSION or saved.get("run") != directory.name:
                 raise ValueError("report belongs to a different run/version")
             for item in saved["experiments"]:
                 if not isinstance(item, dict):
@@ -99,10 +120,8 @@ def load_bundle(directory, prefix):
         expdir = child(child(directory, "experiments"), experiment_name)
         try:
             experiment = read_json(expdir / "experiment.json")
-            body = {k: v for k, v in experiment.items() if k != "id"}
-            if experiment.get("version") != VERSION or digest(canonical(body)) != experiment.get("id"):
-                raise ValueError("experiment identity checksum mismatch")
-            spec = unpack(experiment["spec"])
+            check_experiment(experiment)
+            spec = wire_spec(experiment)
             expected = expected_cells(experiment)
         except (OSError, ValueError, KeyError, TypeError) as error:
             warnings.append(f"{prefix}/{experiment_name}: invalid experiment: {error}")
@@ -131,7 +150,7 @@ def load_bundle(directory, prefix):
         for backend in names:
             key = f"{group}/{backend}"
             jobdir = child(expdir, backend)
-            prov, rows, execution = {}, [], {}
+            prov, rows, execution, auxiliary = {}, [], {}, []
             state = "PENDING" if plan.get("status") == "running" else "NOT_RUN"
             if plan.get("status") == "cancelled":
                 state = "CANCELLED"
@@ -146,7 +165,7 @@ def load_bundle(directory, prefix):
                     error = execution.get("error") or execution.get("cleanup_error")
                 if (jobdir / "result.json").exists():
                     result = read_json(jobdir / "result.json")
-                    if (result.get("version") != VERSION or result.get("backend") != backend
+                    if (result.get("version") not in VERSIONS or result.get("backend") != backend
                             or result.get("experiment_id") != experiment["id"]
                             or result.get("inputs_sha256") != experiment["inputs_sha256"]):
                         raise ValueError("result identity mismatch")
@@ -154,6 +173,12 @@ def load_bundle(directory, prefix):
                     if not isinstance(prov, dict) or any(not isinstance(prov.get(k, {}), dict)
                                                         for k in ("client", "engine", "host", "deployment", "coordinates")):
                         raise ValueError("malformed provenance")
+                    worker_coordinates = prov.get("coordinates", {})
+                    if worker_coordinates.get("schema") is not None or "spec" in worker_coordinates:
+                        prov["coordinates"] = upgrade_coordinates(worker_coordinates)
+                    auxiliary = auxiliary_calls(result.get("auxiliary_calls", []))
+                    if auxiliary:
+                        prov["auxiliary_calls"] = copy.deepcopy(auxiliary)
                     if state == "COMPLETED":
                         if result.get("status") != "completed" or not child(jobdir, "result.pt").is_file():
                             raise ValueError("completed job has no complete artifact")
@@ -177,7 +202,7 @@ def load_bundle(directory, prefix):
                 elif state == "COMPLETED":
                     raise ValueError("completed job is missing result.json")
             except (OSError, ValueError, KeyError, TypeError) as caught:
-                state, error, rows, prov = "JOB_FAILED", str(caught), [], {}
+                state, error, rows, prov, auxiliary = "JOB_FAILED", str(caught), [], {}, []
             if not rows:
                 rows = [{"workload": w, "label": label, "state": state, "error": error}
                         for w, label in sorted(expected)]
@@ -186,11 +211,21 @@ def load_bundle(directory, prefix):
             prov["engine"].setdefault("kind", "unknown")
             prov.setdefault("deployment", {})
             prov.setdefault("host", {})
-            prov["coordinates"] = {"spec": spec["name"], "methodology": spec["methodology"],
-                "family": spec["family"], "repo": spec["repo"],
-                "data": sorted({w["data_name"] for w in spec["workloads"] if w.get("data_name")}),
-                "workloads": spec["workloads"], "tasks": [label for _, label in spec["tasks"]],
-                "interface": prov.get("coordinates", {}).get("interface", "unknown")}
+            # Submitted identity and the worker's executed description have distinct owners.
+            # Preserve complete worker coordinates, including extension fields and call records.
+            worker = prov.get("coordinates") or {}
+            submitted = run_coordinates(
+                spec=spec["name"], methodology=spec["methodology"], family=spec["family"],
+                repo=spec["repo"], interface=worker.get("interface", "unknown"),
+                regimes=[{**w, "data": w.get("data_name")} for w in spec["regimes"]],
+                cases=spec["tasks"], protocol=(InterventionSpec(**spec["protocol"]).coordinate()
+                                              if spec.get("protocol") is not None else None),
+                protocol_coverage=({"status": "described"} if spec.get("protocol") is not None
+                                   else {"status": "legacy" if spec.get("protocol_source") == "legacy" else "undescribed",
+                                         "reason": spec.get("protocol_absence_reason")}),
+                inputs_sha256=experiment["inputs_sha256"], config=coordinate_config(spec))
+            prov["submitted_coordinates"] = submitted
+            prov["coordinates"] = worker if "spec" in worker else {**submitted, **worker}
             prov["view"] = {"group": group, "backend": backend, "run": prefix,
                 "experiment_id": experiment["id"], "inputs_sha256": experiment["inputs_sha256"],
                 "reference": f"{group}/{reference}" if reference else None,
@@ -198,7 +233,8 @@ def load_bundle(directory, prefix):
                 "image_id": execution.get("image_id"), "source": execution.get("source"),
                 "path": str(jobdir), "saved_report": bool(scored_rows)}
             prov.setdefault("executed", directory.name)
-            meta = {(r["workload"], r["label"]): r for r in rows}
+            meta = {tuple(call["key"]): call["record"] for call in auxiliary}
+            meta.update({(r["workload"], r["label"]): r for r in rows})
             entries[key] = ({("__meta__",): meta}, prov)
             results[key] = cells(rows)
         if reference:

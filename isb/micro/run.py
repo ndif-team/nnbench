@@ -82,16 +82,14 @@ def micro_run_file(backend_name: str, repo: str, results: list,
     project's vocabulary "micro" is the perf op-cost benchmark, and these probes surface as
     construct support on backend pages."""
     from ..runfile import save_run
-    from ..runs import EngineConfig, RunConfig, resolve_provenance
+    from ..runs import EngineConfig, RunConfig, resolve_provenance, run_coordinates
 
     engine = (EngineConfig("transformers") if backend_name == "hf"
               else EngineConfig("vllm", mode="sync" if backend_name == "vllm_sync" else "async"))
     prov = resolve_provenance(RunConfig(engine=engine))
-    prov["coordinates"] = {
-        "spec": "constructs", "methodology": "constructs", "family": "gpt2", "repo": repo,
-        "data": [], "regimes": [], "tasks": [r.name for r in results],
-        "interface": backend_name,
-    }
+    prov["coordinates"] = run_coordinates(
+        spec="constructs", methodology="constructs", family="gpt2", repo=repo,
+        interface=backend_name, cases=[{"label": r.name} for r in results])
     meta = {("probe", r.name): {"state": r.state, "note": r.note, "latency_s": r.latency_s}
             for r in results}
     return save_run(out_dir, run_name, {("__meta__",): meta}, prov)

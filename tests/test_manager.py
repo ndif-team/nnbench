@@ -41,6 +41,42 @@ def test_legacy_import_never_guesses_precision_control(tmp_path):
         assert len(call.args) == 4 and "ctl" not in call.kwargs
 
 
+def test_import_keeps_incomplete_history_browsable_without_rescoring(tmp_path):
+    from unittest.mock import patch
+    from isb.runfile import save_run
+    from isb.runs import spec_coordinates
+
+    coords = spec_coordinates(_spec(), "hf")
+    coords.pop("inputs_sha256")
+    coords.pop("config")
+    coords.pop("identity_complete")
+    coords["schema"] = 2
+    save_run(str(tmp_path), "historical", {}, {"coordinates": coords, "engine": {"kind": "transformers"}})
+    with patch.dict(SPECS, {"xs": _spec()}), patch("isb.sweep.score.score_runs") as score:
+        _import(tmp_path)
+    assert not score.called
+    col = manager.Collection(str(tmp_path))
+    assert "historical" in col.entries and col.results["historical"] is None
+    assert any("identity is incomplete" in warning for warning in col.warnings)
+
+
+def test_import_does_not_score_with_a_changed_current_spec(tmp_path):
+    from dataclasses import replace
+    from unittest.mock import patch
+    from isb.runfile import save_run
+    from isb.runs import spec_coordinates
+
+    spec = _spec()
+    save_run(str(tmp_path), "saved", {}, {"coordinates": spec_coordinates(spec, "hf"),
+                                           "engine": {"kind": "transformers"}})
+    with patch.dict(SPECS, {"xs": replace(spec, n_trials=spec.n_trials + 1)}), \
+         patch("isb.sweep.score.score_runs") as score:
+        _import(tmp_path)
+    assert not score.called
+    col = manager.Collection(str(tmp_path))
+    assert any("current spec does not match" in warning for warning in col.warnings)
+
+
 def test_changed_legacy_artifact_requires_explicit_reimport(tmp_path):
     _collection(tmp_path)
     with (tmp_path / "cand.pt").open("ab") as stream:

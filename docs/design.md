@@ -1,8 +1,8 @@
 # Design — interp-serve-bench (living document)
 
 > Status: evolving. Captures decisions as they're made in the design conversation.
-> Last structural update: CausaLab-aligned intervention semantics separated from execution regimes
-> and backend realizations (§5, §12).
+> Current implementation contract: §12.1 and §12.13. Experiment authoring, effective cell calls,
+> historical migration, and result comparison have explicit ownership and validation boundaries.
 
 > Runner update (2026-09-08): the main CLI now uses independent `backends/NAME/compose.yml`
 > configurations, frozen input jobs, explicit references, and artifact-only scoring. See
@@ -470,8 +470,9 @@ patchscopes · future lens · SAE family (gated/JumpReLU/top-k/transcoders/cross
 family (CAA/ITI/RepE) · sparse probing / CCS · integrated gradients.
 
 **Shared vocabulary:** methodology descriptions use the pinned CausaLab protocol vocabulary in
-`isb/causalab_vocabulary.json`. `isb/protocol.py` binds it to explicit cells and specializes their
-requirements. Subspace addresses remain derived-tier Level-1 citizens (§3.2). See
+`isb/causalab_vocabulary.json`. `isb/protocol.py` holds the methodology templates;
+`isb/methodologies/requirements.py` specializes case requirements from effective parameters.
+Subspace addresses remain derived-tier Level-1 citizens (§3.2). See
 `causalab-portability-audit.md` for the current protocol/engine alignment and source-check command.
 
 ## 5. Context — execution regimes (how methodologies get run; the "dataset" distribution)
@@ -498,6 +499,9 @@ struggle.
   deliberately include **non-standard module names** to prove the Resolver isn't hardcoded.
 
 ## 7. Harness — the spec → resolver → builder → runner → oracle → reporter pipeline
+
+Historical proposal. The current independent-backend execution contract is defined in §12.1
+and §12.13; this section preserves the earlier design discussion.
 
 > **SUPERSEDED by §12** (same supersession as §11 — the Resolver/builder stages were dropped; the
 > runner → oracle → reporter tail survives in §12.3). Kept for history.
@@ -612,7 +616,7 @@ tolerance — the "same trace, same answer" claim, and the `SILENTLY_WRONG` dete
 | Resolver vocab resolution | (a)/(b)/(c) | **vocabulary spans all of (a/b/c)**; v1 *portable+perf* addressing = (a)+(b); (c) implemented **HF-eager-only as frontier markers** (run on vLLM expecting ERROR/UNSUPPORTED, verified) | **DECIDED** |
 | Correctness goal | coverage-only vs +equivalence | **+equivalence — LOAD-BEARING**: it's the only `SILENTLY_WRONG` detector (§8.1), not just the OSDI claim | **DECIDED** |
 | Adopt pyvene vocab + causalab harness shape | yes / build fresh | adopt: pyvene names→`FamilyProfile`; causalab Hydra config groups (§11.10) | **SUPERSEDED 2026-08-26** (never implemented; both were removed by causalab PR #20) |
-| Intervention description | ad hoc params / causalab vocabulary | **CausaLab-aligned `InterventionSpec` metadata**, separate from `ExecutionRegime` and `TaskSpec.realization`; it indexes and describes explicit cells. CausaLab owns its scientific metrics, document/artifact identities, workflows, and `Backend` | **IMPLEMENTED 2026-09-02** |
+| Intervention description | ad hoc params / causalab vocabulary | **CausaLab-aligned `InterventionSpec` metadata**, separate from `ExecutionRegime` and case parameters; it indexes and describes explicit cells. CausaLab owns its scientific metrics, document/artifact identities, workflows, and `Backend` | **IMPLEMENTED; current ownership in §12.13** |
 | Repo name | provisional `interp-serve-bench` | finalize later (avoid "InterpBench") | open |
 
 ---
@@ -868,27 +872,29 @@ def _(be, model, prompt):
 - **Variants** (layers touched, overhead, idiomatic-vs-portable unembed) = params or sibling cells.
 - **Protocol semantics are metadata.** `isb/protocol.py` adopts the shared CausaLab names for data
   roles, components, reads/writes, mechanisms, position frames, featurizers, and capabilities.
-  `TaskSpec.semantics` holds a case's values; `TaskSpec.realization` holds spelling choices such as
-  in-place vs replacement or bounded vs unbounded iteration. Their merged `params` mapping is
-  passed to the explicit cell with the same values.
+  `TaskSpec` holds a label and author-supplied `params`. The methodology template declares which
+  parameters express semantics and which select realization spelling, such as in-place vs
+  replacement. Templates stay in a torch-free module so independent host-side job preparation
+  can load specs without loading model implementations.
   `isb/causalab_vocabulary.json` pins the current upstream vocabulary and source checksums;
   `scripts/check_causalab_alignment.py` verifies them against an upstream checkout. Component
   requirements distinguish touched components from write targets, using CausaLab's engine
   capability spelling. The vocabulary covers more sites than the implemented benchmark cells.
-- **Requirements belong to the concrete case.** Methodology descriptors are templates.
-  `describe_task` specializes operations and capabilities from task parameters: DAS apply
-  (`train=0`) needs no gradients, while training does. Provenance calls the shared description
-  `protocol_template`; each case has its own `protocol`. Each regime also records effective cases
-  after dataset defaults and decode length are applied using the execution driver's precedence.
-  Backend selection belongs to the launcher; the cell records its observed execution outcome.
+- **Requirements belong to the concrete case.** Methodology descriptors are templates. Registered
+  case-description functions beside the methodology implementations consume already-bound params
+  and specialize the template. They declare no alternate parameter defaults. DAS apply (`train=0`)
+  records a gradient-free case; training records gradients. Custom methodologies can supply their
+  own case-description function; without one, the template remains explicitly template-level.
+  Descriptions are metadata and never select a backend or predict an execution verdict.
 - **Execution regimes are orthogonal.** `ExecutionRegime` owns inputs, interactive/batched/
   generation shape, decode length, and aggregation. A protocol case can be exercised under
   multiple regimes.
 
-- **Configuration ownership is explicit.** Spec authoring uses editable namespaces. Task accessors
-  and provenance produce detached snapshots. The shared worker gives each invocation fresh nested
-  parameter values, including dataset defaults, baseline and effect parameters; timing prepares
-  those copies before the measured interval. The frozen Docker experiment is the submitted record.
+- **Configuration ownership is explicit.** Authoring specs are editable. Saved coordinates and
+  effective-call records are detached snapshots. Every cell invocation receives fresh nested
+  parameter values, including dataset defaults, baseline and effect parameters. Signature binding
+  and trial configuration copies run before the measured interval. The frozen Docker experiment
+  is the authoritative submitted recipe.
 - **Metadata coverage is explicit.** Built-in methods require descriptors. Custom methods supply
   an `InterventionSpec` or a nonempty `protocol_absence_reason`. The latter produces an
   `undescribed` coverage record with its reason; described cases record `described` coverage.
@@ -896,14 +902,16 @@ def _(be, model, prompt):
   receive a legacy reason during restoration. Coverage and backend execution verdicts are
   separate attributes.
 
-Migration: `CellConfig(workloads=...)` becomes `CellConfig(regimes=...)`. The `Workload` import
-alias and read-only `spec.workloads` property are transitional conveniences, not constructor
-compatibility. Regime provenance includes `new_tokens`, `aggregate`, and `data_knobs`.
+Authoring API: `CellConfig(regimes=...)` and `TaskSpec(label, params)`; `(params, label)` task
+tuples remain an authoring convenience. The old `Workload` alias, `workloads` property, and task
+tuple iterator are retired together. Historical files use explicit versioned migration.
 
 Docker integration: the host freezes resolved specs and inputs through `isb/jobs/contract.py`.
-Its version-1 file contract retains `workloads` and `(params, label)` tasks, with the protocol
-template and `TaskSpec` namespaces in optional, checksum-covered `description` metadata.
-Container workers restore that frozen metadata instead of relying on current template defaults.
+Its version-2 file contract stores `regimes`, `{label, params}` tasks, the protocol template, and
+explicit absence reason. Version-1 readers distinguish original files from files with optional,
+checksum-covered `description` metadata. Migration preserves saved templates and coverage reasons,
+validates duplicate task representations, and marks genuinely missing descriptions as legacy.
+Restoring an old experiment never fills missing metadata from today's protocol table.
 The shared executor accepts a backend, interface, and provenance supplied by the container's
 entrypoint; lazy sweep exports keep host spec loading independent of torch/nnsight imports.
 - **Reuse emerges bottom-up:** when two cells are structurally identical except module names,
@@ -990,8 +998,10 @@ scripts/smoke.py        # enumerate the cells to run; print the map
 | methodology | new file of `@cell` functions + one `InterventionSpec` metadata entry |
 | (family,backend) cell | one explicit function for that combination |
 | backend | a `be` infra impl (trace/collect/teardown) + its cells per methodology |
-| semantic variant | `TaskSpec.semantics` plus the same explicit cell param |
-| realization variant | `TaskSpec.realization` plus the same explicit cell param |
+| semantic variant | `TaskSpec.params` and the methodology template's semantic classification |
+| realization variant | `TaskSpec.params` and the methodology template's realization classification |
+| case-specific requirements | registered case-description function beside the method implementations |
+| backend worker | independent `backends/NAME/compose.yml` and executable implementing the file contract |
 
 ### 12.6 The primitive model as index (2026-06-11)
 
@@ -1123,6 +1133,9 @@ logit lens, `transport=[J_l]` the J-lens (one extra matmul before the final norm
 
 ### 12.9 Split-run is the canonical method-tier mode (2026-07-23)
 
+Historical motivation and preceding launch commands. The current main runner uses independent
+backend jobs and explicit references, as specified in §12.13 and `backends/README.md`.
+
 The integrated one-process sweep (control + candidate co-resident) was a holdover from the
 smoke-script era, and co-residency produced real failures: the object-patch import-order crash
 (HF traces first, then vLLM's import chain hits a library whose classes can no longer be
@@ -1166,6 +1179,9 @@ tags and the bundled vLLM precision-control convention. Installing nnsight from 
 commit from pip's `direct_url.json` inside the container.
 
 ### 12.10 Runs, data bindings, execute/score, provenance (2026-07-24)
+
+These execution routines remain shared by the current worker. Standalone CLI and release-mode
+details below describe the legacy entrypoints; the main launcher follows §12.13.
 
 A result's identity is (spec × data × run config), each axis independent:
 
@@ -1230,16 +1246,16 @@ The replacement is the run layer, which already holds every axis the old field l
 
 ### 12.12 The run manager (2026-07-28; templated package 2026-07-31)
 
-A collection is a directory of run files with one baseline PER SPEC (a run can only reference
-runs of its own spec and data); the manager renders exactly the runs in a selected directory.
-Every run flows through the ONE scoring path (`score_runs`; `reference=None` for baselines,
-whose rows carry raw states because a verdict against itself would be fabricated). Fresh runs
-land in the inbox and appear in no map; archive and discard are file moves, so `mv` from the
-shell is equivalent to the UI buttons.
+A collection contains saved job bundles and explicitly imported legacy run summaries. The manager
+renders the selected directory using JSON metadata and saved comparison reports. Docker scoring
+is an explicit artifact-only operation with a reference selected in the run plan. Legacy import
+uses `score_runs` only when complete saved procedure identity matches the reference and scoring
+spec. Browsing performs no scoring and starts no models. Archive and discard preserve their
+existing recoverable file-move behavior.
 
 The code is shaped like the site: a fixed template stamped over uniform data (`isb/manager/`):
-- `model.py` — Collection (entries, per-spec baselines, scored results; mtime caches), rollup,
-  perf points, archive/discard. Pages never touch files or scoring.
+- `model.py` — collections, comparison eligibility, rollup, perf points, archive/discard.
+- `records.py` — JSON-only job bundle loading, frozen identity, saved worker metadata and reports.
 - `htmlkit.py` — every tag, class, and format rule (one table builder, one chip builder, one
   latency format); pages pass text, the kit escapes.
 - `figure.py` — the operating-point scatter.
@@ -1247,5 +1263,77 @@ The code is shaped like the site: a fixed template stamped over uniform data (`i
   (`scripts/manager.py`), the one-file static export (`--export`), and the tests share, so a
   routed page is exported and crawlable by construction.
 
-The server binds 127.0.0.1 only (run files are unpickled on load) and rejects archive/discard
-names that are not inbox members.
+The server binds 127.0.0.1 only and rejects archive/discard names that are not inbox members.
+Current browsing reads saved JSON reports. Unpickling and scoring legacy artifacts require the
+explicit trusted `--import-legacy` operation.
+
+### 12.13 Current execution and compatibility contract
+
+This section defines the acceptance plan for the consistency refactor. The independent Compose
+runner and explicit method cells remain the extension boundaries. Earlier shared-Compose and
+Resolver descriptions document design history; §12.1 and this section govern current behavior.
+
+**One effective call.** Resolve the cell, merge dataset defaults below task parameters, apply the
+regime's generation length, then use Python signature binding and default application. The same
+path handles measured cases, timing baselines, batched per-prompt references, and both sides of
+the effect guard. A family-bound generic cell exposes its actual three-positional-argument
+signature. Named keyword defaults work alongside `**kwargs`; missing required arguments and
+unexpected arguments become isolated call errors. Registered templates classify declared task,
+baseline, and effect parameters at authoring time. Runtime classification remains checked because
+datasets, restored templates, and independently extended cells can differ from the built-in suite.
+
+**What gets saved.** Successful effective-call records contain parameters, their semantic and
+realization split when available, and a case-level protocol description or explicit template-level
+coverage. Failed calls retain attempted parameters and the error stage. Baseline, effect, and
+batched-reference records include their own settings and errors. Missing metadata has a visible
+reason. Execution findings remain independent from metadata coverage.
+
+The JSON result's optional `auxiliary_calls` field carries baseline, effect, and batched-reference
+records alongside the task-cell list. The manager retains these records and renders failed or
+incomplete effect checks safely. Effect checks use the measured case's full aggregation regime;
+missing, empty, nonfinite, or incompatible outputs produce an isolated effect error.
+
+**One coordinate format.** `isb/runs.py` owns the versioned coordinate builder and load-time
+migration used by method, micro, perf, and manager paths. Snapshot values are detached from mutable
+specs and reader inputs. The manager preserves the worker's executed description and call records;
+the frozen job supplies submitted identity, including for failed or pending jobs. Unknown future
+schema versions are rejected. Older coordinate details remain available for audit after migration.
+
+**Safe comparisons.** Docker comparisons retain the experiment/input identity checks and resolved
+source/model/tokenizer checks. Standalone comparison requires complete matching procedure identity:
+model and method, actual input content, declared case parameters, every regime setting, and
+baseline/effect configuration. Interface differences are an intended comparison axis. Missing
+historical identity permits browsing but gives no automatic equivalence claim, including when both
+sides are missing the same fields. The manager explains this limited comparability. Labels and
+dataset names alone do not establish identity.
+
+**Timing and ownership.** The saved recipe, effective-call metadata, and invocation parameters have
+separate ownership. Each warmup, measured trial, and reference/effect invocation receives a fresh
+deep copy. Copying, metadata specialization, and binding happen outside the measured interval.
+The timed unit is the cell call plus the established synchronization boundary. Tests pin this
+definition; changing it requires an explicit measurement-contract change.
+
+**File compatibility and failure reporting.** Version 2 writes one canonical task representation.
+Readers accept both historical v1 variants and v2 without rewriting input identity. Saved v1
+descriptions take precedence over current templates. Description-free legacy metadata is unknown,
+including for a currently registered methodology. New authored built-ins still require descriptors.
+Malformed jobs and restoration failures produce an atomic structured failure result; identity is
+included when it can be safely recovered. Independent backend executables remain supported through
+the documented file contract. A pinned v1-only worker must reject v2 clearly; bundled entrypoints
+use mounted repository code, while dependency changes require image rebuilds.
+
+Acceptance checks:
+
+| Area | Required evidence |
+|---|---|
+| Effective calls | Real signature binding, generic-family binding, defaults with `**kwargs`, isolated invalid cases, baseline/effect/reference records |
+| Concrete requirements | Branch-behavior tests for no-write and no-gradient cases, plus a custom description hook |
+| Ownership and timing | Nested mutation across warmups/trials/reference calls cannot alter snapshots; preparation occurs before the clock |
+| Comparison | Parameter, input, decode-length, aggregation, and effect changes reject comparison; incomplete historical identity stays unverified |
+| Migration | Main-produced v1 descriptions and original v1 jobs round-trip with saved coverage; unknown future versions and inconsistent duplicate metadata fail clearly |
+| Independent workers | JSON-only worker contract tests and CPU Docker end-to-end jobs; source/model identity guards remain active |
+| Project integration | Full CPU suite, lint, host import isolation, manager export, and pinned CausaLab vocabulary validation |
+
+GPU method runs validate backend behavior separately. Unsupported or incorrect method results are
+preserved as benchmark findings. The nnsight 0.8 GPT-2 sweep follows the framework checks and
+requires an uncontended GPU allocation for performance measurements.

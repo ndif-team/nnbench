@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .contract import prepare, write_json
+from .contract import PLAN_VERSION, prepare, write_json
 from .local import ROOT, backend_file, compose, configuration, discover, environment, run_job
 
 
@@ -90,7 +90,7 @@ def _run(args):
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     directory = args.out.resolve() / f"{stamp}-{uuid.uuid4().hex[:8]}"
     directory.mkdir(parents=True, exist_ok=False)
-    plan = {"version": 1, "backends": args.backends, "reference": args.reference,
+    plan = {"version": PLAN_VERSION, "backends": args.backends, "reference": args.reference,
             "comparison": args.comparison, "gpu": args.gpu, "experiments": [], "status": "preparing"}
     jobs = []
     for index, spec in enumerate(specs):

@@ -26,7 +26,9 @@ V = 8
 
 
 def _onehot(i):
-    t = torch.zeros(1, V); t[0, i] = 9.0; return t
+    t = torch.zeros(1, V)
+    t[0, i] = 9.0
+    return t
 
 
 class _FakeBackend:
@@ -103,7 +105,7 @@ def test_mutating_cell_cannot_change_later_calls_or_saved_coordinates(tmp_path, 
                                     data_knobs={"nested": {"values": [1]}})]
     spec.effect = EffectSpec({"k": "base"}, {"k": "a"})
     for params in (spec.baseline.params, spec.effect.baseline_params,
-                   spec.effect.perturbed_params, spec.tasks[0].semantics):
+                   spec.effect.perturbed_params, spec.tasks[0].params):
         params["nested"] = {"values": [1]}
     seen = []
 
@@ -125,8 +127,126 @@ def test_mutating_cell_cannot_change_later_calls_or_saved_coordinates(tmp_path, 
     _, provenance = load_run(str(tmp_path), "owned")
     assert all(w["data_knobs"]["nested"]["values"] == [1]
                for w in provenance["coordinates"]["regimes"])
-    assert all(c["semantics"]["nested"]["values"] == [1]
-               for w in provenance["coordinates"]["regimes"] for c in w["cases"])
+    assert provenance["coordinates"]["cases"][0]["params"]["nested"]["values"] == [1]
+    outputs, _ = load_run(str(tmp_path), "owned")
+    meta = outputs[("__meta__",)]
+    for key in (("interactive", "a"), ("__baseline__", "interactive"), ("batched_perprompt", "a")):
+        assert meta[key]["params"]["nested"]["values"] == [1]
+    for side in ("baseline", "perturbed"):
+        assert meta[("__effect__", "interactive")][side]["params"]["nested"]["values"] == [1]
+
+
+def test_executor_prepares_parameter_copies_outside_measured_interval(tmp_path, monkeypatch):
+    from isb.perf import timing
+
+    active = False
+    measured_calls = []
+    original_copy = execute_mod.deepcopy
+
+    def copied(value):
+        assert not active, "parameter preparation entered the timed interval"
+        return original_copy(value)
+
+    def clock():
+        nonlocal active
+        active = not active
+        return 0.0 if active else 0.1
+
+    def registry(*args):
+        def cell(be, model, prompts, *, k="base"):
+            if active:
+                measured_calls.append(k)
+            return OUT[k].clone()
+        return cell
+
+    monkeypatch.setattr(execute_mod, "deepcopy", copied)
+    monkeypatch.setattr(timing, "perf_counter", clock)
+    for name in ("force_gc", "sync_cuda", "reset_peak_mem"):
+        monkeypatch.setattr(timing, name, lambda: None)
+    spec = _spec()
+    spec.warmup, spec.n_trials = 1, 2
+    _execute(tmp_path, "timed", "transformers", spec, registry)
+    assert measured_calls == ["base", "base", "a", "a", "b", "b"]
+
+
+def test_effect_check_uses_every_unit_in_the_measured_generation_regime(tmp_path, monkeypatch):
+    from isb.perf import timing
+    from isb.sweep.spec import EffectSpec
+
+    monkeypatch.setattr(timing, "force_gc", lambda: None)
+    spec = _spec()
+    spec.regimes = [ExecutionRegime("generation", ["unchanged", "changes"], new_tokens=2)]
+    spec.effect = EffectSpec({"k": "base"}, {"k": "a"})
+
+    def registry(*args):
+        def cell(be, model, prompts, *, k="base", new_tokens=1):
+            # Generation backends consume one prompt per invocation. Only the second prompt
+            # responds to the intervention, so checking the first alone would report no effect.
+            index = 3 if prompts[0] == "changes" and k == "a" else 0
+            return _onehot(index).repeat(new_tokens, 1)
+        return cell
+
+    _execute(tmp_path, "effect-units", "transformers", spec, registry)
+    outputs, _ = load_run(str(tmp_path), "effect-units")
+    effect = outputs[("__meta__",)][("__effect__", "generation")]
+    assert effect["strong"] and effect["top1_agree"] == 0.5
+    assert effect["error"] is None
+    assert effect["baseline"]["params"]["new_tokens"] == 2
+    assert effect["perturbed"]["params"]["new_tokens"] == 2
+
+
+def test_effect_failure_preserves_successful_cases_and_both_call_records(tmp_path, monkeypatch):
+    from isb.perf import timing
+    from isb.sweep.spec import EffectSpec
+
+    monkeypatch.setattr(timing, "force_gc", lambda: None)
+    spec = _spec()
+    spec.effect = EffectSpec({"k": "missing"}, {"k": "a"})
+    _execute(tmp_path, "effect-error", "transformers", spec, _fake_get_cell)
+    outputs, _ = load_run(str(tmp_path), "effect-error")
+    assert ("interactive", "a") in outputs and ("interactive", "b") in outputs
+    effect = outputs[("__meta__",)][("__effect__", "interactive")]
+    assert not effect["strong"] and effect["error"]
+    assert effect["baseline"]["attempted_params"] == {"k": "missing"}
+    assert effect["baseline"]["error_stage"] == "execute"
+    assert "KeyError" in effect["baseline"]["error"]
+    assert effect["perturbed"]["params"] == {"k": "a"}
+    assert effect["perturbed"]["error"] is None
+
+
+def test_case_records_effective_params_and_isolates_keys_the_cell_rejects(tmp_path, monkeypatch):
+    """The record of a case is the call the cell ran: task params over the cell's own keyword
+    defaults, split by the protocol. A dataset knob the cell does not accept is that case's error,
+    and the baseline's, and the run file is still written with the other cases."""
+    import dataclasses
+
+    from isb.perf import timing
+    from isb.protocol import InterventionSpec
+
+    monkeypatch.setattr(timing, "force_gc", lambda: None)
+    spec = dataclasses.replace(
+        _spec(), protocol_absence_reason=None,
+        protocol=InterventionSpec(semantic_params=("k",), realization_params=("extra",)),
+        regimes=[ExecutionRegime("interactive", ["one prompt"]),
+                 ExecutionRegime("batched", ["p", "q"], data_knobs={"position": "last"})])
+
+    def registry(*args):
+        def cell(impl, model, prompts, *, k="base", extra=1):
+            return OUT[k].clone()
+        return cell
+
+    _execute(tmp_path, "bound", "transformers", spec, registry)
+    out, _ = load_run(str(tmp_path), "bound")
+    meta = out[("__meta__",)]
+    assert meta[("interactive", "a")]["params"] == {"k": "a", "extra": 1}
+    assert meta[("interactive", "a")]["semantics"] == {"k": "a"}
+    assert meta[("interactive", "a")]["realization"] == {"extra": 1}
+    assert meta[("interactive", "a")]["error"] is None and ("interactive", "b") in out
+    assert "unexpected keyword argument 'position'" in meta[("batched", "a")]["error"]
+    assert meta[("batched", "a")]["attempted_params"] == {"k": "a", "position": "last"}
+    assert meta[("batched", "a")]["error_stage"] == "bind"
+    assert "position" in meta[("__baseline__", "batched")]["error"]
+    assert ("batched", "a") not in out
 
 
 def test_model_loaded_once_per_run_not_per_cell(tmp_path):

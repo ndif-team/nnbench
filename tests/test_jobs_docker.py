@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from isb.jobs import contract, local
-from isb.sweep.spec import BaselineSpec, CellConfig, Workload
+from isb.sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
 
 pytestmark = pytest.mark.skipif(os.environ.get("ISB_DOCKER_TESTS") != "1",
                                 reason="opt-in: requires Docker and isb-nnsight-hf:local")
@@ -38,7 +38,7 @@ def test_third_party_directory_with_real_docker(tmp_path, mode, status):
       - ${{ISB_OUTPUT_DIR}}:/output
 """)
     spec = CellConfig("fixture", "fixture", "fixture", "fixture",
-                      [Workload("interactive", ["a"])], [({}, "task")], BaselineSpec({}),
+                      [ExecutionRegime("interactive", ["a"])], [({}, "task")], BaselineSpec({}),
                       protocol_absence_reason="Independent Docker lifecycle fixture")
     job = tmp_path / "job"
     experiment = contract.prepare(spec, job)
