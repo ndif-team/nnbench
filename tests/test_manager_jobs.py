@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from isb.jobs.contract import prepare, write_json
+from isb.jobs.contract import VERSION, prepare, write_json
 from isb.manager import Collection, dispatch, export_html
 from isb.manager.model import archive, discard, _rename_exclusive
 from isb.sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
@@ -25,7 +25,7 @@ def bundle(parent, name="attempt", backends=("nnsight-hf", "custom-backend"), wi
         (directory / "result.pt").write_bytes(b"intentionally not a pickle: viewer must never load it")
         write_json(directory / "execution.json", {"status": "completed", "backend": backend,
             "experiment_id": experiment["id"], "image_id": "sha256:fixture"})
-        write_json(directory / "result.json", {"version": 1, "status": "completed", "backend": backend,
+        write_json(directory / "result.json", {"version": VERSION, "status": "completed", "backend": backend,
             "experiment_id": experiment["id"], "inputs_sha256": experiment["inputs_sha256"],
             "cells": [{"workload": "interactive", "label": "task", "state": "RAN", "median_latency_ms": 1.}],
             "provenance": {"engine": {"kind": "transformers" if backend == backends[0] else "vllm"},

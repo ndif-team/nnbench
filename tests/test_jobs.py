@@ -79,33 +79,6 @@ def test_legacy_descriptor_without_write_targets_restores_without_guessing(tmp_p
     assert original == experiment
 
 
-def _as_version_one(experiment):
-    """Rewrite a prepared experiment into the version-one wire shape: `workloads`, task tuples, no
-    protocol fields."""
-    record = contract.unpack(experiment["spec"])
-    record["workloads"] = record.pop("regimes")
-    record["tasks"] = [(task["params"], task["label"]) for task in record["tasks"]]
-    record.pop("protocol")
-    record.pop("protocol_absence_reason")
-    record.pop("protocol_source", None)
-    legacy = {**experiment, "version": 1, "spec": contract.pack(record)}
-    legacy.pop("id")
-    legacy["id"] = contract.digest(contract.canonical(legacy))
-    return legacy
-
-
-def test_version_one_experiment_restores(tmp_path):
-    experiment = contract.prepare(specimen(), tmp_path / "job")
-    contract.write_json(tmp_path / "job" / "experiment.json", _as_version_one(experiment))
-    restored, reread = contract.restore_spec(tmp_path / "job")
-    assert restored.tasks == specimen().tasks
-    assert restored.protocol is None
-    assert restored.protocol_source == "legacy"
-    assert restored.protocol_coverage()["status"] == "legacy"
-    assert reread["version"] == 1
-    assert contract.expected_cells(reread) == {("interactive", "layers")}
-
-
 def test_explicit_protocol_opt_out_roundtrips_and_is_identity_covered(tmp_path):
     spec = replace(specimen(), methodology="custom", protocol=None,
                    protocol_absence_reason="Experimental custom method")
@@ -114,17 +87,6 @@ def test_explicit_protocol_opt_out_roundtrips_and_is_identity_covered(tmp_path):
     assert contract.restore_spec(tmp_path / "job")[0] == spec
     changed = replace(spec, protocol_absence_reason="Revised explanation")
     assert contract.prepare(changed, tmp_path / "changed")["id"] != experiment["id"]
-
-
-def test_version_one_custom_method_is_marked_legacy_undescribed(tmp_path):
-    spec = replace(specimen(), methodology="custom", protocol=None,
-                   protocol_absence_reason="Experimental fixture")
-    experiment = contract.prepare(spec, tmp_path / "job")
-    contract.write_json(tmp_path / "job" / "experiment.json", _as_version_one(experiment))
-    restored, _ = contract.restore_spec(tmp_path / "job")
-    assert restored.protocol is None
-    assert restored.protocol_coverage() == {
-        "status": "legacy", "reason": "Legacy experiment predates explicit protocol coverage"}
 
 
 def test_undescribed_custom_method_without_reason_is_rejected_on_restore(tmp_path):

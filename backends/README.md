@@ -87,19 +87,12 @@ DAS training; the host does not shard its inputs.
 
 The spec record is the Python dataclass as written: `regimes` (units replaced by their count),
 tasks as `{label, params}`, the methodology's protocol template, and, for a methodology without
-one, its `protocol_absence_reason`. All of it is covered by the experiment id. Readers support
-both historical version-1 forms, which use `workloads` and `(params, label)` tasks:
+one, its `protocol_absence_reason`. All of it is covered by the experiment id. Readers accept
+version 2. Historical version-1 jobs must be rerun. Saved descriptors and absence reasons stay
+frozen when a current job is restored.
 
-- Files with an optional `description` retain their frozen protocol template, task parameters,
-  and recorded coverage reason. Duplicate task descriptions must match the executable parameters.
-- Files without a description retain unknown protocol coverage, including for a methodology
-  that has a descriptor in today's code. Restoring them preserves their executable parameters.
-
-Re-saving a historically undescribed spec as version 2 adds `protocol_source: "legacy"` to
-preserve that distinction from an explicitly authored opt-out.
-
-Migration keeps the original experiment id and bytes. These hashes identify runner inputs and
-artifacts; CausaLab maintains its own document and artifact identities. Newly authored methods
+These hashes identify runner inputs and artifacts; CausaLab maintains its own document and
+artifact identities. Newly authored methods
 remain subject to strict protocol validation; saved calls are checked against their frozen
 descriptor at execution, where errors are recorded with the affected call.
 
@@ -111,14 +104,16 @@ source mount. Dependency changes still require rebuilding the images.
 Built-in methods require protocol descriptors. A custom method can supply an `InterventionSpec`
 directly or opt out with a nonempty `CellConfig.protocol_absence_reason`. Coverage is recorded
 as `protocol_coverage` in the shared worker's provenance: `{"status": "described"}` or
-`{"status": "undescribed", "reason": ...}`. Historically missing descriptions use
-`{"status": "legacy", "reason": ...}`. Coverage describes metadata availability independently
+`{"status": "undescribed", "reason": ...}`. Coverage describes metadata availability independently
 of execution verdicts.
 
 What is frozen: the experiment pins the spec and its inputs, and the launcher pins the executed
 image and source commit. The shared worker binds each case's params to its cell's signature at
 run time and records the effective params, split by the protocol, in `result.json` next to the
 cell's timing, together with the baseline, effect-guard, and batched-reference call settings.
+Bound automatic selectors stay explicit (for example `params.residual = null`); `resolved_params`
+records choices reported by the cell at its existing resolution site. Unreported choices have no
+entry in that map.
 Reproduction uses the frozen experiment, source, and image together. Binding, metadata
 description, and fresh invocation-parameter copies happen outside the measured interval.
 
@@ -179,6 +174,6 @@ padding alignment. Write-method effect guards must be present and strong for the
 interactive/generation reference, or the verdict is `INVALID_REFERENCE`.
 
 The new launcher covers methodology specs. Separate micro/perf entrypoints and the old optional
-serve tooling under `docker/` are legacy paths, not backends of this runner. Existing `.pt` files
-remain usable by the legacy scorer and by the manager after an explicit `--import-legacy` step;
+serve tooling under `docker/` are legacy paths, not backends of this runner. Current schema-3 `.pt` files
+are usable by the standalone scorer and by the manager after an explicit `--import-legacy` step;
 the new scorer requires the complete job directory. See [the result-site guide](../docs/result-site.md).

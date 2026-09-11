@@ -32,16 +32,13 @@ if sys.argv[1] == "timeout":
 job = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("/job")
 output = Path(sys.argv[3]) if len(sys.argv) > 3 else Path("/output")
 experiment = json.loads((job / "experiment.json").read_text())
-supported = (1,) if sys.argv[1] == "v1-only" else (1, 2)
+supported = (1,) if sys.argv[1] == "v1-only" else (2,)
 if type(experiment.get("version")) is not int or experiment["version"] not in supported:
     raise SystemExit(f"unsupported experiment version {experiment.get('version')}; supported: {supported}")
 assert digest(canonical({k: v for k, v in experiment.items() if k != "id"})) == experiment["id"]
 assert digest((job / "inputs.jsonl").read_bytes()) == experiment["inputs_sha256"]
 spec = unpack(experiment["spec"])
-if experiment["version"] == 1:
-    expected = {(r["kind"], label) for r in spec["workloads"] for _, label in spec["tasks"]}
-else:
-    expected = {(r["kind"], t["label"]) for r in spec["regimes"] for t in spec["tasks"]}
+expected = {(r["kind"], t["label"]) for r in spec["regimes"] for t in spec["tasks"]}
 
 import torch  # noqa: E402
 

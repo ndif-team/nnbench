@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 
 from ..runfile import INBOX, load_run
-from ..runs import procedure, spec_coordinates, upgrade_coordinates
+from ..runs import procedure, spec_coordinates, read_coordinates
 
 _PASS = {"SUPPORTED", "SUPPORTED_DEGRADED", "EQUIVALENT", "EQUIVALENT_DEGRADED"}
 
@@ -32,7 +32,7 @@ def _load_cached(dir_path: str, name: str):
     meta = {tuple(key): value for key, value in summary["metadata"]}
     provenance = summary["provenance"]
     if "coordinates" in provenance:
-        provenance["coordinates"] = upgrade_coordinates(provenance["coordinates"])
+        provenance["coordinates"] = read_coordinates(provenance["coordinates"])
     return {("__meta__",): meta, ("perf_rows",): summary.get("perf_rows", [])}, provenance
 
 
@@ -107,7 +107,7 @@ def import_legacy(dir_path: str):
         if probe_results(out) or out.get(("perf_rows",)):
             pass  # Primitive self-checks and performance rows already carry their measured states.
         elif recorded is None:
-            comparison_error = "Historical procedure identity is incomplete; no automatic comparison was made."
+            comparison_error = "Recorded procedure identity is incomplete; no automatic comparison was made."
         elif current != recorded:
             comparison_error = "The current spec does not match the saved procedure; no automatic comparison was made."
         elif base and not comparable(prov, entries[base][1]):
@@ -317,7 +317,8 @@ class Collection:
             except (OSError, ValueError, KeyError, TypeError) as error:
                 self.warnings.append(f"{name}: legacy summary unavailable; run --import-legacy ({error})")
         if self.entries:
-            self.warnings.append("Legacy import snapshots: comparisons lack the new runner's frozen-input identity guarantees.")
+            self.warnings.append("Standalone import snapshots: comparisons lack the Docker runner's resolved "
+                                 "source/model/tokenizer checks.")
         for directory in bundle_paths(root) if dir_path else ():
             relative = directory.relative_to(root).as_posix()
             prefix = directory.name if relative == "." else relative

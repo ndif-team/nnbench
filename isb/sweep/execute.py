@@ -19,8 +19,9 @@ from __future__ import annotations
 import inspect
 import traceback
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from ..methodologies.observations import capture_choices
 from ..methodologies.registry import get_cell
 from ..perf.timing import time_cell
 from ..runfile import save_run
@@ -61,15 +62,21 @@ class BoundCell:
     """One resolved call with owned settings; each invocation prepares fresh parameter values."""
     fn: object
     params: dict
+    record: dict = field(default_factory=dict)
+    positional_names: tuple = field(init=False)
+
+    def __post_init__(self):
+        parameters = list(inspect.signature(self.fn).parameters.values())
+        self.positional_names = tuple(p.name for p in parameters[3:]
+                                      if p.kind is inspect.Parameter.POSITIONAL_ONLY)
 
     def prepare(self, impl, model, prompts):
         owned = deepcopy(self.params)
-        parameters = list(inspect.signature(self.fn).parameters.values())
-        positional = [owned.pop(p.name) for p in parameters[3:]
-                      if p.kind is inspect.Parameter.POSITIONAL_ONLY]
+        positional = [owned.pop(name) for name in self.positional_names]
 
         def invoke():
-            return self.fn(impl, model, prompts, *positional, **owned)
+            with capture_choices(self.params, self.record):
+                return self.fn(impl, model, prompts, *positional, **owned)
 
         return invoke
 
@@ -92,7 +99,7 @@ def _bind_case(spec, name, params, record):
     record.update(deepcopy(describe_case(spec.methodology, deepcopy(effective),
                                         template=spec.protocol, family=spec.family)))
     record["error_stage"] = "execute"
-    return BoundCell(fn, effective)
+    return BoundCell(fn, effective, record)
 
 
 def _failure(record, error):
@@ -198,7 +205,7 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
             try:
                 call = _bind_case(spec, iface, _task_params(regime, spec.baseline.params), baseline)
                 base_timing, _ = time_cell(
-                    None, prepare_call=lambda: call.prepare(be, model, timed_prompts),
+                    lambda: call.prepare(be, model, timed_prompts),
                     warmup=spec.warmup, n_trials=spec.n_trials)
                 baseline["median_latency_ms"] = base_timing.median_ms
                 _success(baseline)
@@ -211,7 +218,7 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
                 try:
                     call = _bind_case(spec, iface, _task_params(regime, task.params), case)
                     timing, warm = time_cell(
-                        None, prepare_call=lambda: call.prepare(be, model, timed_prompts),
+                        lambda: call.prepare(be, model, timed_prompts),
                         warmup=spec.warmup, n_trials=spec.n_trials)
                     if regime.aggregate:
                         case["error_stage"] = "aggregate"

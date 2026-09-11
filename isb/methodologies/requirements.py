@@ -14,20 +14,22 @@ from typing import Any
 from ..protocol import PROTOCOLS, InterventionSpec
 
 
-CASE_DESCRIPTIONS: dict[str, Callable[..., InterventionSpec | None]] = {}
+CASE_DESCRIPTIONS: dict[str, tuple[Callable[..., InterventionSpec | None], InterventionSpec | None]] = {}
 
 
-def case_description(methodology: str, *, override: bool = False):
+def case_description(methodology: str, *, override: bool = False,
+                     template: InterventionSpec | None = None):
     """Register ``fn(params, *, template, family) -> InterventionSpec | None``.
 
     A custom methodology can supply a hook beside its cell implementation. A methodology without
     a hook retains its template and records ``protocol_scope='template'`` in case metadata. A hook
     may return None when it cannot specialize a case. Replacing a hook requires ``override=True``.
+    Supplying ``template`` restricts a hook to that descriptor, preserving custom frozen templates.
     """
     def register(fn):
         if methodology in CASE_DESCRIPTIONS and not override:
             raise ValueError(f"case description already registered for {methodology!r}")
-        CASE_DESCRIPTIONS[methodology] = fn
+        CASE_DESCRIPTIONS[methodology] = (fn, template)
         return fn
 
     return register
@@ -40,9 +42,9 @@ def describe_case(methodology: str, params: Mapping[str, Any], *,
     An absent template stays absent. Hooks receive an independent parameter snapshot so metadata
     extensions cannot mutate the parameters subsequently passed to the cell.
     """
-    hook = CASE_DESCRIPTIONS.get(methodology)
+    hook, expected_template = CASE_DESCRIPTIONS.get(methodology, (None, None))
     if (template is None or hook is None
-            or (hook is _BUILTIN_HOOKS.get(methodology) and template != PROTOCOLS[methodology])):
+            or expected_template is not None and template != expected_template):
         return {"protocol": template.coordinate() if template is not None else None,
                 "protocol_scope": "template"}
     descriptor = hook(deepcopy(dict(params)), template=template, family=family)
@@ -67,7 +69,7 @@ def _without_grad(template: InterventionSpec) -> InterventionSpec:
                                     {"activation_grad", "jacobian_export"}))
 
 
-@case_description("steering")
+@case_description("steering", template=PROTOCOLS["steering"])
 def _steering(params, *, template, family):
     if "alpha" not in params:
         return None
@@ -76,7 +78,7 @@ def _steering(params, *, template, family):
     return template
 
 
-@case_description("gen_steering")
+@case_description("gen_steering", template=PROTOCOLS["gen_steering"])
 def _gen_steering(params, *, template, family):
     if "alpha" not in params:
         return None
@@ -85,7 +87,7 @@ def _gen_steering(params, *, template, family):
     return template
 
 
-@case_description("activation_patching")
+@case_description("activation_patching", template=PROTOCOLS["activation_patching"])
 def _activation_patching(params, *, template, family):
     if "patch" not in params:
         return None
@@ -94,7 +96,7 @@ def _activation_patching(params, *, template, family):
     return template
 
 
-@case_description("gen_patching")
+@case_description("gen_patching", template=PROTOCOLS["gen_patching"])
 def _gen_patching(params, *, template, family):
     if "patch" not in params:
         return None
@@ -103,7 +105,7 @@ def _gen_patching(params, *, template, family):
     return template
 
 
-@case_description("ablation")
+@case_description("ablation", template=PROTOCOLS["ablation"])
 def _ablation(params, *, template, family):
     if "target" not in params:
         return None
@@ -118,22 +120,22 @@ def _ablation(params, *, template, family):
                    write_components=(component,) if template.write_components is not None else None)
 
 
-@case_description("das")
+@case_description("das", template=PROTOCOLS["das"])
 def _das(params, *, template, family):
     if "train" not in params:
         return None
     return template if params["train"] else _without_grad(template)
 
 
-@case_description("attribution_patching")
-@case_description("jacobian_collect")
+@case_description("attribution_patching", template=PROTOCOLS["attribution_patching"])
+@case_description("jacobian_collect", template=PROTOCOLS["jacobian_collect"])
 def _grad(params, *, template, family):
     if "grad" not in params:
         return None
     return template if params["grad"] else _without_grad(template)
 
 
-@case_description("jacobian_lens")
+@case_description("jacobian_lens", template=PROTOCOLS["jacobian_lens"])
 def _jacobian_lens(params, *, template, family):
     if "transport" not in params:
         return None
@@ -142,10 +144,7 @@ def _jacobian_lens(params, *, template, family):
     return template
 
 
-@case_description("logit_lens")
-@case_description("attention_pattern")
+@case_description("logit_lens", template=PROTOCOLS["logit_lens"])
+@case_description("attention_pattern", template=PROTOCOLS["attention_pattern"])
 def _constant(params, *, template, family):
     return template
-
-
-_BUILTIN_HOOKS = dict(CASE_DESCRIPTIONS)

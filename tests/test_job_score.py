@@ -19,7 +19,7 @@ def artifacts(tmp_path, *, batched=False):
     for backend in ("reference-name", "candidate-name"):
         output = directory / backend
         output.mkdir()
-        identity = {"version": 1, "backend": backend, "experiment_id": experiment["id"],
+        identity = {"version": contract.VERSION, "backend": backend, "experiment_id": experiment["id"],
                     "inputs_sha256": experiment["inputs_sha256"]}
         provenance = {"job": identity, "model_identity": {
             "repo": "test/model", "revision": "abc", "vocab_sha256": "def", "vocab_size": 8}}

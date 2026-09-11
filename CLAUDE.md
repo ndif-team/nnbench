@@ -42,19 +42,21 @@ with `@cell(...)` in `isb/methodologies/`. `TaskSpec` holds a case label and par
 semantic values and realization selectors. The worker binds effective params to the resolved
 cell signature, records case requirements through `methodologies/requirements.py`, and gives
 each invocation fresh nested values prepared outside the timer. Protocol metadata indexes cells
-and provenance. Backend selection belongs to the independent Compose launcher. A `vllm_*`
-variant falls back to the `vllm_async` cell when no exact registration exists. Current contracts
+and provenance. Protocol metadata must never construct intervention programs. Backend selection
+belongs to the independent Compose launcher. A `vllm_*` variant falls back to the `vllm_async`
+cell when no exact registration exists. Current contracts
 and acceptance checks live in `docs/design.md` §12.13.
 
 Main data flow: `scripts/bench.py` → frozen experiment/inputs → `backends/NAME/run.py` in its
 own Compose project → validated artifacts → `isb/jobs/score.py`. The shared nnsight worker reuses
-the scientific execution routines below. Legacy standalone execute/score tools retain their
-older `.pt` interface; their orchestration conventions do not define the new runner. The manager
-reads saved job reports; legacy `.pt` browsing requires explicit `--import-legacy` summaries.
+the scientific execution routines below. Standalone execute/score tools retain their `.pt`
+interface. The manager reads saved job reports; standalone `.pt` browsing requires explicit
+`--import-legacy` summaries. Readers accept job wire version 2 and coordinate schema 3;
+older artifacts must be rerun.
 
 1. **Spec** (`isb/specs/`): `InterventionSpec × TaskSpec × ExecutionRegime` per methodology. Batching is a *coverage axis* — each case is oracle-checked in its own regime, not just timed.
 2. **Backend** (`isb/backends/`): `be` objects — `hf` (the per-family control), `vllm_async` (in-process system under test), `vllm_serve` (over-HTTP). One model load per backend, amortized across all tasks; an intervention error is isolated (engine survives, later tasks still run).
-3. **Oracle** (`isb/oracle/equivalence.py`): compares outputs via top-1 agreement and softmax TV. The main runner takes an explicit reference and comparison axis, with no implicit precision-control jobs. The legacy `scripts/score.py --ctl` can still disambiguate precision using old-format artifacts.
+3. **Oracle** (`isb/oracle/equivalence.py`): compares outputs via top-1 agreement and softmax TV. The main runner takes an explicit reference and comparison axis, with no implicit precision-control jobs. The standalone `scripts/score.py --ctl` can disambiguate precision using current schema-3 artifacts.
 4. **Perf** (`isb/perf/`): warm timing (warmup + N trials, CUDA-synced, median±std, peak mem) — correctness is verified in the same warm/batched regime perf is measured in.
 5. **Report** (`isb/report/`): applicability map (`AppState` in `isb/states.py`) + performance table.
 

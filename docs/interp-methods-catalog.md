@@ -189,7 +189,7 @@ outside CausaLab v1. The Level-0/1/1.5 vocabulary above supports engine-failure 
 Saved call records contain effective parameters, semantic/realization values, and the described
 requirements. For example, DAS application (`train=0`) is gradient-free while training requires
 gradients. `protocol_scope` distinguishes concrete cases from template-only descriptions;
-`protocol_coverage` distinguishes described, explicitly opted-out, and legacy-unknown metadata.
+`protocol_coverage` distinguishes described and explicitly opted-out metadata.
 
 Status: ✓ = already an nnbench cell. **frontier** = exercises a primitive where vLLM and HF diverge
 (the highest-signal additions).

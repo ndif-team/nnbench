@@ -2,7 +2,7 @@
 
 > Status: evolving. Captures decisions as they're made in the design conversation.
 > Current implementation contract: §12.1 and §12.13. Experiment authoring, effective cell calls,
-> historical migration, and result comparison have explicit ownership and validation boundaries.
+> artifact versions, and result comparison have explicit ownership and validation boundaries.
 
 > Runner update (2026-09-08): the main CLI now uses independent `backends/NAME/compose.yml`
 > configurations, frozen input jobs, explicit references, and artifact-only scoring. See
@@ -886,6 +886,7 @@ def _(be, model, prompt):
   records a gradient-free case; training records gradients. Custom methodologies can supply their
   own case-description function; without one, the template remains explicitly template-level.
   Descriptions are metadata and never select a backend or predict an execution verdict.
+  Protocol metadata must never construct intervention programs; explicit cells own execution.
 - **Execution regimes are orthogonal.** `ExecutionRegime` owns inputs, interactive/batched/
   generation shape, decode length, and aggregation. A protocol case can be exercised under
   multiple regimes.
@@ -898,20 +899,18 @@ def _(be, model, prompt):
 - **Metadata coverage is explicit.** Built-in methods require descriptors. Custom methods supply
   an `InterventionSpec` or a nonempty `protocol_absence_reason`. The latter produces an
   `undescribed` coverage record with its reason; described cases record `described` coverage.
-  This policy is checked at construction and job preparation. Older undescribed experiments
-  receive a legacy reason during restoration. Coverage and backend execution verdicts are
-  separate attributes.
+  This policy is checked at construction and job preparation. Coverage and backend execution
+  verdicts are separate attributes.
 
 Authoring API: `CellConfig(regimes=...)` and `TaskSpec(label, params)`; `(params, label)` task
 tuples remain an authoring convenience. The old `Workload` alias, `workloads` property, and task
-tuple iterator are retired together. Historical files use explicit versioned migration.
+tuple iterator are retired together. Historical file formats are unsupported; experiments can
+be rerun to produce current artifacts.
 
 Docker integration: the host freezes resolved specs and inputs through `isb/jobs/contract.py`.
 Its version-2 file contract stores `regimes`, `{label, params}` tasks, the protocol template, and
-explicit absence reason. Version-1 readers distinguish original files from files with optional,
-checksum-covered `description` metadata. Migration preserves saved templates and coverage reasons,
-validates duplicate task representations, and marks genuinely missing descriptions as legacy.
-Restoring an old experiment never fills missing metadata from today's protocol table.
+explicit absence reason. Readers accept version 2 and retain its saved template and coverage
+reason. Restoration uses the frozen descriptor, independent of today's protocol table.
 The shared executor accepts a backend, interface, and provenance supplied by the container's
 entrypoint; lazy sweep exports keep host spec loading independent of torch/nnsight imports.
 - **Reuse emerges bottom-up:** when two cells are structurally identical except module names,
@@ -1267,7 +1266,7 @@ The server binds 127.0.0.1 only and rejects archive/discard names that are not i
 Current browsing reads saved JSON reports. Unpickling and scoring legacy artifacts require the
 explicit trusted `--import-legacy` operation.
 
-### 12.13 Current execution and compatibility contract
+### 12.13 Current execution and artifact contract
 
 This section defines the acceptance plan for the consistency refactor. The independent Compose
 runner and explicit method cells remain the extension boundaries. Earlier shared-Compose and
@@ -1282,41 +1281,51 @@ unexpected arguments become isolated call errors. Registered templates classify 
 baseline, and effect parameters at authoring time. Runtime classification remains checked because
 datasets, restored templates, and independently extended cells can differ from the built-in suite.
 
-**What gets saved.** Successful effective-call records contain parameters, their semantic and
+**What gets saved.** Successful effective-call records contain bound parameters, their semantic and
 realization split when available, and a case-level protocol description or explicit template-level
 coverage. Failed calls retain attempted parameters and the error stage. Baseline, effect, and
 batched-reference records include their own settings and errors. Missing metadata has a visible
 reason. Execution findings remain independent from metadata coverage.
+
+Bound parameters include Python defaults, including automatic selectors such as `residual=None`.
+Cells report choices they resolve through an observation-only helper, at the existing resolution
+site. `resolved_params` holds these reported choices separately; an absent entry means unreported.
+The helper leaves execution decisions in the cell. Reported choices must remain consistent across
+invocations of the same case. Changing a choice produces an isolated call error.
 
 The JSON result's optional `auxiliary_calls` field carries baseline, effect, and batched-reference
 records alongside the task-cell list. The manager retains these records and renders failed or
 incomplete effect checks safely. Effect checks use the measured case's full aggregation regime;
 missing, empty, nonfinite, or incompatible outputs produce an isolated effect error.
 
-**One coordinate format.** `isb/runs.py` owns the versioned coordinate builder and load-time
-migration used by method, micro, perf, and manager paths. Snapshot values are detached from mutable
+**One coordinate format.** `isb/runs.py` owns the schema-3 coordinate builder and boundary
+validation used by method, micro, perf, and manager paths. Snapshot values are detached from mutable
 specs and reader inputs. The manager preserves the worker's executed description and call records;
-the frozen job supplies submitted identity, including for failed or pending jobs. Unknown future
-schema versions are rejected. Older coordinate details remain available for audit after migration.
+the frozen job supplies submitted identity, including for failed or pending jobs. Other schema
+versions are rejected with a rerun instruction. Builders emit explicit fields.
 
 **Safe comparisons.** Docker comparisons retain the experiment/input identity checks and resolved
 source/model/tokenizer checks. Standalone comparison requires complete matching procedure identity:
 model and method, actual input content, declared case parameters, every regime setting, and
-baseline/effect configuration. Interface differences are an intended comparison axis. Missing
-historical identity permits browsing but gives no automatic equivalence claim, including when both
-sides are missing the same fields. The manager explains this limited comparability. Labels and
-dataset names alone do not establish identity.
+baseline/effect configuration and model-load options. Warmup count, trial count, and the standalone
+precision-recheck setting (`dtype_control`) remain recorded but are excluded from correctness
+identity. Model-load options are conservatively matched because they can change the model being
+compared. Interface differences are an intended comparison axis. Current micro/perf artifacts can
+have incomplete procedure identity; these remain browsable without automatic equivalence claims.
+Labels and dataset names alone do not establish identity. Docker job identity still covers the
+entire submitted recipe, including timing settings.
 
 **Timing and ownership.** The saved recipe, effective-call metadata, and invocation parameters have
 separate ownership. Each warmup, measured trial, and reference/effect invocation receives a fresh
 deep copy. Copying, metadata specialization, and binding happen outside the measured interval.
-The timed unit is the cell call plus the established synchronization boundary. Tests pin this
+`time_cell` accepts one preparation factory, which returns each fresh invocation. Parameter layout
+is inspected once when binding the case. The timed unit is the cell call, including its lightweight
+choice reporting, plus the established synchronization boundary. Tests pin this
 definition; changing it requires an explicit measurement-contract change.
 
-**File compatibility and failure reporting.** Version 2 writes one canonical task representation.
-Readers accept both historical v1 variants and v2 without rewriting input identity. Saved v1
-descriptions take precedence over current templates. Description-free legacy metadata is unknown,
-including for a currently registered methodology. New authored built-ins still require descriptors.
+**File versions and failure reporting.** Version 2 writes one canonical task representation.
+Readers accept version 2; historical version-1 jobs must be rerun. Saved descriptions take
+precedence over current templates. New authored built-ins still require descriptors.
 Malformed jobs and restoration failures produce an atomic structured failure result; identity is
 included when it can be safely recovered. Independent backend executables remain supported through
 the documented file contract. A pinned v1-only worker must reject v2 clearly; bundled entrypoints
@@ -1329,10 +1338,11 @@ Acceptance checks:
 | Effective calls | Real signature binding, generic-family binding, defaults with `**kwargs`, isolated invalid cases, baseline/effect/reference records |
 | Concrete requirements | Branch-behavior tests for no-write and no-gradient cases, plus a custom description hook |
 | Ownership and timing | Nested mutation across warmups/trials/reference calls cannot alter snapshots; preparation occurs before the clock |
-| Comparison | Parameter, input, decode-length, aggregation, and effect changes reject comparison; incomplete historical identity stays unverified |
-| Migration | Main-produced v1 descriptions and original v1 jobs round-trip with saved coverage; unknown future versions and inconsistent duplicate metadata fail clearly |
+| Comparison | Parameter, input, decode-length, aggregation, effect, and model-load changes reject comparison; timing-only changes compare; incomplete identity stays unverified |
+| File boundaries | Current jobs round-trip with saved coverage; historical and future versions fail clearly; malformed current artifacts fail validation |
+| Resolved choices | Automatic selectors retain their bound values and record the cell's resolved choice; inconsistent choices fail locally |
 | Independent workers | JSON-only worker contract tests and CPU Docker end-to-end jobs; source/model identity guards remain active |
-| Project integration | Full CPU suite, lint, host import isolation, manager export, and pinned CausaLab vocabulary validation |
+| Project integration | Full CPU suite on Python 3.11 and 3.12, lint, host import isolation, manager export, and pinned CausaLab vocabulary validation |
 
 GPU method runs validate backend behavior separately. Unsupported or incorrect method results are
 preserved as benchmark findings. The nnsight 0.8 GPT-2 sweep follows the framework checks and

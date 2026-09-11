@@ -30,6 +30,7 @@ import torch
 import torch.nn.functional as F
 
 from ..profiles import _resid        # the documented read pattern: plain vs fused (out[0]+out[1])
+from .observations import record_resolved
 from .registry import cell
 
 
@@ -107,6 +108,7 @@ def steering_vllm(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, 
     # the previous per-family defaults exactly: gpt2 plain, llama/nemotron fused. An explicit
     # residual= param still overrides.
     residual = residual if residual is not None else m.default_residual(be.name)
+    record_resolved(residual=residual)
     token_id = _resolve_token(model.tokenizer, target)
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
         return _steer_and_read(

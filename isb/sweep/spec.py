@@ -100,10 +100,8 @@ class CellConfig:
     protocol_source: str = field(default="authored", compare=False, repr=False)
 
     def __post_init__(self):
-        if self.protocol_source not in {"authored", "restored", "legacy"}:
+        if self.protocol_source not in {"authored", "restored"}:
             raise ValueError(f"unknown protocol source {self.protocol_source!r}")
-        if self.protocol_source == "legacy" and self.protocol is not None:
-            raise ValueError("legacy protocol coverage must have no descriptor")
         if self.protocol_source == "authored" and self.protocol is None:
             self.protocol = protocol_for(self.methodology)
         self.protocol_coverage()
@@ -130,8 +128,7 @@ class CellConfig:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError(f"methodology {self.methodology!r} requires a protocol descriptor "
                              "or an explicit protocol_absence_reason")
-        return {"status": "legacy" if self.protocol_source == "legacy" else "undescribed",
-                "reason": reason}
+        return {"status": "undescribed", "reason": reason}
 
 
 def spec_with_data(spec: CellConfig, ref) -> CellConfig:

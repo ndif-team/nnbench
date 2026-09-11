@@ -3,6 +3,7 @@ FROM ${PYTORCH_IMAGE}
 ARG NNSIGHT_REF=260c555bf2e3bd3395eed4df0435f35e253b2d3d
 ARG TRANSFORMERS_VERSION=5.12.1
 RUN apt-get update && apt-get install -y --no-install-recommends git gcc python3-dev
+# HF model loading uses device_map, which requires Accelerate independently of nnsight core.
 RUN python3 -m pip install --break-system-packages --no-cache-dir \
       "torch==2.11.0" \
       "click==8.3.1" \

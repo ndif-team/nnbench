@@ -23,7 +23,7 @@ def test_binding_rejects_missing_required_and_unknown_arguments():
     def cell(be, model, prompts, *, required):
         pass
 
-    with pytest.raises(TypeError, match="missing a required argument"):
+    with pytest.raises(TypeError, match="required"):
         _effective_params(cell, {})
     with pytest.raises(TypeError, match="unexpected keyword argument"):
         _effective_params(cell, {"required": 1, "unknown": 2})
@@ -36,7 +36,7 @@ def test_optional_positional_only_defaults_replay_positionally():
     params = _effective_params(cell, {"alpha": 3})
     assert params == {"option": 2, "alpha": 3}
     assert BoundCell(cell, params).prepare(None, None, [])() == (2, 3)
-    with pytest.raises(TypeError, match="positional only"):
+    with pytest.raises(TypeError, match="option"):
         _effective_params(cell, {"option": 4})
 
 
@@ -81,6 +81,20 @@ def test_profile_bound_signature_and_backend_fallback(monkeypatch):
 
     monkeypatch.setitem(CELLS, ("binding_test", "gpt2", "vllm_sync"), exact)
     assert _effective_params(get_cell("binding_test", "gpt2", "vllm_sync"), {}) == {"alpha": 3}
+
+
+def test_trial_preparation_reuses_the_bound_parameter_layout(monkeypatch):
+    def cell(be, model, prompts, option=2, /):
+        return option
+
+    call = BoundCell(cell, _effective_params(cell, {}))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("signature inspection belongs to case binding")
+
+    monkeypatch.setattr(inspect, "signature", forbidden)
+    for _ in range(3):
+        assert call.prepare(None, None, [])() == 2
 
 
 def test_dataset_task_and_generation_precedence():

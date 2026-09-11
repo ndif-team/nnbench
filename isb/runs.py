@@ -222,6 +222,7 @@ def resolve_provenance(run: RunConfig) -> dict:
 
 COORDINATES_SCHEMA = 3
 _CONFIG_FIELDS = ("baseline", "effect", "dtype_control", "warmup", "n_trials", "hf_kwargs", "vllm_kwargs")
+_COMPARISON_CONFIG_FIELDS = ("baseline", "effect", "hf_kwargs", "vllm_kwargs")
 
 
 def coordinate_config(spec_or_record) -> dict:
@@ -306,7 +307,7 @@ def run_coordinates(*, spec: str, methodology: str, family: str, repo: str, inte
     new_tokens/aggregate/data_knobs; a `cases` entry carries its label plus the declared params.
     The params each case actually ran with (cell defaults applied) live in the run's per-cell
     meta, next to its timing."""
-    regimes = [{**r, "kind": r["kind"], "units": r["units"], "data": r.get("data"),
+    regimes = [{"kind": r["kind"], "units": r["units"], "data": r.get("data"),
                 "new_tokens": r.get("new_tokens", 0), "aggregate": r.get("aggregate", True),
                 "data_knobs": dict(r.get("data_knobs") or {})} for r in regimes]
     coordinates = deepcopy({
@@ -315,7 +316,7 @@ def run_coordinates(*, spec: str, methodology: str, family: str, repo: str, inte
         "interface": interface,
         "data": sorted({r["data"] for r in regimes if r["data"]}),
         "regimes": regimes,
-        "cases": [{**c, "label": c["label"], "params": dict(c.get("params") or {})} for c in cases],
+        "cases": [{"label": c["label"], "params": dict(c.get("params") or {})} for c in cases],
         "protocol": protocol,
         "protocol_coverage": protocol_coverage,
         "inputs_sha256": inputs_sha256,
@@ -347,54 +348,34 @@ def spec_coordinates(spec, interface: str, *, inputs_sha256=None, config=None) -
 
 
 def procedure(coordinates: dict) -> tuple | None:
-    """Complete procedure identity, or None when historical records cannot establish it.
+    """Correctness comparison identity, or None for incomplete current records.
 
     Cell interfaces and recorded requirements may differ across intentional backend comparisons.
-    Exact input content, declared parameters, regime settings and spec controls must match.
+    Exact inputs, case/regime settings, baseline/effect settings and load options must match.
+    Timing controls remain in the artifact and have no role in correctness matching.
     """
     from .jobs.contract import canonical, pack
 
     if not coordinates:
         return None
-    c = upgrade_coordinates(coordinates)
+    c = read_coordinates(coordinates)
     if not c["identity_complete"]:
         return None
-    identity = {"inputs_sha256": c["inputs_sha256"], "data": c["data"], "config": c["config"],
+    identity = {"inputs_sha256": c["inputs_sha256"], "data": c["data"],
+                "config": {key: c["config"][key] for key in _COMPARISON_CONFIG_FIELDS},
                 "regimes": [{k: r[k] for k in ("kind", "units", "data", "new_tokens", "aggregate", "data_knobs")}
                             for r in c["regimes"]],
                 "cases": [{"label": case["label"], "params": case["params"]} for case in c["cases"]]}
     return (c["spec"], c["methodology"], c["family"], c["repo"], canonical(pack(identity)))
 
 
-def upgrade_coordinates(coordinates: dict) -> dict:
-    """Coordinates from an older run file in the current shape. Files written before the regime
-    rename carry `workloads` and `tasks` (labels only); the first renamed shape carries `regimes`,
-    `cases` split into semantics/realization, and `protocol_template`."""
-    c = deepcopy(coordinates)
-    if not isinstance(c, dict):
+def read_coordinates(coordinates: dict) -> dict:
+    """Validate a current-format coordinate snapshot at an artifact boundary."""
+    if not isinstance(coordinates, dict):
         raise ValueError("coordinates must be an object")
-    version = c.get("schema")
-    if version is not None and type(version) is not int:
-        raise ValueError(f"unsupported coordinate schema {version!r}")
-    if version == COORDINATES_SCHEMA:
-        _validate_coordinates(c)
-        return c
-    if version not in (None, 1, 2):
-        raise ValueError(f"unsupported coordinate schema {version!r}")
-    regimes = [{**r, "data": r.get("data", r.get("data_name"))}
-               for r in (c.get("regimes") or c.get("workloads") or [])]
-    if "cases" in c:
-        cases = [{**x, "label": x["label"],
-                  "params": x.get("params", {**x.get("semantics", {}), **x.get("realization", {})})}
-                 for x in c["cases"]]
-    else:
-        cases = [{"label": label} for label in c.get("tasks", [])]
-    upgraded = run_coordinates(
-        spec=c["spec"], methodology=c["methodology"], family=c["family"], repo=c.get("repo"),
-        interface=c.get("interface", "unknown"), regimes=regimes, cases=cases,
-        protocol=c.get("protocol", c.get("protocol_template")),
-        protocol_coverage=c.get("protocol_coverage"))
-    upgraded["data"] = c.get("data", upgraded["data"])
-    # Historical nested cases, custom extensions and omitted fields remain available verbatim.
-    upgraded["legacy_coordinates"] = c
-    return upgraded
+    version = coordinates.get("schema")
+    if type(version) is not int or version != COORDINATES_SCHEMA:
+        raise ValueError(f"unsupported coordinate schema {version!r}; rerun with current code")
+    c = deepcopy(coordinates)
+    _validate_coordinates(c)
+    return c

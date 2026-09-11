@@ -218,7 +218,7 @@ def test_saved_custom_template_is_preserved_for_builtin_method():
 
 
 def test_custom_hook_scope_and_parameter_isolation(monkeypatch):
-    monkeypatch.setitem(CASE_DESCRIPTIONS, "custom", lambda *a, **k: None)
+    monkeypatch.setitem(CASE_DESCRIPTIONS, "custom", (lambda *a, **k: None, None))
     template = InterventionSpec(components=("block_output",), semantic_params=("layers",))
 
     @case_description("custom", override=True)
@@ -240,7 +240,7 @@ def test_explicitly_absent_template_stays_absent(monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("an absent template must not invoke a specialization hook")
 
-    monkeypatch.setitem(CASE_DESCRIPTIONS, "steering", forbidden)
+    monkeypatch.setitem(CASE_DESCRIPTIONS, "steering", (forbidden, None))
     assert describe_case("steering", {"alpha": 0}, template=None, family="gpt2") == {
         "protocol": None, "protocol_scope": "template",
     }
@@ -254,7 +254,7 @@ def test_missing_hook_retains_explicit_template_scope():
 
 
 def test_bad_custom_hook_result_is_loud(monkeypatch):
-    monkeypatch.setitem(CASE_DESCRIPTIONS, "bad_hook", lambda *a, **k: {})
+    monkeypatch.setitem(CASE_DESCRIPTIONS, "bad_hook", (lambda *a, **k: {}, None))
     with pytest.raises(TypeError, match="InterventionSpec or None"):
         describe_case("bad_hook", {}, template=InterventionSpec(), family="gpt2")
 

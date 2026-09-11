@@ -8,9 +8,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 VERSION = 2            # experiment/result files this code writes
-VERSIONS = (1, 2)      # experiment/result files this code reads (1: `workloads` + task tuples)
+VERSIONS = (VERSION,)  # experiment/result files this code reads
 PLAN_VERSION = 1       # the launcher's plan.json / report.json
-LEGACY_PROTOCOL_REASON = "Legacy experiment predates explicit protocol coverage"
 
 
 def pack(value):
@@ -64,10 +63,8 @@ def prepare(spec, directory, *, seed=0):
     directory = Path(directory)
     spec.protocol_coverage()                       # re-validate: specs are editable after construction
     record = asdict(spec)
-    # Authored/restored validation policy is in-memory. The legacy marker preserves genuinely
-    # missing historical metadata when an old recipe is submitted as a new v2 job.
-    if record.get("protocol_source") != "legacy":
-        record.pop("protocol_source", None)
+    # Authoring/restoration validation policy belongs to the in-memory spec.
+    record.pop("protocol_source", None)
     if not spec.regimes:
         raise ValueError("experiment must contain a workload")
     records = []
@@ -101,9 +98,10 @@ def check_experiment(experiment):
     if not isinstance(experiment, dict):
         raise ValueError("experiment must be a JSON object")
     body = {k: v for k, v in experiment.items() if k != "id"}
-    if (type(experiment.get("version")) is not int or experiment["version"] not in VERSIONS
-            or digest(canonical(body)) != experiment.get("id")):
-        raise ValueError("invalid experiment version or checksum")
+    if type(experiment.get("version")) is not int or experiment["version"] not in VERSIONS:
+        raise ValueError(f"unsupported experiment version {experiment.get('version')!r}; rerun with current code")
+    if digest(canonical(body)) != experiment.get("id"):
+        raise ValueError("invalid experiment checksum")
 
 
 def read_experiment(directory):
@@ -116,60 +114,13 @@ def read_experiment(directory):
 
 
 def wire_spec(experiment):
-    """Return the frozen spec in the current shape without changing experiment identity.
-
-    Version one has two historical forms: executable tuples alone, and those same tuples plus
-    identity-covered protocol/task descriptions. The saved description owns the latter's
-    metadata. A description-free record keeps its missing metadata visible, including when
-    today's protocol table happens to contain its methodology.
-    """
+    """Validate the frozen current-format spec and retain its saved descriptor."""
     if type(experiment.get("version")) is not int or experiment["version"] not in VERSIONS:
-        raise ValueError("unsupported experiment version")
+        raise ValueError("unsupported experiment version; rerun with current code")
     record = unpack(experiment["spec"])
     if not isinstance(record, dict):
         raise ValueError("experiment spec must be an object")
-    source = record.get("protocol_source", "restored")
-    if source not in {"authored", "restored", "legacy"}:
-        raise ValueError("invalid saved protocol source")
-    record["protocol_source"] = "legacy" if source == "legacy" else "restored"
-    if experiment["version"] == 1:
-        record["regimes"] = record.pop("workloads")
-        record["tasks"] = [{"label": label, "params": params} for params, label in record["tasks"]]
-        if "description" in experiment:
-            description = unpack(experiment["description"])
-            if not isinstance(description, dict):
-                raise ValueError("invalid experiment description")
-            template = description["protocol_template"]
-            described_tasks = []
-            for task in description["tasks"]:
-                semantics, realization = task.get("semantics", {}), task.get("realization", {})
-                if not isinstance(semantics, dict) or not isinstance(realization, dict):
-                    raise ValueError("invalid task description parameters")
-                if semantics.keys() & realization.keys():
-                    raise ValueError("task description parameters overlap")
-                described_tasks.append({"label": task["label"], "params": {**semantics, **realization}})
-            if described_tasks != record["tasks"]:
-                raise ValueError("task description does not match executable parameters")
-            record["protocol"] = template
-            coverage = description.get("protocol_coverage")
-            if "protocol_coverage" not in description:
-                # The earliest descriptions predate explicit coverage. A saved template still
-                # describes the method; absent templates carry no known opt-out policy.
-                record["protocol_absence_reason"] = None if template is not None else LEGACY_PROTOCOL_REASON
-                if template is None:
-                    record["protocol_source"] = "legacy"
-            elif coverage == {"status": "described"} and template is not None:
-                record["protocol_absence_reason"] = None
-            elif (isinstance(coverage, dict) and coverage.get("status") == "undescribed"
-                  and set(coverage) == {"status", "reason"} and template is None
-                  and isinstance(coverage["reason"], str) and coverage["reason"].strip()):
-                record["protocol_absence_reason"] = coverage["reason"]
-            else:
-                raise ValueError("protocol coverage does not match descriptor")
-        else:
-            record["protocol"] = None
-            record["protocol_absence_reason"] = LEGACY_PROTOCOL_REASON
-            record["protocol_source"] = "legacy"
+    record["protocol_source"] = "restored"
     if not isinstance(record.get("tasks"), list) or not isinstance(record.get("regimes"), list):
         raise ValueError("experiment requires task and regime lists")
     labels = [task["label"] for task in record["tasks"]]
@@ -218,7 +169,7 @@ def expected_cells(experiment):
 def validate_result(directory, experiment, backend):
     directory = Path(directory)
     result = json.loads((directory / "result.json").read_text())
-    if (result.get("version") not in VERSIONS or result.get("status") != "completed"
+    if (type(result.get("version")) is not int or result["version"] not in VERSIONS or result.get("status") != "completed"
             or result.get("experiment_id") != experiment["id"]
             or result.get("backend") != backend
             or result.get("inputs_sha256") != experiment["inputs_sha256"]):

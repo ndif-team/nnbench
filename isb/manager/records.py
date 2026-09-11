@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from ..jobs.contract import PLAN_VERSION, VERSIONS, check_experiment, expected_cells, wire_spec
 from ..protocol import InterventionSpec
-from ..runs import coordinate_config, run_coordinates, upgrade_coordinates
+from ..runs import coordinate_config, run_coordinates, read_coordinates
 
 
 def read_json(path):
@@ -165,7 +165,7 @@ def load_bundle(directory, prefix):
                     error = execution.get("error") or execution.get("cleanup_error")
                 if (jobdir / "result.json").exists():
                     result = read_json(jobdir / "result.json")
-                    if (result.get("version") not in VERSIONS or result.get("backend") != backend
+                    if (type(result.get("version")) is not int or result["version"] not in VERSIONS or result.get("backend") != backend
                             or result.get("experiment_id") != experiment["id"]
                             or result.get("inputs_sha256") != experiment["inputs_sha256"]):
                         raise ValueError("result identity mismatch")
@@ -175,7 +175,7 @@ def load_bundle(directory, prefix):
                         raise ValueError("malformed provenance")
                     worker_coordinates = prov.get("coordinates", {})
                     if worker_coordinates.get("schema") is not None or "spec" in worker_coordinates:
-                        prov["coordinates"] = upgrade_coordinates(worker_coordinates)
+                        prov["coordinates"] = read_coordinates(worker_coordinates)
                     auxiliary = auxiliary_calls(result.get("auxiliary_calls", []))
                     if auxiliary:
                         prov["auxiliary_calls"] = copy.deepcopy(auxiliary)
@@ -221,7 +221,7 @@ def load_bundle(directory, prefix):
                 cases=spec["tasks"], protocol=(InterventionSpec(**spec["protocol"]).coordinate()
                                               if spec.get("protocol") is not None else None),
                 protocol_coverage=({"status": "described"} if spec.get("protocol") is not None
-                                   else {"status": "legacy" if spec.get("protocol_source") == "legacy" else "undescribed",
+                                   else {"status": "undescribed",
                                          "reason": spec.get("protocol_absence_reason")}),
                 inputs_sha256=experiment["inputs_sha256"], config=coordinate_config(spec))
             prov["submitted_coordinates"] = submitted

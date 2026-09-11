@@ -8,6 +8,7 @@ import torch
 from isb.jobs import contract, worker
 from isb.manager import Collection, dispatch, export_html
 from isb.methodologies import registry, requirements
+from isb.methodologies.observations import record_resolved
 from isb.perf import timing
 from isb.protocol import InterventionSpec
 from isb.runs import EngineConfig, RunConfig
@@ -35,6 +36,7 @@ def test_real_worker_execution_preserves_calls_through_artifact_and_manager(
         # Every warmup, measured call, aggregate/reference call, and effect invocation owns
         # its nested settings, even when a custom description hook also mutates its input.
         assert not extra
+        record_resolved(mode=mode)
         assert settings == {"layers": [1, 2]}
         invocations.append((alpha, len(prompts), mode))
         settings["layers"].append(99)
@@ -111,6 +113,7 @@ def test_real_worker_execution_preserves_calls_through_artifact_and_manager(
         assert row["params"] == {"alpha": alpha, "settings": {"layers": [1, 2]}, "mode": "fixture"}
         assert row["semantics"] == {"alpha": alpha, "settings": {"layers": [1, 2]}}
         assert row["realization"] == {"mode": "fixture"}
+        assert row["resolved_params"] == {"mode": "fixture"}
         assert row["protocol_scope"] == expected_scope
         assert row["protocol_coverage"] == {"status": "described"}
         assert ("write" in row["protocol"]["operations"]) == (alpha != 0 or not custom_description)
@@ -125,12 +128,14 @@ def test_real_worker_execution_preserves_calls_through_artifact_and_manager(
     for kind in ("interactive", "batched"):
         baseline = saved_meta[("__baseline__", kind)]
         assert baseline["params"]["alpha"] == 0
+        assert baseline["resolved_params"] == {"mode": "fixture"}
         assert baseline["params"]["settings"] == {"layers": [1, 2]}
         assert baseline["protocol_scope"] == expected_scope
         assert baseline["error"] is None
     for label, alpha in (("control", 0), ("write", 3)):
         reference = saved_meta[("batched_perprompt", label)]
         assert reference["params"]["alpha"] == alpha
+        assert reference["resolved_params"] == {"mode": "fixture"}
         assert reference["protocol_scope"] == expected_scope
         assert reference["error"] is None
         assert artifact["outputs"][("batched_perprompt", label)].shape == (2, 2)
@@ -144,6 +149,7 @@ def test_real_worker_execution_preserves_calls_through_artifact_and_manager(
         assert effect["strong"] and effect["error"] is None
     for side, alpha in (("baseline", 0), ("perturbed", effect_alpha)):
         assert effect[side]["params"]["alpha"] == alpha
+        assert effect[side]["resolved_params"] == {"mode": "fixture"}
         assert effect[side]["params"]["settings"] == {"layers": [1, 2]}
         assert effect[side]["protocol_scope"] == expected_scope
         assert effect[side]["error"] is None
@@ -169,7 +175,7 @@ def test_real_worker_execution_preserves_calls_through_artifact_and_manager(
     assert all(cell.state == "RAN" for cell in collection.results[key])
     for row in result["cells"]:
         viewed = viewed_outputs[("__meta__",)][(row["workload"], row["label"])]
-        for field in ("params", "semantics", "realization", "protocol", "protocol_scope", "protocol_coverage"):
+        for field in ("params", "semantics", "realization", "resolved_params", "protocol", "protocol_scope", "protocol_coverage"):
             assert viewed[field] == row[field]
     page = dispatch(collection, f"/run/{key}")
     exported = export_html(str(root), items_per_source=0)

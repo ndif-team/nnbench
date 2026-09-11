@@ -1,4 +1,4 @@
-"""Complete procedure identity and lossless historical coordinate migration."""
+"""Correctness identity and current coordinate boundary validation."""
 import copy
 from dataclasses import replace
 
@@ -6,7 +6,7 @@ import pytest
 
 from isb.jobs import contract
 from isb.manager.model import comparable
-from isb.runs import procedure, run_coordinates, spec_coordinates, upgrade_coordinates
+from isb.runs import procedure, run_coordinates, spec_coordinates, read_coordinates
 from isb.sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime, TaskSpec
 
 
@@ -37,7 +37,6 @@ def test_spec_coordinates_match_frozen_job_inputs(tmp_path):
     {"baseline": BaselineSpec({"alpha": 1})},
     {"effect": EffectSpec({"alpha": 0}, {"alpha": 7})},
     {"effect": EffectSpec({"alpha": 0}, {"alpha": 6}, tv_floor=0.8)},
-    {"warmup": 2}, {"n_trials": 3}, {"dtype_control": "float16"},
     {"hf_kwargs": {"revision": "other"}}, {"vllm_kwargs": {"trust_remote_code": True}},
 ])
 def test_every_procedure_setting_prevents_accidental_comparison(change):
@@ -48,49 +47,34 @@ def test_every_procedure_setting_prevents_accidental_comparison(change):
     assert comparable(base, copy.deepcopy(base))
 
 
-@pytest.mark.parametrize("old_shape", ["original", "renamed", "schema2"])
-def test_historical_details_survive_but_identity_is_unverified(old_shape):
-    legacy = {"spec": "steering", "methodology": "steering", "family": "gpt2", "repo": "repo",
-              "interface": "hf", "data": ["custom"], "extension": {"items": [1]}}
-    regimes = [{"kind": "interactive", "units": 2, "data": "custom",
-                "cases": [{"label": "steer", "protocol": {"capabilities": ["write"]}}]}]
-    if old_shape == "original":
-        legacy.update(workloads=regimes, tasks=["steer"])
-    else:
-        legacy.update(regimes=regimes, cases=[{"label": "steer", "semantics": {"alpha": 6},
-                                               "realization": {"mode": "replace"}}],
-                      protocol_template={"mechanisms": ["add_scaled"]})
-        if old_shape == "schema2":
-            legacy["schema"] = 2
-            legacy["cases"][0]["params"] = {"alpha": 7, "mode": "replace"}
-    upgraded = upgrade_coordinates(legacy)
-    assert upgraded["legacy_coordinates"] == legacy
-    assert upgraded["regimes"][0]["cases"] == regimes[0]["cases"]
-    assert not upgraded["identity_complete"]
-    assert procedure(upgraded) is None
-    assert not comparable({"coordinates": upgraded}, {"coordinates": copy.deepcopy(upgraded)})
-    if old_shape == "schema2":
-        assert upgraded["cases"][0]["params"]["alpha"] == 7
-    legacy["extension"]["items"].append(2)
-    assert upgraded["legacy_coordinates"]["extension"]["items"] == [1]
+@pytest.mark.parametrize("change", [{"warmup": 2}, {"n_trials": 3}, {"dtype_control": "float16"}])
+def test_timing_controls_are_recorded_without_blocking_correctness(change, tmp_path):
+    spec = specimen()
+    changed = replace(spec, **change)
+    base = spec_coordinates(spec, "hf")
+    variant = spec_coordinates(changed, "vllm_async")
+    assert base["config"] != variant["config"]
+    assert comparable({"coordinates": base}, {"coordinates": variant})
+    # The submitted Docker recipe still includes measurement settings in job identity.
+    assert contract.prepare(spec, tmp_path / "base")["id"] != contract.prepare(changed, tmp_path / "other")["id"]
 
 
-def test_coordinate_and_upgrade_snapshots_own_nested_values():
+def test_coordinate_and_reader_snapshots_own_nested_values():
     spec = specimen()
     spec.tasks[0].params["layers"] = [1, 2]
     coords = spec_coordinates(spec, "hf")
-    upgraded = upgrade_coordinates(coords)
+    upgraded = read_coordinates(coords)
     spec.tasks[0].params["layers"].append(3)
     coords["cases"][0]["params"]["layers"].append(4)
     assert upgraded["cases"][0]["params"]["layers"] == [1, 2]
 
 
-@pytest.mark.parametrize("version", [0, 4, 99, "3", 3.0, True])
+@pytest.mark.parametrize("version", [None, 0, 1, 2, 4, 99, "3", 3.0, True])
 def test_unknown_coordinate_versions_are_rejected(version):
     coords = spec_coordinates(specimen(), "hf")
     coords["schema"] = version
     with pytest.raises(ValueError, match="schema"):
-        upgrade_coordinates(coords)
+        read_coordinates(coords)
 
 
 def test_missing_identity_cannot_be_declared_complete():
@@ -99,7 +83,7 @@ def test_missing_identity_cannot_be_declared_complete():
     assert not coords["identity_complete"]
     coords["identity_complete"] = True
     with pytest.raises(ValueError, match="exact inputs"):
-        upgrade_coordinates(coords)
+        read_coordinates(coords)
 
 
 @pytest.mark.parametrize("change", [
@@ -111,7 +95,7 @@ def test_missing_identity_cannot_be_declared_complete():
 def test_malformed_current_coordinate_shapes_fail_clearly(change):
     coords = {**spec_coordinates(specimen(), "hf"), **change}
     with pytest.raises(ValueError):
-        upgrade_coordinates(coords)
+        read_coordinates(coords)
     with pytest.raises(ValueError):
         comparable({"coordinates": coords}, {"coordinates": copy.deepcopy(coords)})
 
@@ -126,14 +110,14 @@ def test_malformed_current_controls_cannot_establish_identity(field, value):
     coords = spec_coordinates(specimen(), "hf")
     coords["config"][field] = value
     with pytest.raises(ValueError):
-        upgrade_coordinates(coords)
+        read_coordinates(coords)
 
 
 def test_current_completeness_field_is_required():
     coords = spec_coordinates(specimen(), "hf")
     coords.pop("identity_complete")
     with pytest.raises(ValueError, match="boolean"):
-        upgrade_coordinates(coords)
+        read_coordinates(coords)
 
 
 def test_coordinates_do_not_bind_or_classify_dataset_overrides():

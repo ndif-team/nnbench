@@ -28,10 +28,10 @@ def load_run(out_dir: str, run_name: str) -> tuple[dict, dict]:
     """Returns (outputs, provenance)."""
     import torch
 
-    from .runs import upgrade_coordinates
+    from .runs import read_coordinates
 
     d = torch.load(run_path(out_dir, run_name), map_location="cpu", weights_only=False)
     provenance = d["provenance"]
     if "coordinates" in provenance:
-        provenance["coordinates"] = upgrade_coordinates(provenance["coordinates"])
+        provenance["coordinates"] = read_coordinates(provenance["coordinates"])
     return d["outputs"], provenance

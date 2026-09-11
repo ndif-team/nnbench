@@ -28,20 +28,21 @@ context; neither is a runtime dependency of this alignment.
 
 The worker binds the final settings to each cell's Python signature, including its defaults.
 Case-description hooks beside the method code record concrete read/write/gradient requirements;
-custom or historical descriptions without a matching hook retain explicit template-level scope.
-Cases record these descriptions, effective semantic and realization values, and the vocabulary
+custom saved descriptions without a matching hook retain explicit template-level scope.
+Cases record these descriptions, bound semantic and realization values, and the vocabulary
 reference with their results. Vocabulary membership establishes a
 valid name; measured backend coverage comes from benchmark runs. nnbench extensions identify
 behavior beyond CausaLab's document contract, such as writes at every decode step.
 
 Custom methods supply an `InterventionSpec` or an explicit `protocol_absence_reason`. The worker
 isolates nested execution parameters and provenance snapshots, preparing trial configuration
-outside the timed interval. Legacy experiment descriptions remain readable.
+outside the timed interval. Cells report automatically resolved choices separately in
+`resolved_params`, preserving the original bound arguments.
 
-The version-2 job format stores one recipe. Readers preserve both earlier version-1 forms,
-including their saved descriptions and coverage reasons. Historical results with incomplete
-procedure identity remain viewable; automatic comparisons require matching input content and
-settings. The [current design and acceptance plan](docs/design.md#1213-current-execution-and-compatibility-contract)
+Readers accept job wire version 2 and coordinate schema 3; older formats must be rerun.
+Correctness comparisons require matching input content, case/regime settings, baseline/effect
+configuration, and model-load options. Timing-only differences are allowed and stay recorded.
+The [current design and acceptance plan](docs/design.md#1213-current-execution-and-artifact-contract)
 defines these boundaries and the extension points for methods and independent backend workers.
 
 See [the alignment audit](docs/causalab-portability-audit.md) for the current engine architecture,
@@ -115,7 +116,7 @@ each backend job; `--strict` also returns a failure exit code for unsuccessful c
 Model downloads populate a persistent cache. Offline flags are useful once that cache is stocked.
 See [the backend guide](backends/README.md) for configuration, model access and custom backends.
 
-Standalone micro/performance and legacy execute/score tools retain their own entrypoints and
+Standalone micro/performance and execute/score tools retain their own entrypoints and
 environment requirements.
 
 ## Browsing results

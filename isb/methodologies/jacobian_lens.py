@@ -41,6 +41,7 @@ import torch.nn.functional as F
 
 from ..profiles import _resid
 from ..tasks.lens_eval import locate
+from .observations import record_resolved
 from .registry import cell
 
 
@@ -127,6 +128,7 @@ def jacobian_lens_vllm(be, model, m, prompts, *, layers="all", position="last",
     if isinstance(transport, str):                        # fitted-lens spec -> per-layer map (cached)
         transport = _load_fitted(transport)
     residual = residual if residual is not None else m.default_residual(be.name)
+    record_resolved(residual=residual)
     pos = locate(model.tokenizer, prompts[0], position)
 
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker

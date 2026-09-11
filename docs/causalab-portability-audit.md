@@ -110,7 +110,7 @@ uses the protocol/engine seam. Pyvene remains related work only.
 
 The frozen experiment and shared worker provenance record metadata coverage. Built-in methods
 have descriptors; custom methods supply one or a nonempty `protocol_absence_reason`.
-Legacy undescribed experiments receive a legacy reason on restoration.
+Current experiments retain their saved descriptor or explicit absence reason on restoration.
 
 Protocol coordinates carry the vocabulary reference used to describe them. Each case's record
 is the effective call: dataset defaults under task values, the cell's own keyword defaults
@@ -119,5 +119,5 @@ Each invocation receives fresh nested parameter values prepared outside the meas
 
 Verification has two distinct parts: the source checker establishes the pinned upstream
 vocabulary, while no-GPU tests exercise canonical aliases, component read/write requirements,
-case specialization, parameter binding and classification, serialization, and coordinate migration. Model
+case specialization, parameter binding and classification, serialization, and coordinate validation. Model
 execution and cross-engine parity require separate benchmark runs.

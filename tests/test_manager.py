@@ -10,6 +10,7 @@ from test_execute_score import _execute as execute_fixture, _spec  # noqa: E402
 
 import isb.manager as manager  # noqa: E402
 from isb.specs import SPECS  # noqa: E402
+from isb.runs import run_coordinates  # noqa: E402
 
 
 def _execute(path, name, engine, **kwargs):
@@ -41,16 +42,15 @@ def test_legacy_import_never_guesses_precision_control(tmp_path):
         assert len(call.args) == 4 and "ctl" not in call.kwargs
 
 
-def test_import_keeps_incomplete_history_browsable_without_rescoring(tmp_path):
+def test_import_keeps_incomplete_current_coordinates_browsable_without_rescoring(tmp_path):
     from unittest.mock import patch
     from isb.runfile import save_run
     from isb.runs import spec_coordinates
 
     coords = spec_coordinates(_spec(), "hf")
-    coords.pop("inputs_sha256")
-    coords.pop("config")
-    coords.pop("identity_complete")
-    coords["schema"] = 2
+    coords["inputs_sha256"] = None
+    coords["config"] = None
+    coords["identity_complete"] = False
     save_run(str(tmp_path), "historical", {}, {"coordinates": coords, "engine": {"kind": "transformers"}})
     with patch.dict(SPECS, {"xs": _spec()}), patch("isb.sweep.score.score_runs") as score:
         _import(tmp_path)
@@ -69,7 +69,7 @@ def test_import_does_not_score_with_a_changed_current_spec(tmp_path):
     spec = _spec()
     save_run(str(tmp_path), "saved", {}, {"coordinates": spec_coordinates(spec, "hf"),
                                            "engine": {"kind": "transformers"}})
-    with patch.dict(SPECS, {"xs": replace(spec, n_trials=spec.n_trials + 1)}), \
+    with patch.dict(SPECS, {"xs": replace(spec, hf_kwargs={"force_text_causal": True})}), \
          patch("isb.sweep.score.score_runs") as score:
         _import(tmp_path)
     assert not score.called
@@ -177,9 +177,9 @@ def _construct_run(dirpath, name="micro-async", engine_kind="vllm"):
             "deployment": {"kind": "local"},
             "engine": {"kind": engine_kind, "mode": "async", "params": {}},
             "host": {"hostname": "testbox", "gpus": []},
-            "coordinates": {"spec": "constructs", "methodology": "constructs", "family": "gpt2",
-                            "repo": "gpt2", "data": [], "regimes": [],
-                            "tasks": ["input_boundary", "barrier"], "interface": iface}}
+            "coordinates": run_coordinates(spec="constructs", methodology="constructs", family="gpt2",
+                                           repo="gpt2", interface=iface,
+                                           cases=[{"label": name} for name in ("input_boundary", "barrier")])}
     save_run(str(dirpath), name, {("__meta__",): meta}, prov)
     _import(dirpath)
 
@@ -248,9 +248,8 @@ def _perf_run(dirpath, name="perf-read-q"):
             "deployment": {"kind": "local"},
             "engine": {"kind": "vllm", "mode": "async", "params": {}},
             "host": {"hostname": "t", "gpus": []},
-            "coordinates": {"spec": name, "methodology": "perf_micro", "family": "-",
-                            "repo": "q", "data": [], "regimes": [], "tasks": [],
-                            "interface": "perf"}}
+            "coordinates": run_coordinates(spec=name, methodology="perf_micro", family="-",
+                                           repo="q", interface="perf")}
     save_run(str(dirpath), name, {("perf_rows",): rows, ("__meta__",): {}}, prov)
     _import(dirpath)
 
