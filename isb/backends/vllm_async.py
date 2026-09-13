@@ -111,9 +111,13 @@ class VLLMAsyncBackend(VLLMBackend):
         outputs are concatenated along the batch dim so they match HF's `[..., N, vocab]` and the
         oracle can compare per prompt (throughput = N / batch-latency).
 
-        Depends on the upstream async multi-prompt submission. Until that lands the engine submits
-        only the first invoke, so this returns fewer than N per-prompt outputs and the cell is
-        flagged by the oracle — surfaced, not silently passed.
+        Upstream decided AGAINST async multi-invoke: nnsight's `AsyncVLLMBackend` submits one
+        engine request per trace and raises NotImplementedError for several invokes, pinned by
+        its `test_multi_invoke_raises` (the multi-invoke merge is a sync-engine capability).
+        The sweep therefore routes the batched regime to a sync-mode twin engine
+        (`sweep/execute._load_sync_twin`); this path still runs where no twin can be built
+        (TP/PP runs, twin load failure) and records the engine's refusal — surfaced, not
+        silently passed.
         """
         import asyncio
 
@@ -135,8 +139,8 @@ class VLLMAsyncBackend(VLLMBackend):
             mats = [r.detach().float().cpu() for r in collected if r is not None]
             if not mats:
                 raise RuntimeError(
-                    "vllm_async batched produced no per-prompt outputs "
-                    "(awaiting the upstream async multi-prompt submission fix)"
+                    "vllm_async batched produced no per-prompt outputs (the async engine "
+                    "runs one request per trace; batched needs the sync-mode twin)"
                 )
             # each per-prompt output is [..., 1, vocab]; concat on the batch dim -> [..., N, vocab]
             return torch.cat(mats, dim=-2) if mats[0].dim() >= 2 else torch.stack(mats)

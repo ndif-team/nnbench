@@ -93,6 +93,32 @@ def _throughput(regime, timing):
     return None
 
 
+def _load_sync_twin(be, repo):
+    """A loaded sync-mode engine for an async run's batched regime, or None.
+
+    nnsight's async vLLM path submits one engine request per trace and refuses several
+    invokes (`AsyncVLLMBackend` raises NotImplementedError; upstream pins that with
+    `test_multi_invoke_raises`, so it is the intended contract). Multi-invoke batching is a
+    sync-engine capability (`VLLM._collect` merges one request per invoke), so the batched
+    regime runs on a sync twin sharing the async run's engine config.
+
+    Returns None when the run's backend isn't the in-process async one, or when it carries
+    parallelism the sync constructor doesn't take (TP/PP runs keep the async engine and
+    record its refusal per cell). Both engines are resident together, which fits the
+    coverage default (gpu_memory_utilization 0.2 each) but not a big-model fraction like
+    0.9 — a failed twin load falls back the same way, recorded per cell.
+    """
+    from ..backends import VLLMAsyncBackend, VLLMSyncBackend
+
+    if not isinstance(be, VLLMAsyncBackend):
+        return None
+    if be.tensor_parallel_size > 1 or be.pipeline_parallel_size > 1:
+        return None
+    twin = VLLMSyncBackend(dtype=be.dtype, trust_remote_code=be.trust_remote_code,
+                           max_model_len=be.max_model_len, tokenizer=be.tokenizer)
+    return twin, twin.load(repo, gpu_memory_utilization=be.gpu_memory_utilization)
+
+
 def _run_coordinates(spec, run: RunConfig) -> dict:
     def case(task, params):
         if spec.protocol is None:
@@ -141,6 +167,7 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
     prov["coordinates"]["interface"] = iface
     outputs, meta = {}, {}
     model = None
+    twin = None       # (sync backend, its model), loaded lazily for the batched regime
     try:
         model = be.load(spec.repo)
         if provenance is not None:
@@ -156,6 +183,21 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
                 "vocab_size": len(vocab),
             }
         for regime in spec.regimes:
+            # The batched regime of an async run executes on a sync-mode twin engine:
+            # the async engine refuses several invokes per trace (see _load_sync_twin).
+            # Everything else in the loop (interactive/generation cells, effect guard)
+            # keeps the run's own backend.
+            r_iface, r_be, r_model = iface, be, model
+            if regime.kind == "batched" and iface == "vllm_async":
+                if twin is None:
+                    try:
+                        twin = _load_sync_twin(be, spec.repo)
+                    except Exception:               # twin load failed: cells record the
+                        traceback.print_exc()       # async engine's refusal instead
+                if twin is not None:
+                    r_iface, (r_be, r_model) = "vllm_sync", twin
+                    prov["coordinates"]["batched_interface"] = r_iface
+
             timed_prompts = ([regime.prompts[0]] if regime.aggregate
                              else regime.prompts)
             if regime.aggregate and isinstance(regime.prompts[0], tuple):
@@ -164,7 +206,7 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
             try:
                 base_timing, _ = time_cell(
                     None, prepare_call=lambda tp=timed_prompts: _prepare_cell(
-                        iface, be, model, tp, spec.methodology, spec.family,
+                        r_iface, r_be, r_model, tp, spec.methodology, spec.family,
                         _task_params(regime, spec.baseline.params)),
                     warmup=spec.warmup, n_trials=spec.n_trials)
             except Exception:
@@ -176,10 +218,10 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
                 try:
                     timing, warm = time_cell(
                         None, prepare_call=lambda tp=timed_prompts, p=_task_params(regime, params): _prepare_cell(
-                            iface, be, model, tp, spec.methodology, spec.family, p),
+                            r_iface, r_be, r_model, tp, spec.methodology, spec.family, p),
                         warmup=spec.warmup, n_trials=spec.n_trials)
                     if regime.aggregate:
-                        warm = _per_prompt_stack(iface, be, model, regime.prompts,
+                        warm = _per_prompt_stack(r_iface, r_be, r_model, regime.prompts,
                                                  spec.methodology, spec.family,
                                                  _task_params(regime, params))
                     outputs[key] = warm
@@ -199,7 +241,7 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
                     params, label = task.params, task.label
                     try:
                         outputs[("batched_perprompt", label)] = _per_prompt_stack(
-                            iface, be, model, regime.prompts,
+                            r_iface, r_be, r_model, regime.prompts,
                             spec.methodology, spec.family, _task_params(regime, params))
                     except Exception:
                         traceback.print_exc()
@@ -229,6 +271,8 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
             except Exception:
                 traceback.print_exc()
     finally:
+        if twin is not None:
+            twin[0].teardown(twin[1])
         if model is not None:
             be.teardown(model)
 
