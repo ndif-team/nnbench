@@ -6,12 +6,12 @@ import torch
 
 from isb.jobs import contract
 from isb.jobs.score import score_experiment
-from isb.sweep.spec import BaselineSpec, CellConfig, Workload
+from isb.sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
 
 
 def artifacts(tmp_path, *, batched=False):
     spec = CellConfig("tiny", "logit_lens", "gpt2", "test/model",
-                      [Workload("batched" if batched else "interactive", ["a"])],
+                      [ExecutionRegime("batched" if batched else "interactive", ["a"])],
                       [({}, "task")], BaselineSpec({}), warmup=0, n_trials=1)
     directory = tmp_path / "experiment"
     experiment = contract.prepare(spec, directory)
@@ -19,7 +19,7 @@ def artifacts(tmp_path, *, batched=False):
     for backend in ("reference-name", "candidate-name"):
         output = directory / backend
         output.mkdir()
-        identity = {"version": 1, "backend": backend, "experiment_id": experiment["id"],
+        identity = {"version": contract.VERSION, "backend": backend, "experiment_id": experiment["id"],
                     "inputs_sha256": experiment["inputs_sha256"]}
         provenance = {"job": identity, "model_identity": {
             "repo": "test/model", "revision": "abc", "vocab_sha256": "def", "vocab_size": 8}}
@@ -86,7 +86,7 @@ def test_batched_correctness_uses_perprompt_reference(tmp_path):
 def test_nonfinite_or_wrong_shape_is_not_rescued(tmp_path, value):
     directory, key = artifacts(tmp_path)
     change(directory, "candidate-name", lambda a: a["outputs"].update({key: value}))
-    assert candidate(directory)["state"] == "SILENTLY_WRONG"
+    assert candidate(directory)["state"] == "INVALID_OUTPUT"
 
 
 def test_missing_tensor_file_is_job_failure(tmp_path):
@@ -95,7 +95,25 @@ def test_missing_tensor_file_is_job_failure(tmp_path):
     assert candidate(directory)["state"] == "JOB_FAILED"
 
 
+def test_numerical_mismatch_is_unresolved_and_eligible(tmp_path):
+    directory, key = artifacts(tmp_path)
+    change(directory, "candidate-name", lambda a: a["outputs"].update({key: torch.zeros(1, 8)}))
+    row = candidate(directory)
+    assert row["state"] == "NUMERICAL_MISMATCH"
+    assert row["validation_state"] == "UNRESOLVED"
+    assert row["performance_eligible"] is True
+    assert row["metrics"]["tv"] > 0.05
+
+
 def test_nonfinite_reference_is_not_candidate_failure(tmp_path):
     directory, key = artifacts(tmp_path)
     change(directory, "reference-name", lambda a: a["outputs"].update({key: torch.full((1, 8), float("nan"))}))
     assert candidate(directory)["state"] == "INVALID_REFERENCE"
+
+
+def test_malformed_reference_keeps_candidate_eligible(tmp_path):
+    directory, key = artifacts(tmp_path)
+    change(directory, "reference-name", lambda a: a["outputs"].update({key: "bad reference"}))
+    row = candidate(directory)
+    assert row["state"] == "INVALID_REFERENCE"
+    assert row["performance_eligible"]

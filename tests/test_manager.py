@@ -10,6 +10,7 @@ from test_execute_score import _execute as execute_fixture, _spec  # noqa: E402
 
 import isb.manager as manager  # noqa: E402
 from isb.specs import SPECS  # noqa: E402
+from isb.runs import run_coordinates  # noqa: E402
 
 
 def _execute(path, name, engine, **kwargs):
@@ -39,6 +40,41 @@ def test_legacy_import_never_guesses_precision_control(tmp_path):
     assert score.call_count == 3
     for call in score.call_args_list:
         assert len(call.args) == 4 and "ctl" not in call.kwargs
+
+
+def test_import_keeps_incomplete_current_coordinates_browsable_without_rescoring(tmp_path):
+    from unittest.mock import patch
+    from isb.runfile import save_run
+    from isb.runs import spec_coordinates
+
+    coords = spec_coordinates(_spec(), "hf")
+    coords["inputs_sha256"] = None
+    coords["config"] = None
+    coords["identity_complete"] = False
+    save_run(str(tmp_path), "historical", {}, {"coordinates": coords, "engine": {"kind": "transformers"}})
+    with patch.dict(SPECS, {"xs": _spec()}), patch("isb.sweep.score.score_runs") as score:
+        _import(tmp_path)
+    assert not score.called
+    col = manager.Collection(str(tmp_path))
+    assert "historical" in col.entries and col.results["historical"] is None
+    assert any("identity is incomplete" in warning for warning in col.warnings)
+
+
+def test_import_does_not_score_with_a_changed_current_spec(tmp_path):
+    from dataclasses import replace
+    from unittest.mock import patch
+    from isb.runfile import save_run
+    from isb.runs import spec_coordinates
+
+    spec = _spec()
+    save_run(str(tmp_path), "saved", {}, {"coordinates": spec_coordinates(spec, "hf"),
+                                           "engine": {"kind": "transformers"}})
+    with patch.dict(SPECS, {"xs": replace(spec, hf_kwargs={"force_text_causal": True})}), \
+         patch("isb.sweep.score.score_runs") as score:
+        _import(tmp_path)
+    assert not score.called
+    col = manager.Collection(str(tmp_path))
+    assert any("current spec does not match" in warning for warning in col.warnings)
 
 
 def test_changed_legacy_artifact_requires_explicit_reimport(tmp_path):
@@ -95,7 +131,8 @@ def test_spec_page_shows_states_metrics_and_stack(tmp_path):
         page = manager.render_spec(str(tmp_path), "xs", inbox=str(tmp_path / "inbox"))
     finally:
         del SPECS["xs"]
-    assert ">SILENTLY_WRONG</span>" in page                        # per-cell state chips
+    assert ">NUMERICAL_MISMATCH</span>" in page                    # unresolved numerical difference
+    assert " ms</span>" in page                                 # measurement remains visible
     assert "top1=" in page and "tv=" in page                       # oracle metrics per cell
     assert "c-cand" in page                                        # stack commit shown
     # the baseline run leads with its own section: stack + latencies, no verdicts
@@ -141,9 +178,9 @@ def _construct_run(dirpath, name="micro-async", engine_kind="vllm"):
             "deployment": {"kind": "local"},
             "engine": {"kind": engine_kind, "mode": "async", "params": {}},
             "host": {"hostname": "testbox", "gpus": []},
-            "coordinates": {"spec": "constructs", "methodology": "constructs", "family": "gpt2",
-                            "repo": "gpt2", "data": [], "regimes": [],
-                            "tasks": ["input_boundary", "barrier"], "interface": iface}}
+            "coordinates": run_coordinates(spec="constructs", methodology="constructs", family="gpt2",
+                                           repo="gpt2", interface=iface,
+                                           cases=[{"label": name} for name in ("input_boundary", "barrier")])}
     save_run(str(dirpath), name, {("__meta__",): meta}, prov)
     _import(dirpath)
 
@@ -212,9 +249,8 @@ def _perf_run(dirpath, name="perf-read-q"):
             "deployment": {"kind": "local"},
             "engine": {"kind": "vllm", "mode": "async", "params": {}},
             "host": {"hostname": "t", "gpus": []},
-            "coordinates": {"spec": name, "methodology": "perf_micro", "family": "-",
-                            "repo": "q", "data": [], "regimes": [], "tasks": [],
-                            "interface": "perf"}}
+            "coordinates": run_coordinates(spec=name, methodology="perf_micro", family="-",
+                                           repo="q", interface="perf")}
     save_run(str(dirpath), name, {("perf_rows",): rows, ("__meta__",): {}}, prov)
     _import(dirpath)
 

@@ -126,7 +126,7 @@ def test_score_cross_engine_is_correctness_and_catches_the_wrong_prompt(tmp_path
     results = score_runs(_spec(), str(tmp_path), "cand", "ref")
     by = {(c.workload, c.label): c for c in results}
     cell = by[("interactive", "t")]
-    assert cell.state == "SILENTLY_WRONG"               # 1/2 top-1 agreement -> caught
+    assert cell.state == "NUMERICAL_MISMATCH"               # 1/2 top-1 agreement -> caught
     header = capsys.readouterr().out
     assert "correctness" in header and "c-cand" in header and "c-ref" in header
 

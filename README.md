@@ -14,8 +14,9 @@ separate question studied by frameworks and benchmarks such as CausaLab, CausalG
 Each benchmark case separates three concerns:
 
 - `InterventionSpec`: intervention semantics and component-level requirements.
-- `TaskSpec`: semantic parameter values and realization selectors, such as residual spelling or
-  bounded iteration.
+- `TaskSpec`: a case label and the params its cell receives; the methodology's `InterventionSpec`
+  names which of them are semantic values and which are realization selectors, such as residual
+  spelling or bounded iteration.
 - `ExecutionRegime`: input units, interactive/batched/generation shape, decode length and aggregation.
 
 These descriptions index explicit cell implementations and their results. CausaLab's current
@@ -25,14 +26,24 @@ protocol/engine stack supplies the shared vocabulary. The checked-in
 including canonical component names and deprecated aliases. Pyvene and nnterp are historical
 context; neither is a runtime dependency of this alignment.
 
-Concrete cases record effective semantic and realization values, component read/write
-requirements, and the vocabulary reference in provenance. Vocabulary membership establishes a
+The worker binds the final settings to each cell's Python signature, including its defaults.
+Case-description hooks beside the method code record concrete read/write/gradient requirements;
+custom saved descriptions without a matching hook retain explicit template-level scope.
+Cases record these descriptions, bound semantic and realization values, and the vocabulary
+reference with their results. Vocabulary membership establishes a
 valid name; measured backend coverage comes from benchmark runs. nnbench extensions identify
 behavior beyond CausaLab's document contract, such as writes at every decode step.
 
 Custom methods supply an `InterventionSpec` or an explicit `protocol_absence_reason`. The worker
 isolates nested execution parameters and provenance snapshots, preparing trial configuration
-outside the timed interval. Legacy experiment descriptions remain readable.
+outside the timed interval. Cells report automatically resolved choices separately in
+`resolved_params`, preserving the original bound arguments.
+
+Readers accept job wire version 2 and coordinate schema 3; older formats must be rerun.
+Correctness comparisons require matching input content, case/regime settings, baseline/effect
+configuration, and model-load options. Timing-only differences are allowed and stay recorded.
+The [current design and acceptance plan](docs/design.md#1213-current-execution-and-artifact-contract)
+defines these boundaries and the extension points for methods and independent backend workers.
 
 See [the alignment audit](docs/causalab-portability-audit.md) for the current engine architecture,
 scope and update procedure. Verify the pinned source against a checkout at that revision:
@@ -50,7 +61,8 @@ the saved artifacts. Select the reference explicitly with `--reference`, normall
 | State | Meaning |
 |---|---|
 | `RAN` | Produced an output; no comparison verdict was assigned, including reference rows |
-| `SUPPORTED` / `SILENTLY_WRONG` | Matches / fails the selected correctness reference |
+| `SUPPORTED` / `NUMERICAL_MISMATCH` | Meets / exceeds the selected numerical thresholds; neither establishes general correctness |
+| `INVALID_OUTPUT` | Output structure or finiteness check failed; timing is diagnostic only |
 | `EQUIVALENT` / `DIVERGENT` | Matches / differs under `--comparison equivalence` |
 | `ERROR` | The cell failed |
 | `NO_REFERENCE` / `INVALID_REFERENCE` | Reference output is unavailable / unsuitable for judgment |
@@ -105,7 +117,7 @@ each backend job; `--strict` also returns a failure exit code for unsuccessful c
 Model downloads populate a persistent cache. Offline flags are useful once that cache is stocked.
 See [the backend guide](backends/README.md) for configuration, model access and custom backends.
 
-Standalone micro/performance and legacy execute/score tools retain their own entrypoints and
+Standalone micro/performance and execute/score tools retain their own entrypoints and
 environment requirements.
 
 ## Browsing results
@@ -138,9 +150,9 @@ cross-project numerical parity require separate runs.
 
 ```text
 isb/
-  protocol.py              methodology descriptions and concrete case requirements
+  protocol.py              torch-free methodology templates and parameter classifications
   causalab_vocabulary.json pinned upstream vocabulary and source checksums
-  methodologies/           explicit intervention cells
+  methodologies/           explicit cells and case-requirement description hooks
   backends/                model-access and execution infrastructure
   specs/                   benchmark case definitions
   sweep/                   spec types and shared cell execution; legacy scoring

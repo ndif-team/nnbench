@@ -55,19 +55,21 @@ or cross-filesystem moves fail without copying/deleting artifacts. POST actions 
 from the inbox page, and the server rejects unexpected hosts and cross-origin actions. Static
 exports contain no action forms.
 
-## Explicit legacy import
+## Explicit standalone artifact import
 
-Old collections containing flat `.pt` files need a one-time import:
+Collections containing current schema-3 `.pt` files need a one-time import. The CLI retains the
+`--import-legacy` name for this standalone path. Older coordinate formats must be rerun:
 
 ```bash
 python scripts/manager.py --dir runs/legacy --import-legacy --export legacy.html
 ```
 
 Only use this flag for artifacts you trust: the import unpickles files and can execute code.
-It saves small `NAME.summary.json` sidecars so subsequent browsing reads JSON only. Legacy
+It saves small `NAME.summary.json` sidecars so subsequent browsing reads JSON only. Standalone
 scoring happens during this explicit import; it never guesses an fp32 control. Reference
-selection requires matching recorded spec, model, data, workloads, and tasks. Legacy comparisons
-still lack the new runner's frozen-input identity guarantees, and the site labels that limitation.
+selection checks exact saved inputs, model and method, case/regime settings, baseline/effect
+configuration, and model-load options. Timing-only changes are allowed. Standalone imports lack
+the Docker runner's resolved source/model/tokenizer checks; the site labels that limitation.
 
 Changing a `.pt` file's size or modification time invalidates its summary; rerun the import.
 Archive and trash move its summary alongside the artifact. No tensor cache is kept by the site.

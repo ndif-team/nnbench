@@ -1,11 +1,11 @@
 """Equivalence oracle (design.md §8.3, §11.8).
 
-Compares a backend's result against the HF-eager reference. This is what distinguishes
-`SUPPORTED` from `SILENTLY_WRONG` (§8.1) — the cell only a numerical check can detect.
+Compares a backend's result against a reference. Threshold failures are numerical
+diagnostics with unresolved correctness, and remain eligible for performance comparison.
 
 For a logits-producing motif (logit lens), the output IS a per-row distribution. We gate
 on TWO criteria so a top-1-preserving divergence cannot pass as SUPPORTED:
-  - **top-1 token agreement** per row (robust to kernel/dtype), and
+  - **top-1 token agreement** per row, and
   - **softmax total-variation distance** (the distributional difference).
 A uniform additive logit shift leaves both top-1 and softmax unchanged — correctly judged
 equivalent, since it does not change the lens's prediction. `max_abs` on raw logits is a

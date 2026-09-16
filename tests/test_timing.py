@@ -17,7 +17,7 @@ def _run_with_clock(fn, seq, **kw):
     orig = timing.perf_counter
     timing.perf_counter = lambda: next(it)
     try:
-        return timing.time_cell(fn, **kw)
+        return timing.time_cell(lambda: fn, **kw)
     finally:
         timing.perf_counter = orig
 
@@ -107,7 +107,7 @@ def test_prepare_call_runs_before_timer_for_every_invocation(monkeypatch):
         return call
 
     monkeypatch.setattr(timing, "perf_counter", clock)
-    result, output = timing.time_cell(None, prepare_call=prepare, warmup=1, n_trials=2)
+    result, output = timing.time_cell(prepare, warmup=1, n_trials=2)
     assert events == ["prepare", "call"] + ["prepare", "clock", "call", "clock"] * 2
     assert output == 42
     assert result.n_trials == 2

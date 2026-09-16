@@ -2,7 +2,7 @@
 
 A normal run file is the RELEASE artifact: the lean cells users actually run, in the regime
 perf is measured in. Verdicts and perf numbers come only from it. `--debug` additionally
-    writes a companion file `debug/<name>-debug.pt` holding an instrumented forward over the
+writes a companion file `debug/<name>-debug.pt` holding an instrumented forward over the
 first few regime inputs: token ids, the residual stream at every layer (readout position),
 and the final logits.
 

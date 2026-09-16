@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from ..profiles import _resid
+from .observations import record_resolved
 from .registry import cell
 
 
@@ -57,6 +58,7 @@ def logit_lens_vllm(be, model, m, prompts, *, layers="all", unembed="weight", re
     # fused-residual denotation mismatch). An explicit residual="plain" still overrides: that is the
     # naive-port frontier task the llama spec keeps as a marker.
     residual = residual if residual is not None else m.default_residual(be.name)
+    record_resolved(residual=residual)
 
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
         return _lens_proxy(

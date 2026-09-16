@@ -1,7 +1,8 @@
 """CausaLab-aligned semantic indexing for nnbench cells.
 
-This module holds intervention descriptors, parameter classifications, and concrete case
-requirements. Explicit ``@cell(methodology, family, backend)`` functions implement the programs
+This torch-free module holds intervention descriptors and parameter classifications. Concrete
+case requirements live beside cells in ``isb.methodologies.requirements``.
+Explicit ``@cell(methodology, family, backend)`` functions implement the programs
 whose backend realizations nnbench measures.
 
 ``InterventionSpec`` is the intersection of CausaLab's intervention-protocol vocabulary and the
@@ -218,55 +219,3 @@ PROTOCOLS: dict[str, InterventionSpec] = {
 
 def protocol_for(methodology: str) -> InterventionSpec | None:
     return PROTOCOLS.get(methodology)
-
-
-def describe_task(methodology: str, params: Mapping[str, Any], *,
-                  template: InterventionSpec, family: str) -> InterventionSpec:
-    """Specialize metadata to the explicit cell's branches, without executing or routing it.
-
-    Defaults here mirror the cells; regression tests exercise their branch behavior. Data roles
-    describe the input contract even when a no-op case only executes one side of a paired feed.
-    Call with effective params (including dataset defaults) when describing a bound run.
-    """
-    operations = set(template.operations)
-    capabilities = set(template.capabilities)
-    mechanisms = template.mechanisms
-    extensions = set(template.extensions)
-    components = template.components
-    write_components = template.write_components
-    if ((methodology == "das" and not params.get("train", 0))
-            or (methodology in {"attribution_patching", "jacobian_collect"}
-                and not params.get("grad", True))):
-        operations.discard("grad")
-        capabilities.discard("grad")
-        extensions.difference_update({"activation_grad", "jacobian_export"})
-    no_write = (
-        methodology in {"activation_patching", "gen_patching"} and not params.get("patch", True)
-        or methodology == "steering" and params.get("alpha", 6.0) == 0
-        or methodology == "ablation" and params.get("target") == "none"
-    )
-    if no_write:
-        write_components = ()
-        operations.discard("write")
-        capabilities.discard("paired_forward")
-        mechanisms = ()
-        # Unpatched generation reads engine logits only; ordinary forward readouts also read
-        # the final block residual. gen_steering still performs a write when alpha=0.
-        components = (("lm_head",) if methodology == "gen_patching"
-                      else ("block_output", "lm_head"))
-    elif methodology == "ablation":
-        target = params.get("target", "mixer" if family == "nemotron" else "mlp")
-        component = {"attn": "attention_output", "mlp": "mlp_output"}.get(target)
-        if component is not None:
-            components = (component, "block_output", "lm_head")
-            if write_components is not None:
-                write_components = (component,)
-        else:
-            # Hybrid mixer targets need layer/model binding before their component is known.
-            write_components = None
-    if methodology == "jacobian_lens" and params.get("transport") is None:
-        extensions.discard("linear_transport")
-    return dataclasses.replace(template, operations=tuple(operations),
-                               capabilities=tuple(capabilities), mechanisms=mechanisms,
-                               extensions=tuple(extensions), components=components,
-                               write_components=write_components)

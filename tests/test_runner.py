@@ -33,7 +33,7 @@ def test_control_is_per_family_not_global():
     assert st[("llama", "hf")] == AppState.SUPPORTED
     # If control were global (first HF = gpt2), llama-vllm (==gpt2_ref) would wrongly pass.
     # With per-family control it is compared to llama-hf and is caught:
-    assert st[("llama", "vllm_async")] == AppState.SILENTLY_WRONG
+    assert st[("llama", "vllm_async")] == AppState.NUMERICAL_MISMATCH
 
 
 def test_no_reference_when_control_failed():
@@ -54,14 +54,14 @@ def test_error_cells_are_not_overwritten():
 
 
 def test_dtype_control_reclassifies_precision_not_bug():
-    """A near-tie SILENTLY_WRONG that matches the control at the control's dtype -> SUPPORTED_DEGRADED;
-    one that still diverges at the control's dtype stays SILENTLY_WRONG."""
+    """A near-tie NUMERICAL_MISMATCH that matches the control at the control's dtype -> SUPPORTED_DEGRADED;
+    one that still diverges at the control's dtype stays NUMERICAL_MISMATCH."""
     ref = torch.zeros(1, 8); ref[0, 3] = 5.0           # control argmax = index 3
     near = ref.clone(); near[0, 3] = 4.9; near[0, 2] = 4.95   # bf16-ish near-tie: argmax flipped to 2
     far = torch.zeros(1, 8); far[0, 7] = 9.0            # genuinely different distribution
 
-    degraded = _cell("gpt2", "vllm_async", None); degraded.state = AppState.SILENTLY_WRONG
-    realbug = _cell("gpt2", "vllm_async", None); realbug.state = AppState.SILENTLY_WRONG
+    degraded = _cell("gpt2", "vllm_async", None); degraded.state = AppState.NUMERICAL_MISMATCH
+    realbug = _cell("gpt2", "vllm_async", None); realbug.state = AppState.NUMERICAL_MISMATCH
     control = _cell("gpt2", "hf", ref); control.state = AppState.SUPPORTED
 
     # rerun-at-control-dtype: the degraded cell becomes ref-equal at fp32; the real bug stays `far`
@@ -69,15 +69,15 @@ def test_dtype_control_reclassifies_precision_not_bug():
     disambiguate_precision([control, degraded, realbug], ref, lambda c: fp32[id(c)])
 
     assert degraded.state == AppState.SUPPORTED_DEGRADED
-    assert realbug.state == AppState.SILENTLY_WRONG
+    assert realbug.state == AppState.NUMERICAL_MISMATCH
     assert control.state == AppState.SUPPORTED          # control untouched
 
 
 def test_dtype_control_noop_without_control_value():
-    cell = _cell("gpt2", "vllm_async", None); cell.state = AppState.SILENTLY_WRONG
+    cell = _cell("gpt2", "vllm_async", None); cell.state = AppState.NUMERICAL_MISMATCH
     called = []
     disambiguate_precision([cell], None, lambda c: called.append(c) or None)
-    assert cell.state == AppState.SILENTLY_WRONG        # unchanged
+    assert cell.state == AppState.NUMERICAL_MISMATCH        # unchanged
     assert called == []                                 # rerun never invoked
 
 

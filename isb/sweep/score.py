@@ -8,7 +8,7 @@ stacks (nnsight commit, engine version, host/GPU) — the provenance whose absen
 branch skew into a two-day hunt.
 
 The comparison AXIS is derived from provenance: different engine kinds -> the correctness axis
-(SUPPORTED / SILENTLY_WRONG vs the reference); same engine kind -> the parallelism/config
+(SUPPORTED / NUMERICAL_MISMATCH vs the reference); same engine kind -> the parallelism/config
 equivalence axis (EQUIVALENT / DIVERGENT). An optional control-dtype run (just another executed
 run, e.g. the same engine at fp32) disambiguates precision near-ties exactly like the live rerun
 used to, but from data.
@@ -18,6 +18,7 @@ from __future__ import annotations
 from ..runfile import load_run
 from ..runner.run import CellResult, disambiguate_precision, evaluate
 from ..report import print_map
+from ..runs import procedure, spec_coordinates
 
 
 def _load(out_dir: str, run_name: str):
@@ -43,8 +44,17 @@ def score_runs(spec, out_dir: str, candidate: str, reference: str | None,
     the map unless `quiet` (the manager computes states for its own rendering)."""
     cand_out, cand_prov = _load(out_dir, candidate)
     ref_out, ref_prov = _load(out_dir, reference) if reference else ({}, None)
-    ctl_out = _load(out_dir, ctl)[0] if ctl else None
+    ctl_out, ctl_prov = _load(out_dir, ctl) if ctl else (None, None)
     meta = cand_out.get(("__meta__",), {})
+    if reference or ctl:
+        recorded = procedure(cand_prov.get("coordinates", {}))
+        if recorded is None:
+            raise ValueError("candidate procedure identity is incomplete; comparison is unverified")
+        if recorded != procedure(spec_coordinates(spec, "unknown")):
+            raise ValueError("current spec differs from the candidate's recorded procedure")
+        for label, provenance in (("reference", ref_prov), ("control", ctl_prov)):
+            if provenance is not None and recorded != procedure(provenance.get("coordinates", {})):
+                raise ValueError(f"{label} procedure is incomplete or different; comparison is unverified")
 
     same_engine = reference is not None and \
         cand_prov["engine"]["kind"] == ref_prov["engine"]["kind"]
@@ -61,7 +71,7 @@ def score_runs(spec, out_dir: str, candidate: str, reference: str | None,
                 print(f"  NOTE: differing hardware ({cg[0]} vs {rg[0]}) — correctness comparable, "
                       f"perf numbers are not")
             axis = "config/topology equivalence (same engine)" if same_engine \
-                else "correctness (cross-engine, reference = ground truth)"
+                else "numerical comparison (cross-engine; correctness unresolved on mismatch)"
             print(f"  axis: {axis}")
         else:
             print("  no reference: raw execution states, no verdicts")
@@ -69,9 +79,10 @@ def score_runs(spec, out_dir: str, candidate: str, reference: str | None,
     results = []
     # union of output keys and meta keys: an errored cell has NO output entry (execute stores
     # outputs only on success), and it must still appear in the map as its ERROR row
-    keys = ({k for k in cand_out if k[0] not in ("__meta__", "batched_perprompt")}
+    keys = ({k for k in cand_out if isinstance(k, tuple) and len(k) == 2
+             and k[0] in {"interactive", "batched", "generation"}}
             | {k for k in meta if isinstance(k, tuple) and len(k) == 2
-               and k[0] not in ("probe", "__effect__")})
+               and k[0] in {"interactive", "batched", "generation"}})
     for workload_kind, label in sorted(keys):
         m = meta.get((workload_kind, label), {})
         cell = CellResult(spec.methodology, spec.family, candidate, label,
