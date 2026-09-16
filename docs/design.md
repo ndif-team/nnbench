@@ -570,6 +570,22 @@ faithfulness → systems**. Our config groups ≈ `workload / model / backend / 
 
 ### 8.1 Applicability map (PRIMARY deliverable)
 
+Current reporting policy (2026-09-15): execution and numerical validation are separate.
+Report timings with validation state by default. Unvalidated results and numerical mismatches
+remain eligible for performance comparison. Exclude a case only when execution failed or
+evidence establishes a workload-contract violation; retain its diagnostic measurements.
+Comparisons also require matching workloads and suitable hardware/configuration context.
+Reference absence, weak effect guards, and incompatible reference provenance leave correctness
+unresolved and do not block report generation. Strict mode checks execution failures, rather
+than numerical thresholds. Numerical differences alone, including persistent differences at
+matched precision, cannot establish an incorrect intervention. This policy supersedes older
+oracle-as-correctness claims elsewhere in this document and historical findings.
+
+Validation is artifact-only where possible and can be rerun independently. Preserve numerical
+metrics as diagnostics. Future direct checks should establish intervention location, scope and
+consumption; token replay should preserve intervention and cache history. Those stronger checks
+are separate work and are not prerequisites for publishing measurements.
+
 For each (workload × backend × config), a multi-valued state — the user guideline:
 
 | State | Meaning | Detected by |
@@ -577,14 +593,14 @@ For each (workload × backend × config), a multi-valued state — the user guid
 | `SUPPORTED` | runs, matches HF reference within tolerance | oracle pass |
 | `SUPPORTED_DEGRADED` | correct, but forced a de-opt (disables CUDA graphs / prefix cache) | runs + perf delta |
 | `ERROR` | raises a clear, catchable error (user gets a signal) | exception captured |
-| `SILENTLY_WRONG` | runs, no error, but fails the oracle — **the dangerous cell** | oracle mismatch |
+| `NUMERICAL_MISMATCH` | runs; correctness unresolved; performance remains eligible | numerical thresholds exceeded |
+| `INVALID_OUTPUT` | diagnostic timing only | output shape, emptiness or finiteness violation |
 | `HANG` | deadlocks | timeout |
 | `UNSUPPORTED_BY_CONSTRUCTION` | value can't exist (flash-attn attention patterns) | declared + confirmed |
 
-`SILENTLY_WRONG` is **only detectable with the equivalence oracle** → this makes the
-equivalence-oracle correctness goal load-bearing, not optional. What a state means for a cell —
-known frontier, regression, fix landed — is answered at runtime by scoring against a stored
-baseline run (§12.11); the documented status record lives in the catalog and findings.md.
+`SILENTLY_WRONG` remains a historical/direct-probe label; numerical comparison never emits it.
+Historical reports keep their original evidence and can be rescored without rerunning models.
+`SUPPORTED` means the stated numerical checks passed, rather than a proof of semantic correctness.
 
 ### 8.2 Performance
 
@@ -595,9 +611,9 @@ time-to-first-save.
 
 ### 8.3 Correctness
 
-(1) the applicability state above · (2) cross-backend numerical equivalence (HF-eager oracle +
-tolerance — the "same trace, same answer" claim, and the `SILENTLY_WRONG` detector) ·
-(3) regression vs golden values.
+(1) execution and output-contract status; (2) cross-backend numerical diagnostics;
+(3) independent validation evidence when available. Numerical differences and regression
+threshold failures require investigation; they do not establish incorrect execution.
 
 ## 9. Cross-cutting concerns
 

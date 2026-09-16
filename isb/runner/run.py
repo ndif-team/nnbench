@@ -84,7 +84,7 @@ def evaluate(cells, control: str = "hf", top1_thresh: float = 0.9, tv_tol: float
 
     Cells are grouped by (methodology, family) and each group is scored against ITS OWN
     control cell — so vLLM-Llama is compared to HF-Llama, never to HF-GPT2. A non-control
-    cell that ran is SUPPORTED iff equivalent to its control, else SILENTLY_WRONG;
+    cell that ran is SUPPORTED iff equivalent to its control, else NUMERICAL_MISMATCH;
     NO_REFERENCE if its control failed.
 
     When `ref_override` is given (a cpu tensor) it is THE reference for every group, and EVERY
@@ -98,15 +98,11 @@ def evaluate(cells, control: str = "hf", top1_thresh: float = 0.9, tv_tol: float
     """
     from collections import defaultdict
 
-    # The axis this comparison measures. control="hf" is the CORRECTNESS axis (vs the HF ground
-    # truth) -> SUPPORTED / SILENTLY_WRONG. control != "hf" is the PARALLELISM-EQUIVALENCE axis
-    # (bench.py --pp/--tp): the (tp,pp) candidate vs single-GPU vLLM -> EQUIVALENT / DIVERGENT. These
-    # are different questions and get different vocabularies on purpose: a read that is wrong vs HF
-    # but faithfully reproduced under parallelism is EQUIVALENT, never SUPPORTED (the vs-HF wrongness
-    # lives on the orthogonal correctness axis, set by the driver, not here).
+    # Preserve the historical axis names. Both axes measure numerical agreement;
+    # a mismatch on either axis leaves semantic correctness unresolved.
     equivalence = control != "hf"
     ok_state = AppState.EQUIVALENT if equivalence else AppState.SUPPORTED
-    bad_state = AppState.DIVERGENT if equivalence else AppState.SILENTLY_WRONG
+    bad_state = AppState.DIVERGENT if equivalence else AppState.NUMERICAL_MISMATCH
 
     groups = defaultdict(list)
     for c in cells:
@@ -151,19 +147,15 @@ def disambiguate_precision(
     cells, control_value, rerun_at_control_dtype,
     control: str = "hf", top1_thresh: float = 0.9, tv_tol: float = 0.05,
 ):
-    """Separate a precision degradation from a real bug for `SILENTLY_WRONG` non-control cells.
+    """Record whether a numerical mismatch passes at the reference's precision.
 
-    The strict oracle flags ANY top1/TV gate failure as `SILENTLY_WRONG`, but a near-tie that only
-    diverges because the backend ran a lower precision than the control is a DEGRADATION, not a bug
-    (e.g. vLLM bf16 vs HF fp32 flipping a near-tie top-1). For each `SILENTLY_WRONG` non-control
-    cell, re-run it at the control's precision via `rerun_at_control_dtype(cell) -> cpu tensor |
-    None`; if that matches `control_value`, relabel the cell `SUPPORTED_DEGRADED`. Mutates
-    `cell.state` / `cell.metrics`. Call AFTER `evaluate`. Returns `cells`.
+    A persistent mismatch remains unresolved; neither outcome proves a mechanism bug.
+    Mutates state/metrics after evaluate, retaining the original distance diagnostics.
     """
     if control_value is None:
         return cells
     for c in cells:
-        if c.backend == control or c.state != AppState.SILENTLY_WRONG:
+        if c.backend == control or c.state != AppState.NUMERICAL_MISMATCH:
             continue
         ctrl_dtype_value = rerun_at_control_dtype(c)
         if ctrl_dtype_value is None:
@@ -171,5 +163,5 @@ def disambiguate_precision(
         m = compare(control_value, ctrl_dtype_value)
         c.metrics["control_dtype_tv"] = round(m["tv"], 4)
         if is_equivalent(m, top1_thresh, tv_tol):
-            c.state = AppState.SUPPORTED_DEGRADED  # matched at the control's precision -> precision, not a bug
+            c.state = AppState.SUPPORTED_DEGRADED  # numerical check passed at control precision
     return cells

@@ -315,10 +315,10 @@ def test_batched_candidate_scored_against_perprompt_reference_not_padded_batch(t
 
 
 def test_control_dtype_run_disambiguates_precision(tmp_path):
-    """A low-precision candidate cell that diverges from the hf reference is SILENTLY_WRONG until
+    """A low-precision candidate cell that diverges from the hf reference is NUMERICAL_MISMATCH until
     a control-dtype run of the same engine disambiguates it: where the control-dtype output
     matches the hf reference, the divergence is precision (SUPPORTED_DEGRADED); where it also
-    diverges, it is a real mechanism bug (stays SILENTLY_WRONG). Same logic as the old live fp32
+    diverges, it is a real mechanism bug (stays NUMERICAL_MISMATCH). Same logic as the old live fp32
     rerun, but from a run file (score.py --ctl)."""
     def cells_for(outputs):
         def get_cell(methodology, family, backend):
@@ -336,12 +336,12 @@ def test_control_dtype_run_disambiguates_precision(tmp_path):
     cells = score_runs(_spec(), str(tmp_path), "cand", "ref", ctl="ctl", quiet=True)
     by = {c.label: c for c in cells}
     assert by["a"].state == AppState.SUPPORTED_DEGRADED   # ctl == hf -> precision
-    assert by["b"].state == AppState.SILENTLY_WRONG       # ctl != hf -> real bug
+    assert by["b"].state == AppState.NUMERICAL_MISMATCH       # ctl != hf -> real bug
 
 
 def test_evaluate_equivalence_mode_emits_equivalent_divergent():
     """In equivalence mode (control != "hf") the oracle scores the candidate vs single-GPU vLLM and
-    emits EQUIVALENT / DIVERGENT — never the correctness vocabulary (SUPPORTED / SILENTLY_WRONG). A
+    emits EQUIVALENT / DIVERGENT — never the correctness vocabulary (SUPPORTED / NUMERICAL_MISMATCH). A
     candidate matching the control is EQUIVALENT even if both are 'wrong' vs HF; a candidate diverging
     is DIVERGENT (the real parallelism break a --pp/--tp run exists to catch)."""
     from isb.runner.run import CellResult, evaluate
@@ -357,7 +357,7 @@ def test_evaluate_equivalence_mode_emits_equivalent_divergent():
     assert ctrl_a.state == AppState.EQUIVALENT        # the single-GPU reference, trivially equivalent
     assert cand_a.state == AppState.EQUIVALENT        # candidate reproduces single-GPU
     assert cand_b.state == AppState.DIVERGENT         # candidate diverges from single-GPU
-    assert cand_b.state not in (AppState.SUPPORTED, AppState.SILENTLY_WRONG)  # not the correctness axis
+    assert cand_b.state not in (AppState.SUPPORTED, AppState.NUMERICAL_MISMATCH)  # not the correctness axis
 
 
 def test_evaluate_equivalence_within_noise_band():
@@ -397,7 +397,7 @@ def test_aggregate_interactive_scores_over_all_prompts(tmp_path):
     """An aggregate-interactive workload runs each prompt as its OWN trace and scores the verdict over
     ALL of them — so a backend that is right on 1 prompt but wrong on another is caught, where a
     single-prompt (n=1) verdict would pass it. The vllm cell here matches hf on 3 of 4 prompts ->
-    top-1 agreement 0.75 < 0.9 -> SILENTLY_WRONG (a single-prompt check on the first prompt would say
+    top-1 agreement 0.75 < 0.9 -> NUMERICAL_MISMATCH (a single-prompt check on the first prompt would say
     SUPPORTED)."""
     refs = {"p0": _onehot(0), "p1": _onehot(1), "p2": _onehot(2), "p3": _onehot(3)}
 
@@ -419,7 +419,7 @@ def test_aggregate_interactive_scores_over_all_prompts(tmp_path):
     _execute(tmp_path, "cand", "vllm", spec, fake)
     cells = score_runs(spec, str(tmp_path), "cand", "ref", quiet=True)
     cell = {c.workload: c for c in cells}["interactive"]
-    assert cell.state == AppState.SILENTLY_WRONG              # 3/4 agreement, caught
+    assert cell.state == AppState.NUMERICAL_MISMATCH              # 3/4 agreement, caught
     assert cell.metrics["top1_agree"] == 0.75                 # aggregated over 4 prompts
 
 
@@ -427,7 +427,7 @@ def test_pair_unit_workload_aggregates_over_pairs(tmp_path):
     """A patching workload's unit is a (clean, corrupted) PAIR, not a single prompt. Execution runs
     each pair as its own trace (the cell consumes the 2-element pair) and aggregates the verdict over
     all pairs, so N pairs stack like N prompts. Here the vllm cell matches hf on 3 of 4 pairs -> top-1
-    0.75 -> SILENTLY_WRONG, which a single-pair check would miss — the multi-trace point, for patching."""
+    0.75 -> NUMERICAL_MISMATCH, which a single-pair check would miss — the multi-trace point, for patching."""
     pairs = [("c0", "k0"), ("c1", "k1"), ("c2", "k2"), ("c3", "k3")]
 
     def fake(methodology, family, backend):
@@ -448,7 +448,7 @@ def test_pair_unit_workload_aggregates_over_pairs(tmp_path):
     _execute(tmp_path, "cand", "vllm", spec, fake)
     cells = score_runs(spec, str(tmp_path), "cand", "ref", quiet=True)
     cell = {c.workload: c for c in cells}["interactive"]
-    assert cell.state == AppState.SILENTLY_WRONG
+    assert cell.state == AppState.NUMERICAL_MISMATCH
     assert cell.metrics["top1_agree"] == 0.75
 
 

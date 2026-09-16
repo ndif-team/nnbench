@@ -61,7 +61,8 @@ the saved artifacts. Select the reference explicitly with `--reference`, normall
 | State | Meaning |
 |---|---|
 | `RAN` | Produced an output; no comparison verdict was assigned, including reference rows |
-| `SUPPORTED` / `SILENTLY_WRONG` | Matches / fails the selected correctness reference |
+| `SUPPORTED` / `NUMERICAL_MISMATCH` | Meets / exceeds the selected numerical thresholds; neither establishes general correctness |
+| `INVALID_OUTPUT` | Output structure or finiteness check failed; timing is diagnostic only |
 | `EQUIVALENT` / `DIVERGENT` | Matches / differs under `--comparison equivalence` |
 | `ERROR` | The cell failed |
 | `NO_REFERENCE` / `INVALID_REFERENCE` | Reference output is unavailable / unsuitable for judgment |

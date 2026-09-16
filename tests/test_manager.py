@@ -131,7 +131,8 @@ def test_spec_page_shows_states_metrics_and_stack(tmp_path):
         page = manager.render_spec(str(tmp_path), "xs", inbox=str(tmp_path / "inbox"))
     finally:
         del SPECS["xs"]
-    assert ">SILENTLY_WRONG</span>" in page                        # per-cell state chips
+    assert ">NUMERICAL_MISMATCH</span>" in page                    # unresolved numerical difference
+    assert " ms</span>" in page                                 # measurement remains visible
     assert "top1=" in page and "tv=" in page                       # oracle metrics per cell
     assert "c-cand" in page                                        # stack commit shown
     # the baseline run leads with its own section: stack + latencies, no verdicts

@@ -115,8 +115,10 @@ def _legend() -> str:
     result_states = table(None, [
         [chip("SUPPORTED"), note("matches the baseline")],
         [chip("SUPPORTED_DEGRADED"),
-         note("matches the baseline at fp32; under bf16 a few near-tie top tokens flip")],
-        [chip("SILENTLY_WRONG"), note("runs without any error but produces wrong numbers")],
+         note("numerical check passes at control precision; original mismatch retained")],
+        [chip("NUMERICAL_MISMATCH"), note("numerical comparison failed; correctness unresolved; performance remains available")],
+        [chip("INVALID_OUTPUT"), note("output structure or finiteness check failed; diagnostic timing only")],
+        [chip("SILENTLY_WRONG"), note("legacy or direct-check finding; inspect the recorded evidence")],
         [chip("ERROR"), note("fails with an error")],
     ])
     rollups = table(None, [
@@ -213,6 +215,9 @@ def _cell_rows(col: Collection, name: str, cells) -> list[list[str]]:
                   f"maxabs={m.get('max_abs', float('nan')):.2f}" if m else (c.error or ""))
         state = _BASELINE_CHIP if is_baseline and c.state == "RAN" else chip(c.state)
         lat = fmt_ms(c.latency_s * 1000 if c.latency_s is not None else None)
+        from isb.validation import performance_eligible
+        if not performance_eligible(c.state):
+            lat += " (diagnostic only)"
         rows.append([esc(c.label), esc(c.workload), state, mono(lat), mono(metric)])
     meta = col.load(name)[0].get(("__meta__",), {})
     rows += [[esc("effect guard"), esc(k[1]), "", mono("-"), mono(_effect_summary(e))]

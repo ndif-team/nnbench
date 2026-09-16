@@ -4,6 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
+Current validation policy (2026-09-15, design §8.1): report measurements with validation
+state, including unvalidated results. Numerical differences alone produce
+NUMERICAL_MISMATCH with correctness unresolved and remain performance-eligible.
+Only execution failures or demonstrated contract violations exclude a case from performance
+comparison; retain diagnostic measurements. This supersedes older oracle-as-correctness
+language below. Persistent matched-precision differences also remain unresolved.
+
 nnbench: a **systems performance + coverage benchmark** for interpretability workloads run through nnsight across serving backends (HuggingFace vs vLLM). It measures whether a workload **runs**, **runs correctly** (numerical equivalence vs an HF reference), and **runs fast** — it is *not* a faithfulness benchmark. The headline deliverable is the applicability map, and the dangerous state it exists to catch is `SILENTLY_WRONG`: runs with no error but produces wrong numbers (e.g. the portable logit-lens on vLLM-Llama drops half the dual residual stream).
 
 ## Environment & commands

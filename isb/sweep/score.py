@@ -8,7 +8,7 @@ stacks (nnsight commit, engine version, host/GPU) — the provenance whose absen
 branch skew into a two-day hunt.
 
 The comparison AXIS is derived from provenance: different engine kinds -> the correctness axis
-(SUPPORTED / SILENTLY_WRONG vs the reference); same engine kind -> the parallelism/config
+(SUPPORTED / NUMERICAL_MISMATCH vs the reference); same engine kind -> the parallelism/config
 equivalence axis (EQUIVALENT / DIVERGENT). An optional control-dtype run (just another executed
 run, e.g. the same engine at fp32) disambiguates precision near-ties exactly like the live rerun
 used to, but from data.
@@ -71,7 +71,7 @@ def score_runs(spec, out_dir: str, candidate: str, reference: str | None,
                 print(f"  NOTE: differing hardware ({cg[0]} vs {rg[0]}) — correctness comparable, "
                       f"perf numbers are not")
             axis = "config/topology equivalence (same engine)" if same_engine \
-                else "correctness (cross-engine, reference = ground truth)"
+                else "numerical comparison (cross-engine; correctness unresolved on mismatch)"
             print(f"  axis: {axis}")
         else:
             print("  no reference: raw execution states, no verdicts")

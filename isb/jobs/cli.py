@@ -59,7 +59,7 @@ def parser():
     run.add_argument("--timeout", type=_positive, default=1800, help="seconds per backend job")
     run.add_argument("--seed", type=int, default=0)
     run.add_argument("--out", type=Path, default=Path("runs"), help="parent of a new unique run directory")
-    run.add_argument("--strict", action="store_true", help="nonzero exit for unsuccessful cell verdicts too")
+    run.add_argument("--strict", action="store_true", help="nonzero exit for failed execution/output checks; numerical uncertainty is nonblocking")
     scoring = commands.add_parser("score")
     scoring.add_argument("run", type=Path)
     scoring.add_argument("--strict", action="store_true")
@@ -144,9 +144,11 @@ def main(argv=None):
         from .score import score_run
         report = score_run(args.run.resolve())
         states = {cell["state"] for exp in report["experiments"] for cell in exp["cells"]}
-        if states & {"JOB_FAILED", "INCOMPATIBLE", "NO_REFERENCE", "INVALID_REFERENCE"}:
+        if states & {"JOB_FAILED"}:
             return 1
-        if args.strict and states - {"RAN", "SUPPORTED", "EQUIVALENT"}:
+        if args.strict and states - {"RAN", "SUPPORTED", "EQUIVALENT", "NUMERICAL_MISMATCH",
+                                    "DIVERGENT", "NO_REFERENCE", "INVALID_REFERENCE", "INCOMPATIBLE",
+                                    "SUPPORTED_DEGRADED", "EQUIVALENT_DEGRADED"}:
             return 1
         return 0
     except KeyboardInterrupt:

@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 
 from .contract import PLAN_VERSION, read_experiment, unpack, validate_result, write_json
+from isb.validation import POLICY_VERSION, performance_eligible
 
 
 def _load(directory, experiment, backend):
@@ -65,6 +66,12 @@ def score_experiment(directory, backends, reference=None, comparison="correctnes
             if cell["state"] != "RAN":
                 rows.append(row)
                 continue
+            actual = artifact["outputs"].get(key)
+            if (not isinstance(actual, torch.Tensor) or not actual.numel()
+                    or not torch.isfinite(actual).all()):
+                row.update(state="INVALID_OUTPUT", error="missing, empty or nonfinite tensor output")
+                rows.append(row)
+                continue
             if reference is None or backend == reference:
                 rows.append(row)
                 continue
@@ -83,8 +90,8 @@ def score_experiment(directory, backends, reference=None, comparison="correctnes
                 elif (spec["effect"] and key[0] in {"interactive", "generation"}
                       and (not effect or not effect.get("strong"))):
                     row.update(state="INVALID_REFERENCE", error="missing or weak intervention effect")
-                elif not isinstance(actual, torch.Tensor) or not isinstance(expected, torch.Tensor):
-                    row.update(state="ERROR", error="expected tensor outputs")
+                elif not isinstance(expected, torch.Tensor):
+                    row.update(state="INVALID_REFERENCE", error="expected tensor reference")
                 else:
                     # Only align documented vocabulary padding; never truncate arbitrary axes.
                     size = artifact["provenance"]["model_identity"]["vocab_size"]
@@ -96,15 +103,23 @@ def score_experiment(directory, backends, reference=None, comparison="correctnes
                         row.update(state="INVALID_REFERENCE", error="empty/nonfinite reference output")
                     elif (actual.shape != expected.shape or not actual.numel()
                           or not torch.isfinite(actual).all()):
-                        row.update(state="SILENTLY_WRONG" if comparison == "correctness" else "DIVERGENT",
+                        row.update(state="INVALID_OUTPUT",
                                    error="shape mismatch or empty/nonfinite output")
                     else:
                         metrics = compare(expected, actual)
-                        good, bad = (("SUPPORTED", "SILENTLY_WRONG") if comparison == "correctness"
+                        good, bad = (("SUPPORTED", "NUMERICAL_MISMATCH") if comparison == "correctness"
                                      else ("EQUIVALENT", "DIVERGENT"))
                         row.update(state=good if is_equivalent(metrics) else bad, metrics=metrics)
             rows.append(row)
-    return {"experiment_id": experiment["id"], "spec": experiment["spec"]["name"],
+    for row in rows:
+        row["performance_eligible"] = performance_eligible(row["state"])
+        row["validation_state"] = (
+            "OUTPUT_CONTRACT_FAILED" if row["state"] == "INVALID_OUTPUT" else
+            "NUMERICAL_CHECK_PASSED" if row["state"] in {"SUPPORTED", "EQUIVALENT"} else
+            "UNRESOLVED" if row["performance_eligible"] else "EXECUTION_FAILED"
+        )
+    return {"validation_policy_version": POLICY_VERSION,
+            "experiment_id": experiment["id"], "spec": experiment["spec"]["name"],
             "reference": reference, "comparison": comparison, "cells": rows}
 
 
