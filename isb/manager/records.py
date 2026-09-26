@@ -46,7 +46,8 @@ def cells(rows):
                for k in ("median_latency_ms", "overhead_vs_baseline", "throughput", "peak_mem_mb")):
             raise ValueError("invalid performance measurement")
     return [SimpleNamespace(label=r.get("label", "job"), workload=r.get("workload", "job"),
-                            state=r["state"], error=r.get("error"), metrics=r.get("metrics") or {},
+                            state=r["state"], error=r.get("error") or r.get("unsupported"),
+                            metrics=r.get("metrics") or {},
                             latency_s=(r["median_latency_ms"] / 1000
                                        if r.get("median_latency_ms") is not None else None))
             for r in rows]

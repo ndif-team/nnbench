@@ -180,6 +180,9 @@ def validate_result(directory, experiment, backend):
         raise ValueError("result does not account for every requested cell exactly once")
     if any(row.get("state") not in {"RAN", "ERROR", "UNSUPPORTED"} for row in cells):
         raise ValueError("invalid execution cell status")
+    if any(row["state"] == "UNSUPPORTED" and not (isinstance(row.get("unsupported"), str)
+                                                  and row["unsupported"].strip()) for row in cells):
+        raise ValueError("an UNSUPPORTED cell must name the missing capability")
     if file_digest(directory / "result.pt") != result.get("outputs_sha256"):
         raise ValueError("missing or corrupted tensor artifact")
     return result

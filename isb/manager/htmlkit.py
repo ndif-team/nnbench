@@ -81,7 +81,7 @@ tr:last-child td{{border-bottom:none}}
 .s-SILENTLY_WRONG,.s-INVALID_OUTPUT{{color:var(--bad);background:var(--bad-bg)}}
 .s-NUMERICAL_MISMATCH,.s-DIVERGENT{{color:var(--deg);background:var(--deg-bg)}}
 .s-ERROR,.s-JOB_FAILED,.s-INCOMPATIBLE,.s-INVALID_REFERENCE{{color:var(--err);background:var(--err-bg)}}
-.s-RAN,.s-NO_REFERENCE,.s-UNTESTED,.s-NOT_RUN,.s-CANCELLED,.s-PENDING,.s-RUNNING{{color:var(--un);background:var(--un-bg)}}
+.s-RAN,.s-NO_REFERENCE,.s-UNTESTED,.s-UNSUPPORTED,.s-NOT_RUN,.s-CANCELLED,.s-PENDING,.s-RUNNING{{color:var(--un);background:var(--un-bg)}}
 .s-LIMITED,.s-BASELINE{{color:var(--lim);background:var(--lim-bg)}}
 .note{{font-size:12.5px;color:var(--mut);max-width:72ch}}
 .berow{{display:flex;gap:8px 22px;flex-wrap:wrap;align-items:center;margin-top:12px;

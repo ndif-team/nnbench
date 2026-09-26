@@ -182,3 +182,61 @@ def test_real_worker_execution_preserves_calls_through_artifact_and_manager(
     assert backend_name in page and backend_name in exported
     if invalid_effect:
         assert "finite tensor" in page and "finite tensor" in exported
+
+
+def test_declared_unsupported_cell_is_recorded_with_its_reason(tmp_path, monkeypatch):
+    import json
+
+    import isb.runs
+
+    method, backend_name, interface = "sampler_override_fixture", "foreign-cpu", "foreign_sys"
+    monkeypatch.setenv("ISB_BACKEND", backend_name)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(timing, "force_gc", lambda: None)
+    monkeypatch.setattr(isb.runs, "resolve_provenance", lambda run: {
+        "engine": {"kind": run.engine.kind}, "client": {}, "host": {}, "deployment": {}})
+    monkeypatch.setattr(registry, "CELLS", dict(registry.CELLS))
+    reason = "hooks fire only at decoder-layer boundaries; the sampler is not addressable"
+
+    @registry.cell(method, family="gpt2", backend=interface)
+    def foreign(be, model, prompts, *, site="residual"):
+        if site == "sampler":
+            raise registry.Unsupported(reason)
+        return torch.ones(len(prompts), 3)
+
+    class Backend:
+        name = interface
+
+        def load(self, repo):
+            return SimpleNamespace(config=SimpleNamespace(_commit_hash="rev"),
+                                   tokenizer=SimpleNamespace(get_vocab=lambda: {"x": 0}))
+
+        def teardown(self, model):
+            pass
+
+    spec = CellConfig(
+        "foreign-unsupported", method, "gpt2", "test/model",
+        [ExecutionRegime("interactive", ["p"])],
+        [TaskSpec("read residual", {"site": "residual"}),
+         TaskSpec("override sampler", {"site": "sampler"})],
+        BaselineSpec({"site": "residual"}), None, warmup=0, n_trials=1,
+        protocol_absence_reason="CPU fixture for a foreign system")
+    job = tmp_path / "exp"
+    experiment = contract.prepare(spec, job)
+    output = job / backend_name
+    worker.main(lambda restored: (Backend(), RunConfig(engine=EngineConfig("vllm"))),
+                job=job, output=output)
+
+    result = contract.validate_result(output, experiment, backend_name)
+    cells = {row["label"]: row for row in result["cells"]}
+    assert cells["read residual"]["state"] == "RAN"
+    assert cells["override sampler"]["state"] == "UNSUPPORTED"
+    assert cells["override sampler"]["unsupported"] == reason
+    assert cells["override sampler"]["error"] is None
+
+    saved = json.loads((output / "result.json").read_text())
+    for row in saved["cells"]:
+        row.pop("unsupported", None)
+    contract.write_json(output / "result.json", saved)
+    with pytest.raises(ValueError, match="missing capability"):
+        contract.validate_result(output, experiment, backend_name)

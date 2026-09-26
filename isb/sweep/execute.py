@@ -22,7 +22,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 
 from ..methodologies.observations import capture_choices
-from ..methodologies.registry import get_cell
+from ..methodologies.registry import Unsupported, get_cell
 from ..perf.timing import time_cell
 from ..runfile import save_run
 from ..runs import RunConfig, cell_interface, make_backend, resolve_provenance, spec_coordinates
@@ -103,6 +103,9 @@ def _bind_case(spec, name, params, record):
 
 
 def _failure(record, error):
+    if isinstance(error, Unsupported):     # the system lacks the capability (design.md §12.14)
+        record.update(unsupported=str(error), error=None, error_stage=None)
+        return
     traceback.print_exc()
     record["error"] = repr(error)[:1000]
 

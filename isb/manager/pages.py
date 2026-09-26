@@ -120,6 +120,8 @@ def _legend() -> str:
         [chip("INVALID_OUTPUT"), note("output structure or finiteness check failed; diagnostic timing only")],
         [chip("SILENTLY_WRONG"), note("legacy or direct-check finding; inspect the recorded evidence")],
         [chip("ERROR"), note("fails with an error")],
+        [chip("UNSUPPORTED"), note("the system cannot express this workload; the note names "
+                                   "the missing capability")],
     ])
     rollups = table(None, [
         [chip("SUPPORTED"), note("every variant and regime passes")],

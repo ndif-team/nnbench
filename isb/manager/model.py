@@ -135,7 +135,7 @@ def rollup(states: list[str]) -> str:
     if states and all(s in _PASS for s in states):
         return "SUPPORTED"
     if not any(s in _PASS for s in states):
-        for state in ("SILENTLY_WRONG", "INVALID_OUTPUT", "JOB_FAILED", "ERROR", "NUMERICAL_MISMATCH", "DIVERGENT", "INCOMPATIBLE",
+        for state in ("SILENTLY_WRONG", "INVALID_OUTPUT", "JOB_FAILED", "ERROR", "NUMERICAL_MISMATCH", "DIVERGENT", "INCOMPATIBLE", "UNSUPPORTED",
                       "INVALID_REFERENCE", "NO_REFERENCE", "RUNNING", "PENDING", "CANCELLED", "NOT_RUN", "RAN"):
             if state in states:
                 return state

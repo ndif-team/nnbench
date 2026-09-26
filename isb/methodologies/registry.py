@@ -27,6 +27,15 @@ from ..profiles import PROFILES
 
 CELLS = {}  # (methodology, family, backend) -> fn(be, model, prompts, **params)
 
+# nnsight's own vLLM interfaces, which share the vllm_async cells. A foreign system on vLLM
+# (e.g. vllm_lens) never inherits nnsight intervention code (design.md §12.14).
+NNSIGHT_VLLM_VARIANTS = frozenset({"vllm_serve", "vllm_sync", "vllm_pp"})
+
+
+class Unsupported(Exception):
+    """Raised by a cell whose system cannot express the workload; the message names the missing
+    capability. Recorded as UNSUPPORTED, distinct from ERROR (design.md §12.14)."""
+
 
 def cell(methodology: str, family: str, backend: str):
     def deco(fn):
@@ -39,7 +48,7 @@ def cell(methodology: str, family: str, backend: str):
 def get_cell(methodology: str, family: str, backend: str):
     def lookup(fam):
         fn = CELLS.get((methodology, fam, backend))
-        if fn is None and backend.startswith("vllm_") and backend != "vllm_async":
+        if fn is None and backend in NNSIGHT_VLLM_VARIANTS:
             # Every vLLM *variant* runs the SAME vLLM model via the SAME intervention code as the
             # in-process async backend: the only difference is fully contained in the backend/model
             # object passed as `be` (over-HTTP for `vllm_serve`, an in-process sync engine for

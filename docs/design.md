@@ -1363,3 +1363,33 @@ Acceptance checks:
 GPU method runs validate backend behavior separately. Unsupported or incorrect method results are
 preserved as benchmark findings. The nnsight 0.8 GPT-2 sweep follows the framework checks and
 requires an uncontended GPU allocation for performance measurements.
+
+### 12.14 Cross-system comparison (2026-09-25)
+
+nnbench compares interpretability systems by holding the workload fixed and varying the system.
+nnsight is one system among several. Each system is an independent backend directory with its own
+pinned image, scored against one baseline run, normally `nnsight-hf`. The nnsight website's
+comparison page served as a weak reference for which workloads separate systems; nnbench keeps its
+own structure of one baseline and N runs.
+
+**Semantic tasks.** A comparison spec's task parameters carry only intervention semantics: layer,
+direction, strength, positions. Each system's cell chooses that system's documented realization.
+Specs whose tasks select nnsight spellings, such as in-place versus replacement writes, stay
+nnsight-internal coverage and are not cross-system rows. Comparison specs live in
+`isb/specs/comparison.py`.
+
+**Foreign cells.** A non-nnsight system registers cells under its own interface name, for example
+`vllm_lens`, from inside its backend directory. The registry's fallback from `vllm_*` variants to
+the `vllm_async` cells applies only to nnsight's own vLLM variants; a foreign interface never
+inherits nnsight cells. The shared worker and executor host foreign cells unchanged: the backend
+object loads the engine, and the cell returns the same tensor shapes as the nnsight cells.
+
+**Declared unsupported.** A system that cannot express a workload registers a cell that raises
+`Unsupported(reason)`, naming the missing capability, for example "hooks fire only at decoder-layer
+boundaries; the attention output is not addressable". The worker records `UNSUPPORTED` with that
+reason. A missing registration stays an `ERROR`, because it means the suite lacks the cell, not
+that the system lacks the capability. `UNSUPPORTED` cells are excluded from performance comparison.
+
+**Denominators.** Throughput shares divide by the same backend's no-intervention baseline call,
+measured in the same job. Engine version and eager or CUDA-graph mode are recorded with the result,
+because an eager engine's absolute throughput depends on host CPU load.

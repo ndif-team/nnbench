@@ -58,6 +58,18 @@ def test_cell_accepts_variances():
     assert "unembed" in params
 
 
+def test_foreign_vllm_interface_never_inherits_nnsight_cells():
+    # nnsight's own vLLM variants share the vllm_async cell; a foreign system whose interface
+    # name also starts with "vllm_" must not silently run nnsight intervention code
+    key = ("residual_probe", "decoder_stack", "vllm_async")
+    CELLS[key] = nnsight_cell = lambda be, model, prompts: "nnsight"  # noqa: E731
+    try:
+        assert get_cell("residual_probe", "decoder_stack", "vllm_sync") is nnsight_cell
+        assert get_cell("residual_probe", "decoder_stack", "vllm_foreign_plugin") is None
+    finally:
+        del CELLS[key]
+
+
 def test_no_resolver_or_predict_imports():
     """The abstraction is gone: these modules must not exist anymore."""
     import importlib

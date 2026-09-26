@@ -61,12 +61,15 @@ def main(create_backend, job=Path("/job"), output=Path("/output")):
             for key in sorted(requested):
                 info = dict(metadata.get(key, {}))
                 error = info.get("error")
-                if not error and outputs.get(key) is None:
-                    error = "cell returned no output"
+                if info.get("unsupported"):
+                    state = "UNSUPPORTED"
+                else:
+                    if not error and outputs.get(key) is None:
+                        error = "cell returned no output"
+                    state = "ERROR" if error else "RAN"
                 info["error"] = error
                 metadata[key] = info
-                cells.append({"workload": key[0], "label": key[1],
-                              "state": "ERROR" if error else "RAN", **info})
+                cells.append({"workload": key[0], "label": key[1], "state": state, **info})
             auxiliary_calls = [{"key": list(key), "record": info}
                                for key, info in metadata.items() if key not in requested]
             outputs[("__meta__",)] = metadata
