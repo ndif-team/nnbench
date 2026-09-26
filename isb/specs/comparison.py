@@ -62,12 +62,12 @@ cmp_ablation = CellConfig(
     methodology="ablation", family="llama", repo=_MODEL,
     regimes=[ExecutionRegime("interactive", _PROMPTS)],
     tasks=[
-        ({"layer": 14, "target": "mlp"}, "zero the MLP output at layer 14"),
-        ({"layer": 14, "target": "attn"}, "zero the attention output at layer 14"),
+        ({"layer": 1, "target": "mlp"}, "zero the MLP output at layer 1"),
+        ({"layer": 1, "target": "attn"}, "zero the attention output at layer 1"),
     ],
-    baseline=BaselineSpec(params={"layer": 14, "target": "none"}),
-    effect=EffectSpec(baseline_params={"layer": 14, "target": "none"},
-                      perturbed_params={"layer": 14, "target": "attn"}),
+    baseline=BaselineSpec(params={"layer": 1, "target": "none"}),
+    effect=EffectSpec(baseline_params={"layer": 1, "target": "none"},
+                      perturbed_params={"layer": 1, "target": "mlp"}),
 )
 
 COMPARISON_SPECS = (cmp_logit_lens, cmp_steering, cmp_gen_steering, cmp_activation_patching,
