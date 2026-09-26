@@ -1,0 +1,74 @@
+"""Cross-system comparison specs (design.md §12.14).
+
+Task parameters carry intervention semantics only (layer, direction, strength, component). Each
+system's cell picks that system's documented realization, so the same row is comparable across
+nnsight and foreign systems. Qwen2.5-1.5B-Instruct is a Llama-shaped decoder (family "llama"), 28
+layers; the MIB IOI pairs are verified length-matched under the Qwen2.5 tokenizer.
+"""
+from ..data import DataRef
+from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime
+
+_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+_PROMPTS = DataRef("counterfact", 32)
+_PAIRS = DataRef("mib/ioi", 16)
+_STEER = {"target": " Rome", "alpha": 6.0}
+
+cmp_logit_lens = CellConfig(
+    name="cmp_logit_lens",
+    methodology="logit_lens", family="llama", repo=_MODEL,
+    regimes=[ExecutionRegime("interactive", _PROMPTS)],
+    tasks=[({"layers": "all"}, "every layer, last token")],
+    baseline=BaselineSpec(params={"layers": [-1]}),
+)
+
+cmp_steering = CellConfig(
+    name="cmp_steering",
+    methodology="steering", family="llama", repo=_MODEL,
+    regimes=[ExecutionRegime("interactive", _PROMPTS)],
+    tasks=[
+        ({**_STEER, "layer": 7}, "add toward ' Rome' at layer 7"),
+        ({**_STEER, "layer": 14}, "add toward ' Rome' at layer 14"),
+    ],
+    baseline=BaselineSpec(params={**_STEER, "layer": 14, "alpha": 0.0}),
+    effect=EffectSpec(baseline_params={**_STEER, "layer": 14, "alpha": 0.0},
+                      perturbed_params={**_STEER, "layer": 14}),
+)
+
+cmp_gen_steering = CellConfig(
+    name="cmp_gen_steering",
+    methodology="gen_steering", family="llama", repo=_MODEL,
+    regimes=[ExecutionRegime("generation", DataRef("counterfact", 16), new_tokens=8)],
+    tasks=[({**_STEER, "layer": 14}, "add toward ' Rome' at layer 14, every step")],
+    baseline=BaselineSpec(params={**_STEER, "layer": 14, "alpha": 0.0}),
+    effect=EffectSpec(baseline_params={**_STEER, "layer": 14, "alpha": 0.0},
+                      perturbed_params={**_STEER, "layer": 14}),
+)
+
+cmp_activation_patching = CellConfig(
+    name="cmp_activation_patching",
+    methodology="activation_patching", family="llama", repo=_MODEL,
+    regimes=[ExecutionRegime("interactive", _PAIRS, aggregate=True)],
+    tasks=[
+        ({"layer": 7}, "clean residual into corrupt run at layer 7"),
+        ({"layer": 21}, "clean residual into corrupt run at layer 21"),
+    ],
+    baseline=BaselineSpec(params={"patch": False}),
+    effect=EffectSpec(baseline_params={"patch": False},
+                      perturbed_params={"layer": 21, "patch": True}),
+)
+
+cmp_ablation = CellConfig(
+    name="cmp_ablation",
+    methodology="ablation", family="llama", repo=_MODEL,
+    regimes=[ExecutionRegime("interactive", _PROMPTS)],
+    tasks=[
+        ({"layer": 14, "target": "mlp"}, "zero the MLP output at layer 14"),
+        ({"layer": 14, "target": "attn"}, "zero the attention output at layer 14"),
+    ],
+    baseline=BaselineSpec(params={"layer": 14, "target": "none"}),
+    effect=EffectSpec(baseline_params={"layer": 14, "target": "none"},
+                      perturbed_params={"layer": 14, "target": "attn"}),
+)
+
+COMPARISON_SPECS = (cmp_logit_lens, cmp_steering, cmp_gen_steering, cmp_activation_patching,
+                    cmp_ablation)

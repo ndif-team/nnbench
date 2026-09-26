@@ -90,7 +90,7 @@ def _steer_and_read(blocks, norm, head, *, layer, token_id, alpha, mode, last_fn
 
 
 @cell("steering", family="*", backend="hf")
-def steering_hf(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace"):
+def steering_hf(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="replace"):
     token_id = _resolve_token(model.tokenizer, target)
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
         return _steer_and_read(
@@ -101,7 +101,7 @@ def steering_hf(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, mo
 
 
 @cell("steering", family="*", backend="vllm_async")
-def steering_vllm(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="inplace",
+def steering_vllm(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="replace",
                   residual=None):
     # The read-out residual default derives from the family's vLLM denotation (fused-residual
     # RMSNorm families must read hidden+residual; plain drops the accumulated residual). Matches

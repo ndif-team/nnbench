@@ -4,6 +4,7 @@ from .ablation import ablation_gpt2
 from .activation_patching import activation_patching_gpt2
 from .attention_pattern import attention_pattern_gpt2
 from .attribution_patching import attribution_patching_gpt2
+from .comparison import COMPARISON_SPECS
 from .das import das_gpt2
 from .gen_patching import gen_patching_gpt2
 from .gen_steering import gen_steering_gpt2
@@ -57,6 +58,8 @@ SPECS = {
         logit_lens_nemotron,
         steering_nemotron,
         ablation_nemotron,
+        # Qwen2.5-1.5B (family=llama) — cross-system comparison rows (design §12.14), by name only
+        *COMPARISON_SPECS,
     )
 }
 
