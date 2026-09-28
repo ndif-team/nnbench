@@ -61,13 +61,13 @@ ablation_qwen = CellConfig(
     methodology="ablation", family="llama", repo=_QWEN,
     regimes=[ExecutionRegime("interactive", PROBE)],
     tasks=[
-        ({"layer": 16, "target": "mlp"}, "target=mlp"),
-        ({"layer": 16, "target": "attn"}, "target=attn"),
+        ({"layer": 16, "target": "mlp", "residual": "plain"}, "target=mlp"),
+        ({"layer": 16, "target": "attn", "residual": "plain"}, "target=attn"),
     ],
-    baseline=BaselineSpec(params={"layer": 16, "target": "none"}),
+    baseline=BaselineSpec(params={"layer": 16, "target": "none", "residual": "plain"}),
     effect=EffectSpec(
-        baseline_params={"layer": 16, "target": "none"},
-        perturbed_params={"layer": 16, "target": "attn"},
+        baseline_params={"layer": 16, "target": "none", "residual": "plain"},
+        perturbed_params={"layer": 16, "target": "attn", "residual": "plain"},
     ),
     dtype_control=_BF16,
 )

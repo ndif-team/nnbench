@@ -53,6 +53,20 @@ def test_capture_fused_sums_hidden_and_residual():
     assert torch.equal(snap, h + r)                  # fused reconstruction (vLLM-Llama blocks return (hidden, residual) whose sum is the true stream)
 
 
+def test_fused_patch_leaves_the_clean_stream_downstream():
+    # vLLM fused-residual layer: output (hidden, residual), stream = hidden + residual. Patching a
+    # clean STREAM must leave exactly that stream, not clean + the corrupt residual.
+    hidden, corrupt_residual = torch.ones(2, HID), torch.full((2, HID), 3.0)
+    block = _Block((hidden, corrupt_residual))
+    clean_stream = torch.arange(2 * HID, dtype=torch.float32).reshape(2, HID)
+    read = _patch_and_read([block], lambda x: x, _Head(), layer=0, clean_act=clean_stream,
+                           residual="fused", last_fn=_last)
+    patched_hidden, kept_residual = block.output
+    assert torch.equal(patched_hidden + kept_residual, clean_stream)
+    assert torch.equal(kept_residual, corrupt_residual)
+    assert torch.equal(read, clean_stream[-1:])
+
+
 def test_patch_replaces_target_layer_residual():
     blocks = [_Block((torch.zeros(2, HID), "kv")), _Block(torch.ones(2, HID))]  # patch 0, read 1
     clean = torch.full((2, HID), 5.0)

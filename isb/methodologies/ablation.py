@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 
 from ..profiles import _resid
+from .observations import record_resolved
 from .registry import cell
 
 
@@ -57,13 +58,12 @@ def ablation_hf(be, model, m, prompts, *, layer=6, target="mlp", residual="plain
 
 
 @cell("ablation", family="*", backend="vllm_async")
-def ablation_vllm(be, model, m, prompts, *, layer=6, target="mlp", residual="plain"):
-    # residual defaults to "plain" for BOTH gpt2 and llama, preserving the pre-conversion per-family
-    # defaults verbatim: the llama-vllm plain default is load-bearing for the qwen GT2 specs (both
-    # sides of the parallel-equivalence oracle read the residual the same way; specs/qwen.py). It is
-    # deliberately NOT derived from m.residual_denotation here; changing the llama ablation read is
-    # a behavior decision to take in the specs, not silently in a refactor. (Nemotron's explicit
-    # cells keep their own fused default.)
+def ablation_vllm(be, model, m, prompts, *, layer=6, target="mlp", residual=None):
+    # Default to the family's vLLM denotation: fused-residual families (Llama/Qwen) read the
+    # hidden+residual sum. An explicit residual= still overrides (the Qwen parallelism specs pass
+    # "plain", scoring vLLM against vLLM).
+    residual = residual if residual is not None else m.default_residual(be.name)
+    record_resolved(residual=residual)
     blk = m.blocks(model)[layer]
     tgt = m.submodule(blk, "mlp" if target == "none" else target)  # "none" never reads it
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker

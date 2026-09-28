@@ -27,6 +27,7 @@ import torch
 import torch.nn.functional as F
 
 from ..profiles import _resid
+from .observations import record_resolved
 from .registry import cell
 
 
@@ -55,7 +56,14 @@ def _patch_and_read(blocks, norm, head, *, layer, clean_act, residual, last_fn):
                 f"patch shape {tuple(clean.shape)} != target {tuple(hidden.shape)} — clean/corrupted "
                 f"token lengths must match for position-aligned patching"
             )
-        blocks[layer].output = (clean, *out[1:]) if is_tuple else clean  # whole-tuple replace (vLLM-safe)
+        if residual == "fused":
+            # vLLM fused-residual layers return (hidden, residual) and the stream is their sum;
+            # the clean snapshot is a whole stream, so write it as (clean - residual, residual).
+            if not (is_tuple and len(out) >= 2):
+                raise ValueError("fused patch needs a (hidden, residual) layer output")
+            blocks[layer].output = (clean - out[1], *out[1:])
+        else:
+            blocks[layer].output = (clean, *out[1:]) if is_tuple else clean  # whole-tuple replace (vLLM-safe)
 
         normed = norm(_resid(blocks[-1].output, residual))      # final residual -> final norm
         logits = F.linear(normed, head.weight)                  # portable unembed (lm_head guarded)
@@ -86,5 +94,10 @@ def patch_hf(be, model, m, prompts, *, layer=6, residual="plain", patch=True):
 
 
 @cell("activation_patching", family="*", backend="vllm_async")
-def patch_vllm(be, model, m, prompts, *, layer=6, residual="plain", patch=True):
+def patch_vllm(be, model, m, prompts, *, layer=6, residual=None, patch=True):
+    # Default to the family's vLLM denotation: fused-residual families (Llama/Qwen) read and write
+    # the hidden+residual sum. An explicit residual= still overrides (the Qwen parallelism specs
+    # pass "plain", scoring vLLM against vLLM).
+    residual = residual if residual is not None else m.default_residual(be.name)
+    record_resolved(residual=residual)
     return _patch_cell(be, model, m, prompts, layer=layer, residual=residual, patch=patch)

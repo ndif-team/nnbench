@@ -29,6 +29,27 @@ def test_real_cells_report_residual_choice_at_resolution_site(method, family, ex
     assert spec.tasks[0].params == {"residual": selector}
 
 
+@pytest.mark.parametrize("method,prompts", [("ablation", ["prompt"]),
+                                            ("activation_patching", ["clean", "corrupt"])])
+@pytest.mark.parametrize("family,expected", [("gpt2", "plain"), ("llama", "fused")])
+def test_ablation_and_patching_default_to_the_family_vllm_residual(method, prompts, family, expected):
+    # Llama-family vLLM layers return (hidden, residual) whose sum is the stream; the default read
+    # must follow the family, not the first tuple element.
+    block = SimpleNamespace(mlp="mlp", attn="attn", self_attn="attn")
+    stack = SimpleNamespace(layers=[block] * 8, norm="norm", h=[block] * 8, ln_f="norm")
+    model = SimpleNamespace(model=stack, transformer=stack, lm_head="head")
+    backend = SimpleNamespace(name="vllm_async",
+                              run=lambda model, prompts, build: "trace reached",
+                              patch=lambda model, clean, corrupt, capture, patch: "trace reached")
+    spec = CellConfig("choice", method, family, "repo",
+                      [ExecutionRegime("interactive", ["prompt"])],
+                      [TaskSpec("auto", {"layer": 1})], BaselineSpec({}))
+    record = {}
+    call = _bind_case(spec, "vllm_async", spec.tasks[0].params, record)
+    assert call.prepare(backend, model, prompts)() == "trace reached"
+    assert record["resolved_params"] == {"residual": expected}
+
+
 def test_reporting_owns_values_and_restores_context_after_error():
     outer, inner = {}, {}
     values = [1]
