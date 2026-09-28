@@ -64,7 +64,9 @@ retained in the Python specs; the host launcher does not interpret them.
 A new inference engine needs actual method implementations, not just a Dockerfile. It can supply
 its own executable, provided it satisfies the file contract below. The shared nnsight worker is
 optional. A text-generation-only provider cannot claim support for inaccessible hidden states,
-interventions, or gradients.
+interventions, or gradients. Write its cells by the procedure in
+[writing workloads](../docs/writing-workloads.md), and declare a workload the system cannot express
+by raising `Unsupported` with the missing capability.
 
 ## Container contract (version 2)
 
