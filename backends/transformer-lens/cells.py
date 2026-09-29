@@ -98,7 +98,8 @@ def activation_patching(be, model, prompts, *, layer=6, patch=True):
     if patch:
         raise Unsupported("an intervention carries one width-shaped value per hook; writing a "
                           "different clean activation at every position in one forward is not "
-                          "expressible")
+                          "expressible; a single-position patch is ('set' with 'pos', which needs "
+                          "boot_vllm(enable_position_interventions=True))")
     return _final_logits(model, prompts[1])                               # the corrupt run, unpatched
 
 

@@ -592,13 +592,30 @@ nnsight-vllm and vLLM-Lens logit-lens outputs are bitwise identical (same vLLM 0
 interp-engine and TransformerLens differ from them by TV 0.016, against TV 0.136 from HF. The
 bf16 ablation gap closes at fp32 on both systems that express ablation, so it is precision.
 
-### Unsupported cells, with the capability each system lacks
-- vLLM-Lens: hooks fire only at decoder-layer boundaries on the summed stream; attention and MLP
-  outputs inside a layer are not addressable.
-- interp-engine: writes are one `d_model` vector per layer applied at every position (add,
-  orthogonal rescale, projection cap). Per-position patching, zeroing a submodule, and a strength
-  recomputed from the live residual at each decode step are not expressible.
-- TransformerLens: one forward per call (`max_new_tokens=1`), and one width-shaped value per hook.
+### Unsupported cells, checked against each system's source (corrected 2026-09-29)
+- vLLM-Lens 1.2.1: hooks are registered only on decoder layers (`_worker_ext.py`,
+  `install_hooks`), and a post-hook sees the summed stream, so attention and MLP outputs inside a
+  layer are not addressable through its API. A `Hook` function does receive the whole model
+  (`HookContext.model`), so user code could install raw PyTorch hooks on submodules; that is
+  outside the documented API and was not tested.
+- interp-engine 1.12.0, patching: each write op carries one `d_model` vector and a request has one
+  position mask (`steer.py`, `_merge_steering`), so a different value at every position is not
+  expressible. A single-position patch is expressible as a masked `AddSpec` of clean minus corrupt.
+- interp-engine, ablation: `mlp_out` and `attn_out` are writable per request
+  (`vllm_capture/requests.py`, `_write_site`), but every op acts along one direction; zeroing a whole
+  output would take `d_model` single-direction removals. Not attempted.
+- interp-engine, generation steering: the per-request lens `steer` op computes its strength live,
+  `(strength * ||h||) * d`, at every decode step with `steer_generated`
+  (`vllm_capture/lens/intervene.py`). It scales by each token's own norm, capped at
+  `max_fraction` (default 1.0); this spec scales by the mean norm over the forward's tokens, which
+  is the same at decode steps and differs at the prefill step. The run recorded an earlier, wrong
+  reason ("a strength relative to the live residual norm is not expressible").
+- TransformerLens 4.0.0, generation: `VLLMDriver.forward` raises unless `max_new_tokens == 1`
+  (`sources/vllm/driver.py`), and `RemoteBridge` has no `generate()`.
+- TransformerLens, patching: an intervention carries one width-shaped value per hook
+  (`intervention_specs.validate_spec`, `worker_extension._write_rows`), so a different value at
+  every position in one forward is not expressible. `set` with `pos` patches a single position when
+  booted with `enable_position_interventions=True`.
 
 ### Norm-relative steering costs a second request on fixed-vector systems
 interp-engine's `AddSpec` and TransformerLens's `add` take a fixed vector, so steering by a

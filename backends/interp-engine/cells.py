@@ -70,22 +70,25 @@ def steering(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0):
 
 @cell("gen_steering", family="llama", backend="interp_engine")
 def gen_steering(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, new_tokens=8):
-    raise Unsupported("a steering vector and its strength are fixed when the request is built; a "
-                      "strength relative to the live residual norm at each decode step is not "
-                      "expressible, and generated-step logits are not returned on vLLM")
+    raise Unsupported("the live norm-relative write (lens 'steer', steer_generated) scales by each "
+                      "token's own norm, capped at max_fraction; this spec scales by the mean norm "
+                      "over the forward's tokens, which differs at the prefill step "
+                      "(vllm_capture/lens/intervene.py)")
 
 
 @cell("activation_patching", family="llama", backend="interp_engine")
 def activation_patching(be, model, prompts, *, layer=6, patch=True):
     if patch:
-        raise Unsupported("writes are one d_model vector per layer applied at every position; "
-                          "replacing each position's residual with another run's is not expressible")
+        raise Unsupported("each write op carries one d_model vector and a request has one position "
+                          "mask, so a different value at every position is not expressible; a "
+                          "single-position patch is (a masked AddSpec of clean minus corrupt)")
     return _final_logits(model, _ids(model, prompts[1]))                  # the corrupt run, unpatched
 
 
 @cell("ablation", family="llama", backend="interp_engine")
 def ablation(be, model, prompts, *, layer=6, target="mlp"):
     if target != "none":
-        raise Unsupported(f"writes add, rescale or cap along one direction; zeroing the {target} "
-                          f"output is not expressible")
+        raise Unsupported(f"{target}_out is writable per request, but every write op acts along "
+                          f"one direction (add, orthogonal rescale, projection cap, lens ablate); "
+                          f"zeroing the whole output would take d_model single-direction removals")
     return _final_logits(model, _ids(model, prompts[0]))
