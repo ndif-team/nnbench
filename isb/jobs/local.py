@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -67,6 +68,32 @@ def source_identity(root=ROOT):
     return {"commit": commit.stdout.strip(), "source_sha256": digest(content.encode())}
 
 
+def gpu_used_mib(gpu):
+    """Used memory on the selected GPU in MiB; None when nvidia-smi cannot report it."""
+    try:
+        result = subprocess.run(["nvidia-smi", "-i", str(gpu), "--query-gpu=memory.used",
+                                 "--format=csv,noheader,nounits"],
+                                capture_output=True, text=True, timeout=15)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    value = result.stdout.strip()
+    return int(value) if result.returncode == 0 and value.isdigit() else None
+
+
+def wait_for_release(gpu, baseline, *, tolerance_mib=1024, timeout=120, poll=1.0):
+    """Wait until the GPU's used memory is back within `tolerance_mib` of `baseline`, at most
+    `timeout` seconds. A finished job's GPU memory can still be draining after `compose down`
+    returns; a vLLM engine that starts meanwhile fails its memory profiling. Returns
+    (used_mib, waited_seconds); used_mib is None when the GPU cannot be read."""
+    start = time.monotonic()
+    used = gpu_used_mib(gpu)
+    while (baseline is not None and used is not None and used > baseline + tolerance_mib
+           and time.monotonic() - start < timeout):
+        time.sleep(poll)
+        used = gpu_used_mib(gpu)
+    return used, round(time.monotonic() - start, 1)
+
+
 def run_job(name, job, experiment, output, *, gpu="0", timeout=1800, root=ROOT):
     """Always collect an execution record and clean only this job's Compose project."""
     output.mkdir(parents=True, exist_ok=False)
@@ -77,6 +104,7 @@ def run_job(name, job, experiment, output, *, gpu="0", timeout=1800, root=ROOT):
     record = {"backend": name, "experiment_id": experiment["id"], "project": project,
               "status": "running", "source": source_identity(root)}
     write_json(output / "execution.json", record)
+    baseline_mib = gpu_used_mib(gpu)
     print(f"[run] {name} / {experiment['spec']['name']} → {output}", flush=True)
     try:
         configuration(name, root, env)
@@ -111,6 +139,9 @@ def run_job(name, job, experiment, output, *, gpu="0", timeout=1800, root=ROOT):
                                          env=env, stdout=log, stderr=subprocess.STDOUT, timeout=30)
             if cleaned.returncode:
                 record.update(status="failed", cleanup_error="Compose cleanup failed; see cleanup.log")
+            after_mib, waited = wait_for_release(gpu, baseline_mib)
+            record["gpu_release"] = {"baseline_mib": baseline_mib, "after_mib": after_mib,
+                                     "waited_s": waited}
         except Exception as error:
             record.update(status="failed", cleanup_error=str(error))
         write_json(output / "execution.json", record)

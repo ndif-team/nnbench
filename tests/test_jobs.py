@@ -311,3 +311,14 @@ def test_cli_uses_names_and_rejects_nonpositive_counts():
     assert args.backends == ["third-party"]
     with pytest.raises(ValueError, match="positive"):
         _specs(["logit_lens_gpt2"], "factual:0")
+
+
+def test_next_job_waits_for_the_gpu_memory_to_drain(tmp_path, fake_docker, monkeypatch):
+    experiment, calls, _ = fake_docker
+    readings = iter([1000, 9000, 6000, 1500, 1200])    # before the job, then while draining
+    monkeypatch.setattr(local, "gpu_used_mib", lambda gpu: next(readings))
+    monkeypatch.setattr(local.time, "sleep", lambda seconds: None)
+    record = local.run_job("third-party", tmp_path / "job", experiment, tmp_path / "output", root=tmp_path)
+    assert record["status"] == "completed"
+    assert record["gpu_release"]["baseline_mib"] == 1000
+    assert record["gpu_release"]["after_mib"] == 1500    # first reading within 1 GiB of baseline
