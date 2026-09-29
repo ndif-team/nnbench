@@ -3,7 +3,7 @@
 The shared worker drives the cells in cells.py through this backend object. vLLM-Lens registers
 through vLLM's general_plugins entry point and forces enforce_eager on every engine.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import metadata
 
 from isb.backends.base import Backend
@@ -17,6 +17,7 @@ class LensModel:
     tokenizer: object
     config: object             # the checkpoint's HF config; model identity reads its revision
     n_layers: int
+    directions: dict = field(default_factory=dict)   # token id -> unit unembedding row, fetched once
 
 
 class VLLMLensBackend(Backend):

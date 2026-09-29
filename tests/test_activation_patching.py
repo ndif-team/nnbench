@@ -107,3 +107,14 @@ def _run_all():
 
 if __name__ == "__main__":
     _run_all()
+
+
+def test_last_position_fused_patch_changes_only_the_last_row_of_the_stream():
+    hidden, corrupt_residual = torch.ones(3, HID), torch.full((3, HID), 2.0)
+    block = _Block((hidden, corrupt_residual))
+    clean_stream = torch.arange(3 * HID, dtype=torch.float32).reshape(3, HID)
+    _patch_and_read([block], lambda x: x, _Head(), layer=0, clean_act=clean_stream,
+                    residual="fused", last_fn=_last, positions="last")
+    stream = block.output[0] + block.output[1]
+    assert torch.equal(stream[:-1], (hidden + corrupt_residual)[:-1])   # corrupt rows kept
+    assert torch.equal(stream[-1], clean_stream[-1])                    # last row from the clean run

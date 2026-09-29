@@ -159,7 +159,7 @@ PROTOCOLS: dict[str, InterventionSpec] = {
         write_components=("block_output",),
         components=("block_output", "lm_head"), operations=("read", "write"),
         mechanisms=("add_scaled",), capabilities=("full_logits",),
-        semantic_params=("layer", "target", "alpha"), realization_params=("mode", "residual"),
+        semantic_params=("layer", "target", "alpha", "scale_by"), realization_params=("mode", "residual"),
     ),
     "ablation": _p(
         write_components=("attention_output", "mlp_output"),
@@ -171,7 +171,7 @@ PROTOCOLS: dict[str, InterventionSpec] = {
         write_components=("block_output",),
         data_roles=("base", "counterfactual"), components=("block_output", "lm_head"),
         operations=("read", "write"), mechanisms=("swap",),
-        capabilities=("paired_forward", "full_logits"), semantic_params=("layer", "patch"),
+        capabilities=("paired_forward", "full_logits"), semantic_params=("layer", "patch", "positions"),
         realization_params=("residual",),
     ),
     "gen_patching": _p(
@@ -186,7 +186,7 @@ PROTOCOLS: dict[str, InterventionSpec] = {
         components=("block_output", "lm_head"), operations=("read", "write"),
         mechanisms=("add_scaled",), position_frames=("prompt", "generated"),
         capabilities=("full_logits", "generate"), extensions=("decode_step_write",),
-        semantic_params=("layer", "target", "alpha", "new_tokens"),
+        semantic_params=("layer", "target", "alpha", "new_tokens", "scale_by"),
         realization_params=("bound", "residual"),
     ),
     "attention_pattern": _p(

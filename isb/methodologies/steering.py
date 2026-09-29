@@ -43,7 +43,18 @@ def _resolve_token(tokenizer, target: str) -> int:
     return ids[-1]  # most content-bearing piece for a multi-token target
 
 
-def _steer_and_read(blocks, norm, head, *, layer, token_id, alpha, mode, last_fn, residual="plain"):
+def _strength_scale(stream, scale_by):
+    """What `alpha` multiplies: the stream's per-token norm averaged over the forward's tokens
+    ("mean_norm"), or each token's own norm ("token_norm", the norm-matched form)."""
+    if scale_by == "mean_norm":
+        return stream.norm(dim=-1).mean()
+    if scale_by == "token_norm":
+        return stream.norm(dim=-1, keepdim=True)
+    raise ValueError(f"unknown steering scale {scale_by!r} (expected 'mean_norm' or 'token_norm')")
+
+
+def _steer_and_read(blocks, norm, head, *, layer, token_id, alpha, mode, last_fn, residual="plain",
+                    scale_by="mean_norm"):
     """Steer blocks[layer], read the final block's portable-unembed logits. Runs INSIDE a trace.
 
     `alpha=0` performs no write at all (the honest unsteered baseline), so the same cell yields the
@@ -77,7 +88,7 @@ def _steer_and_read(blocks, norm, head, *, layer, token_id, alpha, mode, last_fn
             hidden = out[0] if is_tuple else out
             # the stream's own scale -> alpha is relative. On fused-residual vLLM layers the stream
             # is out[0] + out[1]; out[0] alone is the layer's sub-block output.
-            scale = _resid(out, residual).norm(dim=-1).mean()
+            scale = _strength_scale(_resid(out, residual), scale_by)
             vec = (alpha * scale) * direction
             if mode == "inplace":
                 hidden[:] = hidden + vec                    # in-place into the live buffer
@@ -93,19 +104,21 @@ def _steer_and_read(blocks, norm, head, *, layer, token_id, alpha, mode, last_fn
 
 
 @cell("steering", family="*", backend="hf")
-def steering_hf(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="replace"):
+def steering_hf(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="replace",
+                scale_by="mean_norm"):
     token_id = _resolve_token(model.tokenizer, target)
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
         return _steer_and_read(
             m.blocks(model), m.norm(model), m.head(model),
             layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
+            scale_by=scale_by,
         )
     return be.run(model, prompts, build)
 
 
 @cell("steering", family="*", backend="vllm_async")
 def steering_vllm(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="replace",
-                  residual=None):
+                  residual=None, scale_by="mean_norm"):
     # The read-out residual default derives from the family's vLLM denotation (fused-residual
     # RMSNorm families must read hidden+residual; plain drops the accumulated residual). Matches
     # the previous per-family defaults exactly: gpt2 plain, llama/nemotron fused. An explicit
@@ -117,6 +130,6 @@ def steering_vllm(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, 
         return _steer_and_read(
             m.blocks(model), m.norm(model), m.head(model),
             layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
-            residual=residual,
+            residual=residual, scale_by=scale_by,
         )
     return be.run(model, prompts, build)

@@ -68,7 +68,7 @@ def logit_lens(be, model, prompts, *, layers="all"):
 
 
 @cell("steering", family="llama", backend="transformer_lens")
-def steering(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0):
+def steering(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, scale_by="mean_norm"):
     """`add` takes a fixed value, so a strength relative to the stream's own norm needs two
     forwards: one captures the unsteered block output for its mean per-token norm, the second adds
     the vector and returns the steered logits."""
@@ -77,6 +77,10 @@ def steering(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0):
         raise ValueError(f"steer layer {layer} is the read-out layer; pick layer < {last}")
     if alpha == 0:
         return _final_logits(model, prompts[0])
+    if scale_by == "token_norm":
+        raise Unsupported("'add' carries one width-shaped value per hook; a strength proportional "
+                          "to each token's own norm needs a different value at every position "
+                          "(intervention_specs.validate_spec)")
     name = f"blocks.{layer}.hook_out"
     _, cache = _run(model, prompts[0], [name], logits=False)
     stream_norm = cache[name][0].float().norm(dim=-1).mean().item()
@@ -87,20 +91,29 @@ def steering(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0):
 
 
 @cell("gen_steering", family="llama", backend="transformer_lens")
-def gen_steering(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, new_tokens=8):
+def gen_steering(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, new_tokens=8,
+                 scale_by="mean_norm"):
     raise Unsupported("the vLLM driver runs one forward per call (max_new_tokens=1 only) and the "
                       "bridge has no generate(); per-step interventions during decoding are not "
                       "expressible")
 
 
 @cell("activation_patching", family="llama", backend="transformer_lens")
-def activation_patching(be, model, prompts, *, layer=6, patch=True):
-    if patch:
+def activation_patching(be, model, prompts, *, layer=6, patch=True, positions="all"):
+    """`positions="last"`: capture the clean block output, then `set` it at the corrupt run's last
+    position (`pos`, which needs boot_vllm(enable_position_interventions=True))."""
+    if not patch:
+        return _final_logits(model, prompts[1])                           # the corrupt run, unpatched
+    if positions != "last":
         raise Unsupported("an intervention carries one width-shaped value per hook; writing a "
                           "different clean activation at every position in one forward is not "
-                          "expressible; a single-position patch is ('set' with 'pos', which needs "
-                          "boot_vllm(enable_position_interventions=True))")
-    return _final_logits(model, prompts[1])                               # the corrupt run, unpatched
+                          "expressible; a single-position patch is ('set' with 'pos')")
+    name = f"blocks.{layer}.hook_out"
+    _, cache = _run(model, prompts[0], [name], logits=False)
+    clean_last = cache[name][0, -1, :].float()
+    corrupt_len = _ids(model, prompts[1]).shape[-1]
+    return _final_logits(model, prompts[1],
+                         {name: {"op": "set", "value": clean_last, "pos": corrupt_len - 1}})
 
 
 @cell("ablation", family="llama", backend="transformer_lens")

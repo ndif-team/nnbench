@@ -1,6 +1,9 @@
 """Cross-system comparison specs (design.md §12.14).
 
-Task parameters carry intervention semantics only (layer, direction, strength, component). Each
+Task parameters carry intervention semantics only (layer, direction, strength, component,
+positions). Steering strength is `alpha` times the stream norm, averaged over the forward's tokens
+(`mean_norm`, the default) or per token (`token_norm`); patching writes every position (`all`, the
+default) or the last one. Each
 system's cell picks that system's documented realization, so the same row is comparable across
 nnsight and foreign systems. Qwen2.5-1.5B-Instruct is a Llama-shaped decoder (family "llama"), 28
 layers; the MIB IOI pairs are verified length-matched under the Qwen2.5 tokenizer.
@@ -28,6 +31,10 @@ cmp_steering = CellConfig(
     tasks=[
         ({**_STEER, "layer": 7}, "add toward ' Rome' at layer 7"),
         ({**_STEER, "layer": 14}, "add toward ' Rome' at layer 14"),
+        ({**_STEER, "layer": 7, "scale_by": "token_norm"},
+         "add toward ' Rome' at layer 7, scaled by each token's norm"),
+        ({**_STEER, "layer": 14, "scale_by": "token_norm"},
+         "add toward ' Rome' at layer 14, scaled by each token's norm"),
     ],
     baseline=BaselineSpec(params={**_STEER, "layer": 14, "alpha": 0.0}),
     effect=EffectSpec(baseline_params={**_STEER, "layer": 14, "alpha": 0.0},
@@ -38,7 +45,11 @@ cmp_gen_steering = CellConfig(
     name="cmp_gen_steering",
     methodology="gen_steering", family="llama", repo=_MODEL,
     regimes=[ExecutionRegime("generation", DataRef("counterfact", 16), new_tokens=8)],
-    tasks=[({**_STEER, "layer": 14}, "add toward ' Rome' at layer 14, every step")],
+    tasks=[
+        ({**_STEER, "layer": 14}, "add toward ' Rome' at layer 14, every step"),
+        ({**_STEER, "layer": 14, "scale_by": "token_norm"},
+         "add toward ' Rome' at layer 14, every step, scaled by each token's norm"),
+    ],
     baseline=BaselineSpec(params={**_STEER, "layer": 14, "alpha": 0.0}),
     effect=EffectSpec(baseline_params={**_STEER, "layer": 14, "alpha": 0.0},
                       perturbed_params={**_STEER, "layer": 14}),
@@ -51,6 +62,8 @@ cmp_activation_patching = CellConfig(
     tasks=[
         ({"layer": 7}, "clean residual into corrupt run at layer 7"),
         ({"layer": 21}, "clean residual into corrupt run at layer 21"),
+        ({"layer": 7, "positions": "last"}, "clean last-token residual into corrupt run at layer 7"),
+        ({"layer": 21, "positions": "last"}, "clean last-token residual into corrupt run at layer 21"),
     ],
     baseline=BaselineSpec(params={"patch": False}),
     effect=EffectSpec(baseline_params={"patch": False},

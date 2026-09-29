@@ -62,6 +62,33 @@ def _steer_fn(layer, token_id, alpha, last):
     return steer
 
 
+def _direction(model, token_id):
+    """The target token's unit unembedding row, fetched once from the worker through a hook."""
+    if token_id not in model.directions:
+        def fetch(ctx, h):
+            ctx.saved["row"] = ctx.get_parameter("lm_head.weight")[token_id].float().cpu()
+        row = _hooked(model, " ", fetch, [0])["row"]
+        model.directions[token_id] = F.normalize(row, dim=0)
+    return model.directions[token_id]
+
+
+def _norm_matched(model, token_id, layer, alpha):
+    """vLLM-Lens's own per-token form: SteeringVector(norm_match=True) adds
+    scale * ||h|| * v / ||v|| at every forward, with ||h|| from the summed stream."""
+    from vllm_lens import SteeringVector
+
+    vector = SteeringVector(activations=_direction(model, token_id)[None], layer_indices=[layer],
+                            scale=alpha, norm_match=True)
+    return {"apply_steering_vectors": [vector]}
+
+
+def _read_last(last):
+    def read(ctx, h):
+        if ctx.layer_idx == last:
+            ctx.saved.setdefault("rows", []).append(_readout(ctx, h))
+    return read
+
+
 @cell("logit_lens", family="llama", backend="vllm_lens")
 def logit_lens(be, model, prompts, *, layers="all"):
     n = model.n_layers
@@ -75,26 +102,34 @@ def logit_lens(be, model, prompts, *, layers="all"):
 
 
 @cell("steering", family="llama", backend="vllm_lens")
-def steering(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0):
+def steering(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, scale_by="mean_norm"):
     last = model.n_layers - 1
     if alpha != 0 and layer % model.n_layers == last:
         raise ValueError(f"steer layer {layer} is the read-out layer; pick layer < {last}")
     token_id = _resolve_token(model.tokenizer, target)
+    if scale_by == "token_norm":
+        return _rows(_hooked(model, prompts[0], _read_last(last), [last],
+                             extra=_norm_matched(model, token_id, layer, alpha)), 1)[0]
     fn = _steer_fn(layer, token_id, alpha, last)
     return _rows(_hooked(model, prompts[0], fn, [layer, last]), 1)[0]   # [1, vocab]
 
 
 @cell("gen_steering", family="llama", backend="vllm_lens")
-def gen_steering(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, new_tokens=8):
+def gen_steering(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, new_tokens=8,
+                 scale_by="mean_norm"):
     last = model.n_layers - 1
     token_id = _resolve_token(model.tokenizer, target)
+    if scale_by == "token_norm":
+        saved = _hooked(model, prompts[0], _read_last(last), [last], max_tokens=new_tokens,
+                        extra=_norm_matched(model, token_id, layer, alpha))
+        return torch.cat(_rows(saved, new_tokens), dim=0)
     fn = _steer_fn(layer, token_id, alpha, last)
     saved = _hooked(model, prompts[0], fn, [layer, last], max_tokens=new_tokens)
     return torch.cat(_rows(saved, new_tokens), dim=0)      # [new_tokens, vocab]
 
 
 @cell("activation_patching", family="llama", backend="vllm_lens")
-def activation_patching(be, model, prompts, *, layer=6, patch=True):
+def activation_patching(be, model, prompts, *, layer=6, patch=True, positions="all"):
     """Capture the clean residual at `layer` with output_residual_stream, then replace the corrupt
     run's residual there with it and read the corrupt run's next-token logits."""
     from vllm import SamplingParams
@@ -112,7 +147,10 @@ def activation_patching(be, model, prompts, *, layer=6, patch=True):
         if clean is not None and ctx.layer_idx == layer:
             if clean.shape != h.shape:
                 raise ValueError(f"patch shape {tuple(clean.shape)} != target {tuple(h.shape)}")
-            return clean.to(device=h.device, dtype=h.dtype)
+            patched = clean.to(device=h.device, dtype=h.dtype)
+            if positions == "last":                        # keep the corrupt rows, swap the last
+                patched = torch.cat([h[:-1], patched[-1:]])
+            return patched
         if ctx.layer_idx == last:
             ctx.saved.setdefault("rows", []).append(_readout(ctx, h))
         return None

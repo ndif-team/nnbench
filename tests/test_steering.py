@@ -173,3 +173,15 @@ def test_fused_scale_uses_the_whole_stream():
         added = blocks[0].output[0] - sub_block
         assert torch.allclose(added, (3.0 * stream_norm) * direction.expand(2, HID)), steer
         assert blocks[0].output[1] is residual, steer
+
+
+def test_token_norm_scales_each_position_by_its_own_stream_norm():
+    sub_block = torch.tensor([[0.5, 0.0, 0.0, 0.0], [3.0, 0.0, 0.0, 0.0]])
+    residual = torch.tensor([[0.5, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+    blocks = _blocks((sub_block.clone(), residual), torch.ones(2, HID))
+    _steer_and_read(blocks, lambda x: x, _Head(), layer=0, token_id=1, alpha=2.0, mode="replace",
+                    last_fn=_last, residual="fused", scale_by="token_norm")
+    added = blocks[0].output[0] - sub_block
+    direction = torch.nn.functional.normalize(_Head().weight[1], dim=0)
+    expected = 2.0 * (sub_block + residual).norm(dim=-1, keepdim=True) * direction
+    assert torch.allclose(added, expected)               # row 0 scaled by 1.0, row 1 by 4.0
