@@ -630,3 +630,20 @@ The vLLM ablation and patching cells read only the first element of the layer ou
 scaled by its norm; on Llama-family vLLM that element is the layer's sub-block output. Before the
 fix, nnsight-vllm patching and ablation matched no top-1 token (TV 0.92–0.98) and steering showed
 TV 0.08–0.10. See `docs/writing-workloads.md`.
+
+### Native-form rows: token-norm steering and last-token patching (2026-09-29)
+Run `runs/comparison-v2/20260929T182300Z-f0beafb6`, same setup; supersedes the table above for
+every row it repeats. Top-1 agreement / TV against `nnsight-hf`; median single-prompt latency.
+
+| workload | nnsight-vllm | vllm-lens | interp-engine | transformer-lens |
+|---|---|---|---|---|
+| steering, mean norm | 1.00 / 0.000; 40 ms | 1.00 / 0.000; 29 ms | 1.00 / 0.000; 77 ms (two requests) | 1.00 / 0.000; 76 ms (two forwards) |
+| steering, each token's norm | 1.00 / 0.000; 40 ms | 1.00 / 0.000; 31 ms (`norm_match`) | 1.00 / 0.000; 53 ms (lens `steer`) | UNSUPPORTED |
+| every-step steering, mean norm | 1.00 / 0.000; 357 ms | 1.00 / 0.000; 352 ms | UNSUPPORTED | UNSUPPORTED |
+| every-step steering, each token's norm | 1.00 / 0.000; 434 ms | 1.00 / 0.000; 398 ms | 1.00 / 0.000; 222 ms | UNSUPPORTED |
+| patching, every position | 1.00 / 0.09; 84 ms | 1.00 / 0.09; 54 ms | UNSUPPORTED | UNSUPPORTED |
+| patching, last token | 0.88 / 0.07–0.10; 85 ms | 0.88–0.94 / 0.07–0.09; 52 ms | 0.88 / 0.07–0.10; 112 ms | 0.88 / 0.07–0.10; 80 ms |
+
+The last-token patch lands at the same distance from HF on all four vLLM systems, so that gap is
+the engine's as well. The TransformerLens ablation latencies in this run overlap another
+benchmark container on GPU 2 (`isb-nnsight-vllm-inband`), recorded in each job's `gpu_release`.
