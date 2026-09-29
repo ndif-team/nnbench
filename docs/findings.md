@@ -569,3 +569,47 @@ before reaching them: the attribution metric sliced logits as `[:, -1, :]` (brea
 flattened [tokens, vocab] layout), and the jacobian-collection cotangent hard-coded the
 replicated batch count (vLLM traces carry one prompt, so the probe-row count now comes from the
 traced tensor's shape).
+
+## Cross-system comparison — Qwen2.5-1.5B-Instruct, five backends (2026-09-29)
+
+Specs `cmp_*` (design §12.14), GPU 2 (A100 80GB), bf16, scored against `nnsight-hf`. Run
+`runs/comparison-v1/20260929T165939Z-a319d0e8`; fp32 ablation `20260929T173459Z-bfd1ca65`.
+Systems: nnsight 260c555 on HF (transformers 5.12.1) and on vLLM 0.19.1; vLLM-Lens 1.2.1 on vLLM
+0.19.1; interp-engine 1.12.0 on vLLM 0.28.0; TransformerLens 4.0.0 `RemoteBridge.boot_vllm` on vLLM
+0.20.2 (torch.compile and CUDA graphs; the others run eager). Latency is the median single-prompt call.
+
+| workload | nnsight-vllm | vllm-lens | interp-engine | transformer-lens |
+|---|---|---|---|---|
+| logit lens, every layer | top1 0.82, TV 0.136; 73 ms | same; 585 ms | top1 0.82, TV 0.136; 55 ms | top1 0.82, TV 0.136; 148 ms |
+| steering, layer 7 and 14 | SUPPORTED, TV 0.000; 42 ms | SUPPORTED; 29 ms | SUPPORTED; 64–77 ms | SUPPORTED; 65 ms |
+| steering at every decode step | SUPPORTED, TV 0.000; 344 ms | SUPPORTED; 342 ms | UNSUPPORTED | UNSUPPORTED |
+| patching, layer 7 and 21 | top1 1.00, TV 0.09; 82 ms | top1 1.00, TV 0.09; 49 ms | UNSUPPORTED | UNSUPPORTED |
+| ablation, MLP / attention at layer 1 | TV 0.19 / 0.43 | UNSUPPORTED | UNSUPPORTED | TV 0.20 / 0.43 |
+| ablation at fp32 (vs `nnsight-hf-fp32`) | SUPPORTED, TV 0.004 / 0.016 | — | — | SUPPORTED, TV 0.004 / 0.016 |
+
+### The gap to HF belongs to the engine
+nnsight-vllm and vLLM-Lens logit-lens outputs are bitwise identical (same vLLM 0.19.1).
+interp-engine and TransformerLens differ from them by TV 0.016, against TV 0.136 from HF. The
+bf16 ablation gap closes at fp32 on both systems that express ablation, so it is precision.
+
+### Unsupported cells, with the capability each system lacks
+- vLLM-Lens: hooks fire only at decoder-layer boundaries on the summed stream; attention and MLP
+  outputs inside a layer are not addressable.
+- interp-engine: writes are one `d_model` vector per layer applied at every position (add,
+  orthogonal rescale, projection cap). Per-position patching, zeroing a submodule, and a strength
+  recomputed from the live residual at each decode step are not expressible.
+- TransformerLens: one forward per call (`max_new_tokens=1`), and one width-shaped value per hook.
+
+### Norm-relative steering costs a second request on fixed-vector systems
+interp-engine's `AddSpec` and TransformerLens's `add` take a fixed vector, so steering by a
+multiple of the stream's own norm captures the stream first, then steers: two requests per call.
+
+### In-place writes on vLLM now work
+On nnsight 260c555 (0.8.0rc1), GPT-2 steering with `mode=inplace` scores SUPPORTED against HF
+(run `runs/comparison-v0/20260929T033215Z-d98b90af`), superseding the June result above.
+
+### Fused-residual cells fixed (2026-09-28)
+The vLLM ablation and patching cells read only the first element of the layer output, and steering
+scaled by its norm; on Llama-family vLLM that element is the layer's sub-block output. Before the
+fix, nnsight-vllm patching and ablation matched no top-1 token (TV 0.92–0.98) and steering showed
+TV 0.08–0.10. See `docs/writing-workloads.md`.
