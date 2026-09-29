@@ -7,7 +7,7 @@ from .base import Backend
 class HFBackend(Backend):
     name = "hf"
 
-    def __init__(self, force_text_causal: bool = False):
+    def __init__(self, force_text_causal: bool = False, dtype: str | None = None):
         # force_text_causal: load via AutoModelForCausalLM even when the architecture registers as
         # ImageTextToText. Needed for TEXT-ONLY checkpoints of multimodal-wrapper architectures
         # (Qwen/Qwen3.5-4B: no vision weights in the repo, transformers auto-routes its config to
@@ -16,11 +16,13 @@ class HFBackend(Backend):
         # `automodel`, so a trivial AutoModelForCausalLM subclass (identical behavior, different
         # class object) opts out of the second-guessing. Arrives via spec.hf_kwargs.
         self.force_text_causal = force_text_causal
+        self.dtype = dtype          # None loads the checkpoint's own dtype
 
     def load(self, repo: str, device: str = "cuda:0"):
+        import torch
         from nnsight import LanguageModel
 
-        kw = {}
+        kw = {} if self.dtype is None else {"dtype": getattr(torch, self.dtype)}
         if self.force_text_causal:
             from transformers import AutoModelForCausalLM
 
