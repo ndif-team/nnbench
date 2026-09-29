@@ -74,7 +74,9 @@ def _steer_and_read(blocks, norm, head, *, layer, token_id, alpha, mode, last_fn
             out = blocks[layer].output
             is_tuple = isinstance(out, tuple)
             hidden = out[0] if is_tuple else out
-            scale = hidden.norm(dim=-1).mean()              # residual's own scale -> alpha is relative
+            # the stream's own scale -> alpha is relative. On fused-residual vLLM layers the stream
+            # is out[0] + out[1]; out[0] alone is the layer's sub-block output.
+            scale = _resid(out, residual).norm(dim=-1).mean()
             vec = (alpha * scale) * direction
             if mode == "inplace":
                 hidden[:] = hidden + vec                    # in-place into the live buffer (vLLM-fragile)

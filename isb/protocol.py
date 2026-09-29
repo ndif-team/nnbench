@@ -186,7 +186,8 @@ PROTOCOLS: dict[str, InterventionSpec] = {
         components=("block_output", "lm_head"), operations=("read", "write"),
         mechanisms=("add_scaled",), position_frames=("prompt", "generated"),
         capabilities=("full_logits", "generate"), extensions=("decode_step_write",),
-        semantic_params=("layer", "target", "alpha", "new_tokens"), realization_params=("bound",),
+        semantic_params=("layer", "target", "alpha", "new_tokens"),
+        realization_params=("bound", "residual"),
     ),
     "attention_pattern": _p(
         components=("attention_probs",), operations=("read",), semantic_params=("layers",),

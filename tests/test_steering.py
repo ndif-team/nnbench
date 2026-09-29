@@ -153,3 +153,23 @@ def _run_all():
 
 if __name__ == "__main__":
     _run_all()
+
+
+def test_fused_scale_uses_the_whole_stream():
+    # vLLM fused-residual layer: output (sub_block, residual), stream = their sum. alpha is relative
+    # to the STREAM's norm, so the added vector must be scaled by ||sub_block + residual||.
+    from isb.methodologies.gen_steering import _steer_step
+
+    sub_block, residual = torch.full((2, HID), 0.5), torch.full((2, HID), 2.5)
+    stream_norm = (sub_block + residual).norm(dim=-1).mean()
+    direction = torch.nn.functional.normalize(_Head().weight[1], dim=0)
+    for steer in ("single forward", "decode step"):
+        blocks = _blocks((sub_block.clone(), residual), torch.ones(2, HID))
+        if steer == "single forward":
+            _steer_and_read(blocks, lambda x: x, _Head(), layer=0, token_id=1, alpha=3.0,
+                            mode="replace", last_fn=_last, residual="fused")
+        else:
+            _steer_step(blocks, _Head(), layer=0, token_id=1, alpha=3.0, residual="fused")
+        added = blocks[0].output[0] - sub_block
+        assert torch.allclose(added, (3.0 * stream_norm) * direction.expand(2, HID)), steer
+        assert blocks[0].output[1] is residual, steer

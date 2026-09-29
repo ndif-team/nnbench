@@ -31,11 +31,13 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from ..profiles import _resid
+from .observations import record_resolved
 from .registry import cell
 from .steering import _resolve_token
 
 
-def _steer_step(blocks, head, *, layer, token_id, alpha):
+def _steer_step(blocks, head, *, layer, token_id, alpha, residual="plain"):
     """One decode step's steering write: replacement-add `alpha` (relative to the residual's own
     per-token norm) of the target token's unembed direction into blocks[layer]'s output. Runs
     INSIDE the trace, once per iteration step. Replacement-only (the vLLM working form; in-place
@@ -45,7 +47,9 @@ def _steer_step(blocks, head, *, layer, token_id, alpha):
         out = blocks[layer].output
         is_tuple = isinstance(out, tuple)
         hidden = out[0] if is_tuple else out
-        scale = hidden.norm(dim=-1).mean()      # self-calibrating: alpha is relative strength
+        # self-calibrating: alpha is relative to the stream's norm, which on fused-residual vLLM
+        # layers is out[0] + out[1] (out[0] alone is the layer's sub-block output)
+        scale = _resid(out, residual).norm(dim=-1).mean()
         new_hidden = hidden + (alpha * scale) * direction
         blocks[layer].output = (new_hidden, *out[1:]) if is_tuple else new_hidden
 
@@ -73,14 +77,16 @@ def gen_steering_hf(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0
 
 @cell("gen_steering", family="*", backend="vllm_async")
 def gen_steering_vllm(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0,
-                      bound="bounded", new_tokens=8):
+                      bound="bounded", new_tokens=8, residual=None):
     _check_bound(bound)
+    residual = residual if residual is not None else m.default_residual(be.name)
+    record_resolved(residual=residual)
     token_id = _resolve_token(model.tokenizer, target)
 
     def step():
         if alpha != 0:
             _steer_step(m.blocks(model), m.head(model),
-                        layer=layer, token_id=token_id, alpha=alpha)
+                        layer=layer, token_id=token_id, alpha=alpha, residual=residual)
         # engine site == portable unembed (Level-1 sites are portable on vLLM); [-1:, :] keeps the
         # step's LAST row so the prefill step (which may carry more than one logits row) matches
         # HF's [:, -1, :] read
