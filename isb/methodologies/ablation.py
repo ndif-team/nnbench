@@ -3,7 +3,7 @@
 Zero a component's output at one layer to measure its causal contribution, then read the model's
 next-token distribution. Like steering this is a *write* methodology, but the write is a knockout
 (`output = 0`) rather than an additive steer. The vLLM-safe form is whole-tuple **replacement**
-(in-place writes raise on inference tensors; replacement works).
+(in-place writes raised on inference tensors before nnsight 0.8; replacement works).
 
 Observable = the portable unembed of the final block's residual, last token (same readout as
 steering/patching). `target="none"` skips the write -> the un-ablated baseline the effect-size guard

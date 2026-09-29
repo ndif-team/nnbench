@@ -37,9 +37,8 @@ them**.
 **The measured concentration: cross-edge data movement carries most of the vLLM frontier.** Of
 the micro tier's data-op × site probes, 6/6 pass on vLLM; the non-edge failures are the
 taxonomy's other kinds — gradients unavailable (op-level: no autograd in inference mode),
-attention weights absent (site-level: paged attention exposes no probability matrix), in-place
-write and module-call compute (realization-level: in-place writes raise, and the guarded
-lm_head forces the weight matmul), and the fused residual (denotation-level: the dual residual
+attention weights absent (site-level: paged attention exposes no probability matrix),
+module-call compute (realization-level: the guarded lm_head forces the weight matmul; in-place writes work on nnsight 260c555 (0.8.0rc1) with vLLM 0.19.1: GPT-2 steering `mode=inplace` scored SUPPORTED against HF (run 20260929T033215Z-d98b90af); earlier nnsight versions raised), and the fused residual (denotation-level: the dual residual
 stream) — plus one region mode (scan errors cleanly on the vLLM path).
 
 ### Data operations × backend
@@ -47,7 +46,7 @@ stream) — plus one region mode (scan errors cleanly on the vLLM path).
 | op | hf | vllm_async / vllm_serve | evidence |
 |---|---|---|---|
 | read (boundary `.output`/`.input`) | ✓ | ✓ — with per-family denotation caveats (see Level 1) | logit-lens cells; the fused-residual denotation mismatch |
-| write (boundary, replacement) | ✓ (both realizations) | ✓ replacement only; in-place raises | the in-place-write restriction; steering/ablation/patching cells |
+| write (boundary, replacement) | ✓ (both realizations) | ✓ both realizations; in-place writes work on nnsight 260c555 (0.8.0rc1) with vLLM 0.19.1: GPT-2 steering `mode=inplace` scored SUPPORTED against HF (run 20260929T033215Z-d98b90af); earlier nnsight versions raised | steering/ablation/patching cells |
 | write — input side (`module.input = x`) | UNTESTED | UNTESTED | traverse row; the natural form of transcoder-splice and input-side patching |
 | write — module skip (`module.skip(replacement)`) | UNTESTED | UNTESTED | traverse row; SKIP is its own Mediator event — not derivable from the SWAP rows; also a perf primitive (elides the module's FLOPs) |
 | write — gradient (`t.grad = g` mid-backward) | UNTESTED | UNTESTED | traverse row; vLLM plausibly inherits the no-autograd-on-vLLM result's ERROR but is recorded UNTESTED, never derived-as-measured |
@@ -148,7 +147,7 @@ element that works in that context.
 
 | element | hf recipe | vllm recipe |
 |---|---|---|
-| write | in-place or replacement | replacement ONLY (new tensor / whole tuple) — the in-place-write restriction; skip-with-value realization UNTESTED (data-op table) |
+| write | in-place or replacement | in-place or replacement; in-place writes work on nnsight 260c555 (0.8.0rc1) with vLLM 0.19.1: GPT-2 steering `mode=inplace` scored SUPPORTED against HF (run 20260929T033215Z-d98b90af); earlier nnsight versions raised; skip-with-value realization UNTESTED (data-op table) |
 | meta-compute (unembed) | `lm_head(h)` or weight matmul | weight matmul ONLY (`ParallelLMHead.forward` guarded) — the guarded lm_head call |
 | meta-compute (aux) | bare | under `torch.no_grad()` — the inference-tensor no_grad requirement |
 | step quantifier | bounded or unbounded | bounded `iter[0:N]` ONLY (unbounded drops all loop-carried saves) — the unbounded-iteration saves-drop; `tracer.next()` realization UNTESTED (control table) |

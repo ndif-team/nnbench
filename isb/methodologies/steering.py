@@ -9,7 +9,8 @@ a crash-or-not check cannot tell apart:
   - vLLM applies the write -> steered logits match HF-steered            -> SUPPORTED
   - vLLM silently drops the write (no-op) -> logits == unsteered baseline
     -> diverge from HF-steered                                           -> SILENTLY_WRONG  (the dangerous cell)
-  - vLLM raises on the write (e.g. in-place update of an inference tensor) -> ERROR
+  - vLLM raises on the write -> ERROR (in-place updates of inference tensors raised on nnsight
+    versions before 0.8; on 260c555 both write forms score SUPPORTED)
 
 Observable = the **portable** unembed (weight matmul; `lm_head.forward` is guarded on vLLM, so
 unembed must use the weight matmul) of the FINAL block's residual, last token. We steer an *earlier* block (`layer` <
@@ -21,7 +22,7 @@ Variances (params, §12):
   - `target` : token whose unembed row is the steering DIRECTION (interpretable: "steer toward T").
   - `alpha`  : RELATIVE strength = multiples of the residual's own per-token norm. Self-calibrating,
                so there is no hard-coded magnitude; `alpha=0` is the unsteered baseline.
-  - `mode`   : "inplace" (`hidden[:] = ...`, the vLLM-fragile form) vs "replace" (whole-tuple,
+  - `mode`   : "inplace" (`hidden[:] = ...`, the live buffer) vs "replace" (whole-tuple,
                builds a NEW tensor) — the divergence the gotcha cheat-sheet + tribal knowledge flag.
 """
 from __future__ import annotations
@@ -66,8 +67,8 @@ def _steer_and_read(blocks, norm, head, *, layer, token_id, alpha, mode, last_fn
             f"and the portable-unembed read land on different modules (no same-module write-then-read)"
         )
     with torch.no_grad():                                   # forward-only aux compute (vLLM activations
-        # are inference tensors); note no_grad does NOT permit the in-place write below — that hits
-        # InferenceMode protection on vLLM and is the ERROR verdict for mode="inplace".
+        # are inference tensors). The in-place write below raised under InferenceMode on nnsight
+        # versions before 0.8; on 260c555 it scores SUPPORTED.
         direction = F.normalize(head.weight[token_id].float(), dim=0).to(head.weight.dtype)
 
         if alpha != 0:
@@ -79,7 +80,7 @@ def _steer_and_read(blocks, norm, head, *, layer, token_id, alpha, mode, last_fn
             scale = _resid(out, residual).norm(dim=-1).mean()
             vec = (alpha * scale) * direction
             if mode == "inplace":
-                hidden[:] = hidden + vec                    # in-place into the live buffer (vLLM-fragile)
+                hidden[:] = hidden + vec                    # in-place into the live buffer
             elif mode == "replace":
                 new_hidden = hidden + vec
                 blocks[layer].output = (new_hidden, *out[1:]) if is_tuple else new_hidden

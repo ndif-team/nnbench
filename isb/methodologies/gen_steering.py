@@ -3,8 +3,8 @@
 Steering (activation addition) applied at EVERY decode step of a greedy multi-token generation,
 reading the per-step next-token logits. This is the serving-shaped workload: the intervention has
 to survive the engine's decode loop, not just one forward. It is also the first cell measuring a
-COMPOSITION of two separately-measured rows — replacement WRITE (in-place writes raise on vLLM,
-replacement works) inside the iteration construct (unbounded tracer.iter[:] drops all per-step
+COMPOSITION of two separately-measured rows — replacement WRITE (in-place writes raised on vLLM
+before nnsight 0.8) inside the iteration construct (unbounded tracer.iter[:] drops all per-step
 saves on vLLM, bounded iter[0:N] works) — i.e. the "statuses compose upward" claim (design.md
 §3.6) at method tier.
 Its decode-step writes are an nnbench extension to CausaLab's current prefill-only protocol
@@ -40,8 +40,8 @@ from .steering import _resolve_token
 def _steer_step(blocks, head, *, layer, token_id, alpha, residual="plain"):
     """One decode step's steering write: replacement-add `alpha` (relative to the residual's own
     per-token norm) of the target token's unembed direction into blocks[layer]'s output. Runs
-    INSIDE the trace, once per iteration step. Replacement-only (the vLLM working form; in-place
-    writes raise on vLLM)."""
+    INSIDE the trace, once per iteration step. Replacement-only (in-place writes raised on vLLM
+    before nnsight 0.8)."""
     with torch.no_grad():                       # aux compute on inference tensors needs no_grad
         direction = F.normalize(head.weight[token_id].float(), dim=0).to(head.weight.dtype)
         out = blocks[layer].output
