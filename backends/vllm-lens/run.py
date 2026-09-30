@@ -35,6 +35,13 @@ class VLLMLensBackend(Backend):
         config = AutoConfig.from_pretrained(repo)
         return LensModel(llm, llm.get_tokenizer(), config, config.num_hidden_layers)
 
+    def vanilla(self, model, prompt, *, new_tokens):
+        """A plain generate on the plugin's engine: no extra_args, so no capture, steering or hook."""
+        from vllm import SamplingParams
+
+        model.llm.generate([prompt], SamplingParams(max_tokens=new_tokens, temperature=0.0, top_p=1.0),
+                           use_tqdm=False)
+
     def teardown(self, model) -> None:
         model.llm.llm_engine.engine_core.shutdown()
 

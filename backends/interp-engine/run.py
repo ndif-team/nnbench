@@ -36,6 +36,11 @@ class InterpEngineBackend(Backend):
         return EngineModel(engine, AutoTokenizer.from_pretrained(repo), config,
                            config.num_hidden_layers)
 
+    def vanilla(self, model, prompt, *, new_tokens):
+        """generate_text with no capture points and no steering spec."""
+        model.engine.generate_text(model.tokenizer(prompt)["input_ids"], max_tokens=new_tokens,
+                                   temperature=0.0)
+
     def teardown(self, model) -> None:
         model.engine.shutdown()
 

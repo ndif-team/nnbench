@@ -38,6 +38,16 @@ class TransformerLensBackend(Backend):
         return BridgeModel(bridge, AutoTokenizer.from_pretrained(repo), config,
                            config.num_hidden_layers)
 
+    def vanilla(self, model, prompt, *, new_tokens):
+        """One forward with no captures, no interventions and no host-side logit rebuild; the
+        compiled identity hooks still run, since they are part of the engine the bridge boots."""
+        import torch
+
+        if new_tokens != 1:
+            raise NotImplementedError("the vLLM driver runs one forward per call (max_new_tokens=1)")
+        model.bridge.run_with_cache(torch.tensor([model.tokenizer(prompt)["input_ids"]]),
+                                    names_filter=[], return_logits=False, return_type=None)
+
     def teardown(self, model) -> None:
         model.bridge.close()
 

@@ -6,7 +6,10 @@ from isb.runs import EngineConfig, RunConfig
 
 def create_backend(spec):
     params = merge_requirements(spec.vllm_kwargs, options())
-    return VLLMAsyncBackend(**params), RunConfig(EngineConfig("vllm", params=params))
+    # nnsight builds AsyncLLM with enforce_eager=not taps (modeling/vllm/vllm.py, _load_async);
+    # taps are off here, so the engine runs eager.
+    return VLLMAsyncBackend(**params), RunConfig(EngineConfig("vllm", params={**params,
+                                                                              "enforce_eager": True}))
 
 
 if __name__ == "__main__":

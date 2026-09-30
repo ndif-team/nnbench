@@ -63,7 +63,7 @@ def auxiliary_calls(rows):
             raise ValueError("auxiliary call must be an object")
         key = row.get("key")
         if (not isinstance(key, list) or len(key) != 2 or not all(isinstance(k, str) for k in key)
-                or key[0] not in {"__baseline__", "__effect__", "batched_perprompt"}
+                or key[0] not in {"__baseline__", "__effect__", "__vanilla__", "batched_perprompt"}
                 or not isinstance(row.get("record"), dict)):
             raise ValueError("invalid auxiliary call key or record")
         if tuple(key) in seen:

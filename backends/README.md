@@ -126,8 +126,10 @@ the precise fields. Tensor artifacts are trusted local Python/PyTorch artifacts,
 network interchange format.
 
 The shared worker also writes optional `auxiliary_calls` entries as
-`{"key": [role, label], "record": {...}}`. Roles are `__baseline__`, `__effect__`, and
-`batched_perprompt`; the second key is the regime for the first two and case label for the last.
+`{"key": [role, label], "record": {...}}`. Roles are `__baseline__`, `__effect__`, `__vanilla__`
+and `batched_perprompt`; the second key is the regime for the first three and case label for the
+last. `__vanilla__` times the backend's own request with no intervention attached (the backend's
+`vanilla` method), or records why it is unavailable.
 These records preserve supporting-call settings and errors independently of task verdicts.
 Independent workers may omit this field or supply an empty list.
 

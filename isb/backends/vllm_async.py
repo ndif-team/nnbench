@@ -352,6 +352,21 @@ class VLLMAsyncBackend(VLLMBackend):
 
         return self._run_coro(_go())
 
+    def vanilla(self, model, prompt, *, new_tokens):
+        """A request straight to nnsight's AsyncLLM entrypoint with no trace: the same engine and
+        worker, nothing attached."""
+        import uuid
+
+        from vllm import SamplingParams
+
+        params = SamplingParams(temperature=0.0, top_p=1, max_tokens=new_tokens)
+
+        async def _go():
+            async for _ in model.vllm_entrypoint.generate(prompt, params, uuid.uuid4().hex):
+                pass
+
+        self._run_coro(_go())
+
     def last(self, t):
         return t[-1:, :]                          # flat [tokens, vocab] -> [1, vocab]
 

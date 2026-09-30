@@ -24,7 +24,7 @@ services:
       ISB_ENGINE_OPTIONS: '{"dtype":"float32","gpu_memory_utilization":0.2}'
     volumes:
       - ../..:/workspace:ro
-      - .:/backend:ro
+      - ../nnsight-vllm:/backend:ro
       - ${ISB_JOB_DIR:-../../runs/manual/job}:/job:ro
       - ${ISB_OUTPUT_DIR:-../../runs/manual/output}:/output
       - model-cache:/models

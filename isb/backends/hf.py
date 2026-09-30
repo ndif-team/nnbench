@@ -138,6 +138,17 @@ class HFBackend(Backend):
                 f"hf generate_patch collected {len(rows)} per-step rows, expected {new_tokens}")
         return torch.cat([r.detach().float().cpu() for r in rows], dim=0)   # [steps, vocab]
 
+    def vanilla(self, model, prompt, *, new_tokens):
+        """The wrapped transformers module (`model._module`) called directly, with no trace."""
+        import torch
+
+        inputs = model.tokenizer(prompt, return_tensors="pt").to(model._module.device)
+        with torch.no_grad():
+            if new_tokens == 1:
+                model._module(**inputs)
+            else:
+                model._module.generate(**inputs, max_new_tokens=new_tokens, do_sample=False)
+
     def last(self, t):
         return t[:, -1, :]                  # [B, S, vocab] -> [B, vocab]
 

@@ -32,6 +32,35 @@ def _compatible(candidate, reference, cexec, rexec):
         raise ValueError("benchmark source differs between compared jobs")
 
 
+def attach_plain_vllm(rows, results):
+    """Whole-system overhead (design.md §12.14): each timed row on a vLLM engine is divided by the
+    no-intervention request of a plain-vLLM job at the same vLLM version and workload. A plain job
+    is one whose provenance declares engine mode "plain"; its `__vanilla__` record is the latency.
+    `results` maps backend -> {"provenance", "auxiliary_calls"}; a provenance without an engine
+    record (older artifacts) matches nothing."""
+    plain = {}
+    for backend, result in results.items():
+        provenance = result["provenance"]
+        if provenance.get("engine", {}).get("mode") != "plain":
+            continue
+        for call in result.get("auxiliary_calls", []):
+            role, workload = call["key"]
+            latency = call["record"].get("median_latency_ms")
+            if role == "__vanilla__" and latency:
+                plain[(provenance["client"].get("vllm"), workload)] = (backend, latency)
+    for row in rows:
+        result = results.get(row["backend"])
+        if result is None or row.get("median_latency_ms") is None:
+            continue
+        provenance = result["provenance"]
+        if provenance.get("engine", {}).get("kind") != "vllm":
+            continue
+        match = plain.get((provenance["client"].get("vllm"), row.get("workload")))
+        if match:
+            row.update(plain_vllm=match[0], plain_vllm_ms=match[1],
+                       overhead_vs_plain_vllm=row["median_latency_ms"] / match[1])
+
+
 def score_experiment(directory, backends, reference=None, comparison="correctness"):
     import torch
     from isb.oracle.equivalence import compare, is_equivalent
@@ -111,6 +140,9 @@ def score_experiment(directory, backends, reference=None, comparison="correctnes
                                      else ("EQUIVALENT", "DIVERGENT"))
                         row.update(state=good if is_equivalent(metrics) else bad, metrics=metrics)
             rows.append(row)
+    attach_plain_vllm(rows, {backend: {"provenance": artifact["provenance"],
+                                       "auxiliary_calls": result.get("auxiliary_calls", [])}
+                             for backend, (result, artifact, _) in loaded.items()})
     for row in rows:
         row["performance_eligible"] = performance_eligible(row["state"])
         row["validation_state"] = (

@@ -1390,6 +1390,16 @@ boundaries; the attention output is not addressable". The worker records `UNSUPP
 reason. A missing registration stays an `ERROR`, because it means the suite lacks the cell, not
 that the system lacks the capability. `UNSUPPORTED` cells are excluded from performance comparison.
 
-**Denominators.** Throughput shares divide by the same backend's no-intervention baseline call,
-measured in the same job. Engine version and eager or CUDA-graph mode are recorded with the result,
-because an eager engine's absolute throughput depends on host CPU load.
+**Denominators.** Two ratios, both computed from the same experiment's jobs:
+
+- Intervention overhead: each backend's `vanilla` method issues the system's own request with no
+  intervention attached. The executor times it in the same job and regime as the cells
+  (`__vanilla__` auxiliary record), and each cell records `overhead_vs_vanilla`.
+- Whole-system overhead: `vllm-plain-*` backends run plain vLLM at each engine version in use, with
+  vLLM's default configuration (torch.compile and CUDA graphs), and declare every intervention
+  unsupported. The scorer divides each vLLM-engine row by the plain job's `__vanilla__` latency at
+  the same vLLM version and workload (`overhead_vs_plain_vllm`). Plain jobs are identified by the
+  engine mode they declare, never by name.
+
+Engine version and eager or CUDA-graph mode are recorded with each result, because an eager
+engine's absolute latency depends on host CPU load.

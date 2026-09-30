@@ -240,3 +240,53 @@ def test_declared_unsupported_cell_is_recorded_with_its_reason(tmp_path, monkeyp
     contract.write_json(output / "result.json", saved)
     with pytest.raises(ValueError, match="missing capability"):
         contract.validate_result(output, experiment, backend_name)
+
+
+@pytest.mark.parametrize("has_plain_request", [True, False], ids=["plain-request", "no-plain-request"])
+def test_vanilla_request_is_timed_beside_the_cells(tmp_path, monkeypatch, has_plain_request):
+    import isb.runs
+    from isb.backends.base import Backend as BaseBackend
+
+    method, backend_name, interface = "readout_fixture", "plain-cpu", "plain_sys"
+    monkeypatch.setenv("ISB_BACKEND", backend_name)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(timing, "force_gc", lambda: None)
+    monkeypatch.setattr(isb.runs, "resolve_provenance", lambda run: {
+        "engine": {"kind": run.engine.kind}, "client": {}, "host": {}, "deployment": {}})
+    monkeypatch.setattr(registry, "CELLS", dict(registry.CELLS))
+    plain_calls = []
+
+    @registry.cell(method, family="gpt2", backend=interface)
+    def readout(be, model, prompts, *, depth=1):
+        return torch.ones(len(prompts), 3)
+
+    class Backend(BaseBackend):
+        name = interface
+
+        def load(self, repo):
+            return SimpleNamespace(config=SimpleNamespace(_commit_hash="rev"),
+                                   tokenizer=SimpleNamespace(get_vocab=lambda: {"x": 0}))
+
+        if has_plain_request:
+            def vanilla(self, model, prompt, *, new_tokens):
+                plain_calls.append((prompt, new_tokens))
+
+    spec = CellConfig("vanilla-denominator", method, "gpt2", "test/model",
+                      [ExecutionRegime("interactive", ["first prompt", "second prompt"])],
+                      [TaskSpec("read", {"depth": 2})], BaselineSpec({"depth": 1}), None,
+                      warmup=1, n_trials=2, protocol_absence_reason="CPU fixture")
+    job = tmp_path / "exp"
+    experiment = contract.prepare(spec, job)
+    output = job / backend_name
+    worker.main(lambda restored: (Backend(), RunConfig(engine=EngineConfig("vllm"))),
+                job=job, output=output)
+    result = contract.validate_result(output, experiment, backend_name)
+    records = {tuple(a["key"]): a["record"] for a in result["auxiliary_calls"]}
+    record, cell = records[("__vanilla__", "interactive")], result["cells"][0]
+    if has_plain_request:
+        assert plain_calls == [("first prompt", 1)] * 3      # warmup + trials, one forward each
+        assert record["median_latency_ms"] > 0 and record["error"] is None
+        assert cell["overhead_vs_vanilla"] > 0
+    else:
+        assert "has no plain request" in record["unavailable"]
+        assert cell["overhead_vs_vanilla"] is None

@@ -220,7 +220,7 @@ def perf_points(entries: dict, run_names: list[str]) -> list[dict]:
         for k, m in meta.items():
             if not (isinstance(k, tuple) and len(k) == 2) or m.get("error"):
                 continue
-            if k[0] in {"__baseline__", "__effect__", "batched_perprompt"}:
+            if k[0] in {"__baseline__", "__effect__", "__vanilla__", "batched_perprompt"}:
                 continue
             if m.get("median_latency_ms") is None or m.get("overhead_vs_baseline") is None:
                 continue

@@ -97,6 +97,12 @@ class Backend:
         """
         raise NotImplementedError
 
+    def vanilla(self, model, prompt, *, new_tokens):
+        """The system's own request with no intervention attached: one forward over `prompt`
+        (`new_tokens=1`) or a greedy generation of `new_tokens`. Its latency is the denominator for
+        intervention overhead (design.md §12.14). Returns nothing; only its timing is recorded."""
+        raise NotImplementedError(f"{self.name} has no plain request")
+
     def last(self, t):
         """Last-token row of a logits tensor (backend-shape-specific)."""
         raise NotImplementedError

@@ -165,6 +165,29 @@ def _throughput(regime, timing):
     return None
 
 
+def _time_vanilla(spec, regime, be, model, timed_prompts, record):
+    """Time the backend's own request with nothing attached, in the same job and regime as the
+    cells: the intervention-overhead denominator (design.md §12.14). Recorded as unavailable when
+    the backend has no plain request or the regime is batched."""
+    if regime.kind not in ("interactive", "generation"):
+        record["unavailable"] = f"no plain request for the {regime.kind} regime"
+        return None
+    prompt = timed_prompts[0]              # the first timed unit (a paired unit's clean prompt)
+    new_tokens = regime.new_tokens if regime.kind == "generation" else 1
+    record["new_tokens"] = new_tokens
+    try:
+        timing, _ = time_cell(lambda: (lambda: be.vanilla(model, prompt, new_tokens=new_tokens)),
+                              warmup=spec.warmup, n_trials=spec.n_trials)
+    except NotImplementedError as error:
+        record.update(unavailable=str(error), error=None)
+        return None
+    except Exception as error:
+        _failure(record, error)
+        return None
+    record.update(median_latency_ms=timing.median_ms, std_latency_ms=timing.std_ms, error=None)
+    return timing
+
+
 def _load_sync_twin(be, repo):
     """A loaded sync-mode engine for an async run's batched regime, or None.
 
@@ -257,6 +280,9 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
             except Exception as e:
                 _failure(baseline, e)
 
+            vanilla_timing = _time_vanilla(spec, regime, r_be, r_model, timed_prompts,
+                                           meta.setdefault(("__vanilla__", regime.kind), {}))
+
             for task in spec.tasks:
                 key = (regime.kind, task.label)
                 case = meta[key] = {}
@@ -274,6 +300,8 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
                         "peak_mem_mb": timing.peak_mem_mb,
                         "overhead_vs_baseline": (timing.median_ms / base_timing.median_ms)
                         if (base_timing and base_timing.median_ms) else None,
+                        "overhead_vs_vanilla": (timing.median_ms / vanilla_timing.median_ms)
+                        if (vanilla_timing and vanilla_timing.median_ms) else None,
                         "throughput": _throughput(regime, timing),
                     })
                     _success(case)
