@@ -25,12 +25,14 @@ class VLLMAsyncBackend(VLLMBackend):
                  distributed_executor_backend: str | None = None,
                  gpu_memory_utilization: float = 0.2,
                  max_model_len: int | None = None,
-                 tokenizer: str | None = None):
+                 tokenizer: str | None = None,
+                 enable_prefix_caching: bool | None = None):
         # dtype + trust_remote_code + max_model_len are engine-config shared with the sync/serve
         # backends (see VLLMBackend); the parallelism + memory knobs below are specific to the
         # in-process async engine.
         super().__init__(dtype=dtype, trust_remote_code=trust_remote_code,
-                         max_model_len=max_model_len, tokenizer=tokenizer)
+                         max_model_len=max_model_len, tokenizer=tokenizer,
+                         enable_prefix_caching=enable_prefix_caching)
         # Parallelism axes (default 1 == single-GPU, the v1 behaviour). PP>1/TP>1 are forwarded
         # straight to nnsight's VLLM, which passes them to vLLM. distributed_executor_backend
         # must be "ray" for multi-node placement; None uses vLLM's default (mp) on one node.

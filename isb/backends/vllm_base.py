@@ -15,7 +15,8 @@ from .base import Backend
 
 class VLLMBackend(Backend):
     def __init__(self, dtype: str | None = None, trust_remote_code: bool = False,
-                 max_model_len: int | None = None, tokenizer: str | None = None):
+                 max_model_len: int | None = None, tokenizer: str | None = None,
+                 enable_prefix_caching: bool | None = None):
         # dtype: precision axis (None -> vLLM's default, bf16 for GPT-2; "float32" matches HF, which is
         # how the oracle separates SUPPORTED_DEGRADED from a true SILENTLY_WRONG bug).
         self.dtype = dtype
@@ -32,7 +33,10 @@ class VLLMBackend(Backend):
         # (e.g. a shared weights cache whose tokenizer files are unwritable-by-us); forwarded to
         # vLLM's own `tokenizer=` engine arg.
         self.tokenizer = tokenizer
-
+        # enable_prefix_caching: None keeps vLLM's default (on). vLLM keys cached KV blocks by token
+        # content only, so a prompt of 17+ tokens seen before skips its cached prefix — nnsight hooks
+        # never see those positions, and the KV may come from an earlier *intervened* run.
+        self.enable_prefix_caching = enable_prefix_caching
     def _engine_kwargs(self) -> dict:
         """vLLM engine kwargs shared by the in-process backends — fed to nnsight's `VLLM(...)`."""
         kw: dict = {}
@@ -44,4 +48,6 @@ class VLLMBackend(Backend):
             kw["max_model_len"] = self.max_model_len
         if self.tokenizer is not None:
             kw["tokenizer"] = self.tokenizer
+        if self.enable_prefix_caching is not None:
+            kw["enable_prefix_caching"] = self.enable_prefix_caching
         return kw

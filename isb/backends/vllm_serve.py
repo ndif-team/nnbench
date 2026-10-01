@@ -56,14 +56,16 @@ class VLLMServeBackend(VLLMBackend):
     HEALTH_TIMEOUT = 120.0  # seconds to wait for the server's /health before giving up
 
     def __init__(self, host: str, dtype: str | None = None, trust_remote_code: bool = False,
-                 max_model_len: int | None = None, tokenizer: str | None = None):
+                 max_model_len: int | None = None, tokenizer: str | None = None,
+                 enable_prefix_caching: bool | None = None):
         # `host` is the serve URL (e.g. "http://server:6677"). dtype/trust_remote_code/max_model_len
         # share the VLLMBackend engine-config signature so the driver can splat spec.vllm_kwargs here
         # too. dtype and max_model_len are informational client-side (they are the SERVER's engine
         # config — the client is meta-only, and carries them for provenance); trust_remote_code IS
         # applied, because even the meta build reads the repo config.
         super().__init__(dtype=dtype, trust_remote_code=trust_remote_code,
-                         max_model_len=max_model_len, tokenizer=tokenizer)
+                         max_model_len=max_model_len, tokenizer=tokenizer,
+                         enable_prefix_caching=enable_prefix_caching)   # server-side; provenance only
         self.host = host.rstrip("/")
 
     # No __getstate__ needed: unlike vllm_async (which carries a non-picklable event loop), this
