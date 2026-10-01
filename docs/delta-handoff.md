@@ -67,10 +67,12 @@ Notes:
   (`HF_HUB_CACHE=/models/hub`). Qwen2.5-1.5B-Instruct is public; no `HF_TOKEN` is needed. If
   compute nodes cannot reach the Hub, prefetch on the login node:
   `HF_HUB_CACHE=$ISB_APPTAINER_DIR/volumes/isb-model-cache/hub huggingface-cli download Qwen/Qwen2.5-1.5B-Instruct`.
-- The GPUs are A100-SXM4-40GB. Every backend runs vLLM at `gpu_memory_utilization` 0.2, which is
-  8 GB here (16 GB on the 80 GB development cards). If a vLLM backend fails with "No available
-  memory for the cache blocks", report it; raising the fraction must be done for every backend
-  alike, in each `compose.yml`, and committed before the run.
+- The GPUs are A100-SXM4-40GB. Every vLLM backend runs at `gpu_memory_utilization` 0.9 (36 GB
+  here), the same in every `compose.yml`. The earlier 0.2 was for the shared development host; on
+  an exclusive Delta allocation one job owns the GPU. Any change to the fraction must be made for
+  every backend alike and committed before the run. The `cmp_*` specs have no batched regime, so
+  nnsight-vllm never loads its co-resident sync twin (`isb/sweep/execute.py`, `_load_sync_twin`),
+  which would not fit beside a 0.9 engine.
 - The vLLM 0.28.0 image ships CUDA 13.0 torch; driver 595 supports it natively.
 - Inside an allocation the GPU is index 0: pass `--gpu 0`.
 - Run on a GPU no one else uses for the duration. Every job records the GPU's used memory before
