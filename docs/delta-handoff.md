@@ -1,0 +1,201 @@
+# Handoff: cross-system comparison on Delta
+
+Goal: run the cross-system comparison (design.md §12.14) on an uncontended A100, so its latencies
+are usable. The shared host where it was developed had other workloads take the GPU mid-run.
+Correctness results from that host are already recorded in `docs/findings.md`; Delta's job is
+clean timing, plus confirming the same correctness verdicts.
+
+Branch `feat/cross-system-comparison`, commit `4b9242e` or later.
+
+## What this branch adds
+
+- Five comparison specs on Qwen/Qwen2.5-1.5B-Instruct: `cmp_logit_lens`, `cmp_steering`,
+  `cmp_gen_steering`, `cmp_activation_patching`, `cmp_ablation` (`isb/specs/comparison.py`).
+- Backends, one Docker Compose directory each under `backends/`:
+
+| backend | system | vLLM | engine mode |
+|---|---|---|---|
+| `nnsight-hf` | nnsight on transformers 5.12.1 (the reference) | — | eager PyTorch |
+| `nnsight-vllm` | nnsight 0.8.0rc1 (260c555) | 0.19.1 | eager |
+| `vllm-lens` | vLLM-Lens 1.2.1 | 0.19.1 | eager (forced by the plugin) |
+| `interp-engine` | interp-engine 1.12.0 | 0.28.0 | eager |
+| `transformer-lens` | TransformerLens 4.0.0 `RemoteBridge.boot_vllm` | 0.20.2 | torch.compile + CUDA graphs |
+| `vllm-plain-0-19-1`, `-0-20-2`, `-0-28-0` | plain vLLM, nothing installed | each | torch.compile + CUDA graphs |
+
+- Two denominators per timed cell: `overhead_vs_vanilla` (the same system with no intervention
+  attached, timed in the same job) and `overhead_vs_plain_vllm` (plain vLLM at the same version).
+- fp32 variants `nnsight-hf-fp32`, `nnsight-vllm-fp32`, `transformer-lens-fp32` for separating
+  precision from intervention differences.
+
+## Step 0: check the node can run the runner
+
+The runner launches every backend with `docker compose` (`isb/jobs/local.py`). Inside a GPU
+allocation, for example:
+
+```bash
+srun --account=bdnh-delta-gpu --partition=gpuA100x4 --gpus=1 --cpus-per-task=16 --mem=64G \
+     --time=03:00:00 --pty bash
+docker info >/dev/null && docker compose version     # Docker Engine + Compose v2
+docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi   # NVIDIA toolkit
+nvidia-smi --query-gpu=index,name,driver_version,memory.used --format=csv
+df -h /var/lib/docker 2>/dev/null; apptainer --version
+```
+
+- If Docker, Compose and the GPU test all work: continue with step 1.
+- If Docker is unavailable: stop. The runner needs an Apptainer launch path first (see
+  "If there is no Docker" below). Do not work around it by running backends in conda envs: the
+  comparison depends on each system's pinned image.
+
+Requirements to note:
+- Disk: about 45 GB of images (three vLLM bases at ~9–10 GB each, a PyTorch image, the layers on
+  top) plus the model cache.
+- The vLLM 0.28.0 image ships CUDA 13.0 torch. It ran on driver 570.86.15 (CUDA 12.8) on the
+  development host through forward compatibility; record Delta's driver version in the results.
+- Qwen2.5-1.5B-Instruct is public; no `HF_TOKEN` is needed. It downloads into the named Docker
+  volume `isb-model-cache` on first use.
+- Run on a GPU no one else uses for the duration. Every job records the GPU's used memory before
+  and after (`execution.json`, field `gpu_release`); a nonzero `baseline_mib` means something else
+  was on the GPU.
+
+## Step 1: no-GPU tests
+
+```bash
+git fetch origin && git checkout feat/cross-system-comparison
+python -m pytest tests/ -q          # expect 501 passed, 3 skipped (host Python with CPU torch)
+```
+
+## Step 2: smoke tests, smallest first
+
+Each run prints one line per cell and writes `runs/<out>/<timestamp>/report.json`. Build only what
+each step needs; later steps reuse the images.
+
+**2a. nnsight on HF and vLLM, one spec, four prompts**
+
+```bash
+python scripts/bench.py build nnsight-hf nnsight-vllm
+python scripts/bench.py run --spec cmp_steering --data counterfact:4 \
+  --backends nnsight-hf nnsight-vllm --reference nnsight-hf --gpu 0 --out runs/delta-smoke
+```
+
+Expect every `nnsight-vllm` row `SUPPORTED` with top-1 1.00, TV 0.000.
+
+**2b. vLLM-Lens and plain vLLM 0.19.1 (same base image)**
+
+```bash
+python scripts/bench.py build vllm-lens vllm-plain-0-19-1
+python scripts/bench.py run --spec cmp_steering --data counterfact:4 \
+  --backends nnsight-hf vllm-lens vllm-plain-0-19-1 --reference nnsight-hf --gpu 0 --out runs/delta-smoke
+```
+
+Expect `vllm-lens` `SUPPORTED` on all four rows and `vllm-plain-0-19-1` `UNSUPPORTED` on all four
+(plain vLLM has no intervention layer; it only contributes timing). In `report.json`, the
+`vllm-lens` rows should carry `overhead_vs_plain_vllm`.
+
+**2c. interp-engine and TransformerLens with their plain vLLM versions**
+
+```bash
+python scripts/bench.py build interp-engine transformer-lens vllm-plain-0-20-2 vllm-plain-0-28-0
+python scripts/bench.py run --spec cmp_steering cmp_ablation --data counterfact:4 \
+  --backends nnsight-hf interp-engine transformer-lens vllm-plain-0-20-2 vllm-plain-0-28-0 \
+  --reference nnsight-hf --gpu 0 --out runs/delta-smoke
+```
+
+Expect, for `cmp_steering`: `interp-engine` `SUPPORTED` on all four rows; `transformer-lens`
+`SUPPORTED` on the two mean-norm rows and `UNSUPPORTED` on the two "scaled by each token's norm"
+rows. For `cmp_ablation`: `interp-engine` `UNSUPPORTED`, `transformer-lens` `NUMERICAL_MISMATCH`
+(bf16 precision; it matches HF at fp32).
+
+**2d. Patching, which uses paired data**
+
+```bash
+python scripts/bench.py run --spec cmp_activation_patching --data mib/ioi:4 \
+  --backends nnsight-hf nnsight-vllm vllm-lens interp-engine transformer-lens \
+  --reference nnsight-hf --gpu 0 --out runs/delta-smoke
+```
+
+## Step 3: the full comparison
+
+About 40 jobs, roughly 75 minutes on one A100.
+
+```bash
+python scripts/bench.py run \
+  --spec cmp_logit_lens cmp_steering cmp_gen_steering cmp_activation_patching cmp_ablation \
+  --backends nnsight-hf nnsight-vllm vllm-lens interp-engine transformer-lens \
+             vllm-plain-0-19-1 vllm-plain-0-20-2 vllm-plain-0-28-0 \
+  --reference nnsight-hf --gpu 0 --timeout 3600 --out runs/comparison-delta
+```
+
+Optional precision check:
+
+```bash
+python scripts/bench.py build nnsight-hf-fp32 nnsight-vllm-fp32 transformer-lens-fp32
+python scripts/bench.py run --spec cmp_ablation \
+  --backends nnsight-hf-fp32 nnsight-vllm-fp32 transformer-lens-fp32 \
+  --reference nnsight-hf-fp32 --gpu 0 --out runs/comparison-delta
+```
+
+## Expected verdicts (from the development host)
+
+Top-1 agreement / TV against `nnsight-hf`. If Delta differs, report it rather than changing cells.
+
+| workload | nnsight-vllm | vllm-lens | interp-engine | transformer-lens |
+|---|---|---|---|---|
+| logit lens, every layer | 0.82 / 0.136 | same, bitwise equal to nnsight-vllm | 0.82 / 0.136 | 0.82 / 0.136 |
+| steering, mean or token norm | 1.00 / 0.000 | 1.00 / 0.000 | 1.00 / 0.000 | mean: 1.00 / 0.000; token: UNSUPPORTED |
+| every-step steering, mean norm | 1.00 / 0.000 | 1.00 / 0.000 | UNSUPPORTED | UNSUPPORTED |
+| every-step steering, token norm | 1.00 / 0.000 | 1.00 / 0.000 | 1.00 / 0.000 | UNSUPPORTED |
+| patching, every position | 1.00 / 0.09 | 1.00 / 0.09 | UNSUPPORTED | UNSUPPORTED |
+| patching, last token | 0.88 / 0.07–0.10 | 0.88–0.94 / 0.07–0.09 | 0.88 / 0.07–0.10 | 0.88 / 0.07–0.10 |
+| ablation, MLP / attention, layer 1 | 0.78 / 0.19; 0.50 / 0.43 | UNSUPPORTED | UNSUPPORTED | 0.75 / 0.20; 0.56 / 0.43 |
+
+The logit-lens and patching gaps are the vLLM engine's distance from HF (all four vLLM systems land
+there); the ablation gap closes at fp32. Every `UNSUPPORTED` row carries its reason, citing the
+system's source, in the `unsupported` field of the cell.
+
+Uncontended latency for a single forward with nothing attached, measured before contention began:
+plain vLLM 0.19.1 8.4 ms, 0.20.2 11.4 ms, 0.28.0 11.5 ms; nnsight-vllm 20.8 ms; vLLM-Lens 21.6 ms;
+interp-engine 21.7 ms; TransformerLens 11.6 ms.
+
+## Reading and returning results
+
+```bash
+python scripts/manager.py --dir runs/comparison-delta --export comparison-delta.html
+tar czf comparison-delta.tgz runs/comparison-delta        # runs/ is git-ignored
+```
+
+Per cell in `report.json`: `state`, `metrics` (top1_agree, tv, max_abs), `median_latency_ms`,
+`overhead_vs_vanilla`, `overhead_vs_plain_vllm`, and `unsupported` for declared gaps. Per job in
+`execution.json`: `status`, `image_id`, `source`, `gpu_release`. Send back the tarball and the
+HTML export.
+
+## Known issues
+
+- A vLLM job that starts while the previous job's GPU memory is still draining can fail vLLM's
+  memory-profiling assertion ("Error in memory profiling") or find no memory for the KV cache. The
+  runner now waits up to 120 s for the memory to return to its pre-job level. If it still
+  happens, rerun the failed job; it is not a cell failure.
+- "Free memory on device ... less than desired GPU memory utilization" means another process holds
+  the GPU. The result is unusable for timing.
+- vLLM's usage-statistics thread logs `PermissionError: '/.config'` in every vLLM container. It is
+  harmless.
+
+## Rules for working on this branch
+
+- Do not edit `isb/` or `backends/` while a run is active: the job records a source hash, and a
+  change mid-run fails the job.
+- New or changed cells follow `docs/writing-workloads.md`: read the system's docs at the pinned
+  version, check what each read and write site denotes in source, make the documented form the
+  default, test the denotation.
+- A mismatch is reported, not patched around. A divergence that only appears under tensor or
+  pipeline parallelism is a finding to classify (CLAUDE.md).
+
+## If there is no Docker
+
+The runner needs a second launch path in `isb/jobs/local.py` that runs each backend with
+`apptainer exec --nv` instead of `docker compose run`, keeping the same file contract: `/job`
+read-only, `/output` writable, `/workspace` and `/backend` mounted read-only, the environment from
+the backend's `compose.yml`. Each backend needs an image built from its Dockerfile (for example
+`apptainer build backend.sif docker-daemon://...` where a Docker daemon exists elsewhere, or an
+Apptainer definition that starts from the same `vllm/vllm-openai` base and runs the same `pip`
+lines). The host runner must stay backend-agnostic: the launch method is a runner setting, never a
+per-engine switch.
