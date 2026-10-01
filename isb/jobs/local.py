@@ -9,7 +9,18 @@ import time
 import uuid
 from pathlib import Path
 
+from . import apptainer
 from .contract import digest, file_digest, validate_result, write_json
+
+LAUNCHERS = ("docker", "apptainer")
+
+
+def default_launcher():
+    """The runner's launch method: ISB_LAUNCHER, else Docker. A host setting, never per backend."""
+    launcher = os.environ.get("ISB_LAUNCHER", "docker")
+    if launcher not in LAUNCHERS:
+        raise ValueError(f"ISB_LAUNCHER must be one of {LAUNCHERS}, not {launcher!r}")
+    return launcher
 
 ROOT = Path(__file__).resolve().parents[2]
 NAME = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
@@ -94,26 +105,33 @@ def wait_for_release(gpu, baseline, *, tolerance_mib=1024, timeout=120, poll=1.0
     return used, round(time.monotonic() - start, 1)
 
 
-def run_job(name, job, experiment, output, *, gpu="0", timeout=1800, root=ROOT):
-    """Always collect an execution record and clean only this job's Compose project."""
+def run_job(name, job, experiment, output, *, gpu="0", timeout=1800, root=ROOT, launcher="docker"):
+    """Always collect an execution record and clean only this job's Compose project (Docker) or
+    process group (Apptainer)."""
     output.mkdir(parents=True, exist_ok=False)
     project = "isb-" + uuid.uuid4().hex[:20]
     container = project + "-runner"
     command = compose(name, project, root)
     env = environment(name, job, output, gpu)
     record = {"backend": name, "experiment_id": experiment["id"], "project": project,
-              "status": "running", "source": source_identity(root)}
+              "launcher": launcher, "status": "running", "source": source_identity(root)}
     write_json(output / "execution.json", record)
     baseline_mib = gpu_used_mib(gpu)
     print(f"[run] {name} / {experiment['spec']['name']} → {output}", flush=True)
     try:
-        configuration(name, root, env)
-        with (output / "execution.log").open("w") as log:
-            result = subprocess.run(command + ["run", "--name", container, "--no-TTY", "runner"],
-                                    env=env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout)
-        record["exit_code"] = result.returncode
-        if result.returncode:
-            raise RuntimeError(f"container exited {result.returncode}; see execution.log")
+        if launcher == "apptainer":
+            argv, extra_env = apptainer.command(backend_file(name, root), root, env)
+            with (output / "execution.log").open("w") as log:
+                exit_code = apptainer.run(argv, extra_env, log, timeout)
+        else:
+            configuration(name, root, env)
+            with (output / "execution.log").open("w") as log:
+                exit_code = subprocess.run(command + ["run", "--name", container, "--no-TTY", "runner"],
+                                           env=env, stdout=log, stderr=subprocess.STDOUT,
+                                           timeout=timeout).returncode
+        record["exit_code"] = exit_code
+        if exit_code:
+            raise RuntimeError(f"container exited {exit_code}; see execution.log")
         validate_result(output, experiment, name)
         if record["source"] != source_identity(root):
             raise RuntimeError("benchmark/backend source changed during job; rerun with stable sources")
@@ -127,18 +145,23 @@ def run_job(name, job, experiment, output, *, gpu="0", timeout=1800, root=ROOT):
         record.update(status="failed", error=str(error))
     finally:
         try:
-            # Inspect the container's actual image, not a tag that may have moved mid-run.
-            inspected = subprocess.run(["docker", "inspect", "--format", "{{.Image}}", container],
-                                       capture_output=True, text=True, timeout=15)
-            if inspected.returncode == 0:
-                record["image_id"] = inspected.stdout.strip()
-            elif record["status"] == "completed":
-                record.update(status="failed", error="could not record executed image identity")
-            with (output / "cleanup.log").open("w") as log:
-                cleaned = subprocess.run(command + ["down", "--remove-orphans", "--timeout", "10"],
-                                         env=env, stdout=log, stderr=subprocess.STDOUT, timeout=30)
-            if cleaned.returncode:
-                record.update(status="failed", cleanup_error="Compose cleanup failed; see cleanup.log")
+            if launcher == "apptainer":
+                # The process group is gone (run() waited or killed it); the image is the .sif.
+                service, _ = apptainer.load_service(backend_file(name, root), env)
+                record["image_id"] = apptainer.image_identity(apptainer.sif_path(root, service["image"]))
+            else:
+                # Inspect the container's actual image, not a tag that may have moved mid-run.
+                inspected = subprocess.run(["docker", "inspect", "--format", "{{.Image}}", container],
+                                           capture_output=True, text=True, timeout=15)
+                if inspected.returncode == 0:
+                    record["image_id"] = inspected.stdout.strip()
+                elif record["status"] == "completed":
+                    record.update(status="failed", error="could not record executed image identity")
+                with (output / "cleanup.log").open("w") as log:
+                    cleaned = subprocess.run(command + ["down", "--remove-orphans", "--timeout", "10"],
+                                             env=env, stdout=log, stderr=subprocess.STDOUT, timeout=30)
+                if cleaned.returncode:
+                    record.update(status="failed", cleanup_error="Compose cleanup failed; see cleanup.log")
             after_mib, waited = wait_for_release(gpu, baseline_mib)
             record["gpu_release"] = {"baseline_mib": baseline_mib, "after_mib": after_mib,
                                      "waited_s": waited}

@@ -5,7 +5,7 @@ are usable. The shared host where it was developed had other workloads take the 
 Correctness results from that host are already recorded in `docs/findings.md`; Delta's job is
 clean timing, plus confirming the same correctness verdicts.
 
-Branch `feat/cross-system-comparison`, commit `4b9242e` or later.
+Branch `feat/cross-system-comparison`; the Apptainer launcher needs the commit that adds `isb/jobs/apptainer.py` or later.
 
 ## What this branch adds
 
@@ -27,32 +27,52 @@ Branch `feat/cross-system-comparison`, commit `4b9242e` or later.
 - fp32 variants `nnsight-hf-fp32`, `nnsight-vllm-fp32`, `transformer-lens-fp32` for separating
   precision from intervention differences.
 
-## Step 0: check the node can run the runner
+## Step 0: Delta has no Docker; use the Apptainer launcher
 
-The runner launches every backend with `docker compose` (`isb/jobs/local.py`). Inside a GPU
-allocation, for example:
+Checked 2026-09-30 (job 22588849, gpuA100x4, node gpua007): no Docker Engine, Compose or podman;
+Apptainer 1.5.3 on compute nodes, and `apptainer exec --nv` sees the GPU (A100-SXM4-40GB, driver
+595.71.05). The runner therefore uses its Apptainer launch path (`isb/jobs/apptainer.py`). It reads
+the same `compose.yml` and Dockerfile as the Docker path: a build translates the Dockerfile's
+ARG/FROM/RUN lines into an Apptainer definition, and a run maps the runner service onto
+`apptainer exec --nv --cleanenv --no-home` with the same `/job`, `/output`, `/workspace`,
+`/backend` and `/models` mounts.
+
+Set these in every shell (the login node for builds, the allocation for runs):
 
 ```bash
+cd /work/nvme/bdnh/zwang83/nnbench          # or wherever the checkout lives on /work
+export ISB_LAUNCHER=apptainer               # every bench.py build/run below uses Apptainer
+export ISB_APPTAINER_DIR=$PWD/.apptainer    # .sif images, definitions, model cache (not tracked)
+export APPTAINER_CACHEDIR=/work/nvme/bdnh/zwang83/.apptainer-cache   # layer cache, off $HOME
+export APPTAINER_TMPDIR=/tmp                # build scratch; node-local and large
 srun --account=bdnh-delta-gpu --partition=gpuA100x4 --gpus=1 --cpus-per-task=16 --mem=64G \
-     --time=03:00:00 --pty bash
-docker info >/dev/null && docker compose version     # Docker Engine + Compose v2
-docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi   # NVIDIA toolkit
-nvidia-smi --query-gpu=index,name,driver_version,memory.used --format=csv
-df -h /var/lib/docker 2>/dev/null; apptainer --version
+     --time=03:00:00 --pty bash             # for runs; builds can also run here
 ```
 
-- If Docker, Compose and the GPU test all work: continue with step 1.
-- If Docker is unavailable: stop. The runner needs an Apptainer launch path first (see
-  "If there is no Docker" below). Do not work around it by running backends in conda envs: the
-  comparison depends on each system's pinned image.
+Builds run the Dockerfiles' `RUN` steps (apt-get, pip) as root, so they use `--fakeroot` by
+default. Check it works with the cheapest image first (plain vLLM 0.19.1 adds only a `mkdir`):
 
-Requirements to note:
-- Disk: about 45 GB of images (three vLLM bases at ~9–10 GB each, a PyTorch image, the layers on
-  top) plus the model cache.
-- The vLLM 0.28.0 image ships CUDA 13.0 torch. It ran on driver 570.86.15 (CUDA 12.8) on the
-  development host through forward compatibility; record Delta's driver version in the results.
-- Qwen2.5-1.5B-Instruct is public; no `HF_TOKEN` is needed. It downloads into the named Docker
-  volume `isb-model-cache` on first use.
+```bash
+python scripts/bench.py build vllm-plain-0-19-1
+ls -la .apptainer/images/
+```
+
+If `--fakeroot` is refused, try `export ISB_APPTAINER_BUILD_FLAGS=""` (an unprivileged build) and
+report which worked. Building the vLLM images needs memory and time; run builds inside an
+allocation if the login node kills them.
+
+Notes:
+- Disk: about 50 GB of `.sif` images under `ISB_APPTAINER_DIR`, plus the layer cache.
+- The model cache is `$ISB_APPTAINER_DIR/volumes/isb-model-cache`, mounted at `/models`
+  (`HF_HUB_CACHE=/models/hub`). Qwen2.5-1.5B-Instruct is public; no `HF_TOKEN` is needed. If
+  compute nodes cannot reach the Hub, prefetch on the login node:
+  `HF_HUB_CACHE=$ISB_APPTAINER_DIR/volumes/isb-model-cache/hub huggingface-cli download Qwen/Qwen2.5-1.5B-Instruct`.
+- The GPUs are A100-SXM4-40GB. Every backend runs vLLM at `gpu_memory_utilization` 0.2, which is
+  8 GB here (16 GB on the 80 GB development cards). If a vLLM backend fails with "No available
+  memory for the cache blocks", report it; raising the fraction must be done for every backend
+  alike, in each `compose.yml`, and committed before the run.
+- The vLLM 0.28.0 image ships CUDA 13.0 torch; driver 595 supports it natively.
+- Inside an allocation the GPU is index 0: pass `--gpu 0`.
 - Run on a GPU no one else uses for the duration. Every job records the GPU's used memory before
   and after (`execution.json`, field `gpu_release`); a nonzero `baseline_mib` means something else
   was on the GPU.
@@ -61,7 +81,7 @@ Requirements to note:
 
 ```bash
 git fetch origin && git checkout feat/cross-system-comparison
-python -m pytest tests/ -q          # expect 501 passed, 3 skipped (host Python with CPU torch)
+python -m pytest tests/ -q          # expect 509 passed, 3 skipped (host Python with CPU torch and PyYAML)
 ```
 
 ## Step 2: smoke tests, smallest first
@@ -189,13 +209,19 @@ HTML export.
 - A mismatch is reported, not patched around. A divergence that only appears under tensor or
   pipeline parallelism is a finding to classify (CLAUDE.md).
 
-## If there is no Docker
+## Apptainer launcher details
 
-The runner needs a second launch path in `isb/jobs/local.py` that runs each backend with
-`apptainer exec --nv` instead of `docker compose run`, keeping the same file contract: `/job`
-read-only, `/output` writable, `/workspace` and `/backend` mounted read-only, the environment from
-the backend's `compose.yml`. Each backend needs an image built from its Dockerfile (for example
-`apptainer build backend.sif docker-daemon://...` where a Docker daemon exists elsewhere, or an
-Apptainer definition that starts from the same `vllm/vllm-openai` base and runs the same `pip`
-lines). The host runner must stay backend-agnostic: the launch method is a runner setting, never a
-per-engine switch.
+- Launch method: `ISB_LAUNCHER=apptainer` or `--launcher apptainer` on `build` and `run`; recorded
+  as `launcher` in `plan.json` and each `execution.json`. It is a runner setting, never chosen per
+  backend.
+- Image identity: the `.sif` file's sha256 (`image_id` in `execution.json`), cached beside it.
+- A Dockerfile instruction other than ARG, FROM or RUN, a multi-stage build, or a compose file with
+  supporting services is refused with a message; extend `isb/jobs/apptainer.py` rather than
+  working around it. Never run the backends from conda envs instead: the comparison depends on
+  each system's pinned image.
+- Environment reaches the container as `APPTAINERENV_*` variables (so JSON values with commas pass
+  intact); the GPU is selected with `CUDA_VISIBLE_DEVICES`. A timeout kills the container's whole
+  process group.
+- The runner's GPU-memory wait uses the host's `nvidia-smi`, available on Delta GPU nodes.
+- Not yet run on a real Apptainer host; the CPU tests cover the translation, the command mapping
+  and a job lifecycle. The first build and the first smoke run are the real checks.

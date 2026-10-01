@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import subprocess
 import sys
@@ -10,7 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .contract import PLAN_VERSION, prepare, write_json
-from .local import ROOT, backend_file, compose, configuration, discover, environment, run_job
+from . import apptainer
+from .local import (LAUNCHERS, ROOT, backend_file, compose, configuration, default_launcher, discover,
+                    environment, run_job)
 
 
 def _positive(value):
@@ -49,6 +52,8 @@ def parser():
     listing.add_argument("kind", choices=["backends", "specs"])
     build = commands.add_parser("build")
     build.add_argument("backends", nargs="+")
+    build.add_argument("--launcher", choices=LAUNCHERS, default=None,
+                       help="docker or apptainer (default: ISB_LAUNCHER, else docker)")
     run = commands.add_parser("run")
     run.add_argument("--spec", nargs="+", required=True)
     run.add_argument("--data")
@@ -58,6 +63,8 @@ def parser():
     run.add_argument("--gpu", default="0", help="host GPU index or UUID; passed to backend Compose")
     run.add_argument("--timeout", type=_positive, default=1800, help="seconds per backend job")
     run.add_argument("--seed", type=int, default=0)
+    run.add_argument("--launcher", choices=LAUNCHERS, default=None,
+                     help="docker or apptainer (default: ISB_LAUNCHER, else docker)")
     run.add_argument("--out", type=Path, default=Path("runs"), help="parent of a new unique run directory")
     run.add_argument("--strict", action="store_true", help="nonzero exit for failed execution/output checks; numerical uncertainty is nonblocking")
     scoring = commands.add_parser("score")
@@ -83,15 +90,21 @@ def _run(args):
     if not args.gpu or "," in args.gpu:
         raise ValueError("select one GPU index/UUID; multi-GPU settings belong in backend Compose")
     specs = _specs(args.spec, args.data)
+    launcher = args.launcher or default_launcher()
     for name in args.backends:
-        configuration(name, env=environment(name, args.out, args.out, args.gpu))
+        env = environment(name, args.out, args.out, args.gpu)
+        if launcher == "apptainer":
+            apptainer.load_service(backend_file(name), env)
+        else:
+            configuration(name, env=env)
     # Check scorer availability before spending GPU time, without importing it into the launcher.
     subprocess.run([sys.executable, "-c", "import torch"], check=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     directory = args.out.resolve() / f"{stamp}-{uuid.uuid4().hex[:8]}"
     directory.mkdir(parents=True, exist_ok=False)
     plan = {"version": PLAN_VERSION, "backends": args.backends, "reference": args.reference,
-            "comparison": args.comparison, "gpu": args.gpu, "experiments": [], "status": "preparing"}
+            "comparison": args.comparison, "gpu": args.gpu, "launcher": launcher, "experiments": [],
+            "status": "preparing"}
     jobs = []
     for index, spec in enumerate(specs):
         # Preparation uses an index until the content identity is known, then renames atomically.
@@ -108,7 +121,8 @@ def _run(args):
     try:
         for job, experiment in jobs:
             for name in args.backends:
-                record = run_job(name, job, experiment, job / name, gpu=args.gpu, timeout=args.timeout)
+                record = run_job(name, job, experiment, job / name, gpu=args.gpu, timeout=args.timeout,
+                                 launcher=launcher)
                 failed |= record["status"] != "completed"
         plan["status"] = "failed" if failed else "completed"
     except KeyboardInterrupt:
@@ -135,9 +149,14 @@ def main(argv=None):
             # Resolve all names before the first build; do not partially act on a typo.
             for name in args.backends:
                 backend_file(name)
+            launcher = args.launcher or default_launcher()
             for name in args.backends:
-                configuration(name)
-                subprocess.run(compose(name, "isb-build-" + name) + ["build"], check=True)
+                if launcher == "apptainer":
+                    print(f"[build] {name} -> {apptainer.build(backend_file(name), ROOT, dict(os.environ))}",
+                          flush=True)
+                else:
+                    configuration(name)
+                    subprocess.run(compose(name, "isb-build-" + name) + ["build"], check=True)
             return 0
         if args.command == "run":
             return _run(args)
