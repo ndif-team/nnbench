@@ -5,13 +5,15 @@ positions). Steering strength is `alpha` times the stream norm, averaged over th
 (`mean_norm`, the default) or per token (`token_norm`); patching writes every position (`all`, the
 default) or the last one. Each
 system's cell picks that system's documented realization, so the same row is comparable across
-nnsight and foreign systems. Qwen2.5-1.5B-Instruct is a Llama-shaped decoder (family "llama"), 28
-layers; the MIB IOI pairs are verified length-matched under the Qwen2.5 tokenizer.
+nnsight and foreign systems. Qwen2.5-7B-Instruct is a Llama-shaped decoder (family "llama"), 28
+layers; the MIB IOI pairs are verified length-matched under the Qwen2.5 tokenizer. The rows were
+developed on Qwen2.5-1.5B-Instruct (same layer count and tokenizer; tied embeddings, which 7B does
+not have); the Delta run uses 7B because it is in the cluster's model cache.
 """
 from ..data import DataRef
 from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime
 
-_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 _PROMPTS = DataRef("counterfact", 32)
 _PAIRS = DataRef("mib/ioi", 16)
 _STEER = {"target": " Rome", "alpha": 6.0}

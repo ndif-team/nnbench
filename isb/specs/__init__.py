@@ -58,7 +58,7 @@ SPECS = {
         logit_lens_nemotron,
         steering_nemotron,
         ablation_nemotron,
-        # Qwen2.5-1.5B (family=llama) — cross-system comparison rows (design §12.14), by name only
+        # Qwen2.5-7B (family=llama) — cross-system comparison rows (design §12.14), by name only
         *COMPARISON_SPECS,
     )
 }
