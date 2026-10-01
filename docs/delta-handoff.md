@@ -67,8 +67,8 @@ Notes:
   (`HF_HUB_CACHE=/models/hub`). Qwen2.5-1.5B-Instruct is public; no `HF_TOKEN` is needed. If
   compute nodes cannot reach the Hub, prefetch on the login node:
   `HF_HUB_CACHE=$ISB_APPTAINER_DIR/volumes/isb-model-cache/hub huggingface-cli download Qwen/Qwen2.5-1.5B-Instruct`.
-- The GPUs are A100-SXM4-40GB. Every vLLM backend runs at `gpu_memory_utilization` 0.9 (36 GB
-  here), the same in every `compose.yml`. The earlier 0.2 was for the shared development host; on
+- The GPUs are A100-SXM4-40GB. Every vLLM backend runs at `gpu_memory_utilization` 0.85 (34 GB
+  here; at 0.9 TransformerLens's full-vocabulary sampler warmup ran out of memory), the same in every `compose.yml`. The earlier 0.2 was for the shared development host; on
   an exclusive Delta allocation one job owns the GPU. Any change to the fraction must be made for
   every backend alike and committed before the run. The `cmp_*` specs have no batched regime, so
   nnsight-vllm never loads its co-resident sync twin (`isb/sweep/execute.py`, `_load_sync_twin`),
