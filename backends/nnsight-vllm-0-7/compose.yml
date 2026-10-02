@@ -26,7 +26,10 @@ services:
       TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-0}
       VLLM_CACHE_ROOT: /tmp/vllm
       ISB_BACKEND: ${ISB_BACKEND:-nnsight-vllm-0-7}
-      ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","gpu_memory_utilization":0.85}'
+      # nnsight 0.7's VLLM_GUIDE.md says nnsight disables prefix caching, but 0.7 leaves vLLM's default
+      # (on) and its traces read the cache, so a repeated 17+-token prompt skips hooks on the cached
+      # prefix. 0.8 sets skip_reading_prefix_cache per trace. Run 0.7 in its documented form.
+      ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","gpu_memory_utilization":0.85,"enable_prefix_caching":false}'
     volumes:
       - ../..:/workspace:ro
       - ../nnsight-vllm:/backend:ro

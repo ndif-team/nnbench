@@ -264,7 +264,7 @@ the finding in `findings.md`.
 | **EP** expert-parallel (MoE only) | experts sharded; routing is data-dependent | L1 expert-site location; router top-k near-tie | reading a specific expert's activation off-rank; router flips a near-tie | ★ Nemotron param-gather; ★ router near-tie EQUIVALENT_DEGRADED |
 | **PD** prefill/decode disagg | prefill and decode on separate engines; KV shipped between | L2 cross-region edge (prefill→decode) | any read-at-prefill → write/read-at-decode spans two engines | UNTESTED (high risk) |
 | **KV cache** paged + in-place reuse | KV in paged buffers; activation buffers reused | L1 unnamed KV site; L1.5 read value-semantics | direct KV read/write has no site name; un-cloned read decays | ★ clone-on-save (alias → SW without it) |
-| **prefix cache** (often default-on) | a cached prompt prefix is **not recomputed** on a hit | L1 site existence at cached prompt positions | a read/write at a cached position never runs the forward → silently no-op | UNTESTED — predicted SW, the highest-value untested cell |
+| **prefix cache** (often default-on) | a cached prompt prefix is **not recomputed** on a hit | L1 site existence at cached prompt positions | a read/write at a cached position never runs the forward → silently no-op | ★ X SW on nnsight 0.7.0 + vLLM 0.15.1 (traces read the cache, despite 0.7's guide); ★ · on nnsight 0.8 (per-trace `skip_reading_prefix_cache`) |
 | **chunked prefill** (V1 default) | a long prompt's prefill is split across scheduler steps | L0 scope position (prefill fragmented); L2 cross-chunk accumulation | "read at prefill" fires per-chunk; multi-position prompt ops fragment | UNTESTED |
 | **spec decode** | draft proposes K tokens, target verifies, some rejected | L0 step-quantifier denotation | a per-step decode write/read fires on draft steps that get thrown away | UNTESTED |
 | **quantization** fp8/awq/gptq | activations/weights de/quantized | L1 denotation + precision | activation reads degraded; weight-reading ops see quantized weights | UNTESTED |
@@ -295,7 +295,7 @@ safe idiom, right = broken idiom). EP applies on MoE families only.
 | **R** read+project | ★·/SW¹ | ★· | DEG | ·/SW | ★· | SW² | DEG | SW³ | DEG | ERR⁴ |
 | **I** inject/write | ★·/★SW¹ | · | DEG | SW | ★· | **SW²** | SW | · | DEG | ERR⁴ |
 | **S** internal/derived | SW⁵ | · | SW⁶ | SW | ★·/SW | SW | SW | SW | DEG | ERR⁴ |
-| **X** transplant | ·/SW | ★· | DEG | **SW**⁷ | ★· | **SW²** | SW | SW | DEG | ERR⁴ |
+| **X** transplant | ·/SW | ★· | DEG | **SW**⁷ | ★· | **★SW²** | SW | SW | DEG | ERR⁴ |
 | **G** gen-step lift | ·/SW | · | DEG | **SW**⁷ | ★· | SW | ·⁸ | **SW³** | DEG | ERR⁴ |
 | **D** gradient | n/a⁹ | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
 | **E** ext-module | ·/SW⁵ | ·¹⁰ | DEG | SW | ★· | SW | SW | SW | DEG | ERR⁴ |
@@ -317,7 +317,8 @@ on the stage that owns layer L (device placement), else it cannot run there.
 ### The load-bearing predictions
 
 - **prefix cache × {steering, patching, any prompt-position read}** is the densest SILENTLY_WRONG
-  region and is entirely unmeasured: a steer injected at a cached prompt token is silently dropped;
+  region. Patching is now measured (findings 2026-10-01: SW on nnsight 0.7, handled by 0.8's
+  per-trace cache skip); the rest is unmeasured: a steer injected at a cached prompt token is silently dropped;
   a patch whose clean/corrupted activations are cached never runs. Default-on, no error raised.
 - **spec decode × generation-time steering** silently steers rejected draft tokens.
 - **PD disaggregation × {transplant, gen-step}** splits one method's read and write across two
@@ -330,8 +331,8 @@ on the stage that owns layer L (device placement), else it cannot run there.
 
 TP (residual EQUIVALENT, `lm_head` shard SW, reduction-order DEG), PP (cross-stage write,
 fused-residual), EP (MoE param-gather, router near-tie), KV reuse (clone-on-save), continuous
-batching (positions). Everything in columns PD / prefix-cache / chunked-prefill / spec-decode /
-quant is PREDICTED and UNTESTED — that gap is the serving-feature roadmap.
+batching (positions), prefix cache × patching (nnsight 0.7 SW, 0.8 handled). Everything else in
+columns PD / prefix-cache / chunked-prefill / spec-decode / quant is PREDICTED and UNTESTED — that gap is the serving-feature roadmap.
 
 ---
 

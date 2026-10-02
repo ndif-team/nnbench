@@ -647,3 +647,62 @@ every row it repeats. Top-1 agreement / TV against `nnsight-hf`; median single-p
 The last-token patch lands at the same distance from HF on all four vLLM systems, so that gap is
 the engine's as well. The TransformerLens ablation latencies in this run overlap another
 benchmark container on GPU 2 (`isb-nnsight-vllm-inband`), recorded in each job's `gpu_release`.
+
+## Client tier — nnsight 0.7.0 vs 0.8.0rc1, HF and vLLM, Qwen2.5-7B-Instruct on Delta (2026-10-01)
+
+Specs `cmp_*`, one A100-SXM4-40GB per job (NCSA Delta, Apptainer launcher), bf16. nnsight 0.7.0 (tag
+`v0.7.0`) on HF with the same torch 2.11 / transformers 5.12.1 as 0.8.0rc1 (`v0.8.0.rc1`, 260c555);
+on vLLM 0.7 runs on 0.15.1 (its validated pin) and 0.8 on 0.19.1, both eager. Runs
+`runs/nnsight-versions-delta/20261001T164003Z-27269935` (all five specs) and
+`runs/nnsight-versions-diag/20261001T174400Z-01ef8e5b` (logit lens and patching with prefix caching
+off, plus `nnsight-hf-fp32` as reference). Model is 7B, not the 1.5B of the cross-system section.
+
+| workload (median ms) | HF 0.8 | HF 0.7 | vLLM 0.8 | vLLM 0.7 |
+|---|---|---|---|---|
+| no intervention | 31.6 | 33.7 | 16.1 | 17.0 |
+| steering | 33.7 | 41.7 | 29.8 | 38.0 |
+| logit lens, every layer | 46.7 | 50.4 | 59.3 | 79.8 |
+| ablation | 33.7 | 40.3 | 31.3 | 36.8 |
+| steering at every decode step (8 tokens) | 243–260 | 269–272 | 150 | 173 |
+| patching, prefix caching off | 65–74 | ~81 | 61–62 | 73–75 |
+
+### Correctness: identical once 0.7 runs as documented
+HF 0.7 and 0.8 outputs are bitwise identical on all 13 rows. On vLLM, logit lens, steering and
+ablation are bitwise identical across the two versions despite the different vLLM releases;
+every-step steering is bitwise identical at the prefill step for all 16 prompts and drifts by at
+most 0.6 logits over the decode steps (16 → 3 prompts still identical by step 8), with no token
+change. Both versions select `FLASH_ATTN` with CUDA graphs off, so the decode drift sits in the
+attention kernels each vLLM release bundles (not isolated further).
+
+### nnsight 0.7 on vLLM reads the prefix cache, contrary to its own guide
+nnsight 0.7's `intervention-gaps/VLLM_GUIDE.md` says nnsight disables prefix caching by default.
+0.7.0 leaves vLLM's default (`enable_prefix_caching=True` in the engine log) and its trace requests
+do not opt out, so a prompt whose first 16-token block was seen before skips the forward on that
+block: the hooks never see those positions, and the reused KV can come from an earlier intervened
+run of the same prompt. The patching cell's shape check does not catch it, because clean and
+corrupt prompts lose the same cached block. Measured on the 16 IOI pairs: exactly the six pairs of
+17+ tokens (0, 3, 9, 10, 12, 15) differ from 0.8 (TV up to 0.99, max |Δlogit| 19); the ten pairs of
+16 tokens or fewer are bitwise identical. With `enable_prefix_caching=false`, 0.7 matches 0.8
+bitwise on every patching row. CounterFact prompts are 4–13 tokens, below one block, so the other
+specs never hit the cache. nnsight 0.8 sets `skip_reading_prefix_cache=True` on every trace request
+(`modeling/vllm/vllm.py`), so its output with the engine cache on equals its output with it off,
+bitwise. The cache hit also made 0.7 patching look faster (58–60 ms against 73–75 ms with the cache
+off). `backends/nnsight-vllm-0-7` now runs with the cache off, the documented form.
+
+### Against fp32, HF bf16 is the outlier on this model
+Scored against `nnsight-hf-fp32`: vLLM bf16 is SUPPORTED on logit lens (top-1 0.97, TV 0.020;
+final layer 0.015) and patching (TV 0.025–0.028); HF bf16 (eager attention) is NUMERICAL_MISMATCH
+(logit lens TV 0.18, final layer 0.16, top-1 0.69; patching TV 0.28–0.33). So the large
+vLLM-vs-`nnsight-hf` gaps on these rows, in this run and in the Delta cross-system run, measure HF
+bf16's own distance from fp32. On 1.5B (section above) the vLLM systems agreed with each other at
+TV 0.136 from HF bf16; no fp32 logit-lens anchor was taken there. The cause on the HF side is not
+isolated.
+
+### Where 0.8's speed comes from
+0.7 wraps every module at load (a forward wrapper plus a sentinel `register_forward_hook`, 373 on
+this model) so PyTorch takes the hook-dispatch path even outside a trace, and runs each mediator on
+an OS thread with queue hand-offs (`intervention/interleaver.py`). 0.8 installs no forward hooks
+(0 counted) and switches greenlets on one thread. Measured on HF in each image
+(`slurm/diag_overhead.py`; raw transformers 28.6 ms): the wrapped model called directly costs 31.7 ms
+on 0.7 against 29.4 ms on 0.8; a one-read trace adds about 6 ms on both; 27 further reads add 3.7 ms
+on 0.7 and 1.9 ms on 0.8 (about 0.14 against 0.07 ms per event).
