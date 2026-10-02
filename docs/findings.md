@@ -705,4 +705,10 @@ an OS thread with queue hand-offs (`intervention/interleaver.py`). 0.8 installs 
 (0 counted) and switches greenlets on one thread. Measured on HF in each image
 (`slurm/diag_overhead.py`; raw transformers 28.6 ms): the wrapped model called directly costs 31.7 ms
 on 0.7 against 29.4 ms on 0.8; a one-read trace adds about 6 ms on both; 27 further reads add 3.7 ms
-on 0.7 and 1.9 ms on 0.8 (about 0.14 against 0.07 ms per event).
+on 0.7 and 1.9 ms on 0.8 (about 0.14 against 0.07 ms per event). On vLLM (prefix caching off,
+vLLM 0.15.1 against 0.19.1): no-intervention request 16.1 against 15.1 ms; a one-read trace adds
+9.5 ms on both; 27 further reads add 4.2 ms on 0.7 and 2.3 ms on 0.8 (0.16 against 0.08 ms per
+event); a read plus a whole-output write costs the same as one read. These fixed and per-event
+costs account for 1–4 ms of the gaps in the table; the rest of the 0.7 cost on the heavier cells
+(8 ms on steering, 20 ms on logit lens, which do vocab-width tensor work in the trace) is not
+isolated.
