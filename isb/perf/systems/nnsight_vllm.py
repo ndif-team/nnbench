@@ -1,14 +1,15 @@
 """nnsight-on-vLLM perf cell: read / steer / qk (system=nnsight_vllm).
 
-Read forms follow isb/methodologies/logit_lens.py; steer follows steering.py. A read saves the
-block output's first element, one [tokens, hidden] tensor per layer, the same volume vllm-lens's
-residual-stream capture moves. The batch runs as one invoke per prompt in a sync trace.
+Read forms follow isb/methodologies/logit_lens.py; steer follows steering.py. A read returns the
+block output's first element to the client, one [tokens, hidden] tensor per layer per forward, the
+same volume vllm-lens's residual-stream capture moves; `transfer_bytes` records what arrived. The
+batch runs as one invoke per prompt in a sync trace.
 """
 from __future__ import annotations
 
 import torch
 
-from ..core import Config, gpu_used_mb, layer_indices, make_prompts, time_op
+from ..core import Config, gpu_used_mb, layer_indices, make_prompts, returned_bytes, time_op
 
 
 def _blocks(model):
@@ -93,25 +94,34 @@ def run(cfg: Config) -> dict:
             return None
         return None
 
-    def body(tracer):
-        if cfg.phase == "prefill":
-            _do_op()
-        else:
-            # decode: per-step op under bounded iteration (the vLLM-safe realization, isb §generate)
-            for _ in tracer.iter[0:n_new]:
-                _do_op()
-
+    # Reads must land in a saved name of the trace frame: the worker returns the trace scope's
+    # saved names, so a value saved inside a helper and dropped never leaves the engine, and the
+    # read would skip the transfer the other systems pay for. `out` is bound above the invokes
+    # (one slot per prompt, merged across requests) and decode steps append per step.
     def once():
         if len(prompts) == 1:
             with model.trace(prompts[0], temperature=0.0, max_tokens=n_new) as tracer:
-                body(tracer)
-            return None, None
+                out = list().save()
+                if cfg.phase == "prefill":
+                    out.append(_do_op())
+                else:
+                    for _ in tracer.iter[0:n_new]:   # bounded iteration (the vLLM-safe realization)
+                        out.append(_do_op())
+            return out, None
         with model.trace(temperature=0.0, max_tokens=n_new) as tracer:
-            for p in prompts:
+            out = [None] * len(prompts)
+            out = out.save()
+            for i, p in enumerate(prompts):
                 with tracer.invoke(p):
-                    body(tracer)
-        return None, None
+                    steps = list()
+                    if cfg.phase == "prefill":
+                        steps.append(_do_op())
+                    else:
+                        for _ in tracer.iter[0:n_new]:
+                            steps.append(_do_op())
+                    out[i] = steps
+        return out, None
 
-    metrics, _ = time_op(once, n_warmup=cfg.n_warmup, n_reps=cfg.n_reps, mem0=mem0)
-    metrics.update({"artifact_kb": 0.0, "transfer_bytes": 0, "correct": None})
+    metrics, out = time_op(once, n_warmup=cfg.n_warmup, n_reps=cfg.n_reps, mem0=mem0)
+    metrics.update({"artifact_kb": 0.0, "transfer_bytes": returned_bytes(out), "correct": None})
     return metrics

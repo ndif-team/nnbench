@@ -120,3 +120,16 @@ if __name__ == "__main__":
                 fn()
             print(f"ok  {name}")
     print("all perf framework tests passed")
+
+
+def test_returned_bytes_counts_nested_tensors_and_activations():
+    import torch
+
+    from isb.perf.core import returned_bytes
+
+    class Out:  # a vLLM RequestOutput carrying a vllm-lens activations mapping
+        activations = {"residual_stream": torch.zeros(2, 3, 4, dtype=torch.bfloat16)}
+
+    payload = [[torch.zeros(5, dtype=torch.float32)], None, (torch.zeros(2, 2, dtype=torch.float16),), Out()]
+    assert returned_bytes(payload) == 5 * 4 + 4 * 2 + 24 * 2
+    assert returned_bytes([None, [None]]) == 0

@@ -165,6 +165,23 @@ def time_op(once, *, n_warmup: int, n_reps: int, mem0=None) -> dict:
     return res, out
 
 
+def returned_bytes(obj) -> int:
+    """Bytes of tensor data in a call's client-side result (nested lists, tuples, dicts, objects with
+    an `activations` mapping). Recorded per cell so reads are compared at equal volume moved."""
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - the GPU cells always have torch
+        torch = None
+    if torch is not None and isinstance(obj, torch.Tensor):
+        return obj.numel() * obj.element_size()
+    if isinstance(obj, dict):
+        return sum(returned_bytes(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(returned_bytes(v) for v in obj)
+    acts = getattr(obj, "activations", None)
+    return returned_bytes(acts) if acts is not None else 0
+
+
 def throughput(cfg: Config, gen_lat_s: float) -> float:
     """Tokens per second over the in-forward (gen) time. Prefill counts prompt tokens; decode counts
     generated tokens (matches the regime being measured)."""

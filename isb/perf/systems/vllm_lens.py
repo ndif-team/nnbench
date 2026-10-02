@@ -6,7 +6,7 @@ path (they do not expose one). Plugin auto-registers on install.
 """
 from __future__ import annotations
 
-from ..core import Config, gpu_used_mb, layer_indices, make_prompts, time_op
+from ..core import Config, gpu_used_mb, layer_indices, make_prompts, returned_bytes, time_op
 
 
 def _wrap(ids):
@@ -56,9 +56,9 @@ def run(cfg: Config) -> dict:
     sp = SamplingParams(temperature=0.0, max_tokens=n_new, extra_args=extra)
 
     def once():
-        llm.generate(prompts, sp)              # activations attach to the RequestOutput
-        return None, None
+        outs = llm.generate(prompts, sp)       # activations attach to the RequestOutput
+        return outs, None
 
-    metrics, _ = time_op(once, n_warmup=cfg.n_warmup, n_reps=cfg.n_reps, mem0=mem0)
-    metrics.update({"artifact_kb": 0.0, "transfer_bytes": 0, "correct": None})
+    metrics, outs = time_op(once, n_warmup=cfg.n_warmup, n_reps=cfg.n_reps, mem0=mem0)
+    metrics.update({"artifact_kb": 0.0, "transfer_bytes": returned_bytes(outs), "correct": None})
     return metrics

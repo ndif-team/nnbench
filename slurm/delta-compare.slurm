@@ -10,6 +10,7 @@
 #                     sync engine, plain vLLM eager and compiled per version, scored vs HF fp32
 #   micro             construct probes (nnsight 0.7 / 0.8 x HF / vLLM async / sync) and the
 #                     perf microbenchmark sweeps (plans/delta_perf_vllm0191.json, ..._vllm0151.json)
+#   perf-read         the perf read cells again (plans/delta_perf_read_*.json)
 # Images come from slurm/delta-build.slurm. Runs and logs land under runs/ and slurm/logs/.
 #SBATCH --account=bdnh-delta-gpu
 #SBATCH --partition=gpuA100x4
@@ -33,6 +34,32 @@ nvidia-smi --query-gpu=index,name,driver_version,memory.used,memory.total --form
 git status --short isb backends
 
 bench() { echo; echo "### $(date -Is) bench.py $*"; $PY scripts/bench.py "$@"; local rc=$?; echo "### rc=$rc"; return $rc; }
+
+# One python per backend image, as scripts/perf.py's ISB_PY_<system> override expects. Each call
+# waits for the GPU to drain afterwards: perf.py starts the next cell's engine at once.
+make_wrappers() {
+    mkdir -p $bin runs/micro-delta/constructs runs/micro-delta/perf
+    for img in vllm-plain-0-19-1 vllm-plain-0-15-1 nnsight-vllm nnsight-vllm-0-7 vllm-lens nnsight-hf nnsight-hf-0-7; do
+        cat > $bin/py-$img <<WRAP
+#!/bin/bash
+apptainer exec --nv --cleanenv --no-home --bind $PWD --bind /tmp \\
+    --bind $ISB_APPTAINER_DIR/volumes/isb-model-cache:/models --pwd $PWD \\
+    --env PYTHONPATH=$PWD,PYTHONDONTWRITEBYTECODE=1,USER=isb,HF_HOME=/models,HF_HUB_CACHE=/models/hub \\
+    --env HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1,XDG_CACHE_HOME=/tmp/cache,VLLM_CACHE_ROOT=/tmp/vllm \\
+    --env TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor,TRITON_CACHE_DIR=/tmp/triton \\
+    --env FLASHINFER_WORKSPACE_BASE=/tmp,CUDA_VISIBLE_DEVICES=0 \\
+    $ISB_APPTAINER_DIR/images/isb-\${img}_local.sif python3 "\$@"
+rc=\$?
+for _ in \$(seq 120); do
+    used=\$(nvidia-smi -i 0 --query-gpu=memory.used --format=csv,noheader,nounits)
+    [ "\$used" -lt 1024 ] && break; sleep 1
+done
+exit \$rc
+WRAP
+        sed -i "s/\\\${img}/$img/" $bin/py-$img; chmod +x $bin/py-$img
+    done
+}
+bin=runs/micro-delta/bin
 
 case "$1" in
 smoke)
@@ -131,28 +158,7 @@ fair)
     exit $?
     ;;
 micro)
-    # One python per backend image, as scripts/perf.py's ISB_PY_<system> override expects. Each
-    # call waits for the GPU to drain afterwards: perf.py starts the next cell's engine at once.
-    bin=runs/micro-delta/bin; mkdir -p $bin runs/micro-delta/constructs runs/micro-delta/perf
-    for img in vllm-plain-0-19-1 vllm-plain-0-15-1 nnsight-vllm nnsight-vllm-0-7 vllm-lens nnsight-hf nnsight-hf-0-7; do
-        cat > $bin/py-$img <<WRAP
-#!/bin/bash
-apptainer exec --nv --cleanenv --no-home --bind $PWD --bind /tmp \\
-    --bind $ISB_APPTAINER_DIR/volumes/isb-model-cache:/models --pwd $PWD \\
-    --env PYTHONPATH=$PWD,PYTHONDONTWRITEBYTECODE=1,USER=isb,HF_HOME=/models,HF_HUB_CACHE=/models/hub \\
-    --env HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1,XDG_CACHE_HOME=/tmp/cache,VLLM_CACHE_ROOT=/tmp/vllm \\
-    --env TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor,TRITON_CACHE_DIR=/tmp/triton \\
-    --env FLASHINFER_WORKSPACE_BASE=/tmp,CUDA_VISIBLE_DEVICES=0 \\
-    $ISB_APPTAINER_DIR/images/isb-\${img}_local.sif python3 "\$@"
-rc=\$?
-for _ in \$(seq 120); do
-    used=\$(nvidia-smi -i 0 --query-gpu=memory.used --format=csv,noheader,nounits)
-    [ "\$used" -lt 1024 ] && break; sleep 1
-done
-exit \$rc
-WRAP
-        sed -i "s/\\\${img}/$img/" $bin/py-$img; chmod +x $bin/py-$img
-    done
+    make_wrappers
     rc=0
     # Construct probes on GPT-2: nnsight's primitive map per version and engine interface.
     for pair in nnsight-hf:hf nnsight-hf-0-7:hf nnsight-vllm:vllm_async nnsight-vllm:vllm_sync \
@@ -174,6 +180,20 @@ WRAP
         $PY scripts/perf.py sweep --plan plans/delta_perf_vllm0151.json --name delta_perf_vllm0151 \
         --run-dir runs/micro-delta/perf --out runs/micro-delta/perf/delta_perf_vllm0151.json || rc=1
     echo "### $(date -Is) micro done rc=$rc"
+    exit $rc
+    ;;
+perf-read)
+    # Rerun of the read cells (and their pure-vLLM baselines) after nnsight's reads were bound to a
+    # saved name, so they ship to the client like vllm-lens's; rows record transfer_bytes.
+    make_wrappers
+    rc=0
+    ISB_PY_pure_vllm=$bin/py-vllm-plain-0-19-1 ISB_PY_nnsight_vllm=$bin/py-nnsight-vllm \
+    ISB_PY_vllm_lens=$bin/py-vllm-lens \
+        $PY scripts/perf.py sweep --plan plans/delta_perf_read_vllm0191.json --name delta_perf_read_vllm0191 \
+        --run-dir runs/micro-delta/perf --out runs/micro-delta/perf/delta_perf_read_vllm0191.json || rc=1
+    ISB_PY_pure_vllm=$bin/py-vllm-plain-0-15-1 ISB_PY_nnsight_vllm=$bin/py-nnsight-vllm-0-7 \
+        $PY scripts/perf.py sweep --plan plans/delta_perf_read_vllm0151.json --name delta_perf_read_vllm0151 \
+        --run-dir runs/micro-delta/perf --out runs/micro-delta/perf/delta_perf_read_vllm0151.json || rc=1
     exit $rc
     ;;
 *) echo "unknown stage $1"; exit 2 ;;
