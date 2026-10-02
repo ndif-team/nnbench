@@ -8,6 +8,7 @@ primitive. Probe registration order is safest-first for exactly this reason.
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -25,6 +26,21 @@ class ProbeResult:
     state: str
     note: str
     latency_s: float | None = None
+    detail: str | None = None
+
+
+def _error_note(e: BaseException) -> tuple[str, str]:
+    """(`Type: message`, full text) for a probe's exception. A vLLM worker error carries the
+    remote traceback in its message, whose last line is a caret marker, so the note is the last
+    line that reads like an exception (else the last message line), never a source excerpt."""
+    text = str(e)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    msgs = [ln for ln in lines if not set(ln) <= set("^~ ") and not ln.startswith(("File ", "Traceback"))]
+    errlike = [ln for ln in msgs if re.match(r"^[A-Za-z_][\w.]*(Error|Exception|Exit)\b", ln)]
+    head = errlike[-1] if errlike else (msgs[-1] if msgs else "")
+    name = type(e).__name__
+    note = head if head.startswith(name) else (f"{name}: {head}" if head else name)
+    return note, text[:2000]
 
 
 def _run_one(fn, be, model, timeout_s: float):
@@ -34,8 +50,7 @@ def _run_one(fn, be, model, timeout_s: float):
         try:
             box["result"] = fn(be, model)
         except Exception as e:  # clean per-probe ERROR (the runner records, never crashes)
-            msg = str(e).strip().splitlines()
-            box["error"] = msg[-1] if msg else type(e).__name__
+            box["error"], box["detail"] = _error_note(e)
         # a watchdog timeout leaves box empty -> HANG
 
     t = threading.Thread(target=target, daemon=True)
@@ -44,11 +59,11 @@ def _run_one(fn, be, model, timeout_s: float):
     t.join(timeout_s)
     dt = time.perf_counter() - t0
     if t.is_alive():
-        return AppState.HANG, f"exceeded {timeout_s:.0f}s watchdog", dt
+        return AppState.HANG, f"exceeded {timeout_s:.0f}s watchdog", dt, None
     if "error" in box:
-        return AppState.ERROR, box["error"], dt
+        return AppState.ERROR, box["error"], dt, box.get("detail")
     state, note = box["result"]
-    return state, note, dt
+    return state, note, dt, None
 
 
 def run_micro(backend_name: str, repo: str = "openai-community/gpt2",
@@ -62,8 +77,8 @@ def run_micro(backend_name: str, repo: str = "openai-community/gpt2",
         for name in names_for(backend_name):
             if only and name not in only:
                 continue
-            state, note, dt = _run_one(PROBES[(name, backend_name)], be, model, timeout_s)
-            results.append(ProbeResult(name, backend_name, state, note, dt))
+            state, note, dt, detail = _run_one(PROBES[(name, backend_name)], be, model, timeout_s)
+            results.append(ProbeResult(name, backend_name, state, note, dt, detail))
             print(f"  {name:<20}{state:<18}{dt:6.1f}s  {note}", flush=True)
             if state == AppState.HANG:
                 print("  -- HANG poisons the engine; aborting this backend's remaining probes",
@@ -90,7 +105,8 @@ def micro_run_file(backend_name: str, repo: str, results: list,
     prov["coordinates"] = run_coordinates(
         spec="constructs", methodology="constructs", family="gpt2", repo=repo,
         interface=backend_name, cases=[{"label": r.name} for r in results])
-    meta = {("probe", r.name): {"state": r.state, "note": r.note, "latency_s": r.latency_s}
+    meta = {("probe", r.name): {"state": r.state, "note": r.note, "latency_s": r.latency_s,
+                                "detail": r.detail}
             for r in results}
     return save_run(out_dir, run_name, {("__meta__",): meta}, prov)
 

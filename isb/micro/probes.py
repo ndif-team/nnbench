@@ -25,6 +25,8 @@ as possible — the runner stops a backend's sweep at the first HANG.
 """
 from __future__ import annotations
 
+import re
+
 import torch
 import torch.nn.functional as F
 
@@ -32,6 +34,23 @@ from ..oracle.equivalence import compare, is_equivalent
 from ..states import AppState
 
 PROMPT = "The Eiffel Tower is in"
+
+
+def _nnsight_at_least(major: int, minor: int) -> bool:
+    """The installed nnsight release line, for constructs whose documented form changed."""
+    from importlib.metadata import version
+
+    parts = [int(x) for x in re.findall(r"\d+", version("nnsight"))[:2]]
+    return tuple(parts) >= (major, minor)
+
+
+def _zero_attn6(block):
+    """Zero GPT-2 attention output at the given block (tuple- or tensor-shaped), replacement form."""
+    out = block.attn.output
+    if isinstance(out, tuple):
+        block.attn.output = (torch.zeros_like(out[0]), *out[1:])
+    else:
+        block.attn.output = torch.zeros_like(out)
 CLEAN, CORRUPT = "The Eiffel Tower is in", "The Colosseum is in"
 
 PROBES = {}  # (name, backend) -> fn(be, model) -> (state, note)
@@ -252,9 +271,14 @@ def edit_hf(be, model):
         base = model.lm_head.output[:, -1, :].save()
     with model.trace(PROMPT):
         ref_abl = ablate_inline(model).save()
-    with model.edit() as edited:
-        out = edited.transformer.h[6].attn.output
-        edited.transformer.h[6].attn.output = (torch.zeros_like(out[0]), *out[1:])
+    if _nnsight_at_least(0, 8):              # Envoy.edit binds (tracer, edited) since 0.8
+        with model.edit() as (_tracer, edited):
+            out = edited.transformer.h[6].attn.output
+            edited.transformer.h[6].attn.output = (torch.zeros_like(out[0]), *out[1:])
+    else:
+        with model.edit() as edited:
+            out = edited.transformer.h[6].attn.output
+            edited.transformer.h[6].attn.output = (torch.zeros_like(out[0]), *out[1:])
     with edited.trace(PROMPT):
         ed = edited.lm_head.output[:, -1, :].save()
     with model.trace(PROMPT):
@@ -520,6 +544,9 @@ def edit_vllm(be, model):
 
     base = _vllm_trace_saves(be, model, body_base)["base"]
 
+    if _nnsight_at_least(0, 8):
+        return _edit_registration_async(be, model, base)
+
     with model.edit() as edited:
         out = edited.transformer.h[6].attn.output
         if isinstance(out, tuple):
@@ -539,6 +566,47 @@ def edit_vllm(be, model):
     if is_equivalent(compare(_cpu(base), _cpu(ed))):
         return AppState.SILENTLY_WRONG, "edit silently dropped (edited == unedited baseline)"
     return AppState.SUPPORTED, "edit applied (edited logits diverge from baseline)"
+
+
+def _edit_verdict(base, ref, ed, after):
+    """0.8 registration contract (docs/models/vllm-editing.md): the edited request equals the
+    same ablation written in a trace, the edit is non-vacuous, and clear() restores the engine."""
+    if is_equivalent(compare(_cpu(base), _cpu(ed))):
+        return AppState.SILENTLY_WRONG, "edit silently dropped (edited == unedited baseline)"
+    if not is_equivalent(compare(_cpu(base), _cpu(after))):
+        return AppState.SILENTLY_WRONG, "edit still applied after clear()"
+    state, note = _verdict_compare(_cpu(ref), _cpu(ed), "registered edit vs in-trace ablation")
+    return state, f"{note}; cleared engine matches baseline"
+
+
+def _edit_registration_async(be, model, base):
+    async def _go():
+        with model.trace(PROMPT, temperature=0.0, top_p=1, max_tokens=1) as t_ref:
+            _zero_attn6(model.transformer.h[6])
+            ref = model.logits.save()  # noqa: F841
+        last_ref = None
+        async for output in t_ref.backend:
+            last_ref = output
+        async with model.edit() as (_tracer, edit):
+            _zero_attn6(model.transformer.h[6])
+        try:
+            with model.trace(PROMPT, temperature=0.0, top_p=1, max_tokens=1) as t_ed:
+                ed = model.logits.save()  # noqa: F841
+            last_ed = None
+            async for output in t_ed.backend:
+                last_ed = output
+        finally:
+            await edit.aclear()
+        with model.trace(PROMPT, temperature=0.0, top_p=1, max_tokens=1) as t_after:
+            after = model.logits.save()  # noqa: F841
+        last_after = None
+        async for output in t_after.backend:
+            last_after = output
+        return (_vllm_saves(last_ref)["ref"], _vllm_saves(last_ed)["ed"],
+                _vllm_saves(last_after)["after"])
+
+    ref, ed, after = be._run_coro(_go())
+    return _edit_verdict(base, ref, ed, after)
 
 
 @probe("barrier", "vllm_async")
@@ -725,8 +793,13 @@ def _iter_sync(be, model, bounded: bool):
             for _step in tracer.iter[:]:
                 rows.append(model.logits)
     form = "bounded iter[0:3]" if bounded else "unbounded iter[:] (the documented idiom)"
-    if len(rows) != 3:
-        return AppState.SILENTLY_WRONG, f"{form}: expected 3 per-step reads, got {len(rows)}"
+    try:
+        n_rows = len(rows)
+    except UnboundLocalError as e:       # the saved list never bound: every per-step save dropped
+        raise RuntimeError(f"per-step saves dropped under {form}: the saved list never bound; "
+                           "see nnsight docs/developing/vllm-construct-gaps.md §1") from e
+    if n_rows != 3:
+        return AppState.SILENTLY_WRONG, f"{form}: expected 3 per-step reads, got {n_rows}"
     state, note = _verdict_compare(_cpu(ref), _cpu(rows[0]), "step0 vs single-step trace")
     return state, f"{form}: 3 steps; {note}"
 
@@ -763,6 +836,21 @@ def edit_vllm_sync(be, model):
     drops the edit, the baseline-equality branch catches the SILENTLY_WRONG outcome."""
     with model.trace(PROMPT, **_S):
         base = model.logits.save()
+
+    if _nnsight_at_least(0, 8):          # 0.8: engine-wide registration (vllm-editing.md)
+        with model.trace(PROMPT, **_S):
+            _zero_attn6(model.transformer.h[6])
+            ref = model.logits.save()
+        with model.edit() as (_tracer, edit):
+            _zero_attn6(model.transformer.h[6])
+        try:
+            with model.trace(PROMPT, **_S):
+                ed = model.logits.save()
+        finally:
+            edit.clear()
+        with model.trace(PROMPT, **_S):
+            after = model.logits.save()
+        return _edit_verdict(base, ref, ed, after)
 
     with model.edit() as edited:
         out = edited.transformer.h[6].attn.output

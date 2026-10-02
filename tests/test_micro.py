@@ -45,7 +45,17 @@ def test_probe_watchdog_marks_hang_and_error():
     def raises(be, model):
         raise RuntimeError("boom\nlast line wins")
 
-    state, note, _ = _run_one(hangs, None, None, timeout_s=0.2)
+    state, note, _, _ = _run_one(hangs, None, None, timeout_s=0.2)
     assert state == AppState.HANG
-    state, note, _ = _run_one(raises, None, None, timeout_s=5)
-    assert state == AppState.ERROR and note == "last line wins"
+    state, note, _, detail = _run_one(raises, None, None, timeout_s=5)
+    assert state == AppState.ERROR and note == "RuntimeError: last line wins"
+    assert detail == "boom\nlast line wins"
+
+    def raises_from_worker(be, model):     # a vLLM worker error: remote traceback, caret last
+        raise RuntimeError("worker failed\nTraceback (most recent call last):\n"
+                           "  File \"w.py\", line 3, in step\n    x = h.neuron\n"
+                           "AttributeError: 'Envoy' object has no attribute 'neuron'\n"
+                           "    x = h.neuron\n        ^^^^^^^^")
+
+    state, note, _, _ = _run_one(raises_from_worker, None, None, timeout_s=5)
+    assert note == "RuntimeError: AttributeError: 'Envoy' object has no attribute 'neuron'"

@@ -54,11 +54,10 @@ def run(cfg: Config) -> dict:
     idx = layer_indices(cfg, len(blocks))
     n_new = cfg.eff_new_tokens()
 
-    # steer direction: a fixed unit vector at the block's hidden size (perf only; value irrelevant).
-    steer_vec = None
-
+    # nnsight 0.8 recompiles the trace body from source, outside this function's scope, so the
+    # per-op helper holds no `nonlocal` state: the steer adds a constant (the same elementwise add
+    # over [tokens, hidden] a cached vector would cost; the value is irrelevant for perf).
     def _do_op():
-        nonlocal steer_vec
         if cfg.op == "read":
             return [_resid(blocks[i].output).save() for i in idx]
         if cfg.op == "qk":
@@ -89,10 +88,7 @@ def run(cfg: Config) -> dict:
                     out = blocks[i].output
                     is_tuple = isinstance(out, tuple)
                     hidden = out[0] if is_tuple else out
-                    if steer_vec is None or steer_vec.shape[-1] != hidden.shape[-1]:
-                        steer_vec = torch.zeros(hidden.shape[-1], dtype=hidden.dtype,
-                                                device=hidden.device) + 1e-3
-                    new_hidden = hidden + steer_vec
+                    new_hidden = hidden + 1e-3
                     blocks[i].output = (new_hidden, *out[1:]) if is_tuple else new_hidden
             return None
         return None

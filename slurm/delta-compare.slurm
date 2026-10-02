@@ -139,7 +139,7 @@ micro)
 #!/bin/bash
 apptainer exec --nv --cleanenv --no-home --bind $PWD --bind /tmp \\
     --bind $ISB_APPTAINER_DIR/volumes/isb-model-cache:/models --pwd $PWD \\
-    --env PYTHONDONTWRITEBYTECODE=1,USER=isb,HF_HOME=/models,HF_HUB_CACHE=/models/hub \\
+    --env PYTHONPATH=$PWD,PYTHONDONTWRITEBYTECODE=1,USER=isb,HF_HOME=/models,HF_HUB_CACHE=/models/hub \\
     --env HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1,XDG_CACHE_HOME=/tmp/cache,VLLM_CACHE_ROOT=/tmp/vllm \\
     --env TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor,TRITON_CACHE_DIR=/tmp/triton \\
     --env FLASHINFER_WORKSPACE_BASE=/tmp,CUDA_VISIBLE_DEVICES=0 \\
