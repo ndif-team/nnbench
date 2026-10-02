@@ -43,6 +43,7 @@ def gpu_used_mb():
 ROW_CFG_FIELDS = (
     "system", "op", "repo", "footprint", "token_mode", "phase", "destination",
     "tensor_parallel_size", "prompt_len", "batch", "new_tokens", "enforce_eager", "layer",
+    "enable_prefix_caching",
 )
 # Workload key that a cell shares with its pure_vllm baseline (op/footprint/token_mode/
 # destination excluded: the baseline is op-agnostic, it is just the engine running the workload).
@@ -65,6 +66,10 @@ class Config:
     layer: int | None = None          # explicit layer for footprint="one" (default: middle)
     # engine + fairness
     enforce_eager: bool = True
+    # Off for every system: the reps repeat the same synthetic prompts, so with the engine cache on
+    # a system that does not opt its requests out (pure_vllm) serves the prefill from cache while
+    # one that does (nnsight 0.8, vllm-lens hook requests) recomputes it.
+    enable_prefix_caching: bool = False
     dtype: str = "auto"
     gpu_memory_utilization: float = 0.9
     max_model_len: int = 2048

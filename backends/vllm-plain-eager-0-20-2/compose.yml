@@ -1,10 +1,10 @@
 services:
   runner:
-    image: isb-vllm-plain-0-19-1:local
+    image: isb-vllm-plain-0-20-2:local
     build:
       context: ../_plain-vllm
       args:
-        VLLM_IMAGE: vllm/vllm-openai:v0.19.1
+        VLLM_IMAGE: vllm/vllm-openai:v0.20.2
     working_dir: /workspace
     entrypoint: [python3, /backend/run.py]
     user: "${ISB_UID:-1000}:${ISB_GID:-1000}"
@@ -23,8 +23,8 @@ services:
       HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
       TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-0}
       VLLM_CACHE_ROOT: /tmp/vllm
-      ISB_BACKEND: ${ISB_BACKEND:-vllm-plain-0-19-1}
-      ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","gpu_memory_utilization":0.85,"enable_prefix_caching":false}'
+      ISB_BACKEND: ${ISB_BACKEND:-vllm-plain-eager-0-20-2}
+      ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","gpu_memory_utilization":0.85,"enable_prefix_caching":false,"enforce_eager":true}'
     volumes:
       - ../..:/workspace:ro
       - ../_plain-vllm:/backend:ro

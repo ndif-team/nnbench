@@ -6,6 +6,10 @@
 #   full              step 3 + the fp32 precision check + HTML export and tarball
 #   nnsight-versions  nnsight 0.7.0 vs 0.8.0rc1 on HF and vLLM (smoke gate, then five specs)
 #   overhead IMG:hf|vllm ...   per-trace overhead decomposition (slurm/diag_overhead.py)
+#   fair SPEC ...     the fairness-controlled comparison: every system incl. nnsight 0.7 and the
+#                     sync engine, plain vLLM eager and compiled per version, scored vs HF fp32
+#   micro             construct probes (nnsight 0.7 / 0.8 x HF / vLLM async / sync) and the
+#                     perf microbenchmark sweeps (plans/delta_perf_vllm0191.json, ..._vllm0151.json)
 # Images come from slurm/delta-build.slurm. Runs and logs land under runs/ and slurm/logs/.
 #SBATCH --account=bdnh-delta-gpu
 #SBATCH --partition=gpuA100x4
@@ -111,6 +115,65 @@ overhead)
             > runs/nnsight-versions-diag/overhead/$img.log 2>&1 || { echo "overhead $img failed rc=$?"; rc=1; }
         sleep 20
     done
+    exit $rc
+    ;;
+fair)
+    # Fairness-controlled rerun: prefix caching off on every vLLM engine, an eager and a compiled
+    # plain vLLM per version (overhead matched to each system's execution mode), nnsight through
+    # both its async and sync engines, and HF fp32 as the reference (HF bf16 is itself scored).
+    shift
+    bench run --spec "$@" \
+        --backends nnsight-hf-fp32 nnsight-hf nnsight-hf-0-7 \
+                   nnsight-vllm nnsight-vllm-sync nnsight-vllm-0-7 vllm-lens interp-engine transformer-lens \
+                   vllm-plain-0-15-1 vllm-plain-0-19-1 vllm-plain-0-20-2 vllm-plain-0-28-0 \
+                   vllm-plain-eager-0-15-1 vllm-plain-eager-0-19-1 vllm-plain-eager-0-20-2 vllm-plain-eager-0-28-0 \
+        --reference nnsight-hf-fp32 --gpu 0 --timeout 3600 --out runs/fair-delta
+    exit $?
+    ;;
+micro)
+    # One python per backend image, as scripts/perf.py's ISB_PY_<system> override expects. Each
+    # call waits for the GPU to drain afterwards: perf.py starts the next cell's engine at once.
+    bin=runs/micro-delta/bin; mkdir -p $bin runs/micro-delta/constructs runs/micro-delta/perf
+    for img in vllm-plain-0-19-1 vllm-plain-0-15-1 nnsight-vllm nnsight-vllm-0-7 vllm-lens nnsight-hf nnsight-hf-0-7; do
+        cat > $bin/py-$img <<WRAP
+#!/bin/bash
+apptainer exec --nv --cleanenv --no-home --bind $PWD --bind /tmp \\
+    --bind $ISB_APPTAINER_DIR/volumes/isb-model-cache:/models --pwd $PWD \\
+    --env PYTHONDONTWRITEBYTECODE=1,USER=isb,HF_HOME=/models,HF_HUB_CACHE=/models/hub \\
+    --env HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1,XDG_CACHE_HOME=/tmp/cache,VLLM_CACHE_ROOT=/tmp/vllm \\
+    --env TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor,TRITON_CACHE_DIR=/tmp/triton \\
+    --env FLASHINFER_WORKSPACE_BASE=/tmp,CUDA_VISIBLE_DEVICES=0 \\
+    $ISB_APPTAINER_DIR/images/isb-\${img}_local.sif python3 "\$@"
+rc=\$?
+for _ in \$(seq 120); do
+    used=\$(nvidia-smi -i 0 --query-gpu=memory.used --format=csv,noheader,nounits)
+    [ "\$used" -lt 1024 ] && break; sleep 1
+done
+exit \$rc
+WRAP
+        sed -i "s/\\\${img}/$img/" $bin/py-$img; chmod +x $bin/py-$img
+    done
+    rc=0
+    # Construct probes on GPT-2: nnsight's primitive map per version and engine interface.
+    for pair in nnsight-hf:hf nnsight-hf-0-7:hf nnsight-vllm:vllm_async nnsight-vllm:vllm_sync \
+                nnsight-vllm-0-7:vllm_async nnsight-vllm-0-7:vllm_sync; do
+        img=${pair%%:*}; be=${pair##*:}
+        echo "### $(date -Is) constructs $img $be"
+        timeout 2400 $bin/py-$img scripts/micro.py --backend $be --repo openai-community/gpt2 \
+            --out runs/micro-delta/constructs --name $img-$be \
+            > runs/micro-delta/constructs/$img-$be.log 2>&1 || { echo "constructs $img $be rc=$?"; rc=1; }
+    done
+    # Perf microbenchmark: one sweep per vLLM version, each with its own pure-vLLM baseline.
+    echo "### $(date -Is) perf vLLM 0.19.1"
+    ISB_PY_pure_vllm=$bin/py-vllm-plain-0-19-1 ISB_PY_nnsight_vllm=$bin/py-nnsight-vllm \
+    ISB_PY_vllm_lens=$bin/py-vllm-lens \
+        $PY scripts/perf.py sweep --plan plans/delta_perf_vllm0191.json --name delta_perf_vllm0191 \
+        --run-dir runs/micro-delta/perf --out runs/micro-delta/perf/delta_perf_vllm0191.json || rc=1
+    echo "### $(date -Is) perf vLLM 0.15.1"
+    ISB_PY_pure_vllm=$bin/py-vllm-plain-0-15-1 ISB_PY_nnsight_vllm=$bin/py-nnsight-vllm-0-7 \
+        $PY scripts/perf.py sweep --plan plans/delta_perf_vllm0151.json --name delta_perf_vllm0151 \
+        --run-dir runs/micro-delta/perf --out runs/micro-delta/perf/delta_perf_vllm0151.json || rc=1
+    echo "### $(date -Is) micro done rc=$rc"
     exit $rc
     ;;
 *) echo "unknown stage $1"; exit 2 ;;

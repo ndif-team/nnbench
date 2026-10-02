@@ -32,12 +32,20 @@ def _compatible(candidate, reference, cexec, rexec):
         raise ValueError("benchmark source differs between compared jobs")
 
 
+def _eager(provenance):
+    """Whether the job's engine ran eager (no torch.compile / CUDA graphs), as its backend recorded."""
+    return bool(provenance.get("engine", {}).get("params", {}).get("enforce_eager", False))
+
+
 def attach_plain_vllm(rows, results):
     """Whole-system overhead (design.md §12.14): each timed row on a vLLM engine is divided by the
-    no-intervention request of a plain-vLLM job at the same vLLM version and workload. A plain job
-    is one whose provenance declares engine mode "plain"; its `__vanilla__` record is the latency.
-    `results` maps backend -> {"provenance", "auxiliary_calls"}; a provenance without an engine
-    record (older artifacts) matches nothing."""
+    no-intervention request of a plain-vLLM job at the same vLLM version, execution mode (eager or
+    compiled) and workload. A plain job is one whose provenance declares engine mode "plain"; its
+    `__vanilla__` record is the latency. Matching the mode keeps an eager-only system's ratio from
+    absorbing the eager-vs-CUDA-graph gap; `overhead_vs_plain_vllm_default` additionally divides
+    an eager row by vLLM's default compiled engine when that job is present, the cost a user pays
+    relative to plain vLLM as shipped. `results` maps backend -> {"provenance", "auxiliary_calls"};
+    a provenance without an engine record (older artifacts) matches nothing."""
     plain = {}
     for backend, result in results.items():
         provenance = result["provenance"]
@@ -47,7 +55,8 @@ def attach_plain_vllm(rows, results):
             role, workload = call["key"]
             latency = call["record"].get("median_latency_ms")
             if role == "__vanilla__" and latency:
-                plain[(provenance["client"].get("vllm"), workload)] = (backend, latency)
+                key = (provenance["client"].get("vllm"), _eager(provenance), workload)
+                plain[key] = (backend, latency)
     for row in rows:
         result = results.get(row["backend"])
         if result is None or row.get("median_latency_ms") is None:
@@ -55,10 +64,15 @@ def attach_plain_vllm(rows, results):
         provenance = result["provenance"]
         if provenance.get("engine", {}).get("kind") != "vllm":
             continue
-        match = plain.get((provenance["client"].get("vllm"), row.get("workload")))
+        version, eager = provenance["client"].get("vllm"), _eager(provenance)
+        match = plain.get((version, eager, row.get("workload")))
         if match:
             row.update(plain_vllm=match[0], plain_vllm_ms=match[1],
                        overhead_vs_plain_vllm=row["median_latency_ms"] / match[1])
+        default = plain.get((version, False, row.get("workload")))
+        if eager and default:
+            row.update(plain_vllm_default=default[0], plain_vllm_default_ms=default[1],
+                       overhead_vs_plain_vllm_default=row["median_latency_ms"] / default[1])
 
 
 def score_experiment(directory, backends, reference=None, comparison="correctness"):

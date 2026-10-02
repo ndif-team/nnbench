@@ -30,6 +30,7 @@ def run(cfg: Config) -> dict:
         tensor_parallel_size=cfg.tensor_parallel_size,
         gpu_memory_utilization=cfg.gpu_memory_utilization,
         enforce_eager=cfg.enforce_eager,
+        enable_prefix_caching=cfg.enable_prefix_caching,
     )
     prompts = [_wrap(ids) for ids in make_prompts(cfg)]
     n_new = cfg.eff_new_tokens()

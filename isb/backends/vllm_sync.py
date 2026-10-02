@@ -25,13 +25,36 @@ class VLLMSyncBackend(VLLMBackend):
     # dtype + trust_remote_code come from VLLMBackend — the engine-config shared with the async/serve
     # backends, so the driver can splat the same spec.vllm_kwargs into any of them.
 
-    def load(self, repo: str, gpu_memory_utilization: float = 0.2):
+    def __init__(self, dtype: str | None = None, trust_remote_code: bool = False,
+                 max_model_len: int | None = None, tokenizer: str | None = None,
+                 enable_prefix_caching: bool | None = None,
+                 gpu_memory_utilization: float = 0.2):
+        super().__init__(dtype=dtype, trust_remote_code=trust_remote_code,
+                         max_model_len=max_model_len, tokenizer=tokenizer,
+                         enable_prefix_caching=enable_prefix_caching)
+        # Same role as the async backend's knob: a backend directory running the sync engine as
+        # its system under test sizes it through ISB_ENGINE_OPTIONS; the async run's batched twin
+        # passes its own fraction to load().
+        self.gpu_memory_utilization = gpu_memory_utilization
+
+    def load(self, repo: str, gpu_memory_utilization: float | None = None):
         from nnsight.modeling.vllm import VLLM
 
+        if gpu_memory_utilization is None:
+            gpu_memory_utilization = self.gpu_memory_utilization
         return VLLM(
             repo, mode="sync", dispatch=True,
             gpu_memory_utilization=gpu_memory_utilization, **self._engine_kwargs(),
         )
+
+    def vanilla(self, model, prompt, *, new_tokens):
+        """A request straight to nnsight's `vllm.LLM` entrypoint with no trace: the same engine and
+        worker, nothing attached."""
+        from vllm import SamplingParams
+
+        model.vllm_entrypoint.generate(
+            [prompt], SamplingParams(temperature=0.0, top_p=1, max_tokens=new_tokens),
+            use_tqdm=False)
 
     def run(self, model, prompts, build):
         """Single synchronous trace; the saved value binds in-frame (the sync engine

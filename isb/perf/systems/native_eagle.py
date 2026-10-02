@@ -43,6 +43,7 @@ def run(cfg: Config) -> dict:
         tensor_parallel_size=cfg.tensor_parallel_size,
         gpu_memory_utilization=cfg.gpu_memory_utilization,
         enforce_eager=cfg.enforce_eager,
+        enable_prefix_caching=cfg.enable_prefix_caching,
         speculative_config={
             "method": "extract_hidden_states",
             "num_speculative_tokens": 1,

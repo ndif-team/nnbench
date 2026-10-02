@@ -45,6 +45,7 @@ def run(cfg: Config) -> dict:
         enforce_eager=cfg.enforce_eager, dtype=cfg.dtype, max_model_len=cfg.max_model_len,
         tensor_parallel_size=cfg.tensor_parallel_size,
         gpu_memory_utilization=cfg.gpu_memory_utilization,
+        enable_prefix_caching=cfg.enable_prefix_caching,
     )
     hf = llm.llm_engine.model_config.hf_config
     layers = layer_indices(cfg, hf.num_hidden_layers)

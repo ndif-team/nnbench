@@ -210,7 +210,8 @@ def _load_sync_twin(be, repo):
     if be.tensor_parallel_size > 1 or be.pipeline_parallel_size > 1:
         return None
     twin = VLLMSyncBackend(dtype=be.dtype, trust_remote_code=be.trust_remote_code,
-                           max_model_len=be.max_model_len, tokenizer=be.tokenizer)
+                           max_model_len=be.max_model_len, tokenizer=be.tokenizer,
+                           enable_prefix_caching=be.enable_prefix_caching)
     return twin, twin.load(repo, gpu_memory_utilization=be.gpu_memory_utilization)
 
 

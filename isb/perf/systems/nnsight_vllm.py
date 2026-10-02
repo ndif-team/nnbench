@@ -1,10 +1,8 @@
 """nnsight-on-vLLM perf cell: read / steer / qk (system=nnsight_vllm).
 
-SCAFFOLD. The structure (engine config, prompts, op over resolved blocks, split timer) is final,
-but the exact trace idioms (decode iteration, multi-prompt invokes, the steer write form, the Q/K
-access path) must be VERIFIED in the nnsight-serve-test env against the current nnsight vLLM
-contract. Read forms follow isb/methodologies/logit_lens.py; steer follows steering.py. Marked
-inline where verification is required.
+Read forms follow isb/methodologies/logit_lens.py; steer follows steering.py. A read saves the
+block output's first element, one [tokens, hidden] tensor per layer, the same volume vllm-lens's
+residual-stream capture moves. The batch runs as one invoke per prompt in a sync trace.
 """
 from __future__ import annotations
 
@@ -42,13 +40,16 @@ def run(cfg: Config) -> dict:
     kw = dict(
         dispatch=True, dtype=cfg.dtype, max_model_len=cfg.max_model_len,
         gpu_memory_utilization=cfg.gpu_memory_utilization,
+        enable_prefix_caching=cfg.enable_prefix_caching,
     )
     if cfg.tensor_parallel_size > 1:
         kw["tensor_parallel_size"] = cfg.tensor_parallel_size
     model = VLLM(cfg.repo, **kw)                 # sync mode; async/serve are separate systems later
 
-    ids = make_prompts(cfg)
-    prompt = ids[0]                              # VERIFY: multi-prompt = per-prompt tracer.invoke (batch>1 TODO)
+    # Every prompt of the batch runs: one invoke per prompt in a single sync trace (the documented
+    # multi-invoke form; vLLM schedules the invokes as concurrent requests). Timing only prompt 0
+    # while throughput counts `batch` prompts credited nnsight with work it never did.
+    prompts = make_prompts(cfg)
     blocks = _blocks(model)
     idx = layer_indices(cfg, len(blocks))
     n_new = cfg.eff_new_tokens()
@@ -96,15 +97,23 @@ def run(cfg: Config) -> dict:
             return None
         return None
 
-    def once():
+    def body(tracer):
         if cfg.phase == "prefill":
-            with model.trace(prompt, temperature=0.0, max_tokens=1):
+            _do_op()
+        else:
+            # decode: per-step op under bounded iteration (the vLLM-safe realization, isb §generate)
+            for _ in tracer.iter[0:n_new]:
                 _do_op()
+
+    def once():
+        if len(prompts) == 1:
+            with model.trace(prompts[0], temperature=0.0, max_tokens=n_new) as tracer:
+                body(tracer)
             return None, None
-        # decode: per-step op under bounded iteration (the vLLM-safe realization, isb backend §generate)
-        with model.trace(prompt, temperature=0.0, max_tokens=n_new) as tracer:
-            for _ in tracer.iter[0:n_new]:      # VERIFY idiom against current nnsight
-                _do_op()
+        with model.trace(temperature=0.0, max_tokens=n_new) as tracer:
+            for p in prompts:
+                with tracer.invoke(p):
+                    body(tracer)
         return None, None
 
     metrics, _ = time_op(once, n_warmup=cfg.n_warmup, n_reps=cfg.n_reps, mem0=mem0)
