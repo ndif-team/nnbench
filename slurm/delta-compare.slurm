@@ -199,6 +199,18 @@ perf-read)
         --run-dir runs/micro-delta/perf --out runs/micro-delta/perf/delta_perf_read_vllm0151.json || rc=1
     exit $rc
     ;;
+optimal-smoke)
+    # Four prompts per spec through every optimal backend whose image exists.
+    out=runs/optimal-smoke
+    rc=0
+    opt="nnsight-vllm-opt vllm-lens-opt interp-engine-static transformer-lens-opt"
+    [ -f $ISB_APPTAINER_DIR/images/isb-nnsight-vllm-0-28-0_local.sif ] && opt="$opt nnsight-vllm-taps"
+    bench run --spec cmp_logit_lens cmp_steering cmp_gen_steering cmp_ablation --data counterfact:4 \
+        --backends nnsight-hf-fp32 $opt --reference nnsight-hf-fp32 --gpu 0 --out $out || rc=1
+    bench run --spec cmp_activation_patching --data mib/ioi:4 \
+        --backends nnsight-hf-fp32 $opt --reference nnsight-hf-fp32 --gpu 0 --out $out || rc=1
+    exit $rc
+    ;;
 optimal)
     # General vs optimal realization per system, on one node: the general cells (as in `fair`)
     # and each system's fastest documented form for the same workload.
