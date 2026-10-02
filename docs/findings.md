@@ -669,9 +669,10 @@ off, plus `nnsight-hf-fp32` as reference). Model is 7B, not the 1.5B of the cros
 ### Correctness: identical once 0.7 runs as documented
 HF 0.7 and 0.8 outputs are bitwise identical on all 13 rows. On vLLM, logit lens, steering and
 ablation are bitwise identical across the two versions despite the different vLLM releases;
-every-step steering is bitwise identical at the prefill step for all 16 prompts and drifts by at
-most 0.6 logits over the decode steps (16 → 3 prompts still identical by step 8), with no token
-change. Both versions select `FLASH_ATTN` with CUDA graphs off, so the decode drift sits in the
+every-step steering is bitwise identical at the prefill step for all 16 prompts and drifts over the
+decode steps (16 → 3 prompts still identical by step 8; up to 2.1 logits with no token change on
+these saturated alpha-6 rows; the graded alpha-0.5 rows added on 2026-10-02 fork at a near-tie,
+top-1 0.89). Both versions select `FLASH_ATTN` with CUDA graphs off, so the decode drift sits in the
 attention kernels each vLLM release bundles (not isolated further).
 
 ### nnsight 0.7 on vLLM reads the prefix cache, contrary to its own guide
@@ -712,3 +713,104 @@ event); a read plus a whole-output write costs the same as one read. These fixed
 costs account for 1–4 ms of the gaps in the table; the rest of the 0.7 cost on the heavier cells
 (8 ms on steering, 20 ms on logit lens, which do vocab-width tensor work in the trace) is not
 isolated.
+
+## Cross-system comparison on Delta, with fairness controls (2026-10-02)
+
+Specs `cmp_*` on Qwen2.5-7B-Instruct, one A100-SXM4-40GB per job (NCSA Delta, Apptainer launcher).
+Runs `runs/fair-delta/20261002T043817Z-ef7473cf` (logit lens, steering, ablation) and
+`runs/fair-delta/20261002T043817Z-1e4cb4fb` (every-step steering, patching): 17 backends, 85 jobs,
+all completed, each starting on an idle GPU. Reference `nnsight-hf-fp32`. Changes from the first
+Delta pass, each because it skewed the comparison: an eager and a compiled plain vLLM for every
+release, with each system divided by plain vLLM in its own execution mode
+(`overhead_vs_plain_vllm`) and eager systems also by the compiled default
+(`overhead_vs_plain_vllm_default`); engine-wide prefix caching off everywhere (every system already
+kept its intervened requests off the cache; the plain and no-intervention requests did not);
+HF fp32 as the reference; graded steering rows (alpha 0.1 and 0.5); nnsight also through its sync
+engine (`nnsight-vllm-sync`); TransformerLens's transformers pinned.
+
+### Against fp32, every vLLM system is supported; HF bf16 is the outlier
+
+TV against HF fp32 (mean over the workload's prompts):
+
+| workload | HF bf16 | nnsight 0.8 | vLLM-Lens | interp-engine | TransformerLens |
+|---|---|---|---|---|---|
+| logit lens, every layer | 0.181 | 0.019 | 0.019 | 0.018 | 0.016 |
+| patching, last token, layer 21 | 0.327 | 0.025 | 0.026 | 0.027 | 0.024 |
+| patching, all positions, layer 7 | 0.280 | 0.028 | 0.026 | – | – |
+| ablation, MLP at layer 1 | 0.228 | 0.026 | – | – | 0.023 |
+| ablation, attention at layer 1 | 0.240 | 0.028 | – | – | 0.022 |
+| steering, layer 14, alpha 0.1 | 0.117 | 0.002 | 0.001 | 0.001 | 0.001 |
+| steering, token norm, alpha 0.5 | 0.144 | 0.014 | 0.015 | 0.014 | – |
+
+Every vLLM cell above is SUPPORTED; HF bf16 (eager attention, both nnsight releases identically) is
+NUMERICAL_MISMATCH. The NUMERICAL_MISMATCH verdicts of the vLLM systems in the first Delta pass and in
+the 1.5B section above measured HF bf16's distance from fp32. The HF-side cause is not isolated.
+
+### Graded steering rows discriminate, and the systems agree
+At alpha 6 the reference puts probability 1.0000 on ' Rome' for every prompt, so those rows cannot
+tell strengths apart. At alpha 0.1, and at alpha 0.5 with token-norm scaling, every system that
+expresses the operation is within TV 0.015 of fp32 (top-1 0.94 or better). Mean-norm scaling at
+alpha 0.5 still saturates: the mean over the forward's tokens includes the first token's outsized
+norm. On every-step steering at alpha 0.5 every engine drifts from fp32 over the decode steps
+(nnsight on vLLM: TV 0.015 at the prefill, 0.43 by step 8), while vLLM-Lens and interp-engine match
+nnsight on vLLM to TV 0.012–0.015 at every step (token norm). On the mean-norm row vLLM-Lens and
+nnsight agree exactly at the prefill and fork after a near-tie flips (top-1 0.92).
+
+### Running eager costs more on generation, and more on newer vLLM
+Plain vLLM, eager over compiled: one 9-token forward +0.5 ms (0.15.1), +1.4 (0.19.1), +2.6 (0.20.2),
++1.8 (0.28.0); an 8-token generation +7%, +15%, +25%, +33% (compiled stays near 101 ms on every
+release). Against the eager baseline, the eager-only systems' ratios come out 2–19% lower on single
+forwards and 13–25% lower on generation than against the compiled default.
+
+### nnsight's sync and async engines
+Bitwise-identical outputs on all 19 rows. Steering at layer 14: 31.5 ms async, 31.2 ms sync; logit
+lens 68.5 and 63.4 ms; patching 60.5 and 61.1 ms.
+
+### TransformerLens's latency is its readout
+A steering call takes 313.6 ms, 1.04× the same call with no intervention that still returns logits
+(301.9 ms), against 17.9 ms for a request that returns none. The driver rebuilds logits for every
+position on the CPU in fp32 for every call that returns them.
+
+### Construct probes, nnsight 0.7.0 vs 0.8.0rc1 (GPT-2)
+Run with each release's documented form (0.8's `edit` binds `(tracer, edited)`; on vLLM it is an
+engine-wide registration, `async with` on the async engine). Supported of 13: HF 13 / 13 on both;
+vLLM async 7 (0.7) / 8 (0.8); vLLM sync 8 plus one SILENTLY_WRONG `barrier` (0.7) / 9 (0.8).
+0.8 newly passes `edit` and unbounded `tracer.iter[:]` on vLLM (0.7 drops every per-step save under
+its own documented idiom) and raises with a reason for `scan` and `barrier`. Neither release
+bridges sessions across traces on vLLM.
+
+vLLM builds activation modules through a cached registry (`get_act_fn`, a `LazyDict`), so every
+GPT-2 MLP holds the same `act` module; Llama/Qwen's `SiluAndMul` comes from the same kind of cache.
+0.8 gives a shared module one location (`docs/concepts/envoy.md`, "Shared modules"), so
+`h[6].mlp.act.output` after reading layer 6's `c_fc` raises `OutOfOrderError` naming
+`h.0.mlp.act`. 0.7 passed the same probe because its one-shot hook caught the shared module's next
+call, which followed layer 6's `c_fc`; whether 0.7 returns layer 0's value when `act` is read alone
+was not tested. Reading each layer's activation through the MLP's `.source` call site was not
+probed either (the `source_mlp` probe reads `c_fc` that way, supported on both releases).
+
+### Perf microbenchmark on Delta: nnsight 0.8, vLLM-Lens, nnsight 0.7 (2026-10-02)
+`plans/delta_perf_vllm0191.json` (plain vLLM, nnsight 0.8, vLLM-Lens on vLLM 0.19.1) and
+`plans/delta_perf_vllm0151.json` (plain vLLM, nnsight 0.7 on 0.15.1): Qwen2.5-7B-Instruct, 128
+synthetic tokens, batch 1 and 4, prefill and a 64-token decode, eager, prefix caching off, 5
+warm-ups and 10 reps. The read cells were rerun (`plans/delta_perf_read_*.json`) after the nnsight
+cell was found returning nothing: its reads were saved inside a helper, and the worker returns only
+the trace scope's saved names, so they never left the engine (a 28-layer read cost it about what a
+1-layer read did). In the rerun every read cell records the bytes it returned; nnsight and vLLM-Lens
+return identical volumes on every cell (0.9 MB to 153 MB per call). Overhead is latency over plain
+vLLM at the same release, from the same sweep. Runs under `runs/micro-delta/perf/`.
+
+| cell | nnsight 0.8 | vLLM-Lens | nnsight 0.7 |
+|---|---|---|---|
+| steer 1 layer, prefill, batch 1 | +56% | +0% | +75% |
+| steer 28 layers, decode, batch 4 | +86% | +9% | +199% |
+| read 1 layer, prefill, batch 1 (0.9 MB) | +66% | +20% | +82% |
+| read 28 layers, prefill, batch 1 (25.7 MB) | +242% | +293% | +597% |
+| read 28 layers, prefill, batch 4 (103 MB) | +878% | +326% | +2175% |
+| read 28 layers, decode, batch 1 (38 MB) | +75% | +76% | +121% |
+| read 28 layers, decode, batch 4 (153 MB) | +309% | +122% | +546% |
+
+vLLM-Lens adds a fixed steering vector inside the engine's forward and steers for close to nothing;
+nnsight pays a fixed cost per trace plus a cost per layer and decode step for running an intervention
+block. Reads at batch 1 cost the two about the same; at batch 4 nnsight's per-invoke save
+collection costs about twice vLLM-Lens's at large volumes. nnsight 0.8 is cheaper than 0.7 in every
+cell.
