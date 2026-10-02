@@ -11,6 +11,9 @@
 #   micro             construct probes (nnsight 0.7 / 0.8 x HF / vLLM async / sync) and the
 #                     perf microbenchmark sweeps (plans/delta_perf_vllm0191.json, ..._vllm0151.json)
 #   perf-read         the perf read cells again (plans/delta_perf_read_*.json)
+#   optimal SPEC ...  each system's general cells beside its fastest documented realization
+#                     (backends/*-opt, nnsight-vllm-taps, interp-engine-static), plain vLLM
+#                     eager and compiled per version, scored vs HF fp32
 # Images come from slurm/delta-build.slurm. Runs and logs land under runs/ and slurm/logs/.
 #SBATCH --account=bdnh-delta-gpu
 #SBATCH --partition=gpuA100x4
@@ -195,6 +198,20 @@ perf-read)
         $PY scripts/perf.py sweep --plan plans/delta_perf_read_vllm0151.json --name delta_perf_read_vllm0151 \
         --run-dir runs/micro-delta/perf --out runs/micro-delta/perf/delta_perf_read_vllm0151.json || rc=1
     exit $rc
+    ;;
+optimal)
+    # General vs optimal realization per system, on one node: the general cells (as in `fair`)
+    # and each system's fastest documented form for the same workload.
+    shift
+    bench run --spec "$@" \
+        --backends nnsight-hf-fp32 \
+                   nnsight-vllm nnsight-vllm-sync nnsight-vllm-opt nnsight-vllm-taps \
+                   vllm-lens vllm-lens-opt interp-engine interp-engine-static \
+                   transformer-lens transformer-lens-opt \
+                   vllm-plain-0-15-1 vllm-plain-0-19-1 vllm-plain-0-20-2 vllm-plain-0-28-0 \
+                   vllm-plain-eager-0-15-1 vllm-plain-eager-0-19-1 vllm-plain-eager-0-20-2 vllm-plain-eager-0-28-0 \
+        --reference nnsight-hf-fp32 --gpu 0 --timeout 3600 --out runs/optimal-delta
+    exit $?
     ;;
 *) echo "unknown stage $1"; exit 2 ;;
 esac

@@ -18,23 +18,29 @@ class EngineModel:
     tokenizer: object          # the checkpoint's HF tokenizer, used exactly as the nnsight cells do
     config: object             # the checkpoint's HF config; model identity reads its revision
     n_layers: int
+    concurrent: bool = False   # issue independent captures concurrently (cells.py, patching)
 
 
 class InterpEngineBackend(Backend):
     name = "interp_engine"
 
-    def __init__(self, **engine_options):
+    def __init__(self, backend="vllm", concurrent_captures=False, **engine_options):
+        # backend: interp-engine's engine choice (load.py). "vllm" hooks the eager forward and
+        # serves every point; "vllm-static" replays CUDA graphs over the taps it bakes in
+        # (resid_post at every layer by default), its documented fast mode.
+        self.backend = backend
+        self.concurrent_captures = concurrent_captures
         self.engine_options = engine_options
 
     def load(self, repo: str):
         from interp_engine import load_model, sync_model
         from transformers import AutoConfig, AutoTokenizer
 
-        engine = sync_model(load_model(repo, backend="vllm", **self.engine_options))
+        engine = sync_model(load_model(repo, backend=self.backend, **self.engine_options))
         engine.warmup()
         config = AutoConfig.from_pretrained(repo)
         return EngineModel(engine, AutoTokenizer.from_pretrained(repo), config,
-                           config.num_hidden_layers)
+                           config.num_hidden_layers, self.concurrent_captures)
 
     def vanilla(self, model, prompt, *, new_tokens):
         """generate_text with no capture points and no steering spec."""
@@ -50,7 +56,8 @@ def create_backend(spec):
     import cells  # noqa: F401  (registers the interp_engine cells)
 
     run = RunConfig(EngineConfig("vllm", mode="interp-engine", params={
-        **params, "enforce_eager": True, "interp_engine": metadata.version("interp-engine")}))
+        **params, "enforce_eager": params.get("backend", "vllm") == "vllm",
+        "interp_engine": metadata.version("interp-engine")}))
     return InterpEngineBackend(**params), run
 
 

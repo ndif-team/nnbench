@@ -30,6 +30,23 @@ def _capture(model, ids, layers, steering_spec=None):
     return torch.stack([acts[to_address(p)] for p in points])
 
 
+def _capture_pair(model, ids_a, ids_b, layer):
+    """Two independent captures as concurrent requests on the engine's own loop
+    (`capture` is "safe to call concurrently", vllm_backend.py), one round trip instead of two."""
+    import asyncio
+
+    from interp_engine import to_address
+
+    point = f"resid_post.{layer}"
+
+    async def both():
+        m = model.engine.model
+        return await asyncio.gather(m.capture(ids_a, [point]), m.capture(ids_b, [point]))
+
+    acts_a, acts_b = model.engine.runner.run(both())
+    return torch.stack([acts_a[to_address(point)]]), torch.stack([acts_b[to_address(point)]])
+
+
 def _final_logits(model, ids, steering_spec=None):
     """Next-token logits of the last position: the last layer's residual through the model's own
     final norm and unembedding. [1, vocab]"""
@@ -121,8 +138,11 @@ def activation_patching(be, model, prompts, *, layer=6, patch=True, positions="a
         raise Unsupported("each write op carries one d_model vector and a request has one position "
                           "mask, so a different value at every position is not expressible; a "
                           "single-position patch is (a masked AddSpec of clean minus corrupt)")
-    clean = _capture(model, clean_ids, [layer])[0][-1].float()
-    corrupt = _capture(model, corrupt_ids, [layer])[0][-1].float()
+    if model.concurrent:
+        clean, corrupt = (a[0][-1].float() for a in _capture_pair(model, clean_ids, corrupt_ids, layer))
+    else:
+        clean = _capture(model, clean_ids, [layer])[0][-1].float()
+        corrupt = _capture(model, corrupt_ids, [layer])[0][-1].float()
     spec = SteeringSpec(layers={layer: LayerSteeringSpec(
         operations=[AddSpec(vector=clean - corrupt, scale=1.0)])})
     point, captured = f"resid_post.{model.n_layers - 1}", {}
