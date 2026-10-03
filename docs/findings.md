@@ -880,3 +880,36 @@ row NUMERICAL_MISMATCH (TV 0.78); the diagnostic demonstrates a contract violati
 excluded from performance comparison. `_apply_lens_scope` in `vllm_capture/static.py` honours
 `steer_generated`; the drop is on the decode path under graph replay, exact site not isolated.
 Single-forward static writes (steering, patching) are correct.
+
+## vLLM-Hook (IBM) in the Delta comparison and perf microbenchmark (2026-10-03)
+
+IBM/vLLM-Hook at 0e34fdd on vLLM 0.19.1, built-in workers only (`backends/vllm-hook`, rpc storage,
+the `HookLLM` default; `backends/vllm-hook-disk`, `disk-st-async`, the storage `docs/configs.md`
+recommends). Run `runs/vllm-hook-delta/20261003T033445Z-b9314734` (gpua008, with nnsight and
+vLLM-Lens general cells in the same job) and `runs/micro-delta/perf/delta_perf_vllmhook_0191.json`.
+
+- **Coverage: the logit lens only.** Its plugin forces `enforce_eager` on every engine
+  (`_hook_plugin._patched_create_engine_config`). An engine carries one worker extension, so it
+  either reads (`probe_hidden_states`) or steers (`steer_hook_act`). The steer worker adds a fixed
+  vector at the last row of each forward only (`_apply_steer`, `slice_view[-1:]`; commit afdf36a:
+  the last prompt token, then each decoded token). Steering at every prompt position, norm-scaled
+  strengths, generation steering, patching (needs a read and a write) and ablation (no zero op) are
+  unsupported.
+- **Logit lens: 38.0 ms (rpc), 33.8 ms (disk-st-async)**, TV 0.018 vs HF fp32; nnsight 66.8 ms and
+  vLLM-Lens 73.3 ms general cells in the same job; plain vLLM 0.19.1 16.1 ms. It captures the last
+  token in the worker, the plugin's documented strength. The readout is user code: vLLM-Hook
+  returns hidden states without an unembedding, so the cell loads the final norm and `lm_head`
+  from the checkpoint and projects on the GPU in fp32 (the other systems project in the engine
+  in bf16).
+- **Perf microbenchmark, equal bytes (prefill reads, all tokens):** one layer 22–24% over plain
+  vLLM (vLLM-Lens 13–16%, nnsight 40–50%); all 28 layers 84–88% (vLLM-Lens 75–77%, nnsight 71–90%).
+  `last_token` mode, its documented fast path, moves 1/128 the bytes and costs 6–42%; not an
+  equal-work row. Steering at one layer costs 0.7–9.6%, but writes one row per forward where the
+  others write every row.
+- **Decode reads are not comparable, for two reasons in the plugin.** The rpc path pads every
+  decode forward's capture to the prompt length (`get_captured_states`, `pad_sequence`), so a
+  one-layer batch-1 decode read returns 58.7 MB where nnsight and vLLM-Lens return 1.37 MB. And for a
+  batch, `HookLLM.generate` merges probes onto `outputs[0]` keeping only each request's first
+  forward (`p[cache_key][layer][tensor_key][0]`): decode steps are captured on the GPU, then silently
+  dropped from what the caller receives (batch-4 decode bytes equal batch-4 prefill bytes). The
+  second is a silent data loss in vLLM-Hook's batched rpc path.
