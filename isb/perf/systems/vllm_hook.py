@@ -7,14 +7,18 @@ through `HookLLM`, not raw extra_args: `worker_name` selects the worker and conf
   qk    -> worker probe_hook_qk        ; layer_to_heads (keys = layers) + _hookq_mode
   steer -> worker steer_hook_act       ; _steering_config dict, targets a SINGLE optimal_layer and
            loads a vector .pt ({"dir": tensor}). vllm-hook steers ONE layer per request, so footprint
-           half/all are not expressible here (capability boundary, not a harness bug).
+           half/all are not expressible here (capability boundary, not a harness bug). The write
+           lands on the LAST row of each forward only (steer_activation_worker._apply_steer), so a
+           prefill steer touches one token where the other systems' steer touches all of them.
+The plugin forces enforce_eager on every engine (_hook_plugin._patched_create_engine_config,
+IBM/vLLM-Hook 0e34fdd); cfg.enforce_eager=False is overridden.
 """
 from __future__ import annotations
 
 import os
 import tempfile
 
-from ..core import Config, gpu_used_mb, layer_indices, make_prompts, time_op
+from ..core import Config, gpu_used_mb, layer_indices, make_prompts, returned_bytes, time_op
 
 _WORKER = {"read": "probe_hidden_states", "qk": "probe_hook_qk", "steer": "steer_hook_act"}
 
@@ -67,12 +71,18 @@ def run(cfg: Config) -> dict:
         }
 
     prompts = [_wrap(ids) for ids in make_prompts(cfg)]
-    sp = SamplingParams(temperature=0.0, max_tokens=cfg.eff_new_tokens())
+    # The probe worker captures the prefill only unless the request says otherwise
+    # (probe_hidden_states_worker: extra_args["hooks_on"], default "prefill"); a decode-phase read
+    # captures every step, as the other systems' decode reads do. HookLLM keeps keys already set.
+    extra = {"hooks_on": "both"} if cfg.op == "read" and cfg.phase == "decode" else None
+    sp = SamplingParams(temperature=0.0, max_tokens=cfg.eff_new_tokens(), extra_args=extra)
 
     def once():
-        llm.generate(prompts, sp)              # HookLLM injects the worker's extra_args internally
-        return None, None
+        # HookLLM injects the worker's extra_args; on the rpc path the plugin attaches the captured
+        # states to the outputs, merged onto outputs[0] for a batch (hook_llm.HookLLM.generate).
+        outs = llm.generate(prompts, sp, use_tqdm=False)
+        return getattr(outs[0], "probes", None), None
 
-    metrics, _ = time_op(once, n_warmup=cfg.n_warmup, n_reps=cfg.n_reps, mem0=mem0)
-    metrics.update({"artifact_kb": 0.0, "transfer_bytes": 0, "correct": None})
+    metrics, probes = time_op(once, n_warmup=cfg.n_warmup, n_reps=cfg.n_reps, mem0=mem0)
+    metrics.update({"artifact_kb": 0.0, "transfer_bytes": returned_bytes(probes), "correct": None})
     return metrics

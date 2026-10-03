@@ -11,6 +11,8 @@
 #   micro             construct probes (nnsight 0.7 / 0.8 x HF / vLLM async / sync) and the
 #                     perf microbenchmark sweeps (plans/delta_perf_vllm0191.json, ..._vllm0151.json)
 #   perf-read         the perf read cells again (plans/delta_perf_read_*.json)
+#   vllm-hook         IBM vLLM-Hook (built-in workers, rpc and disk-st-async storage) through every
+#                     comparison spec beside nnsight and vLLM-Lens, then its perf microbenchmark cells
 #   optimal SPEC ...  each system's general cells beside its fastest documented realization
 #                     (backends/*-opt, nnsight-vllm-taps, interp-engine-static), plain vLLM
 #                     eager and compiled per version, scored vs HF fp32
@@ -42,7 +44,7 @@ bench() { echo; echo "### $(date -Is) bench.py $*"; $PY scripts/bench.py "$@"; l
 # waits for the GPU to drain afterwards: perf.py starts the next cell's engine at once.
 make_wrappers() {
     mkdir -p $bin runs/micro-delta/constructs runs/micro-delta/perf
-    for img in vllm-plain-0-19-1 vllm-plain-0-15-1 nnsight-vllm nnsight-vllm-0-7 vllm-lens nnsight-hf nnsight-hf-0-7; do
+    for img in vllm-plain-0-19-1 vllm-plain-0-15-1 nnsight-vllm nnsight-vllm-0-7 vllm-lens vllm-hook nnsight-hf nnsight-hf-0-7; do
         cat > $bin/py-$img <<WRAP
 #!/bin/bash
 apptainer exec --nv --cleanenv --no-home --bind $PWD --bind /tmp \\
@@ -197,6 +199,18 @@ perf-read)
     ISB_PY_pure_vllm=$bin/py-vllm-plain-0-15-1 ISB_PY_nnsight_vllm=$bin/py-nnsight-vllm-0-7 \
         $PY scripts/perf.py sweep --plan plans/delta_perf_read_vllm0151.json --name delta_perf_read_vllm0151 \
         --run-dir runs/micro-delta/perf --out runs/micro-delta/perf/delta_perf_read_vllm0151.json || rc=1
+    exit $rc
+    ;;
+vllm-hook)
+    rc=0
+    bench run --spec cmp_logit_lens cmp_steering cmp_gen_steering cmp_activation_patching cmp_ablation \
+        --backends nnsight-hf-fp32 nnsight-vllm vllm-lens vllm-hook vllm-hook-disk \
+                   vllm-plain-0-19-1 vllm-plain-eager-0-19-1 \
+        --reference nnsight-hf-fp32 --gpu 0 --timeout 3600 --out runs/vllm-hook-delta || rc=1
+    make_wrappers
+    ISB_PY_pure_vllm=$bin/py-vllm-plain-0-19-1 ISB_PY_vllm_hook=$bin/py-vllm-hook \
+        $PY scripts/perf.py sweep --plan plans/delta_perf_vllmhook_0191.json --name delta_perf_vllmhook_0191 \
+        --run-dir runs/micro-delta/perf --out runs/micro-delta/perf/delta_perf_vllmhook_0191.json || rc=1
     exit $rc
     ;;
 optimal-smoke)
