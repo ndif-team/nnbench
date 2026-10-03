@@ -815,24 +815,28 @@ block. Reads at batch 1 cost the two about the same; at batch 4 nnsight's per-in
 collection costs about twice vLLM-Lens's at large volumes. nnsight 0.8 is cheaper than 0.7 in every
 cell.
 
-## General vs optimal realization per system, Delta (2026-10-02)
+## Each system's fastest public realization, and headroom beyond it, Delta (2026-10-02)
 
-Each system's general cells beside the fastest form its own documentation and source support for
-the same workload (`backends/*-opt`, `nnsight-vllm-taps`, `interp-engine-static`), timed in the same
-job on one node (gpua017, A100-40GB), Qwen2.5-7B-Instruct bf16, prefix caching off, scored vs
-nnsight-hf-fp32. Runs: `runs/optimal-delta/20261003T000226Z-612bf792` (logit lens, steering,
-ablation) and `-7905a82b` (generation steering, patching); `slurm/delta-compare.slurm optimal`.
+Each system's general cells beside its fastest realization inside its public interface
+(`docs/writing-workloads.md` §4a): nnsight installed edits (`nnsight-vllm-opt`) and `taps`
+(`nnsight-vllm-taps`, vLLM 0.28.0), interp-engine `vllm-static`, vLLM-Lens's `Hook` API composed for
+a batched readout and hook-built ablation (`vllm-lens-opt`). TransformerLens has no documented
+faster mode at batch 1; its GPU readout (`transformer-lens-opt`) steps outside the public interface
+and is reported as headroom, not as its score. All timed in the same job on one node (gpua017,
+A100-40GB), Qwen2.5-7B-Instruct bf16, prefix caching off, scored vs nnsight-hf-fp32. Runs:
+`runs/optimal-delta/20261003T000226Z-612bf792` (logit lens, steering, ablation) and `-7905a82b`
+(generation steering, patching); `slurm/delta-compare.slurm optimal`.
 
-| Workload (median ms) | nnsight general → opt / taps | vLLM-Lens general → opt | interp-engine hooked → static | TransformerLens general → opt | plain vLLM compiled |
+| Workload (median ms) | nnsight general → edits / taps | vLLM-Lens general → composed | interp-engine hooked → static | TransformerLens general (headroom: GPU readout) | plain vLLM compiled |
 |---|---|---|---|---|---|
-| Logit lens, all layers | 69.7 → 39.0 / 34.5 | 74.1 → 52.3 | 39.6 → 29.7 | 411.8 → 25.6 | 15.0–16.3 |
-| Steering L14 (mean norm) | 29.6 → 20.7 / 19.1 | 30.6 → 30.4 | 43.6 → 40.5 | 317.7 → 38.4 | 15.1–16.3 |
+| Logit lens, all layers | 69.7 → 39.0 / 34.5 | 74.1 → 52.3 | 39.6 → 29.7 | 411.8 (25.6) | 15.0–16.3 |
+| Steering L14 (mean norm) | 29.6 → 20.7 / 19.1 | 30.6 → 30.4 | 43.6 → 40.5 | 317.7 (38.4) | 15.1–16.3 |
 | Steering L14 (token norm) | 30.1 → 20.5 / 19.1 | 32.8 → 32.6 | 25.1 → 22.9 | unsupported | |
-| Zero MLP, layer 1 | 29.4 → 19.2 / 19.1 | unsupported → 31.2 | unsupported | 302.0 → 19.9 | 15.3–16.1 |
+| Zero MLP, layer 1 | 29.4 → 19.2 / 19.1 | unsupported → 31.2 | unsupported | 302.0 (19.9) | 15.3–16.1 |
 | Gen steering, 8 tokens | 145.4 → 141.4 / 112.6 | 206.7 → 210.2 | 144.4 → *wrong* | unsupported | 100.9–101.5 |
-| Last-token patching L7 | 60.6 → 42.2 / 42.1 | 50.2 → 49.6 | 64.1 → 55.9 | 490.9 → 39.7 | 2 × ~16 |
+| Last-token patching L7 | 60.6 → 42.2 / 42.1 | 50.2 → 49.6 | 64.1 → 55.9 | 490.9 (39.7) | 2 × ~16 |
 
-- **TransformerLens**'s general cost is its logit rebuild, which runs on the CPU. Whenever a call returns
+- **TransformerLens (headroom, not its score)**: its general cost is its logit rebuild, which runs on the CPU. Whenever a call returns
   logits, the driver ships the post-norm stream for every prompt position to its own process and
   multiplies it there by an fp32 copy of the unembedding fetched over RPC (`driver.py`
   `probe_logit_reconstruction` / `_reconstruct_logits`; `worker_extension.encode_tensor` moves
@@ -843,9 +847,8 @@ ablation) and `-7905a82b` (generation steering, patching); `slurm/delta-compare.
   cost; taking the last row only roughly halves it. The optimal cells call with
   `return_logits=False`, capture the final block, and apply norm + unembedding to the last row on
   the GPU (fp32 weights fetched once with `get_param`). Result: 19–32× plain vLLM → 1.3–2.6×,
-  outputs unchanged (TV vs HF fp32 within 0.001 of the general cells). It is the fastest system on the logit
-  lens and last-token patching, ties nnsight on ablation, and is ~2× nnsight on mean-norm steering,
-  which needs two requests on TransformerLens. Cost: the driver process holds its own CUDA context
+  outputs unchanged (TV vs HF fp32 within 0.001 of the general cells). With that change it would be the fastest on
+  the logit lens and last-token patching. Cost: the driver process holds its own CUDA context
   and a 2.2 GB fp32 unembedding outside vLLM's memory budget (peak 38.9 GB vs 36.2–36.8 GB), and the
   projection is our code on top of the bridge, not a TransformerLens option; the other systems
   project inside the engine's worker with the model's own bf16 `lm_head` (nnsight `F.linear` in the
@@ -857,11 +860,12 @@ ablation) and `-7905a82b` (generation steering, patching); `slurm/delta-compare.
 - **nnsight**: installed named edits (`model.edit(name=...)`, `edits=[name]` per request) remove
   10–30 ms per single-forward call. Taps (vLLM 0.28.0 breakable CUDA graphs) matter on decode:
   generation 141 → 112 ms, 1.11× compiled plain vLLM.
-- **vLLM-Lens** is already at its optimum for steering (native `SteeringVector`); hooks keep the
-  engine eager, ~2× a compiled forward. The optimal backend's gain is coverage: ablation runs via
-  hooks alone (pre-hook zero on layer+1 for MLP; recompute the MLP branch for attention).
+- **vLLM-Lens** is already at its optimum for steering (native `SteeringVector`); its plugin forces
+  eager on every engine, ~2× a compiled forward. Composing its `Hook` API differently gains the
+  logit lens (one batched readout, 74 → 52 ms) and coverage: ablation runs through hooks alone
+  (pre-hook zero on layer+1 for the MLP; recompute the MLP branch for attention).
 - **interp-engine static** is faster on single forwards, but see below.
-- Correctness: optimal cells match their general cells' states except at the tolerance edge (TV
+- Correctness: the faster realizations match their general cells' states except at the tolerance edge (TV
   0.02–0.03) and the interp-engine static generation rows.
 
 ### interp-engine `vllm-static` drops decode-step lens writes (SILENTLY_WRONG)

@@ -45,6 +45,26 @@ The documented, correct realization is the cell's default. Family-dependent defa
 profile (`m.default_residual(be.name)`), never a literal. A naive port stays only as an explicitly
 labeled frontier task. Report automatically resolved choices with `record_resolved`.
 
+## 4a. Stay inside the system's public interface
+
+A score measures the system, not the cell author. A cell may compose the system's public,
+documented API the way a user would: several requests, a documented engine mode or storage
+option, the system's documented extension point, plain user code for steps the system leaves to the
+user (loading a checkpoint weight, a final projection the system does not offer). A cell must not
+reach into private attributes or internals, and must not re-implement work the system already
+does, to make it cheaper. When a workload has no public form, the cell raises `Unsupported` with the
+source reason; that is the finding.
+
+Each system's score is then its fastest realization inside that interface: the general cell, a
+documented performance mode (nnsight installed edits and `taps`, interp-engine `vllm-static`,
+vLLM-Hook `disk-st-async`), or a better composition of the public API (vLLM-Lens's batched lens
+readout and hook-built ablation use its documented `Hook`). Faster forms that step outside it (the
+TransformerLens GPU readout, which reads weights through the private `_driver` and replaces the
+bridge's own logit rebuild) are reported as headroom: evidence of a gap in the system, never as its
+score. A cell that cannot avoid an internal (TransformerLens's logit lens and steering direction
+read the unembedding through `_driver.get_param`; the bridge has no public accessor) says so in its
+docstring and is labeled in the report.
+
 ## 5. Test the denotation, not the plumbing
 
 Add one unit test per read and write denotation. Use a fake `(hidden, residual)` output whose two
