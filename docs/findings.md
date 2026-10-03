@@ -814,3 +814,46 @@ nnsight pays a fixed cost per trace plus a cost per layer and decode step for ru
 block. Reads at batch 1 cost the two about the same; at batch 4 nnsight's per-invoke save
 collection costs about twice vLLM-Lens's at large volumes. nnsight 0.8 is cheaper than 0.7 in every
 cell.
+
+## General vs optimal realization per system, Delta (2026-10-02)
+
+Each system's general cells beside the fastest form its own documentation and source support for
+the same workload (`backends/*-opt`, `nnsight-vllm-taps`, `interp-engine-static`), timed in the same
+job on one node (gpua017, A100-40GB), Qwen2.5-7B-Instruct bf16, prefix caching off, scored vs
+nnsight-hf-fp32. Runs: `runs/optimal-delta/20261003T000226Z-612bf792` (logit lens, steering,
+ablation) and `-7905a82b` (generation steering, patching); `slurm/delta-compare.slurm optimal`.
+
+| Workload (median ms) | nnsight general → opt / taps | vLLM-Lens general → opt | interp-engine hooked → static | TransformerLens general → opt | plain vLLM compiled |
+|---|---|---|---|---|---|
+| Logit lens, all layers | 69.7 → 39.0 / 34.5 | 74.1 → 52.3 | 39.6 → 29.7 | 411.8 → 25.6 | 15.0–16.3 |
+| Steering L14 (mean norm) | 29.6 → 20.7 / 19.1 | 30.6 → 30.4 | 43.6 → 40.5 | 317.7 → 38.4 | 15.1–16.3 |
+| Steering L14 (token norm) | 30.1 → 20.5 / 19.1 | 32.8 → 32.6 | 25.1 → 22.9 | unsupported | |
+| Zero MLP, layer 1 | 29.4 → 19.2 / 19.1 | unsupported → 31.2 | unsupported | 302.0 → 19.9 | 15.3–16.1 |
+| Gen steering, 8 tokens | 145.4 → 141.4 / 112.6 | 206.7 → 210.2 | 144.4 → *wrong* | unsupported | 100.9–101.5 |
+| Last-token patching L7 | 60.6 → 42.2 / 42.1 | 50.2 → 49.6 | 64.1 → 55.9 | 490.9 → 39.7 | 2 × ~16 |
+
+- **TransformerLens** is fastest on single forwards once its readout moves off the CPU
+  (`return_logits=False`, capture the final block, last-row norm + unembed on the GPU): 1.3–2.5×
+  plain vLLM, from 12–26×. Its interventions already run inside the compiled graph.
+- **nnsight**: installed named edits (`model.edit(name=...)`, `edits=[name]` per request) remove
+  10–30 ms per single-forward call. Taps (vLLM 0.28.0 breakable CUDA graphs) matter on decode:
+  generation 141 → 112 ms, 1.11× compiled plain vLLM.
+- **vLLM-Lens** is already at its optimum for steering (native `SteeringVector`); hooks keep the
+  engine eager, ~2× a compiled forward. The optimal backend's gain is coverage: ablation runs via
+  hooks alone (pre-hook zero on layer+1 for MLP; recompute the MLP branch for attention).
+- **interp-engine static** is faster on single forwards, but see below.
+- Correctness: optimal cells match their general cells' states except at the tolerance edge (TV
+  0.02–0.03) and the interp-engine static generation rows.
+
+### interp-engine `vllm-static` drops decode-step lens writes (SILENTLY_WRONG)
+
+`capture_generation(..., lens_intervention={"specs": [steer], "steer_generated": True})` on
+`backend="vllm-static"` applies the write on the prompt forward only. Diagnostic
+(`slurm/diag_ie_static.py`, `runs/ie-static-diag/`, 3 prompts, strength 6 at layer 14): with no
+steering and with prompt-only steering, static and hooked agree (top-1 1.00); with steering at every
+forward, static's output is bitwise equal to its prompt-only output on 3/3 prompts and diverges from
+hooked from the first decode step (top-1 agreement 0.12–0.25). No error or warning. The oracle scored the
+row NUMERICAL_MISMATCH (TV 0.78); the diagnostic demonstrates a contract violation, so the row is
+excluded from performance comparison. `_apply_lens_scope` in `vllm_capture/static.py` honours
+`steer_generated`; the drop is on the decode path under graph replay, exact site not isolated.
+Single-forward static writes (steering, patching) are correct.
