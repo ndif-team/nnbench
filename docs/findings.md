@@ -832,9 +832,28 @@ ablation) and `-7905a82b` (generation steering, patching); `slurm/delta-compare.
 | Gen steering, 8 tokens | 145.4 → 141.4 / 112.6 | 206.7 → 210.2 | 144.4 → *wrong* | unsupported | 100.9–101.5 |
 | Last-token patching L7 | 60.6 → 42.2 / 42.1 | 50.2 → 49.6 | 64.1 → 55.9 | 490.9 → 39.7 | 2 × ~16 |
 
-- **TransformerLens** is fastest on single forwards once its readout moves off the CPU
-  (`return_logits=False`, capture the final block, last-row norm + unembed on the GPU): 1.3–2.5×
-  plain vLLM, from 12–26×. Its interventions already run inside the compiled graph.
+- **TransformerLens**'s general cost is its logit rebuild, which runs on the CPU. Whenever a call returns
+  logits, the driver ships the post-norm stream for every prompt position to its own process and
+  multiplies it there by an fp32 copy of the unembedding fetched over RPC (`driver.py`
+  `probe_logit_reconstruction` / `_reconstruct_logits`; `worker_extension.encode_tensor` moves
+  everything through CPU bytes). The same steering call costs 302.0 ms with logits and 18.1 ms
+  without (plain vLLM 15.6 ms). On the A100 nodes' CPU (EPYC 7763, 16 threads) that matmul alone
+  measures 208 ms for 9 rows and still 108 ms for 1 row: a matrix-vector product against a
+  2.2 GB fp32 matrix is memory-bandwidth bound. Placing the matmul on the GPU is what removes the
+  cost; taking the last row only roughly halves it. The optimal cells call with
+  `return_logits=False`, capture the final block, and apply norm + unembedding to the last row on
+  the GPU (fp32 weights fetched once with `get_param`). Result: 19–32× plain vLLM → 1.3–2.6×,
+  outputs unchanged (TV vs HF fp32 within 0.001 of the general cells). It is the fastest system on the logit
+  lens and last-token patching, ties nnsight on ablation, and is ~2× nnsight on mean-norm steering,
+  which needs two requests on TransformerLens. Cost: the driver process holds its own CUDA context
+  and a 2.2 GB fp32 unembedding outside vLLM's memory budget (peak 38.9 GB vs 36.2–36.8 GB), and the
+  projection is our code on top of the bridge, not a TransformerLens option; the other systems
+  project inside the engine's worker with the model's own bf16 `lm_head` (nnsight `F.linear` in the
+  trace, vLLM-Lens in the readout hook, interp-engine `decode_residuals` via vLLM `compute_logits`).
+  TransformerLens rebuilds every position because its bridge promises sequence logits
+  (`provides_sequence_logits`, enough to back a loss) and vLLM computes logits only at sampled
+  positions. Its interventions already run inside vLLM's compiled graph (affine buffers swapped
+  between forwards, `plugin.py`).
 - **nnsight**: installed named edits (`model.edit(name=...)`, `edits=[name]` per request) remove
   10–30 ms per single-forward call. Taps (vLLM 0.28.0 breakable CUDA graphs) matter on decode:
   generation 141 → 112 ms, 1.11× compiled plain vLLM.
