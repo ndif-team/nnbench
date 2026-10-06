@@ -8,6 +8,8 @@ central backend registry or Compose override list. `scripts/bench.py` never sele
 
 Requirements: Docker Engine, Docker Compose v2, NVIDIA Container Toolkit for the bundled GPU
 backends, and host Python with CPU PyTorch for artifact scoring. Host nnsight/vLLM are not needed.
+Without Docker, `ISB_LAUNCHER=apptainer` runs the same directories through Apptainer
+(`isb/jobs/apptainer.py`; see the top-level README).
 
 ```bash
 python scripts/bench.py list backends
@@ -66,7 +68,8 @@ its own executable, provided it satisfies the file contract below. The shared nn
 optional. A text-generation-only provider cannot claim support for inaccessible hidden states,
 interventions, or gradients. Write its cells by the procedure in
 [writing workloads](../docs/writing-workloads.md), and declare a workload the system cannot express
-by raising `Unsupported` with the missing capability.
+by raising `Unsupported` with the missing capability. Stay inside the system's public interface
+(§4a there): a faster form that uses its internals is reported as headroom, not as its score.
 
 ## Container contract (version 2)
 

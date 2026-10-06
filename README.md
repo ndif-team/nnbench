@@ -1,9 +1,9 @@
 # nnbench
 
 A systems performance and coverage benchmark for interpretability workloads run through
-[nnsight](https://nnsight.net) across serving backends. nnbench measures whether an intervention
-runs, whether its outputs agree across backends, and its latency, throughput, memory use and
-overhead. Numerical comparison exposes silent errors that successful execution alone can miss.
+[nnsight](https://nnsight.net) across serving backends, and through other interpretability systems
+on vLLM for comparison. nnbench measures whether an intervention runs, whether its outputs agree
+across backends, and its latency, throughput, memory use and overhead. Numerical comparison exposes silent errors that successful execution alone can miss.
 
 The core unit is an explicit cell for a methodology, model family and backend. Cases vary the
 intervention parameters, implementation choices and input regime. Scientific faithfulness is a
@@ -90,6 +90,34 @@ available method/model combinations; the inventory is not a claim that every com
 See [measured findings](docs/findings.md) and the
 [primitive status inventory](docs/interp-methods-catalog.md) for results tied to tested stacks.
 
+## Cross-system comparison
+
+The `cmp_*` specs (logit lens, steering, generation steering, activation patching, ablation on
+Qwen2.5-7B-Instruct; [`isb/specs/comparison.py`](isb/specs/comparison.py)) run one workload
+through several interpretability systems on vLLM, each in its own backend directory:
+
+| System | Backends |
+|---|---|
+| nnsight 0.8 | `nnsight-vllm` (async), `nnsight-vllm-sync`, `nnsight-vllm-opt` (installed edits), `nnsight-vllm-taps` (CUDA-graph taps, vLLM 0.28.0) |
+| nnsight 0.7 | `nnsight-vllm-0-7`, `nnsight-hf-0-7` |
+| vLLM-Lens | `vllm-lens`, `vllm-lens-opt` |
+| interp-engine | `interp-engine` (hooked), `interp-engine-static` (`vllm-static`) |
+| TransformerLens 4 | `transformer-lens`, `transformer-lens-opt` (headroom, see below) |
+| vLLM-Hook (IBM) | `vllm-hook` (rpc storage), `vllm-hook-disk` (`disk-st-async`) |
+| Plain vLLM | `vllm-plain-<version>` (compiled) and `vllm-plain-eager-<version>` |
+| Reference | `nnsight-hf-fp32` (HF transformers in fp32) |
+
+Plain vLLM at each system's release and execution mode is the overhead floor. Prefix caching is off
+on every vLLM engine. A workload a system cannot express is `UNSUPPORTED` with the reason from its
+source; that is a result.
+
+A score measures the system, not the cell author. Each system is scored by its general cell and by
+its fastest realization inside its public interface: documented engine modes, documented storage,
+and compositions of its documented API. A faster form that needs the system's internals or redoes
+its work is reported as headroom, never as its score. The rule is in
+[writing workloads §4a](docs/writing-workloads.md); measured results, including the fairness
+controls, are in [the findings](docs/findings.md).
+
 ## Running it
 
 Requirements: Docker Engine, Compose v2, NVIDIA Container Toolkit for the bundled GPU backends,
@@ -117,8 +145,30 @@ each backend job; `--strict` also returns a failure exit code for unsuccessful c
 Model downloads populate a persistent cache. Offline flags are useful once that cache is stocked.
 See [the backend guide](backends/README.md) for configuration, model access and custom backends.
 
+### Hosts without Docker (Apptainer)
+
+On HPC hosts such as NCSA Delta, set `ISB_LAUNCHER=apptainer` (or pass `--launcher apptainer`).
+The runner reads the same `compose.yml` and Dockerfile: `build` translates the Dockerfile into an
+Apptainer definition and a `.sif` image, and `run` maps the `runner` service onto
+`apptainer exec --nv`. Images, definitions and named volumes live under `ISB_APPTAINER_DIR`
+(default `.apptainer/`); the model cache is `$ISB_APPTAINER_DIR/volumes/isb-model-cache`.
+
+```bash
+export ISB_LAUNCHER=apptainer ISB_APPTAINER_DIR=$PWD/.apptainer
+python scripts/bench.py build nnsight-vllm vllm-lens
+HF_HUB_OFFLINE=1 python scripts/bench.py run --spec cmp_steering \
+  --backends nnsight-hf-fp32 nnsight-vllm vllm-lens vllm-plain-0-19-1 --reference nnsight-hf-fp32 --gpu 0
+```
+
+`slurm/delta-build.slurm` builds images and `slurm/delta-compare.slurm STAGE` runs the comparison
+stages (`fair`, `optimal`, `vllm-hook`, `micro`, ...) as batch jobs; set the account, partition and
+node exclusions in their `#SBATCH` headers for your allocation. [`docs/delta-handoff.md`](docs/delta-handoff.md)
+walks through a first run.
+
 Standalone micro/performance and execute/score tools retain their own entrypoints and
-environment requirements.
+environment requirements. The perf microbenchmark (`scripts/perf.py`) runs one system per process;
+`ISB_PY_<system>` selects each system's interpreter, for example an `apptainer exec` wrapper around
+its backend image.
 
 ## Browsing results
 
@@ -161,6 +211,7 @@ isb/
   perf/                    timing and microbenchmarks
   manager/                 saved-report browser and HTML export
 backends/                  independent NAME/{compose.yml,Dockerfile,run.py} packages
+slurm/                     batch scripts for the Apptainer path on Slurm clusters
 scripts/                   benchmark CLI, alignment checker, manager and standalone tools
 docs/                      design, alignment audit, guides and measured findings
 ```
