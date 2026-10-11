@@ -6,11 +6,15 @@ ill-defined here. The baseline reads a single layer (`layers=[0]`); the task rea
 overhead-vs-baseline reflects the per-layer attention-read cost.
 """
 from ..sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
-from ._prompts import ONE
+from ._models import GPT2
+
+# One prompt: an existence check — the attention-probability site is absent on vLLM (paged
+# attention), so the verdict is works-vs-ERROR and input volume adds nothing.
+ONE = ["The Eiffel Tower is in the city of"]
 
 attention_pattern_gpt2 = CellConfig(
     name="attention_pattern_gpt2",
-    methodology="attention_pattern", family="gpt2", repo="openai-community/gpt2",
+    methodology="attention_pattern", family="gpt2", repo=GPT2,
     # output is [layers, heads, k_len] — variable k_len across prompts can't be stacked, so no
     # per-prompt aggregation (the verdict already spans layers×heads).
     regimes=[ExecutionRegime("interactive", ONE, aggregate=False)],

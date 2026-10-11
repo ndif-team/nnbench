@@ -4,8 +4,8 @@
 > Current implementation contract: §12.1 and §12.13. Experiment authoring, effective cell calls,
 > artifact versions, and result comparison have explicit ownership and validation boundaries.
 
-> Runner update (2026-09-08): the main CLI now uses independent `backends/NAME/compose.yml`
-> configurations, frozen input jobs, explicit references, and artifact-only scoring. See
+> Runner update (2026-09-08): the main CLI now uses independent `backends/<system>/<config>/compose.yml`
+> configurations (§12.15), frozen input jobs, explicit references, and artifact-only scoring. See
 > [the runner contract](../backends/README.md). Historical CLI/shared-Compose examples below
 > describe the preceding runner and are not current launch instructions.
 
@@ -1016,7 +1016,7 @@ scripts/smoke.py        # enumerate the cells to run; print the map
 | semantic variant | `TaskSpec.params` and the methodology template's semantic classification |
 | realization variant | `TaskSpec.params` and the methodology template's realization classification |
 | case-specific requirements | registered case-description function beside the method implementations |
-| backend worker | independent `backends/NAME/compose.yml` and executable implementing the file contract |
+| backend worker | independent `backends/<system>/<config>/compose.yml` and executable implementing the file contract (§12.15) |
 
 ### 12.6 The primitive model as index (2026-06-11)
 
@@ -1118,7 +1118,7 @@ ablation) are **EQUIVALENT**. The manual-unembed steering write was **DIVERGENT*
 params on read); after the fix tv → 0.040 and the residual argmax flip is within-noise (MoE-router
 reduction order) → `EQUIVALENT_DEGRADED`. **PP was not validly testable** — nnsight `dev` has no
 pipeline parallelism (it lives on `pp-on-dev`); `--pp 2` `EngineDeadError` is an unimplemented-path
-artifact, retracted. → `isb/specs/nemotron.py`, `isb/methodologies/{logit_lens,steering,ablation}.py`,
+artifact, retracted. → `isb/specs/{logit_lens,steering,ablation}.py` (`*_nemotron*`), `isb/methodologies/{logit_lens,steering,ablation}.py`,
 `isb/sweep/driver.py` (`_fp32_rerun`).
 
 ### 12.8 Model profiles, family-generic cells, tasks (2026-07-21)
@@ -1222,7 +1222,7 @@ A result's identity is (spec × data × run config), each axis independent:
   patching (and their clean side for ablation), CounterFact factual-recall prompts for
   logit lens, steering, generation steering, and the family probes. The single-trace
   frontier markers (attention pattern, attribution patching) keep their fixed inputs
-  (`isb/specs/_prompts.py`), and the template banks remain as `--data` alternatives.
+  (`isb/specs/attention_pattern.py`, `ONE`), and the template banks remain as `--data` alternatives.
 - **execute** (`isb/sweep/execute.py`, `scripts/execute.py`): one run, one process, ALWAYS writes
   ONE self-contained run file `<name>.pt` (`isb/runfile.py`): cell outputs (per-prompt stacks for
   batched-reference duty; per-cell perf + the effect guard) together with the four-layer
@@ -1367,19 +1367,19 @@ requires an uncontended GPU allocation for performance measurements.
 ### 12.14 Cross-system comparison (2026-09-25)
 
 nnbench compares interpretability systems by holding the workload fixed and varying the system.
-nnsight is one system among several. Each system is an independent backend directory with its own
-pinned image, scored against one baseline run, normally `nnsight-hf`. The nnsight website's
+nnsight is one system among several. Each system is an independent directory under `backends/` with
+its own pinned image (§12.15), scored against one baseline run, normally `nnsight-hf/default`. The nnsight website's
 comparison page served as a weak reference for which workloads separate systems; nnbench keeps its
 own structure of one baseline and N runs.
 
 **Semantic tasks.** A comparison spec's task parameters carry only intervention semantics: layer,
 direction, strength, positions. Each system's cell chooses that system's documented realization.
 Specs whose tasks select nnsight spellings, such as in-place versus replacement writes, stay
-nnsight-internal coverage and are not cross-system rows. Comparison specs live in
-`isb/specs/comparison.py`.
+nnsight-internal coverage and are not cross-system rows. Comparison specs (`cmp_*`) live with
+their methodology in `isb/specs/<methodology>.py`; `isb/specs/suites.py` lists them as `COMPARISON`.
 
 **Foreign cells.** A non-nnsight system registers cells under its own interface name, for example
-`vllm_lens`, from inside its backend directory. The registry's fallback from `vllm_*` variants to
+`vllm_lens`, from its system directory's `cells.py`. The registry's fallback from `vllm_*` variants to
 the `vllm_async` cells applies only to nnsight's own vLLM variants; a foreign interface never
 inherits nnsight cells. The shared worker and executor host foreign cells unchanged: the backend
 object loads the engine, and the cell returns the same tensor shapes as the nnsight cells.
@@ -1395,7 +1395,7 @@ that the system lacks the capability. `UNSUPPORTED` cells are excluded from perf
 - Intervention overhead: each backend's `vanilla` method issues the system's own request with no
   intervention attached. The executor times it in the same job and regime as the cells
   (`__vanilla__` auxiliary record), and each cell records `overhead_vs_vanilla`.
-- Whole-system overhead: `vllm-plain-*` backends run plain vLLM at each engine version in use, with
+- Whole-system overhead: `vllm-plain/*` configs run plain vLLM at each engine version in use, with
   vLLM's default configuration (torch.compile and CUDA graphs), and declare every intervention
   unsupported. The scorer divides each vLLM-engine row by the plain job's `__vanilla__` latency at
   the same vLLM version and workload (`overhead_vs_plain_vllm`). Plain jobs are identified by the
@@ -1403,3 +1403,28 @@ that the system lacks the capability. `UNSUPPORTED` cells are excluded from perf
 
 Engine version and eager or CUDA-graph mode are recorded with each result, because an eager
 engine's absolute latency depends on host CPU load.
+
+### 12.15 Backend tree and spec layout (2026-10-10)
+
+**Backends are `<system>/<config>`.** A top-level directory under `backends/` is one system on one
+engine (`nnsight-vllm`, `interp-engine-vllm`, `vllm-plain`); a directory inside it holding a
+`compose.yml` is one config, and the backend name is that path (`nnsight-vllm/fp32`). The system
+directory owns the image (`Dockerfile`, with versions as build args a config sets), the backend
+object (`backend.py`) and the workload implementation (`cells.py`). A config owns its options and
+image tag, and carries its own `backend.py` / `cells.py` only when it needs a separate
+implementation (`*/opt`, `nnsight-vllm/sync`). Code resolves to the nearest file on the config's
+own path (`isb/jobs/layout.py`); a config that shares another config's implementation nests under
+it (`nnsight-vllm/opt/taps`). No config mounts or builds from a sibling, so the files a config runs
+are exactly the ones on its path. Before this, each config was a flat top-level directory and
+borrowed its parent's code through relative Compose mounts, so a config's code was often in another
+directory. The nnsight systems keep their cells in `isb/methodologies/` (the `hf` / `vllm_async`
+registrations shared with the tests and the micro tier) and have no `cells.py`.
+
+Job directories mirror the name (`experiments/<id>/<system>/<config>/`). Saved runs were renamed to
+the new names by `scripts/migrate_backend_names.py`; interface names inside artifacts (`hf`,
+`vllm_lens_opt`, ...) and image tags are unchanged.
+
+**Specs are one file per methodology.** `isb/specs/<methodology>.py` holds that methodology's spec
+for every model (smoke, parallel, Nemotron, comparison); model repos and load flags are in
+`isb/specs/_models.py`; `isb/specs/suites.py` names the suites (`smoke`, `parallel`, `nemotron_4b`,
+`nemotron`, `comparison`, `fitted_jlens`) and says why each exists. `--spec all` is `smoke`.

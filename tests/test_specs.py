@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from isb.specs import SPECS, default_specs  # noqa: E402
+from isb.specs import SPECS, SUITES, default_specs  # noqa: E402
 
 _QWEN = ("logit_lens_qwen", "steering_qwen", "ablation_qwen",
          "activation_patching_qwen", "gen_steering_qwen")
@@ -26,6 +26,17 @@ def test_default_all_still_includes_the_gpt2_corpus():
     names = default_specs()
     for n in ("logit_lens_gpt2", "steering_gpt2", "ablation_gpt2"):
         assert n in names, f"{n} is gpt2-scale and belongs in the default --spec all sweep"
+
+
+def test_each_spec_lives_in_its_methodology_file_and_one_suite():
+    import importlib
+    for name, spec in SPECS.items():
+        module = importlib.import_module(f"isb.specs.{spec.methodology}")
+        assert any(v is spec for v in vars(module).values()), \
+            f"{name} must be defined in isb/specs/{spec.methodology}.py"
+    assert sorted(SPECS) == sorted(s.name for suite in SUITES.values() for s in suite)
+    assert default_specs() == [s.name for s in SUITES["smoke"]]
+    assert {s.name for s in SUITES["parallel"]} == set(_QWEN)
 
 
 def _run_all():

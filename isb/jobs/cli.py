@@ -12,8 +12,8 @@ from pathlib import Path
 
 from .contract import PLAN_VERSION, prepare, write_json
 from . import apptainer
-from .local import (LAUNCHERS, ROOT, backend_file, compose, configuration, default_launcher, discover,
-                    environment, run_job)
+from .local import (LAUNCHERS, ROOT, backend_file, canonical, compose, configuration, default_launcher,
+                    discover, environment, project_name, run_job)
 
 
 def _positive(value):
@@ -57,8 +57,9 @@ def parser():
     run = commands.add_parser("run")
     run.add_argument("--spec", nargs="+", required=True)
     run.add_argument("--data")
-    run.add_argument("--backends", nargs="+", required=True)
-    run.add_argument("--reference", help="a selected backend; omit to collect without scoring")
+    run.add_argument("--backends", nargs="+", required=True,
+                     help="config names, <system>/<config>; a bare system name means <system>/default")
+    run.add_argument("--reference", help="one of --backends; omit to collect without scoring")
     run.add_argument("--comparison", choices=["correctness", "equivalence"], default="correctness")
     run.add_argument("--gpu", default="0", help="host GPU index or UUID; passed to backend Compose")
     run.add_argument("--timeout", type=_positive, default=1800, help="seconds per backend job")
@@ -81,10 +82,11 @@ def _score(directory, strict):
 
 
 def _run(args):
+    # Records carry only full config names; a bare system name means its default config.
+    args.backends = [canonical(name) for name in args.backends]
+    args.reference = canonical(args.reference) if args.reference else None
     if len(args.backends) != len(set(args.backends)):
         raise ValueError("backend names must be unique")
-    for name in args.backends:
-        backend_file(name)
     if args.reference and args.reference not in args.backends:
         raise ValueError("reference must be one of --backends")
     if not args.gpu or "," in args.gpu:
@@ -147,8 +149,7 @@ def main(argv=None):
             return 0
         if args.command == "build":
             # Resolve all names before the first build; do not partially act on a typo.
-            for name in args.backends:
-                backend_file(name)
+            args.backends = [canonical(name) for name in args.backends]
             launcher = args.launcher or default_launcher()
             for name in args.backends:
                 if launcher == "apptainer":
@@ -156,7 +157,7 @@ def main(argv=None):
                           flush=True)
                 else:
                     configuration(name)
-                    subprocess.run(compose(name, "isb-build-" + name) + ["build"], check=True)
+                    subprocess.run(compose(name, project_name("isb-build-", name)) + ["build"], check=True)
             return 0
         if args.command == "run":
             return _run(args)

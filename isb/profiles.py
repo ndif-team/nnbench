@@ -147,7 +147,7 @@ _FUSED_ON_VLLM = {"hf": "plain", "vllm": "fused"}
 PROFILES = {
     "gpt2": ModelProfile("gpt2", "transformer.h", "transformer.ln_f"),
     # llama covers the Llama-tree families the specs already bind to it (SmolLM2, Qwen2.5: same
-    # model.layers/model.norm/lm_head tree; specs/qwen.py documents the reuse)
+    # model.layers/model.norm/lm_head tree; specs/suites.py, PARALLEL, documents the reuse)
     "llama": ModelProfile("llama", "model.layers", "model.norm",
                           residual_denotation=_FUSED_ON_VLLM, attn_name="self_attn"),
     # NemotronH hybrid (Mamba/attention/MoE blocks): same tree on HF and vLLM, norm is norm_f (§12.7);

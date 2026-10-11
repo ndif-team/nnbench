@@ -1,8 +1,31 @@
 # Independent backend jobs
 
-The main benchmark discovers **directory names** under `backends/`. Each directory has its own
-`compose.yml`, Dockerfile (unless using a prebuilt image), and executable entrypoint. There is no
-central backend registry or Compose override list. `scripts/bench.py` never selects an engine.
+A **system** is a top-level directory under `backends/`: one interpretability system on one engine
+(`nnsight-vllm`, `interp-engine-vllm`, ...). A **config** is a directory inside it holding a
+`compose.yml`; the backend name is its path, `<system>/<config>`. There is no central backend
+registry or Compose override list, and `scripts/bench.py` never selects an engine. A bare system
+name on the command line means `<system>/default`; records always carry the full name.
+
+```text
+backends/<system>/
+  Dockerfile         the system's image; configs choose its build args (versions)
+  backend.py         the system's backend object and create_backend(spec)
+  cells.py           the system's workload implementation, one per system
+  <config>/
+    compose.yml      options (ISB_ENGINE_OPTIONS), image tag, build args
+    backend.py       only when this config wires the engine differently
+    cells.py         only when this config needs its own workload implementation
+    <config>/        a config that shares its parent config's implementation
+```
+
+A config's code is the **nearest** `backend.py` / `cells.py` on its own path, searched from its
+directory up to the system directory (`isb/jobs/layout.py`); a config never reads a sibling's
+files, and its compose builds from its system directory only. For example, `nnsight-vllm/fp32` runs
+the system's `backend.py`; `nnsight-vllm/opt` has its own `backend.py` and `cells.py` (installed
+edits); `nnsight-vllm/opt/taps` adds CUDA-graph taps and a newer vLLM image to that same
+implementation. The bundled configs start `python3 -m isb.jobs.entry`, which resolves `ISB_BACKEND`
+this way and runs the shared worker. The nnsight systems keep no `cells.py`: their cells are the
+`hf` / `vllm_async` registrations in `isb/methodologies/`, shared with the tests and the micro tier.
 
 ## Run
 
@@ -14,17 +37,17 @@ Without Docker, `ISB_LAUNCHER=apptainer` runs the same directories through Appta
 ```bash
 python scripts/bench.py list backends
 python scripts/bench.py list specs
-python scripts/bench.py build nnsight-hf nnsight-vllm
+python scripts/bench.py build nnsight-hf/default nnsight-vllm/default
 
 python scripts/bench.py run --spec logit_lens_gpt2 --data factual:32 \
-  --backends nnsight-hf nnsight-vllm --reference nnsight-hf --gpu 0
+  --backends nnsight-hf/default nnsight-vllm/default --reference nnsight-hf/default --gpu 0
 
 # Several experiments; one isolated container per experiment/backend pair.
 python scripts/bench.py run --spec logit_lens_gpt2 steering_gpt2 \
-  --backends nnsight-hf nnsight-vllm --reference nnsight-hf --gpu 0
+  --backends nnsight-hf/default nnsight-vllm/default --reference nnsight-hf/default --gpu 0
 
 # Collect without a correctness reference. No hidden control runs.
-python scripts/bench.py run --spec all --backends nnsight-hf --gpu 0
+python scripts/bench.py run --spec all --backends nnsight-hf/default --gpu 0
 
 # Re-score saved artifacts; no Docker/model startup.
 python scripts/bench.py score runs/REPLACE_WITH_RUN_ID
@@ -40,8 +63,8 @@ Jobs run sequentially on the selected host GPU index/UUID. Only that GPU is expo
 Compose configurations. Multiple timed jobs must not share an allocation; the runner is not a
 cluster scheduler or a cross-process GPU reservation service.
 
-The images pin nnsight and their library stacks. Repository code and the backend directory are
-mounted read-only; output files are written as the invoking UID/GID. The model cache is a persistent
+The images pin nnsight and their library stacks. Repository code, including `backends/`, is
+mounted read-only at `/workspace`; output files are written as the invoking UID/GID. The model cache is a persistent
 named volume (`isb-model-cache`, override with `ISB_MODEL_CACHE`). New caches download model files;
 for an already populated cache, `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1` avoids network access.
 Provide `HF_TOKEN` only when required. Credentials are not copied into execution records.
@@ -51,19 +74,22 @@ Provide `HF_TOKEN` only when required. Credentials are not copied into execution
 For an fp32 variant of the same vLLM implementation:
 
 ```bash
-cp -R backends/nnsight-vllm backends/nnsight-vllm-fp32
-# In the new compose.yml, change ISB_ENGINE_OPTIONS dtype to float32.
+mkdir backends/nnsight-vllm/fp32
+cp backends/nnsight-vllm/default/compose.yml backends/nnsight-vllm/fp32/
+# In the new compose.yml, change ISB_ENGINE_OPTIONS dtype to float32 and the ISB_BACKEND default.
 python scripts/bench.py run --spec logit_lens_gpt2 --data factual:2 \
-  --backends nnsight-hf nnsight-vllm-fp32 --reference nnsight-hf --gpu 0
+  --backends nnsight-hf/default nnsight-vllm/fp32 --reference nnsight-hf/default --gpu 0
 ```
 
 No Python registration or launcher edit is needed. A runtime-only variant can reuse the image. If
-changing dependencies, choose a distinct image tag in the new Compose file before building it.
-All backend-specific options live in that directory. The bundled `run.py` files translate existing
-spec model-load hints and reject conflicts with configured options. Those compatibility hints are
+changing dependencies, set build args and a distinct image tag in the new Compose file before
+building it. A config that needs a different implementation adds its own `cells.py` (and
+`backend.py` if the engine wiring differs) in its directory; a config-level `backend.py` reuses the
+system's through a relative import (`from ..backend import ...`). The bundled `backend.py` files
+translate existing spec model-load hints and reject conflicts with configured options. Those compatibility hints are
 retained in the Python specs; the host launcher does not interpret them.
 
-A new inference engine needs actual method implementations, not just a Dockerfile. It can supply
+A new system needs actual method implementations, not just a Dockerfile. It can supply
 its own executable, provided it satisfies the file contract below. The shared nnsight worker is
 optional. A text-generation-only provider cannot claim support for inaccessible hidden states,
 interventions, or gradients. Write its cells by the procedure in
@@ -80,7 +106,7 @@ writes `/output`. The host supplies these environment variables for Compose inte
 |---|---|
 | `ISB_JOB_DIR` | Absolute host directory mounted read-only at `/job` |
 | `ISB_OUTPUT_DIR` | Absolute host directory mounted read/write at `/output` |
-| `ISB_BACKEND` | Directory name, forwarded to the worker |
+| `ISB_BACKEND` | Config name `<system>/<config>`, forwarded to the worker |
 | `ISB_GPU` | Selected host GPU index/UUID; backend Compose determines device requirements |
 | `ISB_UID`, `ISB_GID` | Invoking user, for output ownership |
 
@@ -159,8 +185,8 @@ runs/<run-id>/
   experiments/<experiment-id>/
     experiment.json
     inputs.jsonl
-    <backend>/
-      execution.json
+    <system>/<config>/          one directory per backend name; a nested config's sits
+      execution.json            inside its parent config's (opt/taps in opt)
       execution.log
       cleanup.log
       result.json

@@ -7,8 +7,9 @@ June to September 2026, because no step asked what that element denotes.
 
 ## 1. Read the system's documentation at the pinned version
 
-The version that runs is the one pinned in `backends/NAME/Dockerfile`. The images do not ship
-documentation, so read it in the system's repository at that commit.
+The version that runs is the one pinned in `backends/<system>/Dockerfile` and the build args of
+the config's `compose.yml`. The images do not ship documentation, so read it in the system's
+repository at that commit.
 
 - **nnsight** (`NNSIGHT_REF`): `docs/models/vllm.md`, section "What your block sees on vLLM";
   `docs/patterns/<method>.md`; `docs/gotchas/`.
@@ -73,7 +74,7 @@ reading explicitly checks nothing about the default.
 
 ## 6. Smoke against the reference before recording a finding
 
-Run the new cell against `nnsight-hf` on a few inputs. On a mismatch, repeat steps 1 to 3 before
+Run the new cell against `nnsight-hf/default` on a few inputs. On a mismatch, repeat steps 1 to 3 before
 writing it up. For cross-system rows, a second system on the same engine locates the difference:
 bitwise-identical outputs mean the gap belongs to the engine, not to either interpretability layer.
 

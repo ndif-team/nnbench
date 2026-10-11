@@ -9,13 +9,14 @@ forward+backward attribution.
 """
 from ..data import DataRef
 from ..sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
+from ._models import GPT2
 
 # labeled pairs: (clean, corrupted, (correct, incorrect)) — answers ride with the data
 _PAIRS = DataRef("mib/ioi_labeled", 20)
 
 attribution_patching_gpt2 = CellConfig(
     name="attribution_patching_gpt2",
-    methodology="attribution_patching", family="gpt2", repo="openai-community/gpt2",
+    methodology="attribution_patching", family="gpt2", repo=GPT2,
     regimes=[ExecutionRegime("interactive", _PAIRS, aggregate=True)],
     tasks=[({"residual": "plain"}, "residual=plain")],
     baseline=BaselineSpec(params={"residual": "plain", "grad": False}),

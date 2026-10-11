@@ -572,7 +572,7 @@ traced tensor's shape).
 
 ## Cross-system comparison — Qwen2.5-1.5B-Instruct, five backends (2026-09-29)
 
-Specs `cmp_*` (design §12.14), GPU 2 (A100 80GB), bf16, scored against `nnsight-hf`. Run
+Specs `cmp_*` (design §12.14), GPU 2 (A100 80GB), bf16, scored against `nnsight-hf/default`. Run
 `runs/comparison-v1/20260929T165939Z-a319d0e8`; fp32 ablation `20260929T173459Z-bfd1ca65`.
 Systems: nnsight 260c555 on HF (transformers 5.12.1) and on vLLM 0.19.1; vLLM-Lens 1.2.1 on vLLM
 0.19.1; interp-engine 1.12.0 on vLLM 0.28.0; TransformerLens 4.0.0 `RemoteBridge.boot_vllm` on vLLM
@@ -585,7 +585,7 @@ Systems: nnsight 260c555 on HF (transformers 5.12.1) and on vLLM 0.19.1; vLLM-Le
 | steering at every decode step | SUPPORTED, TV 0.000; 344 ms | SUPPORTED; 342 ms | UNSUPPORTED | UNSUPPORTED |
 | patching, layer 7 and 21 | top1 1.00, TV 0.09; 82 ms | top1 1.00, TV 0.09; 49 ms | UNSUPPORTED | UNSUPPORTED |
 | ablation, MLP / attention at layer 1 | TV 0.19 / 0.43 | UNSUPPORTED | UNSUPPORTED | TV 0.20 / 0.43 |
-| ablation at fp32 (vs `nnsight-hf-fp32`) | SUPPORTED, TV 0.004 / 0.016 | — | — | SUPPORTED, TV 0.004 / 0.016 |
+| ablation at fp32 (vs `nnsight-hf/fp32`) | SUPPORTED, TV 0.004 / 0.016 | — | — | SUPPORTED, TV 0.004 / 0.016 |
 
 ### The gap to HF belongs to the engine
 nnsight-vllm and vLLM-Lens logit-lens outputs are bitwise identical (same vLLM 0.19.1).
@@ -633,7 +633,7 @@ TV 0.08–0.10. See `docs/writing-workloads.md`.
 
 ### Native-form rows: token-norm steering and last-token patching (2026-09-29)
 Run `runs/comparison-v2/20260929T182300Z-f0beafb6`, same setup; supersedes the table above for
-every row it repeats. Top-1 agreement / TV against `nnsight-hf`; median single-prompt latency.
+every row it repeats. Top-1 agreement / TV against `nnsight-hf/default`; median single-prompt latency.
 
 | workload | nnsight-vllm | vllm-lens | interp-engine | transformer-lens |
 |---|---|---|---|---|
@@ -655,7 +655,7 @@ Specs `cmp_*`, one A100-SXM4-40GB per job (NCSA Delta, Apptainer launcher), bf16
 on vLLM 0.7 runs on 0.15.1 (its validated pin) and 0.8 on 0.19.1, both eager. Runs
 `runs/nnsight-versions-delta/20261001T164003Z-27269935` (all five specs) and
 `runs/nnsight-versions-diag/20261001T174400Z-01ef8e5b` (logit lens and patching with prefix caching
-off, plus `nnsight-hf-fp32` as reference). Model is 7B, not the 1.5B of the cross-system section.
+off, plus `nnsight-hf/fp32` as reference). Model is 7B, not the 1.5B of the cross-system section.
 
 | workload (median ms) | HF 0.8 | HF 0.7 | vLLM 0.8 | vLLM 0.7 |
 |---|---|---|---|---|
@@ -688,13 +688,13 @@ bitwise on every patching row. CounterFact prompts are 4–13 tokens, below one 
 specs never hit the cache. nnsight 0.8 sets `skip_reading_prefix_cache=True` on every trace request
 (`modeling/vllm/vllm.py`), so its output with the engine cache on equals its output with it off,
 bitwise. The cache hit also made 0.7 patching look faster (58–60 ms against 73–75 ms with the cache
-off). `backends/nnsight-vllm-0-7` now runs with the cache off, the documented form.
+off). `backends/nnsight-vllm/0-7` now runs with the cache off, the documented form.
 
 ### Against fp32, HF bf16 is the outlier on this model
-Scored against `nnsight-hf-fp32`: vLLM bf16 is SUPPORTED on logit lens (top-1 0.97, TV 0.020;
+Scored against `nnsight-hf/fp32`: vLLM bf16 is SUPPORTED on logit lens (top-1 0.97, TV 0.020;
 final layer 0.015) and patching (TV 0.025–0.028); HF bf16 (eager attention) is NUMERICAL_MISMATCH
 (logit lens TV 0.18, final layer 0.16, top-1 0.69; patching TV 0.28–0.33). So the large
-vLLM-vs-`nnsight-hf` gaps on these rows, in this run and in the Delta cross-system run, measure HF
+vLLM-vs-`nnsight-hf/default` gaps on these rows, in this run and in the Delta cross-system run, measure HF
 bf16's own distance from fp32. On 1.5B (section above) the vLLM systems agreed with each other at
 TV 0.136 from HF bf16; no fp32 logit-lens anchor was taken there. The cause on the HF side is not
 isolated.
@@ -719,14 +719,14 @@ isolated.
 Specs `cmp_*` on Qwen2.5-7B-Instruct, one A100-SXM4-40GB per job (NCSA Delta, Apptainer launcher).
 Runs `runs/fair-delta/20261002T043817Z-ef7473cf` (logit lens, steering, ablation) and
 `runs/fair-delta/20261002T043817Z-1e4cb4fb` (every-step steering, patching): 17 backends, 85 jobs,
-all completed, each starting on an idle GPU. Reference `nnsight-hf-fp32`. Changes from the first
+all completed, each starting on an idle GPU. Reference `nnsight-hf/fp32`. Changes from the first
 Delta pass, each because it skewed the comparison: an eager and a compiled plain vLLM for every
 release, with each system divided by plain vLLM in its own execution mode
 (`overhead_vs_plain_vllm`) and eager systems also by the compiled default
 (`overhead_vs_plain_vllm_default`); engine-wide prefix caching off everywhere (every system already
 kept its intervened requests off the cache; the plain and no-intervention requests did not);
 HF fp32 as the reference; graded steering rows (alpha 0.1 and 0.5); nnsight also through its sync
-engine (`nnsight-vllm-sync`); TransformerLens's transformers pinned.
+engine (`nnsight-vllm/sync`); TransformerLens's transformers pinned.
 
 ### Against fp32, every vLLM system is supported; HF bf16 is the outlier
 
@@ -818,12 +818,12 @@ cell.
 ## Each system's fastest public realization, and headroom beyond it, Delta (2026-10-02)
 
 Each system's general cells beside its fastest realization inside its public interface
-(`docs/writing-workloads.md` §4a): nnsight installed edits (`nnsight-vllm-opt`) and `taps`
-(`nnsight-vllm-taps`, vLLM 0.28.0), interp-engine `vllm-static`, vLLM-Lens's `Hook` API composed for
-a batched readout and hook-built ablation (`vllm-lens-opt`). TransformerLens has no documented
-faster mode at batch 1; its GPU readout (`transformer-lens-opt`) steps outside the public interface
+(`docs/writing-workloads.md` §4a): nnsight installed edits (`nnsight-vllm/opt`) and `taps`
+(`nnsight-vllm/opt/taps`, vLLM 0.28.0), interp-engine `vllm-static`, vLLM-Lens's `Hook` API composed for
+a batched readout and hook-built ablation (`vllm-lens/opt`). TransformerLens has no documented
+faster mode at batch 1; its GPU readout (`transformer-lens-vllm/opt`) steps outside the public interface
 and is reported as headroom, not as its score. All timed in the same job on one node (gpua017,
-A100-40GB), Qwen2.5-7B-Instruct bf16, prefix caching off, scored vs nnsight-hf-fp32. Runs:
+A100-40GB), Qwen2.5-7B-Instruct bf16, prefix caching off, scored vs `nnsight-hf/fp32`. Runs:
 `runs/optimal-delta/20261003T000226Z-612bf792` (logit lens, steering, ablation) and `-7905a82b`
 (generation steering, patching); `slurm/delta-compare.slurm optimal`.
 
@@ -883,8 +883,8 @@ Single-forward static writes (steering, patching) are correct.
 
 ## vLLM-Hook (IBM) in the Delta comparison and perf microbenchmark (2026-10-03)
 
-IBM/vLLM-Hook at 0e34fdd on vLLM 0.19.1, built-in workers only (`backends/vllm-hook`, rpc storage,
-the `HookLLM` default; `backends/vllm-hook-disk`, `disk-st-async`, the storage `docs/configs.md`
+IBM/vLLM-Hook at 0e34fdd on vLLM 0.19.1, built-in workers only (`backends/vllm-hook/default`, rpc storage,
+the `HookLLM` default; `backends/vllm-hook/disk`, `disk-st-async`, the storage `docs/configs.md`
 recommends). Run `runs/vllm-hook-delta/20261003T033445Z-b9314734` (gpua008, with nnsight and
 vLLM-Lens general cells in the same job) and `runs/micro-delta/perf/delta_perf_vllmhook_0191.json`.
 

@@ -10,13 +10,14 @@ Baseline = apply, so overhead-vs-baseline prices the training loop itself.
 """
 from ..data import DataRef
 from ..sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
+from ._models import GPT2
 
 # labeled units: 16 train + 8 held-out (the cell's heldout default)
 _UNITS = DataRef("mib/ioi_labeled", 24)
 
 das_gpt2 = CellConfig(
     name="das_gpt2",
-    methodology="das", family="gpt2", repo="openai-community/gpt2",
+    methodology="das", family="gpt2", repo=GPT2,
     regimes=[ExecutionRegime("interactive", _UNITS, aggregate=False)],
     tasks=[
         ({"train": 0}, "apply (seeded orthogonal rotation)"),

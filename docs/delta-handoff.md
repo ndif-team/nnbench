@@ -10,21 +10,21 @@ Branch `feat/cross-system-comparison`; the Apptainer launcher needs the commit t
 ## What this branch adds
 
 - Five comparison specs on Qwen/Qwen2.5-1.5B-Instruct: `cmp_logit_lens`, `cmp_steering`,
-  `cmp_gen_steering`, `cmp_activation_patching`, `cmp_ablation` (`isb/specs/comparison.py`).
+  `cmp_gen_steering`, `cmp_activation_patching`, `cmp_ablation` (the `comparison` suite, `isb/specs/suites.py`).
 - Backends, one Docker Compose directory each under `backends/`:
 
 | backend | system | vLLM | engine mode |
 |---|---|---|---|
-| `nnsight-hf` | nnsight on transformers 5.12.1 (the reference) | — | eager PyTorch |
-| `nnsight-vllm` | nnsight 0.8.0rc1 (260c555) | 0.19.1 | eager |
-| `vllm-lens` | vLLM-Lens 1.2.1 | 0.19.1 | eager (forced by the plugin) |
-| `interp-engine` | interp-engine 1.12.0 | 0.28.0 | eager |
-| `transformer-lens` | TransformerLens 4.0.0 `RemoteBridge.boot_vllm` | 0.20.2 | torch.compile + CUDA graphs |
-| `vllm-plain-0-19-1`, `-0-20-2`, `-0-28-0` | plain vLLM, nothing installed | each | torch.compile + CUDA graphs |
+| `nnsight-hf/default` | nnsight on transformers 5.12.1 (the reference) | — | eager PyTorch |
+| `nnsight-vllm/default` | nnsight 0.8.0rc1 (260c555) | 0.19.1 | eager |
+| `vllm-lens/default` | vLLM-Lens 1.2.1 | 0.19.1 | eager (forced by the plugin) |
+| `interp-engine-vllm/default` | interp-engine 1.12.0 | 0.28.0 | eager |
+| `transformer-lens-vllm/default` | TransformerLens 4.0.0 `RemoteBridge.boot_vllm` | 0.20.2 | torch.compile + CUDA graphs |
+| `vllm-plain/0-19-1`, `/0-20-2`, `/0-28-0` | plain vLLM, nothing installed | each | torch.compile + CUDA graphs |
 
 - Two denominators per timed cell: `overhead_vs_vanilla` (the same system with no intervention
   attached, timed in the same job) and `overhead_vs_plain_vllm` (plain vLLM at the same version).
-- fp32 variants `nnsight-hf-fp32`, `nnsight-vllm-fp32`, `transformer-lens-fp32` for separating
+- fp32 variants `nnsight-hf/fp32`, `nnsight-vllm/fp32`, `transformer-lens-vllm/fp32` for separating
   precision from intervention differences.
 
 ## Step 0: Delta has no Docker; use the Apptainer launcher
@@ -53,7 +53,7 @@ Builds run the Dockerfiles' `RUN` steps (apt-get, pip) as root, so they use `--f
 default. Check it works with the cheapest image first (plain vLLM 0.19.1 adds only a `mkdir`):
 
 ```bash
-python scripts/bench.py build vllm-plain-0-19-1
+python scripts/bench.py build vllm-plain/0-19-1
 ls -la .apptainer/images/
 ```
 
@@ -94,45 +94,45 @@ each step needs; later steps reuse the images.
 **2a. nnsight on HF and vLLM, one spec, four prompts**
 
 ```bash
-python scripts/bench.py build nnsight-hf nnsight-vllm
+python scripts/bench.py build nnsight-hf/default nnsight-vllm/default
 python scripts/bench.py run --spec cmp_steering --data counterfact:4 \
-  --backends nnsight-hf nnsight-vllm --reference nnsight-hf --gpu 0 --out runs/delta-smoke
+  --backends nnsight-hf/default nnsight-vllm/default --reference nnsight-hf/default --gpu 0 --out runs/delta-smoke
 ```
 
-Expect every `nnsight-vllm` row `SUPPORTED` with top-1 1.00, TV 0.000.
+Expect every `nnsight-vllm/default` row `SUPPORTED` with top-1 1.00, TV 0.000.
 
 **2b. vLLM-Lens and plain vLLM 0.19.1 (same base image)**
 
 ```bash
-python scripts/bench.py build vllm-lens vllm-plain-0-19-1
+python scripts/bench.py build vllm-lens/default vllm-plain/0-19-1
 python scripts/bench.py run --spec cmp_steering --data counterfact:4 \
-  --backends nnsight-hf vllm-lens vllm-plain-0-19-1 --reference nnsight-hf --gpu 0 --out runs/delta-smoke
+  --backends nnsight-hf/default vllm-lens/default vllm-plain/0-19-1 --reference nnsight-hf/default --gpu 0 --out runs/delta-smoke
 ```
 
-Expect `vllm-lens` `SUPPORTED` on all four rows and `vllm-plain-0-19-1` `UNSUPPORTED` on all four
+Expect `vllm-lens/default` `SUPPORTED` on all four rows and `vllm-plain/0-19-1` `UNSUPPORTED` on all four
 (plain vLLM has no intervention layer; it only contributes timing). In `report.json`, the
-`vllm-lens` rows should carry `overhead_vs_plain_vllm`.
+`vllm-lens/default` rows should carry `overhead_vs_plain_vllm`.
 
 **2c. interp-engine and TransformerLens with their plain vLLM versions**
 
 ```bash
-python scripts/bench.py build interp-engine transformer-lens vllm-plain-0-20-2 vllm-plain-0-28-0
+python scripts/bench.py build interp-engine-vllm/default transformer-lens-vllm/default vllm-plain/0-20-2 vllm-plain/0-28-0
 python scripts/bench.py run --spec cmp_steering cmp_ablation --data counterfact:4 \
-  --backends nnsight-hf interp-engine transformer-lens vllm-plain-0-20-2 vllm-plain-0-28-0 \
-  --reference nnsight-hf --gpu 0 --out runs/delta-smoke
+  --backends nnsight-hf/default interp-engine-vllm/default transformer-lens-vllm/default vllm-plain/0-20-2 vllm-plain/0-28-0 \
+  --reference nnsight-hf/default --gpu 0 --out runs/delta-smoke
 ```
 
-Expect, for `cmp_steering`: `interp-engine` `SUPPORTED` on all four rows; `transformer-lens`
+Expect, for `cmp_steering`: `interp-engine-vllm/default` `SUPPORTED` on all four rows; `transformer-lens-vllm/default`
 `SUPPORTED` on the two mean-norm rows and `UNSUPPORTED` on the two "scaled by each token's norm"
-rows. For `cmp_ablation`: `interp-engine` `UNSUPPORTED`, `transformer-lens` `NUMERICAL_MISMATCH`
+rows. For `cmp_ablation`: `interp-engine-vllm/default` `UNSUPPORTED`, `transformer-lens-vllm/default` `NUMERICAL_MISMATCH`
 (bf16 precision; it matches HF at fp32).
 
 **2d. Patching, which uses paired data**
 
 ```bash
 python scripts/bench.py run --spec cmp_activation_patching --data mib/ioi:4 \
-  --backends nnsight-hf nnsight-vllm vllm-lens interp-engine transformer-lens \
-  --reference nnsight-hf --gpu 0 --out runs/delta-smoke
+  --backends nnsight-hf/default nnsight-vllm/default vllm-lens/default interp-engine-vllm/default transformer-lens-vllm/default \
+  --reference nnsight-hf/default --gpu 0 --out runs/delta-smoke
 ```
 
 ## Step 3: the full comparison
@@ -142,23 +142,23 @@ About 40 jobs, roughly 75 minutes on one A100.
 ```bash
 python scripts/bench.py run \
   --spec cmp_logit_lens cmp_steering cmp_gen_steering cmp_activation_patching cmp_ablation \
-  --backends nnsight-hf nnsight-vllm vllm-lens interp-engine transformer-lens \
-             vllm-plain-0-19-1 vllm-plain-0-20-2 vllm-plain-0-28-0 \
-  --reference nnsight-hf --gpu 0 --timeout 3600 --out runs/comparison-delta
+  --backends nnsight-hf/default nnsight-vllm/default vllm-lens/default interp-engine-vllm/default transformer-lens-vllm/default \
+             vllm-plain/0-19-1 vllm-plain/0-20-2 vllm-plain/0-28-0 \
+  --reference nnsight-hf/default --gpu 0 --timeout 3600 --out runs/comparison-delta
 ```
 
 Optional precision check:
 
 ```bash
-python scripts/bench.py build nnsight-hf-fp32 nnsight-vllm-fp32 transformer-lens-fp32
+python scripts/bench.py build nnsight-hf/fp32 nnsight-vllm/fp32 transformer-lens-vllm/fp32
 python scripts/bench.py run --spec cmp_ablation \
-  --backends nnsight-hf-fp32 nnsight-vllm-fp32 transformer-lens-fp32 \
-  --reference nnsight-hf-fp32 --gpu 0 --out runs/comparison-delta
+  --backends nnsight-hf/fp32 nnsight-vllm/fp32 transformer-lens-vllm/fp32 \
+  --reference nnsight-hf/fp32 --gpu 0 --out runs/comparison-delta
 ```
 
 ## Expected verdicts (from the development host)
 
-Top-1 agreement / TV against `nnsight-hf`. If Delta differs, report it rather than changing cells.
+Top-1 agreement / TV against `nnsight-hf/default`. If Delta differs, report it rather than changing cells.
 
 | workload | nnsight-vllm | vllm-lens | interp-engine | transformer-lens |
 |---|---|---|---|---|

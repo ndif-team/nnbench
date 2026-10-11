@@ -1,6 +1,6 @@
 """Apptainer launch path, for hosts without Docker (for example NCSA Delta).
 
-The backend directory contract is unchanged: `compose.yml` and the `Dockerfile` it builds stay the
+The backend config contract is unchanged: `compose.yml` and the `Dockerfile` it builds stay the
 single source. This module reads them. A build translates the Dockerfile's ARG/FROM/RUN lines into
 an Apptainer definition; a run maps the `runner` service's image, entrypoint, working directory,
 environment and volumes onto `apptainer exec --nv`. The launch method is a runner setting, never a

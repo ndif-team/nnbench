@@ -46,11 +46,11 @@ services:
     working_dir: /workspace
     entrypoint: [python3, /backend/run.py]
     environment:
-      ISB_BACKEND: ${ISB_BACKEND:-probe-system}
+      ISB_BACKEND: ${ISB_BACKEND:-probe-system/default}
       ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","gpu_memory_utilization":0.2}'
       HF_TOKEN: ${HF_TOKEN:-}
     volumes:
-      - ../..:/workspace:ro
+      - ../../..:/workspace:ro
       - ${ISB_OUTPUT_DIR:-./out}:/output
       - weights:/models
 volumes:
@@ -61,10 +61,10 @@ volumes:
 
 def test_compose_maps_to_apptainer_exec(tmp_path, monkeypatch):
     monkeypatch.setenv("ISB_APPTAINER_DIR", str(tmp_path / "store"))
-    backend = tmp_path / "repo" / "backends" / "probe-system"
+    backend = tmp_path / "repo" / "backends" / "probe-system" / "default"
     backend.mkdir(parents=True)
     (backend / "compose.yml").write_text(COMPOSE)
-    env = {"ISB_BACKEND": "probe-system", "ISB_GPU": "3", "ISB_OUTPUT_DIR": str(tmp_path / "o")}
+    env = {"ISB_BACKEND": "probe-system/default", "ISB_GPU": "3", "ISB_OUTPUT_DIR": str(tmp_path / "o")}
     with pytest.raises(ValueError, match="missing"):
         apptainer.command(backend / "compose.yml", tmp_path / "repo", env)
     image = apptainer.sif_path(tmp_path / "repo", "probe-system:local")
@@ -91,7 +91,7 @@ def test_supporting_services_need_docker(tmp_path):
 
 def test_job_lifecycle_through_apptainer(tmp_path, monkeypatch):
     monkeypatch.setenv("ISB_APPTAINER_DIR", str(tmp_path / "store"))
-    backend = tmp_path / "backends" / "probe-system"
+    backend = tmp_path / "backends" / "probe-system" / "default"
     backend.mkdir(parents=True)
     (backend / "compose.yml").write_text(COMPOSE)
     image = apptainer.sif_path(tmp_path, "probe-system:local")
@@ -103,7 +103,7 @@ def test_job_lifecycle_through_apptainer(tmp_path, monkeypatch):
 
     def fake_run(argv, extra_env, log, timeout):
         launched.append(argv)
-        completed(tmp_path / "output", experiment, "probe-system")
+        completed(tmp_path / "output", experiment, "probe-system/default")
         return 0
 
     monkeypatch.setattr(apptainer, "run", fake_run)
@@ -114,7 +114,7 @@ def test_job_lifecycle_through_apptainer(tmp_path, monkeypatch):
         return real_run(argv, *args, **kwargs)
 
     monkeypatch.setattr(local.subprocess, "run", no_docker)
-    record = local.run_job("probe-system", tmp_path / "job", experiment, tmp_path / "output",
+    record = local.run_job("probe-system/default", tmp_path / "job", experiment, tmp_path / "output",
                            root=tmp_path, launcher="apptainer")
     assert record["status"] == "completed" and record["launcher"] == "apptainer"
     assert record["image_id"] == "sha256:" + contract.file_digest(image)

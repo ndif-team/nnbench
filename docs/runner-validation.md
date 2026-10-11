@@ -9,7 +9,7 @@ Intervention implementations and trace bodies were not rewritten to improve cove
 Both independent images built through:
 
 ```bash
-python scripts/bench.py build nnsight-hf nnsight-vllm
+python scripts/bench.py build nnsight-hf/default nnsight-vllm/default
 ```
 
 Final execution command (reusing the existing populated cache):
@@ -18,7 +18,7 @@ Final execution command (reusing the existing populated cache):
 ISB_MODEL_CACHE=nnbench-docker-test_model-cache \
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 python scripts/bench.py run --spec logit_lens_gpt2 --data factual:8 \
-  --backends nnsight-hf nnsight-vllm --reference nnsight-hf --gpu 5 \
+  --backends nnsight-hf/default nnsight-vllm/default --reference nnsight-hf/default --gpu 5 \
   --out runs/runner-v2-validation --timeout 600
 ```
 

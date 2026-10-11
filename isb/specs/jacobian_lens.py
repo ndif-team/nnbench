@@ -1,4 +1,4 @@
-"""Jacobian-lens spec — the first spec whose workload is a REAL external dataset.
+"""Jacobian-lens specs (gpt2, Qwen3.5-4B) — the first spec whose workload is a REAL external dataset.
 
 The interactive workload is the upstream multi-hop lens eval (anthropics/jacobian-lens,
 `data/jlens/lens-eval-multihop.json`, 93 items): "Fact: The ocean on the coast of the country
@@ -17,13 +17,14 @@ so overhead-vs-baseline reflects the full-band sweep + transport cost.
 """
 from ..data import DataRef
 from ..sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
+from ._models import GPT2, QWEN35_4B
 
 # default binding: the upstream multi-hop eval; any other lens-eval source swaps in via --data
 MULTIHOP = DataRef("jlens/multihop")
 
 jacobian_lens_gpt2 = CellConfig(
     name="jacobian_lens_gpt2",
-    methodology="jacobian_lens", family="gpt2", repo="openai-community/gpt2",
+    methodology="jacobian_lens", family="gpt2", repo=GPT2,
     regimes=[ExecutionRegime("interactive", MULTIHOP)],
     tasks=[
         ({"unembed": "weight", "transport": None}, "transport=identity (logit-lens readout)"),
@@ -46,7 +47,7 @@ _QWEN35_BAND = list(range(31))          # the lens's source layers (0..30 of the
 
 jacobian_lens_qwen35 = CellConfig(
     name="jacobian_lens_qwen35",
-    methodology="jacobian_lens", family="qwen3_5", repo="Qwen/Qwen3.5-4B",
+    methodology="jacobian_lens", family="qwen3_5", repo=QWEN35_4B,
     regimes=[ExecutionRegime("interactive", MULTIHOP)],
     tasks=[
         ({"unembed": "weight", "transport": None, "layers": _QWEN35_BAND},

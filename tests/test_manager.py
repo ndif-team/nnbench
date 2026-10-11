@@ -316,7 +316,7 @@ def test_repo_pages_render(tmp_path=None):
     model = manager.render_model("llama")
     assert "residual denotation" in model and "fused" in model
     backends = manager.render_backends()
-    assert "nnsight-vllm" in backends
+    assert "nnsight-vllm/default" in backends
     backend = manager.render_backend("vllm_async")
     assert "vLLM async engine, in-process" in backend              # the setup line
     assert "micro.py --backend vllm_async" in backend              # no micro run in this dir

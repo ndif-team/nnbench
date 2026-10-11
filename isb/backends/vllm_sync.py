@@ -32,7 +32,7 @@ class VLLMSyncBackend(VLLMBackend):
         super().__init__(dtype=dtype, trust_remote_code=trust_remote_code,
                          max_model_len=max_model_len, tokenizer=tokenizer,
                          enable_prefix_caching=enable_prefix_caching)
-        # Same role as the async backend's knob: a backend directory running the sync engine as
+        # Same role as the async backend's knob: a backend config running the sync engine as
         # its system under test sizes it through ISB_ENGINE_OPTIONS; the async run's batched twin
         # passes its own fraction to load().
         self.gpu_memory_utilization = gpu_memory_utilization

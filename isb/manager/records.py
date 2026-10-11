@@ -31,6 +31,16 @@ def child(root, name):
     return path
 
 
+def job_dir(root, name):
+    """A backend's job directory: one validated component per segment of `<system>/<config>`."""
+    if not isinstance(name, str) or not name:
+        raise ValueError("invalid manifest path component")
+    path = root
+    for part in name.split("/"):
+        path = child(path, part)
+    return path
+
+
 def cells(rows):
     if not isinstance(rows, list):
         raise ValueError("cells must be a list")
@@ -95,8 +105,10 @@ def load_bundle(directory, prefix):
     experiments = plan["experiments"]
     if not isinstance(names, list) or not isinstance(experiments, list):
         raise ValueError("backend and experiment identities must be lists")
-    for name in names + experiments:
+    for name in experiments:
         child(directory, name)
+    for name in names:
+        job_dir(directory, name)
     if not names or len(set(names)) != len(names) or len(set(experiments)) != len(experiments):
         raise ValueError("duplicate/empty manifest identities")
     reference = plan.get("reference")
@@ -150,7 +162,7 @@ def load_bundle(directory, prefix):
                 scored_rows = {}
         for backend in names:
             key = f"{group}/{backend}"
-            jobdir = child(expdir, backend)
+            jobdir = job_dir(expdir, backend)
             prov, rows, execution, auxiliary = {}, [], {}, []
             state = "PENDING" if plan.get("status") == "running" else "NOT_RUN"
             if plan.get("status") == "cancelled":

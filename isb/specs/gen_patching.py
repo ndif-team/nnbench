@@ -18,8 +18,9 @@ single-forward patch (a near-tie precision degradation); the dtype control gives
 verdict at fp32. A SILENTLY_WRONG here is a finding to investigate (real composition
 failure vs the cross-engine greedy-trajectory artifact), not an assumed pass.
 """
-from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime
 from ..data import DataRef
+from ..sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime
+from ._models import GPT2
 
 # data is a named, swappable pair source; the MIB IOI snapshot (data/mib/README.md), sized at 12
 # to keep the generation regime (pair x 5 decode steps x trials) tractable while the verdict still
@@ -30,7 +31,7 @@ _P = {"layer": 9, "residual": "plain"}
 
 gen_patching_gpt2 = CellConfig(
     name="gen_patching_gpt2",
-    methodology="gen_patching", family="gpt2", repo="openai-community/gpt2",
+    methodology="gen_patching", family="gpt2", repo=GPT2,
     regimes=[ExecutionRegime("generation", _PAIRS, new_tokens=5, aggregate=True)],
     tasks=[
         ({**_P, "bound": "bounded"}, "bound=iter[0:N]"),

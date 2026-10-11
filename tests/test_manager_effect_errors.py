@@ -21,7 +21,7 @@ from isb.sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime
 
 def _assert_pages_render(tmp_path, effect, expected):
     root = bundle(tmp_path / "bundles")
-    path = root / "experiments/exp/custom-backend/result.json"
+    path = root / "experiments/exp/custom-backend/opt/result.json"
     result = json.loads(path.read_text())
     result["auxiliary_calls"] = [{"key": ["__effect__", "interactive"], "record": effect}]
     write_json(path, result)
@@ -29,7 +29,7 @@ def _assert_pages_render(tmp_path, effect, expected):
     with patch("torch.load", side_effect=AssertionError("browsing must use JSON only")):
         collection = Collection(str(root), inbox)
         pages = [dispatch(collection, route) for route in (
-            "/run/attempt/exp/custom-backend", "/spec/attempt/exp")]
+            "/run/attempt/exp/custom-backend/opt", "/spec/attempt/exp")]
         pages.append(export_html(str(root), inbox, items_per_source=0))
     for page in pages:
         assert "effect guard" in page

@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("ISB_DOCKER_TESTS") != "1",
 @pytest.mark.parametrize("mode,status", [("success", "completed"), ("crash", "failed"),
                                         ("timeout", "failed")])
 def test_third_party_directory_with_real_docker(tmp_path, mode, status):
-    package = tmp_path / "backends" / "third-party"
+    package = tmp_path / "backends" / "third-party" / "default"
     package.mkdir(parents=True)
     fixture = Path(__file__).parent / "fixtures" / "job_worker.py"
     # These are runtime test fixtures, not another registered benchmark backend.
@@ -42,8 +42,8 @@ def test_third_party_directory_with_real_docker(tmp_path, mode, status):
                       protocol_absence_reason="Independent Docker lifecycle fixture")
     job = tmp_path / "job"
     experiment = contract.prepare(spec, job)
-    assert local.discover(tmp_path) == ["third-party"]
-    record = local.run_job("third-party", job, experiment, tmp_path / "output", root=tmp_path,
+    assert local.discover(tmp_path) == ["third-party/default"]
+    record = local.run_job("third-party/default", job, experiment, tmp_path / "output", root=tmp_path,
                            timeout=2 if mode == "timeout" else 60)
     assert record["status"] == status
     assert record["image_id"].startswith("sha256:")

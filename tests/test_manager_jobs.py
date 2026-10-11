@@ -11,7 +11,7 @@ from isb.manager.model import archive, discard, _rename_exclusive
 from isb.sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
 
 
-def bundle(parent, name="attempt", backends=("nnsight-hf", "custom-backend"), with_report=True):
+def bundle(parent, name="attempt", backends=("nnsight-hf/default", "custom-backend/opt"), with_report=True):
     root = parent / name
     spec = CellConfig("lens", "logit_lens", "gpt2", "model", [ExecutionRegime("interactive", ["a"])],
                       [({}, "task")], BaselineSpec({}))
@@ -21,7 +21,7 @@ def bundle(parent, name="attempt", backends=("nnsight-hf", "custom-backend"), wi
     write_json(root / "plan.json", plan)
     for backend in backends:
         directory = root / "experiments" / "exp" / backend
-        directory.mkdir()
+        directory.mkdir(parents=True)
         (directory / "result.pt").write_bytes(b"intentionally not a pickle: viewer must never load it")
         write_json(directory / "execution.json", {"status": "completed", "backend": backend,
             "experiment_id": experiment["id"], "image_id": "sha256:fixture"})
@@ -47,12 +47,12 @@ def test_new_results_use_saved_verdicts_without_torch_load_or_scoring(tmp_path):
          patch("isb.sweep.score.score_runs", side_effect=AssertionError("must not rescore")):
         col = Collection(str(root), str(tmp_path / "inbox"))
         assert len(col.entries) == 2
-        assert col.results["attempt/exp/custom-backend"][0].state == "SILENTLY_WRONG"
-        assert ">SILENTLY_WRONG</span>" in dispatch(col, "/run/attempt/exp/custom-backend")
-        assert "sha256:fixture" in dispatch(col, "/run/attempt/exp/custom-backend")
-        assert dispatch(col, "/backend/custom-backend") is not None
+        assert col.results["attempt/exp/custom-backend/opt"][0].state == "SILENTLY_WRONG"
+        assert ">SILENTLY_WRONG</span>" in dispatch(col, "/run/attempt/exp/custom-backend/opt")
+        assert "sha256:fixture" in dispatch(col, "/run/attempt/exp/custom-backend/opt")
+        assert dispatch(col, "/backend/custom-backend/opt") is not None
         page = export_html(str(root), str(tmp_path / "inbox"), items_per_source=1)
-        assert "SILENTLY_WRONG" in page and "custom-backend" in page
+        assert "SILENTLY_WRONG" in page and "custom-backend/opt" in page
         assert "<form" not in page
 
 
@@ -63,7 +63,7 @@ def test_manager_preserves_executed_coordinates_and_call_records(tmp_path):
     root = bundle(tmp_path)
     experiment = json.loads((root / "experiments/exp/experiment.json").read_text())
     spec = wire_spec(experiment)
-    path = root / "experiments/exp/custom-backend/result.json"
+    path = root / "experiments/exp/custom-backend/opt/result.json"
     result = json.loads(path.read_text())
     coords = run_coordinates(
         spec=spec["name"], methodology=spec["methodology"], family=spec["family"], repo=spec["repo"],
@@ -78,7 +78,7 @@ def test_manager_preserves_executed_coordinates_and_call_records(tmp_path):
     result["cells"][0].update(call)
     write_json(path, result)
     col = Collection(str(root))
-    outputs, prov = col.entries["attempt/exp/custom-backend"]
+    outputs, prov = col.entries["attempt/exp/custom-backend/opt"]
     assert prov["coordinates"] == coords
     assert prov["submitted_coordinates"]["inputs_sha256"] == experiment["inputs_sha256"]
     assert prov["submitted_coordinates"]["cases"] == spec["tasks"]
@@ -91,7 +91,7 @@ def test_pending_job_has_frozen_submitted_identity(tmp_path):
     from isb.protocol import InterventionSpec
 
     root = bundle(tmp_path, with_report=False)
-    directory = root / "experiments/exp/custom-backend"
+    directory = root / "experiments/exp/custom-backend/opt"
     (directory / "execution.json").unlink()
     (directory / "result.json").unlink()
     plan_path = root / "plan.json"
@@ -99,7 +99,7 @@ def test_pending_job_has_frozen_submitted_identity(tmp_path):
     plan["status"] = "running"
     write_json(plan_path, plan)
     col = Collection(str(root))
-    _, prov = col.entries["attempt/exp/custom-backend"]
+    _, prov = col.entries["attempt/exp/custom-backend/opt"]
     assert prov["coordinates"]["identity_complete"]
     assert prov["coordinates"] == prov["submitted_coordinates"]
     experiment = json.loads((root / "experiments/exp/experiment.json").read_text())
@@ -107,16 +107,16 @@ def test_pending_job_has_frozen_submitted_identity(tmp_path):
     assert prov["coordinates"]["protocol"] == expected_protocol
     assert "vocabulary" in prov["coordinates"]["protocol"]
     assert "required_capabilities" in prov["coordinates"]["protocol"]
-    assert col.results["attempt/exp/custom-backend"][0].state == "PENDING"
+    assert col.results["attempt/exp/custom-backend/opt"][0].state == "PENDING"
 
 
 def test_manager_rejects_unknown_worker_coordinate_schema(tmp_path):
     root = bundle(tmp_path)
-    path = root / "experiments/exp/custom-backend/result.json"
+    path = root / "experiments/exp/custom-backend/opt/result.json"
     result = json.loads(path.read_text())
     result["provenance"]["coordinates"] = {"schema": 999}
     write_json(path, result)
-    cell = Collection(str(root)).results["attempt/exp/custom-backend"][0]
+    cell = Collection(str(root)).results["attempt/exp/custom-backend/opt"][0]
     assert cell.state == "JOB_FAILED" and "schema" in cell.error
 
 
@@ -124,7 +124,7 @@ def test_manager_preserves_auxiliary_calls_without_adding_task_results(tmp_path)
     from isb.manager.model import perf_points
 
     root = bundle(tmp_path)
-    path = root / "experiments/exp/custom-backend/result.json"
+    path = root / "experiments/exp/custom-backend/opt/result.json"
     result = json.loads(path.read_text())
     supporting = [
         {"key": ["__baseline__", "interactive"],
@@ -137,7 +137,7 @@ def test_manager_preserves_auxiliary_calls_without_adding_task_results(tmp_path)
     result["auxiliary_calls"] = supporting
     write_json(path, result)
     col = Collection(str(root))
-    name = "attempt/exp/custom-backend"
+    name = "attempt/exp/custom-backend/opt"
     outputs, prov = col.entries[name]
     assert prov["auxiliary_calls"] == supporting
     assert outputs[("__meta__",)][("__effect__", "interactive")] == supporting[1]["record"]
@@ -151,11 +151,11 @@ def test_manager_preserves_auxiliary_calls_without_adding_task_results(tmp_path)
                                       [{"key": ["__baseline__", "interactive"], "record": {}}] * 2])
 def test_manager_rejects_invalid_auxiliary_calls(tmp_path, auxiliary):
     root = bundle(tmp_path)
-    path = root / "experiments/exp/custom-backend/result.json"
+    path = root / "experiments/exp/custom-backend/opt/result.json"
     result = json.loads(path.read_text())
     result["auxiliary_calls"] = auxiliary
     write_json(path, result)
-    cell = Collection(str(root)).results["attempt/exp/custom-backend"][0]
+    cell = Collection(str(root)).results["attempt/exp/custom-backend/opt"][0]
     assert cell.state == "JOB_FAILED" and "auxiliary" in cell.error
 
 
@@ -166,25 +166,25 @@ def test_history_preserves_experiment_and_backend_identities(tmp_path):
     assert len(col.by_spec()) == 2
     assert len(col.baselines) == 2
     page = dispatch(col, "/method/logit_lens")
-    assert "first/exp" in page and "second/exp" in page and "custom-backend" in page
+    assert "first/exp" in page and "second/exp" in page and "custom-backend/opt" in page
     assert "not a latest-run selector" in dispatch(col, "/")
 
 
 def test_without_report_never_invents_comparison(tmp_path):
     root = bundle(tmp_path, with_report=False)
     col = Collection(str(root))
-    assert col.results["attempt/exp/custom-backend"][0].state == "RAN"
+    assert col.results["attempt/exp/custom-backend/opt"][0].state == "RAN"
     assert col.warnings
 
 
 def test_failed_execution_overrides_old_passing_report(tmp_path):
     root = bundle(tmp_path)
-    path = root / "experiments/exp/custom-backend/execution.json"
+    path = root / "experiments/exp/custom-backend/opt/execution.json"
     data = json.loads(path.read_text())
     data.update(status="failed", error="timeout")
     write_json(path, data)
     col = Collection(str(root))
-    cell = col.results["attempt/exp/custom-backend"][0]
+    cell = col.results["attempt/exp/custom-backend/opt"][0]
     assert cell.state == "JOB_FAILED" and cell.error == "timeout"
 
 
@@ -192,20 +192,20 @@ def test_job_level_scoring_failure_is_visible(tmp_path):
     root = bundle(tmp_path)
     path = root / "report.json"
     data = json.loads(path.read_text())
-    data["experiments"][0]["cells"][1] = {"backend": "custom-backend", "state": "JOB_FAILED", "error": "corrupt tensor"}
+    data["experiments"][0]["cells"][1] = {"backend": "custom-backend/opt", "state": "JOB_FAILED", "error": "corrupt tensor"}
     write_json(path, data)
-    assert Collection(str(root)).results["attempt/exp/custom-backend"][0].state == "JOB_FAILED"
+    assert Collection(str(root)).results["attempt/exp/custom-backend/opt"][0].state == "JOB_FAILED"
 
 
 def test_missing_output_or_mismatched_result_is_visible(tmp_path):
     root = bundle(tmp_path)
-    (root / "experiments/exp/custom-backend/result.pt").unlink()
-    assert Collection(str(root)).results["attempt/exp/custom-backend"][0].state == "JOB_FAILED"
-    path = root / "experiments/exp/nnsight-hf/result.json"
+    (root / "experiments/exp/custom-backend/opt/result.pt").unlink()
+    assert Collection(str(root)).results["attempt/exp/custom-backend/opt"][0].state == "JOB_FAILED"
+    path = root / "experiments/exp/nnsight-hf/default/result.json"
     data = json.loads(path.read_text())
     data["inputs_sha256"] = "wrong"
     write_json(path, data)
-    assert Collection(str(root)).results["attempt/exp/nnsight-hf"][0].state == "JOB_FAILED"
+    assert Collection(str(root)).results["attempt/exp/nnsight-hf/default"][0].state == "JOB_FAILED"
 
 
 def test_invalid_manifest_does_not_hide_other_runs(tmp_path):
@@ -240,7 +240,7 @@ def test_archive_moves_entire_bundle_and_refuses_collision(tmp_path):
         archive("attempt", str(dest), str(inbox))
     assert source.exists() and (stored / "report.json").read_bytes() == original
     moved = Path(archive("attempt", str(tmp_path / "other"), str(inbox)))
-    assert not source.exists() and (moved / "experiments/exp/custom-backend/result.pt").exists()
+    assert not source.exists() and (moved / "experiments/exp/custom-backend/opt/result.pt").exists()
     assert len(Collection(str(moved)).entries) == 2
 
 
@@ -265,8 +265,8 @@ def test_inbox_links_and_details_use_namespaced_ids(tmp_path):
     bundle(tmp_path / "inbox")
     col = Collection(str(tmp_path / "archive"), str(tmp_path / "inbox"))
     assert "/inbox-run/attempt" in dispatch(col, "/inbox")
-    assert "/run/inbox/attempt/exp/custom-backend" in dispatch(col, "/inbox-run/attempt")
-    assert "SILENTLY_WRONG" in dispatch(col, "/run/inbox/attempt/exp/custom-backend")
+    assert "/run/inbox/attempt/exp/custom-backend/opt" in dispatch(col, "/inbox-run/attempt")
+    assert "SILENTLY_WRONG" in dispatch(col, "/run/inbox/attempt/exp/custom-backend/opt")
 
 
 def test_legacy_files_are_not_loaded_implicitly(tmp_path):
@@ -292,13 +292,13 @@ def test_malformed_report_rows_fall_back_to_execution(tmp_path, bad):
     write_json(path, data)
     col = Collection(str(root))
     assert col.warnings
-    assert col.results["attempt/exp/custom-backend"][0].state == "RAN"
-    assert dispatch(col, "/run/attempt/exp/custom-backend") is not None
+    assert col.results["attempt/exp/custom-backend/opt"][0].state == "RAN"
+    assert dispatch(col, "/run/attempt/exp/custom-backend/opt") is not None
 
 
 def test_failed_reference_remains_visible_in_method_matrix(tmp_path):
     root = bundle(tmp_path)
-    (root / "experiments/exp/nnsight-hf/result.pt").unlink()
+    (root / "experiments/exp/nnsight-hf/default/result.pt").unlink()
     assert ">JOB_FAILED</span>" in dispatch(Collection(str(root)), "/method/logit_lens")
 
 
@@ -364,15 +364,15 @@ def test_partial_report_never_looks_complete(tmp_path):
     data["experiments"][0]["cells"].pop()
     write_json(path, data)
     col = Collection(str(root))
-    assert col.results["attempt/exp/custom-backend"][0].state == "RAN"
+    assert col.results["attempt/exp/custom-backend/opt"][0].state == "RAN"
     assert any("does not cover" in warning for warning in col.warnings)
 
 
 def test_provenance_cannot_create_executable_commit_link(tmp_path):
     root = bundle(tmp_path)
-    path = root / "experiments/exp/custom-backend/result.json"
+    path = root / "experiments/exp/custom-backend/opt/result.json"
     data = json.loads(path.read_text())
     data["provenance"]["client"]["nnsight"] = {"commit": "123456", "remote": "javascript:alert('github.com')"}
     write_json(path, data)
-    page = dispatch(Collection(str(root)), "/run/attempt/exp/custom-backend")
+    page = dispatch(Collection(str(root)), "/run/attempt/exp/custom-backend/opt")
     assert page is not None and "href=\"javascript:" not in page

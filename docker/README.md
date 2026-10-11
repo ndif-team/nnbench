@@ -3,7 +3,7 @@
 > **Legacy tooling.** The main benchmark no longer reads this shared Compose file or accepts
 > the old `--compose-file`/engine-name CLI shown below. Use
 > [`backends/README.md`](../backends/README.md) and
-> `python scripts/bench.py build nnsight-hf nnsight-vllm` for the independent backend runner.
+> `python scripts/bench.py build nnsight-hf/default nnsight-vllm/default` for the independent backend runner.
 > The material below documents the previous setup; `run_vm.sh` now invokes the legacy standalone
 > executor directly and is outside the new HF/local-vLLM validation.
 

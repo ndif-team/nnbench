@@ -1,81 +1,14 @@
-"""Spec registry — `bench.py --spec <name>` looks up here. Each spec is one CellConfig that
-replaces a former `scripts/smoke_*.py`."""
-from .ablation import ablation_gpt2
-from .activation_patching import activation_patching_gpt2
-from .attention_pattern import attention_pattern_gpt2
-from .attribution_patching import attribution_patching_gpt2
-from .comparison import COMPARISON_SPECS
-from .das import das_gpt2
-from .gen_patching import gen_patching_gpt2
-from .gen_steering import gen_steering_gpt2
-from .jacobian_collect import jacobian_collect_gpt2
-from .jacobian_lens import jacobian_lens_gpt2, jacobian_lens_qwen35
-from .logit_lens import logit_lens_gpt2, logit_lens_llama
-from .steering import steering_gpt2
-from .qwen import (
-    ablation_qwen,
-    activation_patching_qwen,
-    gen_steering_qwen,
-    logit_lens_qwen,
-    steering_qwen,
-)
-from .nemotron import (
-    ablation_nemotron,
-    ablation_nemotron_4b,
-    logit_lens_nemotron,
-    logit_lens_nemotron_4b,
-    steering_nemotron,
-    steering_nemotron_4b,
-)
+"""Spec registry — `bench.py --spec <name>` looks up here. One file per methodology holds every
+model's spec for it; suites.py groups them into the named suites."""
+from .suites import SUITES
 
-SPECS = {
-    s.name: s
-    for s in (
-        logit_lens_gpt2,
-        logit_lens_llama,
-        jacobian_lens_gpt2,
-        steering_gpt2,
-        gen_steering_gpt2,
-        gen_patching_gpt2,
-        activation_patching_gpt2,
-        ablation_gpt2,
-        attention_pattern_gpt2,
-        attribution_patching_gpt2,
-        das_gpt2,
-        jacobian_collect_gpt2,
-        # Qwen3.5-4B (family=qwen3_5) — the fitted-J-lens spec; by name only, not in `all`
-        jacobian_lens_qwen35,
-        # Qwen2.5-14B (family=llama) — large-model TP/PP equivalence specs
-        logit_lens_qwen,
-        steering_qwen,
-        ablation_qwen,
-        activation_patching_qwen,
-        gen_steering_qwen,
-        # Nemotron 3 Nano (family=nemotron) — hybrid Mamba; 4B dense (runnable) + 30B-A3B MoE (headline)
-        logit_lens_nemotron_4b,
-        steering_nemotron_4b,
-        ablation_nemotron_4b,
-        logit_lens_nemotron,
-        steering_nemotron,
-        ablation_nemotron,
-        # Qwen2.5-7B (family=llama) — cross-system comparison rows (design §12.14), by name only
-        *COMPARISON_SPECS,
-    )
-}
-
-# The corpus swept by `bench.py --spec all`: the small smoke specs (gpt2 + SmolLM2-135M), which load
-# on one modest GPU. Allowlist by design — large specs (Qwen 14B, and any later big model) are run by
-# exact name and stay out of `all` automatically.
-_DEFAULT_SPECS = (
-    logit_lens_gpt2, logit_lens_llama, jacobian_lens_gpt2, steering_gpt2, gen_steering_gpt2,
-    gen_patching_gpt2, activation_patching_gpt2, ablation_gpt2, attention_pattern_gpt2,
-    attribution_patching_gpt2, das_gpt2, jacobian_collect_gpt2,
-)
+SPECS = {s.name: s for suite in SUITES.values() for s in suite}
+assert len(SPECS) == sum(map(len, SUITES.values())), "a spec belongs to exactly one suite"
 
 
 def default_specs():
-    """Spec names swept by `bench.py --spec all` — the small default corpus (large specs run by name)."""
-    return [s.name for s in _DEFAULT_SPECS]
+    """Spec names swept by `bench.py --spec all` — the smoke suite (larger specs run by name)."""
+    return [s.name for s in SUITES["smoke"]]
 
 
-__all__ = ["SPECS", "default_specs"]
+__all__ = ["SPECS", "SUITES", "default_specs"]

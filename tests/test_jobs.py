@@ -213,19 +213,22 @@ def test_result_must_account_for_all_cells_and_match_inputs(tmp_path):
 
 
 def test_discovery_is_directory_based_and_rejects_escape(tmp_path):
-    backend = tmp_path / "backends" / "third-party"
+    backend = tmp_path / "backends" / "third-party" / "default"
     backend.mkdir(parents=True)
     (backend / "compose.yml").write_text("services: {runner: {image: example}}")
-    assert local.discover(tmp_path) == ["third-party"]
-    assert local.backend_file("third-party", tmp_path) == backend / "compose.yml"
-    for name in ("../third-party", "/tmp", "missing", "third-party/child"):
+    (tmp_path / "backends" / "third-party" / "compose.yml").write_text("services: {}")  # not a config
+    assert local.discover(tmp_path) == ["third-party/default"]
+    assert local.backend_file("third-party/default", tmp_path) == backend / "compose.yml"
+    assert local.canonical("third-party", tmp_path) == "third-party/default"
+    for name in ("../third-party/default", "/tmp", "missing/default", "third-party/child",
+                 "third-party", "third-party/../third-party/default"):
         with pytest.raises(ValueError):
             local.backend_file(name, tmp_path)
 
 
 @pytest.fixture
 def fake_docker(tmp_path, monkeypatch):
-    backend = tmp_path / "backends" / "third-party"
+    backend = tmp_path / "backends" / "third-party" / "default"
     backend.mkdir(parents=True)
     (backend / "compose.yml").write_text("services: {runner: {image: example}}")
     experiment = contract.prepare(specimen(), tmp_path / "job")
@@ -244,7 +247,7 @@ def fake_docker(tmp_path, monkeypatch):
             if behavior["kind"] == "crash":
                 return subprocess.CompletedProcess(argv, 17)
             if behavior["kind"] != "missing":
-                completed(Path(kwargs["env"]["ISB_OUTPUT_DIR"]), experiment, "third-party")
+                completed(Path(kwargs["env"]["ISB_OUTPUT_DIR"]), experiment, "third-party/default")
         if "inspect" in argv:
             return subprocess.CompletedProcess(argv, 0, "sha256:actual-image\n")
         return subprocess.CompletedProcess(argv, 0, "")
@@ -258,7 +261,7 @@ def fake_docker(tmp_path, monkeypatch):
 def test_lifecycle_always_cleans_and_validates(tmp_path, fake_docker, kind, status):
     experiment, calls, behavior = fake_docker
     behavior["kind"] = kind
-    record = local.run_job("third-party", tmp_path / "job", experiment, tmp_path / "output", root=tmp_path)
+    record = local.run_job("third-party/default", tmp_path / "job", experiment, tmp_path / "output", root=tmp_path)
     assert record["status"] == status
     assert record["image_id"] == "sha256:actual-image"
     assert any("down" in cmd for cmd in calls)
@@ -271,7 +274,7 @@ def test_cancel_cleans_before_propagating(tmp_path, fake_docker):
     experiment, calls, behavior = fake_docker
     behavior["kind"] = "cancel"
     with pytest.raises(KeyboardInterrupt):
-        local.run_job("third-party", tmp_path / "job", experiment, tmp_path / "output", root=tmp_path)
+        local.run_job("third-party/default", tmp_path / "job", experiment, tmp_path / "output", root=tmp_path)
     assert any("down" in cmd for cmd in calls)
     assert json.loads((tmp_path / "output" / "execution.json").read_text())["status"] == "cancelled"
 
@@ -280,7 +283,7 @@ def test_source_changes_invalidate_a_completed_container(tmp_path, fake_docker, 
     experiment, calls, _ = fake_docker
     identities = iter([{"source_sha256": "before"}, {"source_sha256": "after"}])
     monkeypatch.setattr(local, "source_identity", lambda root: next(identities))
-    record = local.run_job("third-party", tmp_path / "job", experiment, tmp_path / "output", root=tmp_path)
+    record = local.run_job("third-party/default", tmp_path / "job", experiment, tmp_path / "output", root=tmp_path)
     assert record["status"] == "failed"
     assert "source changed" in record["error"]
     assert any("down" in cmd for cmd in calls)
@@ -292,7 +295,7 @@ def test_backend_services_must_be_job_isolated(tmp_path, fake_docker, monkeypatc
     monkeypatch.setattr(local.subprocess, "run", lambda cmd, **kw:
                         subprocess.CompletedProcess(cmd, 0, json.dumps({"services": {"runner": service}})))
     with pytest.raises(ValueError):
-        local.configuration("third-party", tmp_path)
+        local.configuration("third-party/default", tmp_path)
 
 
 def test_launcher_and_specs_do_not_import_torch():
@@ -318,7 +321,7 @@ def test_next_job_waits_for_the_gpu_memory_to_drain(tmp_path, fake_docker, monke
     readings = iter([1000, 9000, 6000, 1500, 1200])    # before the job, then while draining
     monkeypatch.setattr(local, "gpu_used_mib", lambda gpu: next(readings))
     monkeypatch.setattr(local.time, "sleep", lambda seconds: None)
-    record = local.run_job("third-party", tmp_path / "job", experiment, tmp_path / "output", root=tmp_path)
+    record = local.run_job("third-party/default", tmp_path / "job", experiment, tmp_path / "output", root=tmp_path)
     assert record["status"] == "completed"
     assert record["gpu_release"]["baseline_mib"] == 1000
     assert record["gpu_release"]["after_mib"] == 1500    # first reading within 1 GiB of baseline

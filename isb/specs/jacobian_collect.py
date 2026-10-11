@@ -9,12 +9,13 @@ exports to a fitted-lens artifact via scripts/export_jacobian.py ("file:" transp
 """
 from ..data import DataRef
 from ..sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
+from ._models import GPT2
 
 _PROMPTS = DataRef("wikitext", 4)
 
 jacobian_collect_gpt2 = CellConfig(
     name="jacobian_collect_gpt2",
-    methodology="jacobian_collect", family="gpt2", repo="openai-community/gpt2",
+    methodology="jacobian_collect", family="gpt2", repo=GPT2,
     regimes=[ExecutionRegime("interactive", _PROMPTS, aggregate=False)],
     tasks=[({"grad": True}, "collect (8 batched VJPs per prompt)")],
     baseline=BaselineSpec(params={"grad": False}),

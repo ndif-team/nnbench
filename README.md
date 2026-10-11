@@ -56,7 +56,7 @@ python scripts/check_causalab_alignment.py /path/to/causalab --check
 
 The launcher freezes one experiment and its inputs, then runs each selected backend in an
 independent container. Workers save outputs, timing and provenance; a separate scorer compares
-the saved artifacts. Select the reference explicitly with `--reference`, normally `nnsight-hf`.
+the saved artifacts. Select the reference explicitly with `--reference`, normally `nnsight-hf/default`.
 
 | State | Meaning |
 |---|---|
@@ -93,19 +93,20 @@ See [measured findings](docs/findings.md) and the
 ## Cross-system comparison
 
 The `cmp_*` specs (logit lens, steering, generation steering, activation patching, ablation on
-Qwen2.5-7B-Instruct; [`isb/specs/comparison.py`](isb/specs/comparison.py)) run one workload
-through several interpretability systems on vLLM, each in its own backend directory:
+Qwen2.5-7B-Instruct; the `comparison` suite in [`isb/specs/suites.py`](isb/specs/suites.py)) run one workload
+through several interpretability systems on vLLM, each a system directory with one config per
+variant:
 
 | System | Backends |
 |---|---|
-| nnsight 0.8 | `nnsight-vllm` (async), `nnsight-vllm-sync`, `nnsight-vllm-opt` (installed edits), `nnsight-vllm-taps` (CUDA-graph taps, vLLM 0.28.0) |
-| nnsight 0.7 | `nnsight-vllm-0-7`, `nnsight-hf-0-7` |
-| vLLM-Lens | `vllm-lens`, `vllm-lens-opt` |
-| interp-engine | `interp-engine` (hooked), `interp-engine-static` (`vllm-static`) |
-| TransformerLens 4 | `transformer-lens`, `transformer-lens-opt` (headroom, see below) |
-| vLLM-Hook (IBM) | `vllm-hook` (rpc storage), `vllm-hook-disk` (`disk-st-async`) |
-| Plain vLLM | `vllm-plain-<version>` (compiled) and `vllm-plain-eager-<version>` |
-| Reference | `nnsight-hf-fp32` (HF transformers in fp32) |
+| nnsight 0.8 | `nnsight-vllm/default` (async), `nnsight-vllm/sync`, `nnsight-vllm/opt` (installed edits), `nnsight-vllm/opt/taps` (CUDA-graph taps, vLLM 0.28.0) |
+| nnsight 0.7 | `nnsight-vllm/0-7`, `nnsight-hf/0-7` |
+| vLLM-Lens | `vllm-lens/default`, `vllm-lens/opt` |
+| interp-engine | `interp-engine-vllm/default` (hooked), `interp-engine-vllm/static` (`vllm-static`) |
+| TransformerLens 4 | `transformer-lens-vllm/default`, `transformer-lens-vllm/opt` (headroom, see below) |
+| vLLM-Hook (IBM) | `vllm-hook/default` (rpc storage), `vllm-hook/disk` (`disk-st-async`) |
+| Plain vLLM | `vllm-plain/<version>` (compiled) and `vllm-plain/eager-<version>` |
+| Reference | `nnsight-hf/fp32` (HF transformers in fp32) |
 
 Plain vLLM at each system's release and execution mode is the overhead floor. Prefix caching is off
 on every vLLM engine. A workload a system cannot express is `UNSUPPORTED` with the reason from its
@@ -121,20 +122,20 @@ controls, are in [the findings](docs/findings.md).
 ## Running it
 
 Requirements: Docker Engine, Compose v2, NVIDIA Container Toolkit for the bundled GPU backends,
-and host Python with CPU PyTorch for scoring. Each backend directory owns its image, dependencies
-and entrypoint.
+and host Python with CPU PyTorch for scoring. Each system directory under `backends/` owns its
+image and implementation; each config inside it (`<system>/<config>`) owns its options.
 
 ```bash
 python scripts/bench.py list backends
 python scripts/bench.py list specs
-python scripts/bench.py build nnsight-hf nnsight-vllm
+python scripts/bench.py build nnsight-hf/default nnsight-vllm/default
 
 # Compare vLLM with an explicit HF reference.
 python scripts/bench.py run --spec logit_lens_gpt2 --data factual:2 \
-  --backends nnsight-hf nnsight-vllm --reference nnsight-hf --gpu 0
+  --backends nnsight-hf/default nnsight-vllm/default --reference nnsight-hf/default --gpu 0
 
 # Collect the small default corpus on HF.
-python scripts/bench.py run --spec all --backends nnsight-hf --gpu 0
+python scripts/bench.py run --spec all --backends nnsight-hf/default --gpu 0
 
 # Re-score an existing run.
 python scripts/bench.py score runs/REPLACE_WITH_RUN_ID
@@ -155,9 +156,10 @@ Apptainer definition and a `.sif` image, and `run` maps the `runner` service ont
 
 ```bash
 export ISB_LAUNCHER=apptainer ISB_APPTAINER_DIR=$PWD/.apptainer
-python scripts/bench.py build nnsight-vllm vllm-lens
+python scripts/bench.py build nnsight-vllm/default vllm-lens/default
 HF_HUB_OFFLINE=1 python scripts/bench.py run --spec cmp_steering \
-  --backends nnsight-hf-fp32 nnsight-vllm vllm-lens vllm-plain-0-19-1 --reference nnsight-hf-fp32 --gpu 0
+  --backends nnsight-hf/fp32 nnsight-vllm/default vllm-lens/default vllm-plain/0-19-1 \
+  --reference nnsight-hf/fp32 --gpu 0
 ```
 
 `slurm/delta-build.slurm` builds images and `slurm/delta-compare.slurm STAGE` runs the comparison
@@ -210,7 +212,7 @@ isb/
   oracle/                  numerical comparison
   perf/                    timing and microbenchmarks
   manager/                 saved-report browser and HTML export
-backends/                  independent NAME/{compose.yml,Dockerfile,run.py} packages
+backends/                  <system>/{Dockerfile,backend.py,cells.py} + <system>/<config>/compose.yml
 slurm/                     batch scripts for the Apptainer path on Slurm clusters
 scripts/                   benchmark CLI, alignment checker, manager and standalone tools
 docs/                      design, alignment audit, guides and measured findings

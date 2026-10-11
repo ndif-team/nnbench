@@ -1,4 +1,5 @@
-"""Local Docker Compose job lifecycle. Backend names are directory names, never engine keys."""
+"""Local Docker Compose job lifecycle. Backend names are config paths under backends/
+(`<system>/<config>`, isb/jobs/layout.py), never engine keys."""
 from __future__ import annotations
 
 import json
@@ -11,6 +12,7 @@ from pathlib import Path
 
 from . import apptainer
 from .contract import digest, file_digest, validate_result, write_json
+from .layout import ROOT, canonical, config_dir, discover  # noqa: F401  (re-exported for the CLI)
 
 LAUNCHERS = ("docker", "apptainer")
 
@@ -22,23 +24,20 @@ def default_launcher():
         raise ValueError(f"ISB_LAUNCHER must be one of {LAUNCHERS}, not {launcher!r}")
     return launcher
 
-ROOT = Path(__file__).resolve().parents[2]
-NAME = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
-
-
-def discover(root=ROOT):
-    return sorted(p.name for p in (root / "backends").iterdir()
-                  if NAME.fullmatch(p.name) and (p / "compose.yml").is_file()
-                  and p.resolve().parent == (root / "backends").resolve())
-
 
 def backend_file(name, root=ROOT):
-    if not NAME.fullmatch(name) or name not in discover(root):
+    """compose.yml of one config; `name` must be the full `<system>/<config>` name."""
+    if name not in discover(root):
         raise ValueError(f"unknown backend {name!r}; available: {', '.join(discover(root))}")
-    path = root / "backends" / name / "compose.yml"
-    if path.resolve().parent != (root / "backends" / name).resolve():
+    path = config_dir(name, root) / "compose.yml"
+    if path.resolve().parent != config_dir(name, root).resolve():
         raise ValueError("backend configuration must be inside its directory")
     return path
+
+
+def project_name(prefix, name):
+    """A Compose project name for one config (lowercase letters, digits, '-' and '_' only)."""
+    return prefix + re.sub(r"[^a-z0-9_-]", "-", name)
 
 
 def compose(name, project, root=ROOT):
@@ -108,7 +107,11 @@ def wait_for_release(gpu, baseline, *, tolerance_mib=1024, timeout=120, poll=1.0
 def run_job(name, job, experiment, output, *, gpu="0", timeout=1800, root=ROOT, launcher="docker"):
     """Always collect an execution record and clean only this job's Compose project (Docker) or
     process group (Apptainer)."""
-    output.mkdir(parents=True, exist_ok=False)
+    # A nested config's job directory sits inside its parent config's (opt/taps in opt): the
+    # directory may exist, a previous job's record in it may not.
+    output.mkdir(parents=True, exist_ok=True)
+    if (output / "execution.json").exists():
+        raise FileExistsError(f"{output} already holds a job")
     project = "isb-" + uuid.uuid4().hex[:20]
     container = project + "-runner"
     command = compose(name, project, root)

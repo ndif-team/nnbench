@@ -15,8 +15,10 @@ nnbench: a **systems performance + coverage benchmark** for interpretability wor
 
 ## Environment & commands
 
-The main benchmark discovers independent `backends/NAME/compose.yml` configurations. Every one
-defines a `runner` service; its Dockerfile and entrypoint own dependencies and execution settings.
+The main benchmark discovers independent `backends/<system>/<config>/compose.yml` configurations;
+the backend name is that path. Every one defines a `runner` service. The system directory owns the
+Dockerfile, `backend.py` and `cells.py`; a config adds its own `backend.py`/`cells.py` only when it
+needs a separate implementation, and never reads a sibling's files (`isb/jobs/layout.py`).
 The host runner in `isb/jobs/` is backend-agnostic: do not add engine switches, backend registries,
 Conda paths, or shared-Compose override selection. See `backends/README.md` for the file contract.
 
@@ -26,9 +28,9 @@ python -m pytest tests/ -q
 python -m pytest tests/test_sweep.py -q
 
 # Benchmark (needs GPU): build images, then the host script launches one container per run
-python scripts/bench.py build nnsight-hf nnsight-vllm
-python scripts/bench.py run --spec steering_gpt2 --backends nnsight-hf nnsight-vllm --reference nnsight-hf --gpu 0
-python scripts/bench.py run --spec all --backends nnsight-hf --gpu 0
+python scripts/bench.py build nnsight-hf/default nnsight-vllm/default
+python scripts/bench.py run --spec steering_gpt2 --backends nnsight-hf/default nnsight-vllm/default --reference nnsight-hf/default --gpu 0
+python scripts/bench.py run --spec all --backends nnsight-hf/default --gpu 0
 # Specs live in isb/specs/ (logit_lens_gpt2, logit_lens_llama, steering_gpt2, activation_patching_gpt2,
 # ablation_gpt2, ...).
 
@@ -54,9 +56,9 @@ belongs to the independent Compose launcher. A `vllm_*` variant falls back to th
 cell when no exact registration exists. Current contracts
 and acceptance checks live in `docs/design.md` §12.13.
 
-Main data flow: `scripts/bench.py` → frozen experiment/inputs → `backends/NAME/run.py` in its
-own Compose project → validated artifacts → `isb/jobs/score.py`. The shared nnsight worker reuses
-the scientific execution routines below. Standalone execute/score tools retain their `.pt`
+Main data flow: `scripts/bench.py` → frozen experiment/inputs → `isb.jobs.entry` (the config's
+nearest `backend.py`/`cells.py`) in its own Compose project → validated artifacts →
+`isb/jobs/score.py`. The shared nnsight worker reuses the scientific execution routines below. Standalone execute/score tools retain their `.pt`
 interface. The manager reads saved job reports; standalone `.pt` browsing requires explicit
 `--import-legacy` summaries. Readers accept job wire version 2 and coordinate schema 3;
 older artifacts must be rerun.
