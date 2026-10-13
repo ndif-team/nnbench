@@ -78,14 +78,14 @@ def test_driver_injects_knobs_under_task_params():
 
 
 def test_spec_with_data_swaps_feed_not_procedure():
-    from isb.specs import SPECS
-    spec = SPECS["jacobian_lens_gpt2"]
+    from isb.workloads import case
+    spec = case("jacobian_lens/gpt2")
     rebound = spec_with_data(spec, DataRef("jlens/poetry"))
-    assert rebound.name == "jacobian_lens_gpt2@jlens-poetry"      # refs/banners never collide
+    assert rebound.name == "jacobian_lens/gpt2@jlens-poetry"      # refs/banners never collide
     assert len(rebound.regimes[0].prompts) == 98
     assert rebound.regimes[0].data_knobs == {"position": "last_newline"}
     assert rebound.tasks == spec.tasks                            # procedure untouched
-    assert len(SPECS["jacobian_lens_gpt2"].regimes[0].prompts) == 93        # original untouched
+    assert len(spec.regimes[0].prompts) == 93                     # original untouched
     # unit-kind mismatch is loud: pair data cannot feed a prompt procedure
     try:
         spec_with_data(spec, DataRef("ioi_pairs", 8))
@@ -107,8 +107,8 @@ def test_labeled_pair_source_and_kind_check():
     assert all(a.startswith(" ") for a in answers)        # leading-space token form
     pairs, _ = load_data(DataRef("mib/ioi", 5))
     assert [(u[0], u[1]) for u in units] == pairs          # same snapshot, answers appended
-    from isb.specs import attribution_patching as ap
-    spec = ap.attribution_patching_gpt2
+    from isb.workloads import case
+    spec = case("attribution_patching/gpt2")
     try:                                                   # labeled procedure rejects plain pairs
         spec_with_data(spec, DataRef("mib/ioi", 5))
         raise AssertionError("pair data bound to a labeled-pair procedure must raise")
@@ -146,9 +146,9 @@ def test_wikitext_source_and_jacobian_valid_slice():
 def test_debug_companion_compare_and_prompts():
     import torch
     from isb.debugtrace import compare_debug, debug_prompts
-    from isb.specs import activation_patching, logit_lens
-    assert all(isinstance(p, str) for p in debug_prompts(activation_patching.activation_patching_gpt2))
-    assert all(isinstance(p, str) for p in debug_prompts(logit_lens.logit_lens_gpt2))
+    from isb.workloads import case
+    assert all(isinstance(p, str) for p in debug_prompts(case("activation_patching/gpt2")))
+    assert all(isinstance(p, str) for p in debug_prompts(case("logit_lens/gpt2")))
 
     g = torch.Generator().manual_seed(0)
     resid = torch.randn(4, 8, generator=g)

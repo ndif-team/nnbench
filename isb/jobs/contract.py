@@ -9,6 +9,8 @@ from pathlib import Path
 
 VERSION = 2            # experiment/result files this code writes
 VERSIONS = (VERSION,)  # experiment/result files this code reads
+# A result cell carrying `row` and `alternative` is an alternative realization of that row (design.md
+# §12.16), an additive field: a result without such cells holds the default realizations only.
 PLAN_VERSION = 1       # the launcher's plan.json / report.json
 
 
@@ -176,8 +178,13 @@ def validate_result(directory, experiment, backend):
         raise ValueError("result identity/status does not match requested job")
     cells = result.get("cells", [])
     keys = [(row["workload"], row["label"]) for row in cells]
-    if len(keys) != len(set(keys)) or set(keys) != expected_cells(experiment):
+    expected = expected_cells(experiment)
+    defaults = {key for key, row in zip(keys, cells) if "row" not in row}
+    if len(keys) != len(set(keys)) or defaults != expected:
         raise ValueError("result does not account for every requested cell exactly once")
+    if any((row["workload"], row["row"]) not in expected or not isinstance(row.get("alternative"), dict)
+           for row in cells if "row" in row):
+        raise ValueError("an alternative realization must name a requested row and its params")
     if any(row.get("state") not in {"RAN", "ERROR", "UNSUPPORTED"} for row in cells):
         raise ValueError("invalid execution cell status")
     if any(row["state"] == "UNSUPPORTED" and not (isinstance(row.get("unsupported"), str)

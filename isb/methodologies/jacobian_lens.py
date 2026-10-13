@@ -10,7 +10,7 @@ Upstream, J_l is the fitted average input-output Jacobian E[dh_final/dh_l]; fitt
 (offline, HF-side — on vLLM `grad` is ERROR, the known frontier). The BENCH question is not the
 map's faithfulness but whether the serving backend reproduces the readout: read-at-position +
 transport matmul (meta-compute) + norm + portable unembed, HF vs vLLM, on the real J-lens datasets
-(`data/jlens/`, spec `jacobian_lens_gpt2`).
+(`data/jlens/`, workload `jacobian_lens`).
 
 `transport` selects the map, in order of realism:
   - None: identity, the plain logit lens at the readout position.
@@ -108,7 +108,7 @@ def _jlens_proxy(blocks, norm, head, *, layers, pos, unembed, residual, transpor
     return torch.stack(rows, dim=0)             # [n_band_layers, 1-or-B, vocab]
 
 
-@cell("jacobian_lens", family="*", backend="hf")
+@cell("jacobian_lens", family="*", backend="hf", realizations=[{"unembed": "weight"}])
 def jacobian_lens_hf(be, model, m, prompts, *, layers="all", position="last",
                      unembed="module", residual="plain", transport=None):
     if isinstance(transport, str):                        # fitted-lens spec -> per-layer map (cached)
@@ -122,7 +122,7 @@ def jacobian_lens_hf(be, model, m, prompts, *, layers="all", position="last",
     return be.run(model, prompts, build)
 
 
-@cell("jacobian_lens", family="*", backend="vllm_async")
+@cell("jacobian_lens", family="*", backend="vllm_async", realizations=[{"unembed": "module"}])
 def jacobian_lens_vllm(be, model, m, prompts, *, layers="all", position="last",
                        unembed="weight", residual=None, transport=None):
     if isinstance(transport, str):                        # fitted-lens spec -> per-layer map (cached)

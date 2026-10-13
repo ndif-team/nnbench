@@ -84,12 +84,12 @@ Run files record the installed nnsight Git commit using pip's installation metad
 
 ## Optional serve backend (outside the HF/vLLM validation)
 
-The Compose file also contains an optional `server` service. `docker/run_vm.sh` groups specs by model,
+The Compose file also contains an optional `server` service. `docker/run_vm.sh` groups cases by model,
 starts that server, and lets `bench.py` launch the GPU-less `vllm_serve` runner against it:
 
 ```bash
 GPU=0 docker/run_vm.sh
-GPU=0 docker/run_vm.sh steering_gpt2 ablation_gpt2
+GPU=0 docker/run_vm.sh steering/gpt2 ablation/gpt2
 ```
 
 Reference files must already exist in `results/runs`; stock them with normal containerized runs:

@@ -29,10 +29,10 @@ python -m pytest tests/test_sweep.py -q
 
 # Benchmark (needs GPU): build images, then the host script launches one container per run
 python scripts/bench.py build nnsight-hf/default nnsight-vllm/default
-python scripts/bench.py run --spec steering_gpt2 --backends nnsight-hf/default nnsight-vllm/default --reference nnsight-hf/default --gpu 0
-python scripts/bench.py run --spec all --backends nnsight-hf/default --gpu 0
-# Specs live in isb/specs/ (logit_lens_gpt2, logit_lens_llama, steering_gpt2, activation_patching_gpt2,
-# ablation_gpt2, ...).
+python scripts/bench.py run --workload steering --model gpt2 --backends nnsight-hf/default nnsight-vllm/default --reference nnsight-hf/default --gpu 0
+python scripts/bench.py run --suite smoke --gpu 0
+# Workloads in isb/workloads/ (one per methodology), models in isb/models.py, suites (run recipes)
+# in isb/suites.py; `bench.py list workloads|models|suites`. A case is named <workload>/<model>.
 
 # Client/server (vllm_serve) split — after stocking HF and control run files
 GPU=0 docker/run_vm.sh
@@ -63,7 +63,7 @@ interface. The manager reads saved job reports; standalone `.pt` browsing requir
 `--import-legacy` summaries. Readers accept job wire version 2 and coordinate schema 3;
 older artifacts must be rerun.
 
-1. **Spec** (`isb/specs/`): `InterventionSpec × TaskSpec × ExecutionRegime` per methodology. Batching is a *coverage axis* — each case is oracle-checked in its own regime, not just timed.
+1. **Workload × model** (`isb/workloads/`, `isb/models.py`, design §12.16): a workload is a methodology's semantic rows, data, regimes and effect check, naming no model and no system; layers are `Depth` fractions. `instantiate` resolves it on a model into the frozen `CellConfig` (`InterventionSpec × TaskSpec × ExecutionRegime`). Realizations (nnsight's in-place vs replacement write, the naive plain-residual port) are declared on the cell registration, never written in a workload. Suites (`isb/suites.py`) are run recipes. Batching is a *coverage axis* — each case is oracle-checked in its own regime, not just timed.
 2. **Backend** (`isb/backends/`): `be` objects — `hf` (the per-family control), `vllm_async` (in-process system under test), `vllm_serve` (over-HTTP). One model load per backend, amortized across all tasks; an intervention error is isolated (engine survives, later tasks still run).
 3. **Oracle** (`isb/oracle/equivalence.py`): compares outputs via top-1 agreement and softmax TV. The main runner takes an explicit reference and comparison axis, with no implicit precision-control jobs. The standalone `scripts/score.py --ctl` can disambiguate precision using current schema-3 artifacts.
 4. **Perf** (`isb/perf/`): warm timing (warmup + N trials, CUDA-synced, median±std, peak mem) — correctness is verified in the same warm/batched regime perf is measured in.

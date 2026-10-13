@@ -36,18 +36,21 @@ Without Docker, `ISB_LAUNCHER=apptainer` runs the same directories through Appta
 
 ```bash
 python scripts/bench.py list backends
-python scripts/bench.py list specs
+python scripts/bench.py list workloads   # also: models, suites
 python scripts/bench.py build nnsight-hf/default nnsight-vllm/default
 
-python scripts/bench.py run --spec logit_lens_gpt2 --data factual:32 \
+python scripts/bench.py run --workload logit_lens --model gpt2 --data factual:32 \
   --backends nnsight-hf/default nnsight-vllm/default --reference nnsight-hf/default --gpu 0
 
 # Several experiments; one isolated container per experiment/backend pair.
-python scripts/bench.py run --spec logit_lens_gpt2 steering_gpt2 \
+python scripts/bench.py run --workload logit_lens steering --model gpt2 \
   --backends nnsight-hf/default nnsight-vllm/default --reference nnsight-hf/default --gpu 0
 
 # Collect without a correctness reference. No hidden control runs.
-python scripts/bench.py run --spec all --backends nnsight-hf/default --gpu 0
+python scripts/bench.py run --workload logit_lens --model gpt2 --backends nnsight-hf/default --gpu 0
+
+# A suite (isb/suites.py): its workloads x models, backends and reference.
+python scripts/bench.py run --suite smoke --gpu 0
 
 # Re-score saved artifacts; no Docker/model startup.
 python scripts/bench.py score runs/REPLACE_WITH_RUN_ID
@@ -77,7 +80,7 @@ For an fp32 variant of the same vLLM implementation:
 mkdir backends/nnsight-vllm/fp32
 cp backends/nnsight-vllm/default/compose.yml backends/nnsight-vllm/fp32/
 # In the new compose.yml, change ISB_ENGINE_OPTIONS dtype to float32 and the ISB_BACKEND default.
-python scripts/bench.py run --spec logit_lens_gpt2 --data factual:2 \
+python scripts/bench.py run --workload logit_lens --model gpt2 --data factual:2 \
   --backends nnsight-hf/default nnsight-vllm/fp32 --reference nnsight-hf/default --gpu 0
 ```
 
@@ -86,8 +89,8 @@ changing dependencies, set build args and a distinct image tag in the new Compos
 building it. A config that needs a different implementation adds its own `cells.py` (and
 `backend.py` if the engine wiring differs) in its directory; a config-level `backend.py` reuses the
 system's through a relative import (`from ..backend import ...`). The bundled `backend.py` files
-translate existing spec model-load hints and reject conflicts with configured options. Those compatibility hints are
-retained in the Python specs; the host launcher does not interpret them.
+translate the model row's load options (`hf_kwargs`, `vllm_kwargs` in `isb/models.py`, frozen into the
+experiment) and reject conflicts with configured options; the host launcher does not interpret them.
 
 A new system needs actual method implementations, not just a Dockerfile. It can supply
 its own executable, provided it satisfies the file contract below. The shared nnsight worker is

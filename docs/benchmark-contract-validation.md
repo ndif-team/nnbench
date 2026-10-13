@@ -39,7 +39,7 @@ python -m pytest -q -p no:cacheprovider
 ISB_DOCKER_TESTS=1 python -m pytest tests/test_jobs_docker.py -q -p no:cacheprovider
 python scripts/check_causalab_alignment.py /path/to/pinned/causalab --check
 python scripts/bench.py list backends
-python scripts/bench.py list specs
+python scripts/bench.py list workloads
 git diff --check
 ```
 

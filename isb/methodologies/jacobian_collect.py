@@ -1,5 +1,5 @@
 """Jacobian collection — fitting the jacobian lens's transport maps (the workload the existing
-jacobian_lens spec only APPLIES).
+jacobian_lens workload only APPLIES).
 
 Upstream estimator (anthropics/jacobian-lens, jlens/fitting.py): J_l is the average input-output
 Jacobian dh_target/dh_l. Per prompt: one forward plus ceil(d_model / dim_batch) backward passes.

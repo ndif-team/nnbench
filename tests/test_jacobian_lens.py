@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import isb.methodologies  # noqa: F401,E402  (registers cells)
 from isb.methodologies.jacobian_lens import _orthogonal  # noqa: E402
 from isb.methodologies.registry import CELLS, get_cell  # noqa: E402
-from isb.specs import SPECS, default_specs  # noqa: E402
+from isb.suites import suite_cases  # noqa: E402
+from isb.workloads import case  # noqa: E402
 
 HID = 6
 
@@ -108,8 +109,8 @@ def test_hub_transport_spec_parses_and_rejects_malformed():
 
 
 def test_spec_workload_is_the_upstream_multihop_dataset():
-    spec = SPECS["jacobian_lens_gpt2"]
-    assert spec.name in default_specs()                          # gpt2-scale -> in the default sweep
+    spec = case("jacobian_lens/gpt2")
+    assert spec.name in {s.name for s in suite_cases("smoke")}   # gpt2-scale -> in the smoke suite
     prompts = spec.regimes[0].prompts
     assert len(prompts) == 93                                    # the shipped multihop item count
     assert any("Carnival" in p for p in prompts)                 # really the upstream data

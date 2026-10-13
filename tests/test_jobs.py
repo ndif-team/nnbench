@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 
 from isb.jobs import contract, local
-from isb.jobs.cli import _specs, parser
+from isb.jobs.cli import _recipe, parser
+from isb.suites import cases, parse_data
 from isb.jobs.worker import merge_requirements
 from isb.sweep.spec import BaselineSpec, CellConfig, ExecutionRegime, TaskSpec
 
@@ -298,8 +299,9 @@ def test_backend_services_must_be_job_isolated(tmp_path, fake_docker, monkeypatc
         local.configuration("third-party/default", tmp_path)
 
 
-def test_launcher_and_specs_do_not_import_torch():
-    code = "import isb.jobs.cli, isb.specs, sys; assert 'torch' not in sys.modules; assert 'nnsight' not in sys.modules"
+def test_launcher_and_definitions_do_not_import_torch():
+    code = ("import isb.jobs.cli, isb.workloads, isb.models, isb.suites, sys; "
+            "assert 'torch' not in sys.modules; assert 'nnsight' not in sys.modules")
     subprocess.run([sys.executable, "-c", code], check=True, cwd=local.ROOT)
 
 
@@ -310,10 +312,40 @@ def test_requirement_conflicts_are_not_silent():
 
 
 def test_cli_uses_names_and_rejects_nonpositive_counts():
-    args = parser().parse_args(["run", "--spec", "logit_lens_gpt2", "--backends", "third-party"])
+    args = parser().parse_args(["run", "--workload", "logit_lens", "--model", "gpt2",
+                                "--backends", "third-party"])
     assert args.backends == ["third-party"]
     with pytest.raises(ValueError, match="positive"):
-        _specs(["logit_lens_gpt2"], "factual:0")
+        parse_data("factual:0")
+
+
+def test_cli_suite_settings_and_overrides():
+    args = parser().parse_args(["run", "--suite", "cross-system", "--backends", "nnsight-hf/default",
+                                "--realizations", "all"])
+    suite, entries, settings = _recipe(args)
+    assert suite == "cross-system" and settings["backends"] == ["nnsight-hf/default"]
+    assert settings["realizations"] == "all" and settings["reference"] == "nnsight-hf/default"
+    specs, skipped = cases(entries, settings["realizations"])
+    assert {s.name for s in specs} == {f"{w}/qwen2.5-7b" for w in (
+        "logit_lens", "steering", "ablation", "gen_steering", "activation_patching")}
+    assert all(s.realizations == "all" for s in specs)
+    _, entries, _ = _recipe(parser().parse_args(["run", "--suite", "cross-system", "--workload", "steering"]))
+    assert [s.name for s in cases(entries)[0]] == ["steering/qwen2.5-7b"]
+    with pytest.raises(ValueError, match="no case"):
+        _recipe(parser().parse_args(["run", "--suite", "smoke", "--model", "qwen2.5-7b"]))
+    with pytest.raises(ValueError, match="--backends"):
+        _recipe(parser().parse_args(["run", "--workload", "steering", "--model", "gpt2"]))
+
+
+def test_cli_records_rows_a_model_cannot_express():
+    args = parser().parse_args(["run", "--workload", "ablation", "--model", "nemotron3-nano-4b",
+                                "--backends", "nnsight-hf/default"])
+    specs, skipped = cases(*(lambda r: (r[1], r[2]["realizations"]))(_recipe(args)))
+    assert [s.name for s in specs] == ["ablation/nemotron3-nano-4b"]
+    assert {row["label"] for row in skipped} == {
+        "zero the attention output at layer 1", "zero the MLP output at layer 1",
+        "zero the attention output at half depth", "zero the MLP output at half depth"}
+    assert all("block component" in row["reason"] for row in skipped)
 
 
 def test_next_job_waits_for_the_gpu_memory_to_drain(tmp_path, fake_docker, monkeypatch):

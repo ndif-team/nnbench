@@ -4,16 +4,16 @@
 #   smoke             steps 2a-2d; exits nonzero if any job failed
 #   rebuild-full      rebuild transformer-lens, re-check its smoke rows, then `full`
 #   full              step 3 + the fp32 precision check + HTML export and tarball
-#   nnsight-versions  nnsight 0.7.0 vs 0.8.0rc1 on HF and vLLM (smoke gate, then five specs)
+#   nnsight-versions  nnsight 0.7.0 vs 0.8.0rc1 on HF and vLLM (smoke gate, then five workloads)
 #   overhead IMG:hf|vllm ...   per-trace overhead decomposition (slurm/diag_overhead.py)
-#   fair SPEC ...     the fairness-controlled comparison: every system incl. nnsight 0.7 and the
+#   fair WORKLOAD ... the fairness-controlled comparison: every system incl. nnsight 0.7 and the
 #                     sync engine, plain vLLM eager and compiled per version, scored vs HF fp32
 #   micro             construct probes (nnsight 0.7 / 0.8 x HF / vLLM async / sync) and the
 #                     perf microbenchmark sweeps (plans/delta_perf_vllm0191.json, ..._vllm0151.json)
 #   perf-read         the perf read cells again (plans/delta_perf_read_*.json)
 #   vllm-hook         IBM vLLM-Hook (built-in workers, rpc and disk-st-async storage) through every
-#                     comparison spec beside nnsight and vLLM-Lens, then its perf microbenchmark cells
-#   optimal SPEC ...  each system's general cells beside its fastest documented realization
+#                     comparison workload beside nnsight and vLLM-Lens, then its perf microbenchmark cells
+#   optimal WORKLOAD ... each system's general cells beside its fastest documented realization
 #                     (the */opt configs, nnsight-vllm/opt/taps, interp-engine-vllm/static), plain vLLM
 #                     eager and compiled per version, scored vs HF fp32
 # Images come from slurm/delta-build.slurm. Runs and logs land under runs/ and slurm/logs/.
@@ -70,16 +70,16 @@ case "$1" in
 smoke)
     out=runs/delta-smoke
     rc=0
-    bench run --spec cmp_steering --data counterfact:4 \
+    bench run --suite cross-system --workload steering --data counterfact:4 \
         --backends nnsight-hf/default nnsight-vllm/default --reference nnsight-hf/default --gpu 0 --out $out || rc=1
     # 2a exercises the launcher end to end; stop here if even that failed.
     [ $rc -eq 0 ] || { echo "2a failed; skipping the rest"; exit 1; }
-    bench run --spec cmp_steering --data counterfact:4 \
+    bench run --suite cross-system --workload steering --data counterfact:4 \
         --backends nnsight-hf/default vllm-lens/default vllm-plain/0-19-1 --reference nnsight-hf/default --gpu 0 --out $out || rc=1
-    bench run --spec cmp_steering cmp_ablation --data counterfact:4 \
+    bench run --suite cross-system --workload steering ablation --data counterfact:4 \
         --backends nnsight-hf/default interp-engine-vllm/default transformer-lens-vllm/default vllm-plain/0-20-2 vllm-plain/0-28-0 \
         --reference nnsight-hf/default --gpu 0 --out $out || rc=1
-    bench run --spec cmp_activation_patching --data mib/ioi:4 \
+    bench run --suite cross-system --workload activation_patching --data mib/ioi:4 \
         --backends nnsight-hf/default nnsight-vllm/default vllm-lens/default interp-engine-vllm/default transformer-lens-vllm/default \
         --reference nnsight-hf/default --gpu 0 --out $out || rc=1
     exit $rc
@@ -90,7 +90,7 @@ rebuild-full)
     export APPTAINER_TMPDIR=/tmp/isb-build-$SLURM_JOB_ID; mkdir -p $APPTAINER_TMPDIR
     bench build transformer-lens-vllm/default || exit 1
     rm -rf $APPTAINER_TMPDIR
-    bench run --spec cmp_steering cmp_ablation --data counterfact:4 \
+    bench run --suite cross-system --workload steering ablation --data counterfact:4 \
         --backends nnsight-hf/default transformer-lens-vllm/default vllm-plain/0-20-2 --reference nnsight-hf/default \
         --gpu 0 --out runs/delta-smoke || { echo "TL re-check failed; skipping full run"; exit 1; }
     exec bash "$0" full
@@ -99,12 +99,12 @@ full)
     out=runs/comparison-delta
     rc=0
     bench run \
-        --spec cmp_logit_lens cmp_steering cmp_gen_steering cmp_activation_patching cmp_ablation \
+        --suite cross-system \
         --backends nnsight-hf/default nnsight-vllm/default vllm-lens/default interp-engine-vllm/default transformer-lens-vllm/default \
                    vllm-plain/0-19-1 vllm-plain/0-20-2 vllm-plain/0-28-0 \
         --reference nnsight-hf/default --gpu 0 --timeout 3600 --out $out || rc=1
     # Optional precision check. 7B fp32 is ~30 GB of weights on a 40 GB card: may not fit.
-    bench run --spec cmp_ablation \
+    bench run --suite cross-system --workload ablation \
         --backends nnsight-hf/fp32 nnsight-vllm/fp32 transformer-lens-vllm/fp32 \
         --reference nnsight-hf/fp32 --gpu 0 --timeout 3600 --out $out || echo "fp32 check failed (non-gating)"
     $PY scripts/manager.py --dir $out --export comparison-delta.html
@@ -115,11 +115,11 @@ nnsight-versions)
     # nnsight 0.7.0 vs 0.8.0rc1 on HF and vLLM. 0.7 runs on vLLM 0.15.1 (its validated pin),
     # 0.8 on 0.19.1; each has its plain vLLM for overhead_vs_plain_vllm.
     out=runs/nnsight-versions-delta
-    bench run --spec cmp_steering --data counterfact:4 \
+    bench run --suite cross-system --workload steering --data counterfact:4 \
         --backends nnsight-hf/default nnsight-hf/0-7 nnsight-vllm/0-7 vllm-plain/0-15-1 --reference nnsight-hf/default \
         --gpu 0 --out runs/delta-smoke || { echo "0.7 smoke failed; skipping full run"; exit 1; }
     bench run \
-        --spec cmp_logit_lens cmp_steering cmp_gen_steering cmp_activation_patching cmp_ablation \
+        --suite cross-system \
         --backends nnsight-hf/default nnsight-hf/0-7 nnsight-vllm/default nnsight-vllm/0-7 \
                    vllm-plain/0-15-1 vllm-plain/0-19-1 \
         --reference nnsight-hf/default --gpu 0 --timeout 3600 --out $out
@@ -154,7 +154,7 @@ fair)
     # plain vLLM per version (overhead matched to each system's execution mode), nnsight through
     # both its async and sync engines, and HF fp32 as the reference (HF bf16 is itself scored).
     shift
-    bench run --spec "$@" \
+    bench run --suite cross-system --workload "$@" \
         --backends nnsight-hf/fp32 nnsight-hf/default nnsight-hf/0-7 \
                    nnsight-vllm/default nnsight-vllm/sync nnsight-vllm/0-7 vllm-lens/default interp-engine-vllm/default transformer-lens-vllm/default \
                    vllm-plain/0-15-1 vllm-plain/0-19-1 vllm-plain/0-20-2 vllm-plain/0-28-0 \
@@ -203,7 +203,7 @@ perf-read)
     ;;
 vllm-hook)
     rc=0
-    bench run --spec cmp_logit_lens cmp_steering cmp_gen_steering cmp_activation_patching cmp_ablation \
+    bench run --suite cross-system \
         --backends nnsight-hf/fp32 nnsight-vllm/default vllm-lens/default vllm-hook/default vllm-hook/disk \
                    vllm-plain/0-19-1 vllm-plain/eager-0-19-1 \
         --reference nnsight-hf/fp32 --gpu 0 --timeout 3600 --out runs/vllm-hook-delta || rc=1
@@ -214,14 +214,14 @@ vllm-hook)
     exit $rc
     ;;
 optimal-smoke)
-    # Four prompts per spec through every optimal backend whose image exists.
+    # Four prompts per workload through every optimal backend whose image exists.
     out=runs/optimal-smoke
     rc=0
     opt="nnsight-vllm/opt vllm-lens/opt interp-engine-vllm/static transformer-lens-vllm/opt"
     [ -f $ISB_APPTAINER_DIR/images/isb-nnsight-vllm-0-28-0_local.sif ] && opt="$opt nnsight-vllm/opt/taps"
-    bench run --spec cmp_logit_lens cmp_steering cmp_gen_steering cmp_ablation --data counterfact:4 \
+    bench run --suite cross-system --workload logit_lens steering gen_steering ablation --data counterfact:4 \
         --backends nnsight-hf/fp32 $opt --reference nnsight-hf/fp32 --gpu 0 --out $out || rc=1
-    bench run --spec cmp_activation_patching --data mib/ioi:4 \
+    bench run --suite cross-system --workload activation_patching --data mib/ioi:4 \
         --backends nnsight-hf/fp32 $opt --reference nnsight-hf/fp32 --gpu 0 --out $out || rc=1
     exit $rc
     ;;
@@ -229,7 +229,7 @@ optimal)
     # General vs optimal realization per system, on one node: the general cells (as in `fair`)
     # and each system's fastest documented form for the same workload.
     shift
-    bench run --spec "$@" \
+    bench run --suite cross-system --workload "$@" \
         --backends nnsight-hf/fp32 \
                    nnsight-vllm/default nnsight-vllm/sync nnsight-vllm/opt nnsight-vllm/opt/taps \
                    vllm-lens/default vllm-lens/opt interp-engine-vllm/default interp-engine-vllm/static \

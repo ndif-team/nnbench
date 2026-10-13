@@ -1,6 +1,6 @@
-"""vLLM-Lens cells for the comparison specs (design.md §12.14).
+"""vLLM-Lens cells for the cross-system workloads (design.md §12.14).
 
-Each cell expresses the spec's semantics with vLLM-Lens 1.2.1's own mechanisms: `Hook` functions on
+Each cell expresses the workload row's semantics with vLLM-Lens 1.2.1's own mechanisms: `Hook` functions on
 decoder layers (post-hooks see the summed residual stream, and a returned tensor replaces it) and
 `output_residual_stream` capture. Readouts run on the worker inside a hook, as in vLLM-Lens's
 logit-lens example: the model's final norm, then the unembedding weight from `ctx.get_parameter`.

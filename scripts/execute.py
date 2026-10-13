@@ -1,13 +1,13 @@
-"""Execute ONE fully described run: (spec × data × engine/deployment config) -> outputs + provenance.
+"""Execute ONE fully described run: (case × data × engine/deployment config) -> outputs + provenance.
 
 Legacy standalone executor, directly callable inside the optional legacy backend containers.
 The main scripts/bench.py runner instead invokes backends/NAME/run.py using frozen job inputs:
 
-    python scripts/execute.py --spec jacobian_lens_gpt2 \
+    python scripts/execute.py --case jacobian_lens/gpt2 \
         --engine transformers --name hf-ref
-    python scripts/execute.py --spec jacobian_lens_gpt2 \
+    python scripts/execute.py --case jacobian_lens/gpt2 \
         --engine vllm --name vllm-cand
-    # then compare (no GPU needed):  python scripts/score.py --spec jacobian_lens_gpt2 \
+    # then compare (no GPU needed):  python scripts/score.py --case jacobian_lens/gpt2 \
         --candidate vllm-cand --reference hf-ref
 
 Every run writes ONE self-contained file, <out>/<name>.pt (cell outputs + provenance: client
@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT))
 import isb.methodologies  # noqa: F401,E402  (registers the cells)
 from isb.runfile import INBOX  # noqa: E402
 from isb.runs import DeploymentConfig, EngineConfig, RunConfig  # noqa: E402
-from isb.specs import SPECS  # noqa: E402
+from isb.workloads import WORKLOADS, case  # noqa: E402
 from isb.sweep.execute import execute_run  # noqa: E402
 
 
@@ -41,9 +41,12 @@ def _coerce(v: str):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--spec", required=True)
+    ap.add_argument("--case", required=True, metavar="WORKLOAD/MODEL",
+                    help="a workload (isb/workloads/) on a model (isb/models.py)")
     ap.add_argument("--data", default=None, metavar="SOURCE[:N]",
-                    help="rebind the spec's regimes to a registered data source")
+                    help="rebind the case's regimes to a registered data source")
+    ap.add_argument("--realizations", default="default", choices=["default", "all"],
+                    help="also run every alternative realization the cells declare")
     ap.add_argument("--engine", required=True, choices=["transformers", "vllm"])
     ap.add_argument("--engine-mode", default="async", choices=["async", "sync"])
     ap.add_argument("--deployment", default="local", choices=["local", "serve", "ndif"])
@@ -61,9 +64,12 @@ def main():
                          "diff two companions with scripts/debug_compare.py")
     args = ap.parse_args()
 
-    if args.spec not in SPECS:
-        raise SystemExit(f"unknown spec {args.spec!r}; choices: {', '.join(SPECS)}")
-    spec = SPECS[args.spec]
+    spec = case(args.case)
+    if spec is None:
+        raise SystemExit(f"unknown case {args.case!r}; use <workload>/<model> with a workload of "
+                         f"{', '.join(WORKLOADS)} and a model from isb/models.py")
+    import dataclasses
+    spec = dataclasses.replace(spec, realizations=args.realizations)
     if args.data:
         from isb.data import DataRef
         from isb.sweep.spec import spec_with_data

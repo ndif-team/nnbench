@@ -3,7 +3,7 @@
 The three vLLM backends — in-process async, in-process sync, and over-HTTP serve — differ only in
 HOW they run a trace (event loop / in-frame / wire). They share the same vLLM *engine config*: the
 precision `dtype`, and `trust_remote_code` (which permits vLLM to READ an auto_map repo's config,
-e.g. NemotronH — the native impl runs, no remote modeling is executed). The driver splats a spec's
+e.g. NemotronH — the native impl runs, no remote modeling is executed). The driver splats a case's
 `vllm_kwargs` into ANY of their constructors, so they must accept ONE signature for that config —
 defining it here means a new shared knob can't be added to one backend and silently rejected by the
 others (the inconsistency this base exists to prevent).
@@ -22,10 +22,10 @@ class VLLMBackend(Backend):
         self.dtype = dtype
         # trust_remote_code: lets vLLM read a repo whose config declares custom code (auto_map). The
         # remote modeling is never executed (vLLM uses its native impl) — needed by NemotronH, arrives
-        # via spec.vllm_kwargs.
+        # via the model row's vllm_kwargs (isb/models.py).
         self.trust_remote_code = trust_remote_code
         # max_model_len: caps the KV reservation so big weights + KV fit; a per-model requirement
-        # (specs) or per-run choice (RunConfig), meaningful to every vLLM venue, so it lives here
+        # (the model row) or per-run choice (RunConfig), meaningful to every vLLM venue, so it lives here
         # per this base's one-signature rule. The serve client carries it for provenance even
         # though the server's engine was configured at deploy time.
         self.max_model_len = max_model_len

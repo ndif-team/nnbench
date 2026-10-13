@@ -9,7 +9,7 @@ the final block's output, and applies the final RMSNorm and the unembedding to t
 GPU with fp32 weights fetched once through the driver's `get_param`. The logit lens projects its
 rows on the GPU the same way.
 
-TransformerLens 4.0 vLLM-bridge cells for the comparison specs (design.md §12.14).
+TransformerLens 4.0 vLLM-bridge cells for the cross-system workloads (design.md §12.14).
 
 Denotation, from transformer-lens 4.0.0 source (`model_bridge/sources/vllm/overlays/decoder_only.py`,
 `plugin.py`): on vLLM's fused-residual layers `blocks.{i}.hook_out` reads `hidden + residual` and a

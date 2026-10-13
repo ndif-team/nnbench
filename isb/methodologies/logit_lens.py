@@ -41,7 +41,7 @@ def _lens_proxy(blocks, norm, head, *, layers, unembed, last_fn, residual="plain
     return torch.stack(rows, dim=0)                     # [n_layers, ., vocab]
 
 
-@cell("logit_lens", family="*", backend="hf")
+@cell("logit_lens", family="*", backend="hf", realizations=[{"unembed": "weight"}])
 def logit_lens_hf(be, model, m, prompts, *, layers="all", unembed="module", residual="plain"):
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
         return _lens_proxy(
@@ -51,12 +51,15 @@ def logit_lens_hf(be, model, m, prompts, *, layers="all", unembed="module", resi
     return be.run(model, prompts, build)
 
 
-@cell("logit_lens", family="*", backend="vllm_async")
+# alternatives: the module unembed, and the naive port (plain residual read; SILENTLY_WRONG on
+# fused-residual families)
+@cell("logit_lens", family="*", backend="vllm_async",
+      realizations=[{"unembed": "module"}, {"residual": "plain"}])
 def logit_lens_vllm(be, model, m, prompts, *, layers="all", unembed="weight", residual=None):
     # The residual default derives from the family's vLLM denotation: fused-residual families must
     # read hidden+residual (a plain read drops the accumulated residual -> SILENTLY_WRONG, the
     # fused-residual denotation mismatch). An explicit residual="plain" still overrides: that is the
-    # naive-port frontier task the llama spec keeps as a marker.
+    # naive-port alternative this cell declares, kept as a frontier marker.
     residual = residual if residual is not None else m.default_residual(be.name)
     record_resolved(residual=residual)
 

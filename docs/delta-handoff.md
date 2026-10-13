@@ -9,8 +9,9 @@ Branch `feat/cross-system-comparison`; the Apptainer launcher needs the commit t
 
 ## What this branch adds
 
-- Five comparison specs on Qwen/Qwen2.5-1.5B-Instruct: `cmp_logit_lens`, `cmp_steering`,
-  `cmp_gen_steering`, `cmp_activation_patching`, `cmp_ablation` (the `comparison` suite, `isb/specs/suites.py`).
+- The `cross-system` suite (`isb/suites.py`): the `logit_lens`, `steering`, `gen_steering`,
+  `activation_patching` and `ablation` workloads on Qwen2.5-7B-Instruct (developed on
+  Qwen2.5-1.5B-Instruct, the same layer count and tokenizer).
 - Backends, one Docker Compose directory each under `backends/`:
 
 | backend | system | vLLM | engine mode |
@@ -70,7 +71,7 @@ Notes:
 - The GPUs are A100-SXM4-40GB. Every vLLM backend runs at `gpu_memory_utilization` 0.85 (34 GB
   here; at 0.9 TransformerLens's full-vocabulary sampler warmup ran out of memory), the same in every `compose.yml`. The earlier 0.2 was for the shared development host; on
   an exclusive Delta allocation one job owns the GPU. Any change to the fraction must be made for
-  every backend alike and committed before the run. The `cmp_*` specs have no batched regime, so
+  every backend alike and committed before the run. The `cross-system` suite runs no batched regime, so
   nnsight-vllm never loads its co-resident sync twin (`isb/sweep/execute.py`, `_load_sync_twin`),
   which would not fit beside a 0.9 engine.
 - The vLLM 0.28.0 image ships CUDA 13.0 torch; driver 595 supports it natively.
@@ -91,11 +92,11 @@ python -m pytest tests/ -q          # expect 509 passed, 3 skipped (host Python 
 Each run prints one line per cell and writes `runs/<out>/<timestamp>/report.json`. Build only what
 each step needs; later steps reuse the images.
 
-**2a. nnsight on HF and vLLM, one spec, four prompts**
+**2a. nnsight on HF and vLLM, one workload, four prompts**
 
 ```bash
 python scripts/bench.py build nnsight-hf/default nnsight-vllm/default
-python scripts/bench.py run --spec cmp_steering --data counterfact:4 \
+python scripts/bench.py run --suite cross-system --workload steering --data counterfact:4 \
   --backends nnsight-hf/default nnsight-vllm/default --reference nnsight-hf/default --gpu 0 --out runs/delta-smoke
 ```
 
@@ -105,7 +106,7 @@ Expect every `nnsight-vllm/default` row `SUPPORTED` with top-1 1.00, TV 0.000.
 
 ```bash
 python scripts/bench.py build vllm-lens/default vllm-plain/0-19-1
-python scripts/bench.py run --spec cmp_steering --data counterfact:4 \
+python scripts/bench.py run --suite cross-system --workload steering --data counterfact:4 \
   --backends nnsight-hf/default vllm-lens/default vllm-plain/0-19-1 --reference nnsight-hf/default --gpu 0 --out runs/delta-smoke
 ```
 
@@ -117,20 +118,20 @@ Expect `vllm-lens/default` `SUPPORTED` on all four rows and `vllm-plain/0-19-1` 
 
 ```bash
 python scripts/bench.py build interp-engine-vllm/default transformer-lens-vllm/default vllm-plain/0-20-2 vllm-plain/0-28-0
-python scripts/bench.py run --spec cmp_steering cmp_ablation --data counterfact:4 \
+python scripts/bench.py run --suite cross-system --workload steering ablation --data counterfact:4 \
   --backends nnsight-hf/default interp-engine-vllm/default transformer-lens-vllm/default vllm-plain/0-20-2 vllm-plain/0-28-0 \
   --reference nnsight-hf/default --gpu 0 --out runs/delta-smoke
 ```
 
-Expect, for `cmp_steering`: `interp-engine-vllm/default` `SUPPORTED` on all four rows; `transformer-lens-vllm/default`
+Expect, for `steering`: `interp-engine-vllm/default` `SUPPORTED` on all four rows; `transformer-lens-vllm/default`
 `SUPPORTED` on the two mean-norm rows and `UNSUPPORTED` on the two "scaled by each token's norm"
-rows. For `cmp_ablation`: `interp-engine-vllm/default` `UNSUPPORTED`, `transformer-lens-vllm/default` `NUMERICAL_MISMATCH`
+rows. For `ablation`: `interp-engine-vllm/default` `UNSUPPORTED`, `transformer-lens-vllm/default` `NUMERICAL_MISMATCH`
 (bf16 precision; it matches HF at fp32).
 
 **2d. Patching, which uses paired data**
 
 ```bash
-python scripts/bench.py run --spec cmp_activation_patching --data mib/ioi:4 \
+python scripts/bench.py run --suite cross-system --workload activation_patching --data mib/ioi:4 \
   --backends nnsight-hf/default nnsight-vllm/default vllm-lens/default interp-engine-vllm/default transformer-lens-vllm/default \
   --reference nnsight-hf/default --gpu 0 --out runs/delta-smoke
 ```
@@ -140,18 +141,14 @@ python scripts/bench.py run --spec cmp_activation_patching --data mib/ioi:4 \
 About 40 jobs, roughly 75 minutes on one A100.
 
 ```bash
-python scripts/bench.py run \
-  --spec cmp_logit_lens cmp_steering cmp_gen_steering cmp_activation_patching cmp_ablation \
-  --backends nnsight-hf/default nnsight-vllm/default vllm-lens/default interp-engine-vllm/default transformer-lens-vllm/default \
-             vllm-plain/0-19-1 vllm-plain/0-20-2 vllm-plain/0-28-0 \
-  --reference nnsight-hf/default --gpu 0 --timeout 3600 --out runs/comparison-delta
+python scripts/bench.py run --suite cross-system --gpu 0 --out runs/comparison-delta
 ```
 
 Optional precision check:
 
 ```bash
 python scripts/bench.py build nnsight-hf/fp32 nnsight-vllm/fp32 transformer-lens-vllm/fp32
-python scripts/bench.py run --spec cmp_ablation \
+python scripts/bench.py run --suite cross-system --workload ablation \
   --backends nnsight-hf/fp32 nnsight-vllm/fp32 transformer-lens-vllm/fp32 \
   --reference nnsight-hf/fp32 --gpu 0 --out runs/comparison-delta
 ```

@@ -122,10 +122,10 @@ def test_current_completeness_field_is_required():
 
 def test_coordinates_do_not_bind_or_classify_dataset_overrides():
     from isb.data import DataRef
-    from isb.specs import SPECS
     from isb.sweep.spec import spec_with_data
+    from isb.workloads import case
 
-    rebound = spec_with_data(SPECS["logit_lens_gpt2"], DataRef("jlens/poetry", n=2))
+    rebound = spec_with_data(case("logit_lens/gpt2"), DataRef("jlens/poetry", n=2))
     coords = spec_coordinates(rebound, "hf")
     assert "position" in coords["regimes"][0]["data_knobs"]
     assert coords["data"] == ["jlens/poetry"]

@@ -103,7 +103,7 @@ def _steer_and_read(blocks, norm, head, *, layer, token_id, alpha, mode, last_fn
     return last_fn(logits)
 
 
-@cell("steering", family="*", backend="hf")
+@cell("steering", family="*", backend="hf", realizations=[{"mode": "inplace"}])
 def steering_hf(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="replace",
                 scale_by="mean_norm"):
     token_id = _resolve_token(model.tokenizer, target)
@@ -116,7 +116,7 @@ def steering_hf(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, mo
     return be.run(model, prompts, build)
 
 
-@cell("steering", family="*", backend="vllm_async")
+@cell("steering", family="*", backend="vllm_async", realizations=[{"mode": "inplace"}])
 def steering_vllm(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="replace",
                   residual=None, scale_by="mean_norm"):
     # The read-out residual default derives from the family's vLLM denotation (fused-residual

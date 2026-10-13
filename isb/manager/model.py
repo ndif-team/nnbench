@@ -86,7 +86,7 @@ def dir_results(dir_path: str, entries: dict, baselines: dict[str, str]):
 def import_legacy(dir_path: str):
     """Explicit, trusted .pt import. Keep only metadata; never guess precision controls."""
     from ..jobs.contract import write_json
-    from ..specs import SPECS
+    from ..workloads import case
     from ..sweep.score import score_runs
 
     entries = {}
@@ -100,7 +100,8 @@ def import_legacy(dir_path: str):
     baselines = baselines_of(dir_path, entries)
     for name, (out, prov) in entries.items():
         base = baselines.get(spec_of(prov))
-        spec = SPECS.get(prov["coordinates"]["spec"].split("@")[0])
+        # The current definition of a saved case name; historical spec names have none.
+        spec = case(prov["coordinates"]["spec"])
         rows, comparison_error = None, None
         recorded = procedure(prov["coordinates"])
         current = procedure(spec_coordinates(spec, "unknown")) if spec is not None else None

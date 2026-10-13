@@ -2,10 +2,10 @@
 
 A profile is DATA: where a family's blocks / final norm / unembed head live in the module
 tree, plus the family's residual denotation on vLLM (fused `(hidden, residual)` tuples vs a
-plain tensor). This is the implementation half of "model knowledge"; the identity half
-(repo, load kwargs) stays in specs. Before this module the same module paths were
-copy-pasted into every methodology file (~55 hardcoded occurrences), so adding a family
-meant editing ~8 files; now it is one row here.
+plain tensor). The rows live torch-free in `isb/models.py` (`FAMILIES`, §12.16) beside the
+checkpoints; this module adds the torch helpers and module accessors the cells call. Before
+profiles the same module paths were copy-pasted into every methodology file (~55 hardcoded
+occurrences), so adding a family meant editing ~8 files; now it is one row.
 
 Family-generic cells register `family="*"` and receive the profile as `m` (bound by
 `registry.get_cell`). An explicit `(methodology, family, backend)` registration still takes
@@ -16,9 +16,11 @@ Resolver lesson still holds).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, fields, replace
 
 import torch
+
+from .models import FAMILIES, Family
 
 
 def _untuple(x):
@@ -73,37 +75,8 @@ def _attr(obj, path: str):
 
 
 @dataclass(frozen=True)
-class ModelProfile:
-    """One architecture's module locations. Paths are dotted attribute paths from the model root;
-    they are the same on HF and on nnsight's vLLM wrapper (both expose the HF module tree).
-
-    Scope: the profile carries BOUNDARY-tier locations only (block list, final norm, head, and the
-    within-block attn/mlp submodule names). Internal-tier `.source` op names stay out: they are
-    family x implementation specific (e.g. GPT-2 HF-eager's `attention_interface_0`) and belong to
-    the explicit cells that measure them (attention_pattern stays per-family for exactly this
-    reason)."""
-    family: str
-    blocks_path: str            # the decoder block list
-    norm_path: str              # the final norm before the unembed
-    head_path: str = "lm_head"
-    # A block-output's DENOTATION is per (family x engine), not per family alone (design §3.2: the
-    # same site name means different things per context): HF blocks carry the full residual stream
-    # in [0] ("plain") for every family, while vLLM's implementation of RMSNorm families returns
-    # (hidden, residual) whose sum is the stream ("fused"). It cannot live on the backend (backends
-    # would each need a family table) and cannot be runtime-detected (HF llama blocks ALSO return
-    # tuples, whose [1] is attention metadata, not a residual — shape probing cannot tell them
-    # apart), so the family row carries it keyed by engine kind. An engine kind with no entry fails
-    # loudly: an undeclared denotation read is exactly the SILENTLY_WRONG shape.
-    residual_denotation: dict = field(default_factory=lambda: {"hf": "plain", "vllm": "plain"})
-    # within-block submodule names (ablation targets); None = the family has no such split (e.g.
-    # nemotron's single per-layer `mixer`, whose ablation cells stay explicit)
-    attn_name: str | None = "attn"
-    mlp_name: str | None = "mlp"
-    # Some architectures mount the SAME text tree under an extra prefix on vLLM: Qwen3.5's
-    # multimodal wrapper is `model.layers` on HF but `language_model.model.layers` on the nnsight
-    # vLLM envoy (measured 2026-07-22 on Qwen/Qwen3.5-4B: `model.layers` absent, prefixed tree
-    # present). The registry binds the engine view via `for_backend`, so cells never see this.
-    vllm_prefix: str = ""
+class ModelProfile(Family):
+    """A family row (isb/models.py) with the module accessors the cells call."""
 
     def for_backend(self, backend_name: str) -> "ModelProfile":
         """The engine-specific view of this profile: identity on HF or when no prefix is declared;
@@ -142,24 +115,5 @@ class ModelProfile:
     resid = staticmethod(_resid)
 
 
-_FUSED_ON_VLLM = {"hf": "plain", "vllm": "fused"}
-
-PROFILES = {
-    "gpt2": ModelProfile("gpt2", "transformer.h", "transformer.ln_f"),
-    # llama covers the Llama-tree families the specs already bind to it (SmolLM2, Qwen2.5: same
-    # model.layers/model.norm/lm_head tree; specs/suites.py, PARALLEL, documents the reuse)
-    "llama": ModelProfile("llama", "model.layers", "model.norm",
-                          residual_denotation=_FUSED_ON_VLLM, attn_name="self_attn"),
-    # NemotronH hybrid (Mamba/attention/MoE blocks): same tree on HF and vLLM, norm is norm_f (§12.7);
-    # blocks are single-op (`mixer`), so there is no attn/mlp split (ablation cells stay explicit)
-    "nemotron": ModelProfile("nemotron", "model.layers", "model.norm_f",
-                             residual_denotation=_FUSED_ON_VLLM, attn_name=None, mlp_name=None),
-    # Qwen3.5 (hybrid linear-attention, e.g. Qwen3.5-4B): HF auto-routes the text-only repo to
-    # Qwen3_5ForCausalLM (llama-shaped tree), while vLLM builds the multimodal wrapper, so the same
-    # tree sits behind `language_model.` there (the vllm_prefix). vLLM decoder layers return
-    # (hidden, residual) like the other RMSNorm families. Blocks mix `linear_attn` and `self_attn`
-    # per layer_types, so there is no uniform attn submodule name.
-    "qwen3_5": ModelProfile("qwen3_5", "model.layers", "model.norm",
-                            residual_denotation=_FUSED_ON_VLLM, attn_name=None,
-                            vllm_prefix="language_model"),
-}
+PROFILES = {name: ModelProfile(**{f.name: getattr(row, f.name) for f in fields(Family)})
+            for name, row in FAMILIES.items()}

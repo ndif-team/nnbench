@@ -1013,8 +1013,9 @@ scripts/smoke.py        # enumerate the cells to run; print the map
 | methodology | new file of `@cell` functions + one `InterventionSpec` metadata entry |
 | (family,backend) cell | one explicit function for that combination |
 | backend | a `be` infra impl (trace/collect/teardown) + its cells per methodology |
-| semantic variant | `TaskSpec.params` and the methodology template's semantic classification |
-| realization variant | `TaskSpec.params` and the methodology template's realization classification |
+| model | one `MODELS` row (+ one `FAMILIES` row for a new architecture) (§12.16) |
+| semantic variant | a workload row; its params are the template's semantic parameters (§12.16) |
+| realization variant | a `realizations=` entry on the system's cell registration (§12.16) |
 | case-specific requirements | registered case-description function beside the method implementations |
 | backend worker | independent `backends/<system>/<config>/compose.yml` and executable implementing the file contract (§12.15) |
 
@@ -1222,7 +1223,7 @@ A result's identity is (spec × data × run config), each axis independent:
   patching (and their clean side for ablation), CounterFact factual-recall prompts for
   logit lens, steering, generation steering, and the family probes. The single-trace
   frontier markers (attention pattern, attribution patching) keep their fixed inputs
-  (`isb/specs/attention_pattern.py`, `ONE`), and the template banks remain as `--data` alternatives.
+  (`isb/workloads/attention_pattern.py`), and the template banks remain as `--data` alternatives.
 - **execute** (`isb/sweep/execute.py`, `scripts/execute.py`): one run, one process, ALWAYS writes
   ONE self-contained run file `<name>.pt` (`isb/runfile.py`): cell outputs (per-prompt stacks for
   batched-reference duty; per-cell perf + the effect guard) together with the four-layer
@@ -1372,11 +1373,10 @@ its own pinned image (§12.15), scored against one baseline run, normally `nnsig
 comparison page served as a weak reference for which workloads separate systems; nnbench keeps its
 own structure of one baseline and N runs.
 
-**Semantic tasks.** A comparison spec's task parameters carry only intervention semantics: layer,
-direction, strength, positions. Each system's cell chooses that system's documented realization.
-Specs whose tasks select nnsight spellings, such as in-place versus replacement writes, stay
-nnsight-internal coverage and are not cross-system rows. Comparison specs (`cmp_*`) live with
-their methodology in `isb/specs/<methodology>.py`; `isb/specs/suites.py` lists them as `COMPARISON`.
+**Semantic tasks.** Workload rows carry only intervention semantics: layer, direction, strength,
+positions. Each system's cell chooses that system's documented realization; nnsight spellings, such
+as in-place versus replacement writes, are realizations the nnsight cells declare (§12.16). The
+comparison is the `cross-system` suite.
 
 **Foreign cells.** A non-nnsight system registers cells under its own interface name, for example
 `vllm_lens`, from its system directory's `cells.py`. The registry's fallback from `vllm_*` variants to
@@ -1404,7 +1404,7 @@ that the system lacks the capability. `UNSUPPORTED` cells are excluded from perf
 Engine version and eager or CUDA-graph mode are recorded with each result, because an eager
 engine's absolute latency depends on host CPU load.
 
-### 12.15 Backend tree and spec layout (2026-10-10)
+### 12.15 Backend tree (2026-10-10)
 
 **Backends are `<system>/<config>`.** A top-level directory under `backends/` is one system on one
 engine (`nnsight-vllm`, `interp-engine-vllm`, `vllm-plain`); a directory inside it holding a
@@ -1424,7 +1424,104 @@ Job directories mirror the name (`experiments/<id>/<system>/<config>/`). Saved r
 the new names by `scripts/migrate_backend_names.py`; interface names inside artifacts (`hf`,
 `vllm_lens_opt`, ...) and image tags are unchanged.
 
-**Specs are one file per methodology.** `isb/specs/<methodology>.py` holds that methodology's spec
-for every model (smoke, parallel, Nemotron, comparison); model repos and load flags are in
-`isb/specs/_models.py`; `isb/specs/suites.py` names the suites (`smoke`, `parallel`, `nemotron_4b`,
-`nemotron`, `comparison`, `fitted_jlens`) and says why each exists. `--spec all` is `smoke`.
+### 12.16 Workloads, models, realizations and suites (2026-10-10)
+
+**Problem.** A spec (`CellConfig`) fuses four independent things: the workload (methodology, task
+rows, data, regimes, baseline and effect), the model (repo, family, load options, control
+precision), one system's realization (nnsight's `mode`, `unembed`, `residual`, `bound` in the task
+rows) and the run (which specs go together, timing). Every combination therefore needs a
+hand-written spec and a compound name (`steering_qwen`, `cmp_steering`), and layer indices are
+written per model, so no workload exists apart from a model. The `cmp_*` specs exist only because
+the older specs carry nnsight spellings (§12.14). This section separates the four.
+
+| Layer | Says | Never says | Lives in | Named by |
+|---|---|---|---|---|
+| Workload | what intervention, on what data, in which regimes, how its effect is checked | a model, a system, a realization | `isb/workloads/<methodology>.py` | its methodology (`steering`) |
+| Model | which checkpoint, its architecture, size, load options, control precision, fitted assets | a workload | `isb/models.py` | the checkpoint (`qwen2.5-7b`) |
+| Realization | how one system spells a row (in-place vs replacement write, naive port vs documented form) | a model or data | the system's cell registrations | its parameters (`mode=inplace`) |
+| Suite | workloads × models, backends, reference, data size, regimes, realizations, timing | intervention semantics | `isb/suites.py` | its purpose (`cross-system`) |
+
+No name combines two layers. The identity of an instantiated case is generated,
+`<workload>/<model>` (plus `@<data>` when the data is rebound), never authored.
+
+**Workloads.** A workload holds a methodology, rows (`label`, `params`, `requires`), regimes with
+their default data, a baseline, an effect check and default timing. Row parameters are intervention
+semantics only: the methodology's protocol template (§12.1) already classifies every parameter, and
+a workload that passes a realization parameter is rejected at import. Labels say what the row does
+("add toward ' Rome' at half depth, alpha 0.5"). Layers are written as `Depth(f)`, which resolves to
+`round(f · n_layers)` clamped to the last layer, or as indices whose meaning does not depend on
+model size (`0`, `1`, `-1`, `"all"`). One workload per methodology; a second one is added only when
+it asks a different question, not when it runs on a different model.
+
+**Models.** `isb/models.py` is torch-free and holds two tables. `FAMILIES` is the architecture
+index that `isb/profiles.py` holds today (§12.8): module paths, residual denotation per engine, and
+the block components (`attn`, `mlp`, or a single `mixer`). `MODELS` is one row per checkpoint:
+repo, family, layer count, control precision, HF and vLLM load options, and fitted assets (the
+Qwen3.5-4B Jacobian lens, with the layer band it covers). The worker checks the layer count against
+the loaded model and fails loudly on a mismatch. `isb/profiles.py` keeps only the torch helpers
+(`_resid`, `_untuple`) and reads `FAMILIES`.
+
+**Instantiation.** `instantiate(workload, model, data=None, regimes=None, timing=None)` produces
+the resolved `CellConfig`. It resolves depths, checks absolute indices against the layer count,
+resolves asset references, and drops each row whose requirements (a component or an asset) the
+model lacks, recording the row and the reason in `plan.json` so the report shows it as not
+applicable rather than silently absent. The effect check names candidate perturbations in order
+(ablation: attention sublayer, else the mixer) and uses the first applicable one. `CellConfig`
+becomes the internal resolved record; the frozen experiment contract (§12.13) is unchanged.
+
+**Realizations belong to the system.** A cell registration declares its alternative realizations,
+for example `@cell("steering", "*", "vllm_async", realizations=[{"mode": "inplace"}])` or the
+logit lens's naive port `{"residual": "plain"}` on `vllm_async`. A foreign system declares its own
+in its `cells.py`, if it has any. Every row runs once with the cell's documented default (no
+realization parameters; the resolved choice is recorded as in §12.13) and, when the run asks for
+them, once per declared alternative. The scorer compares every realization of a row with the
+reference's default realization of the same row; baseline and effect use the default. The matched
+pairs of the corpus (naive port and documented form) are declared alternatives, so frontier markers
+stay measured. An alternative is its own result row, labelled `<row> [k=v]`, carrying `row` and
+`alternative` (its declared params) fields; the job file format stays version 2, since a result without such rows holds
+the default realizations only.
+
+**Suites are run recipes.** A suite names entries of workloads × models, the backends, the
+reference, the comparison axis, data overrides (`counterfact:32` for the large models), a regime
+subset, `realizations: default | all`, timing and timeout. `bench run --suite <name>` runs one;
+`bench run --workload … --model … --backends …` runs an ad-hoc combination through the same
+`instantiate`; with `--suite`, other options override the suite's settings and `--workload`/`--model`
+keep only those of its cases. Initial suites:
+
+| Suite | Entries | Backends | Realizations |
+|---|---|---|---|
+| `smoke` | every workload × `gpt2`, `logit_lens` × `smollm2-135m` | `nnsight-hf/default`, `nnsight-vllm/default` | all |
+| `parallel` | `logit_lens`, `steering`, `ablation`, `activation_patching`, `gen_steering` × `qwen2.5-14b` | `nnsight-vllm/default` as the reference; the TP/PP config is added with `--backends` (GT2, §12.2; multi-GPU settings belong in a backend config) | all |
+| `nemotron` | `logit_lens`, `steering`, `ablation` × `nemotron3-nano-4b` (the 30B needs a multi-GPU config) | nnsight HF and vLLM | all |
+| `cross-system` | `logit_lens`, `steering`, `gen_steering`, `activation_patching`, `ablation` × `qwen2.5-7b` | every system (§12.14) | default |
+| `fitted-jlens` | `jacobian_lens` × `qwen3.5-4b` | nnsight HF and vLLM | default |
+
+`slurm/delta-compare.slurm` calls suites; it does not list cases.
+
+**Initial rows.** Taken from the current specs, with realization parameters moved to the systems:
+
+| Workload | Rows | Declared nnsight alternatives |
+|---|---|---|
+| `logit_lens` | every layer, last token | HF `unembed=weight`; vLLM `unembed=module` and `residual=plain` (naive port) |
+| `jacobian_lens` | identity transport; seeded orthogonal transport; fitted transport (requires the model's lens asset) | HF `unembed=weight`; vLLM `unembed=module` |
+| `steering` | depth 1/4 and 1/2 × mean-norm and token-norm scaling at alpha 6; depth 1/2 at alpha 0.1 and 0.5 × both scalings | `mode=inplace` |
+| `gen_steering` | depth 1/2, every step: alpha 6 and 0.5 × both scalings | `bound=unbounded` |
+| `activation_patching` | depth 1/4 and 3/4 × all positions and last position | `residual=plain` on vLLM |
+| `gen_patching` | depth 3/4, every step | `bound=unbounded` |
+| `ablation` | layer 1 and depth 1/2 × attention and MLP sublayer (requires the split); depth 1/3 and 2/3 × mixer (requires a mixer) | `residual=plain` on vLLM |
+| `attention_pattern`, `attribution_patching`, `das`, `jacobian_collect` | as before, with DAS at depth 1/2 | — |
+
+Some measured cases move: GPT-2 steering ran at layer 8 (depth 2/3) and now runs at 3 and 6; the
+14B rows move from layers 8/16/24 to their depth fractions; the 14B and Nemotron rows that pinned
+`residual=plain` now run the documented default, with `plain` as a declared alternative.
+
+**Existing runs are not renamed.** Rows and layers change, so a saved run is a record of the spec
+it ran, under that spec's name, and claiming it is an instance of the new workload would be false.
+The manager displays saved coordinates without consulting live definitions; legacy import already
+refuses an automatic comparison when the current definition differs. `docs/findings.md` keeps
+citing the old names with their run directories.
+
+**Layout.** `isb/workloads/<methodology>.py`, `isb/models.py`, `isb/suites.py`; `Depth`, `Row`,
+`Workload` and `instantiate` beside `CellConfig` in `isb/sweep/spec.py`; `isb/specs/` is removed.
+Out of scope here: the micro tier, `scripts/perf.py` and `isb/tasks/`, which keep their own entry
+points.

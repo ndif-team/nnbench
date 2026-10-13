@@ -5,6 +5,11 @@ with the oracle's measured top1/TV per cell. Where a cell's behavior reflects a 
 HF↔vLLM representational difference, the note describes the relevant intervention-gaps
 mechanism for context (`nnsight/src/nnsight/modeling/vllm/intervention-gaps/`).
 
+Sections before 2026-10-10 cite the spec names and `isb/specs/` files they ran (`steering_gpt2`,
+`cmp_steering`, ...). Those specs were replaced by model-free workloads (`isb/workloads/`), models
+(`isb/models.py`) and suites (design.md §12.16); their rows and layer choices changed, so the saved
+runs keep the old names as the record of what ran.
+
 ## Smoke tier — logit lens, GPT-2, HF vs vLLM-async (2026-06)
 
 Result (`results/smoke_gpt2.txt`):

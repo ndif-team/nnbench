@@ -9,8 +9,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_execute_score import _execute as execute_fixture, _spec  # noqa: E402
 
 import isb.manager as manager  # noqa: E402
-from isb.specs import SPECS  # noqa: E402
 from isb.runs import run_coordinates  # noqa: E402
+
+
+def _current(spec):
+    """Make `spec` the current definition of its case name for the manager."""
+    from unittest.mock import patch
+    return patch("isb.workloads.case", lambda name: spec if name == spec.name else None)
 
 
 def _execute(path, name, engine, **kwargs):
@@ -35,7 +40,7 @@ def test_legacy_import_never_guesses_precision_control(tmp_path):
     _execute(tmp_path, "base", "transformers")
     _execute(tmp_path, "candidate", "vllm")
     _execute(tmp_path, "unrelated-fp32", "vllm")
-    with patch.dict(SPECS, {"xs": _spec()}), patch("isb.sweep.score.score_runs", return_value=[]) as score:
+    with _current(_spec()), patch("isb.sweep.score.score_runs", return_value=[]) as score:
         _import(tmp_path)
     assert score.call_count == 3
     for call in score.call_args_list:
@@ -52,7 +57,7 @@ def test_import_keeps_incomplete_current_coordinates_browsable_without_rescoring
     coords["config"] = None
     coords["identity_complete"] = False
     save_run(str(tmp_path), "historical", {}, {"coordinates": coords, "engine": {"kind": "transformers"}})
-    with patch.dict(SPECS, {"xs": _spec()}), patch("isb.sweep.score.score_runs") as score:
+    with _current(_spec()), patch("isb.sweep.score.score_runs") as score:
         _import(tmp_path)
     assert not score.called
     col = manager.Collection(str(tmp_path))
@@ -69,7 +74,7 @@ def test_import_does_not_score_with_a_changed_current_spec(tmp_path):
     spec = _spec()
     save_run(str(tmp_path), "saved", {}, {"coordinates": spec_coordinates(spec, "hf"),
                                            "engine": {"kind": "transformers"}})
-    with patch.dict(SPECS, {"xs": replace(spec, hf_kwargs={"force_text_causal": True})}), \
+    with _current(replace(spec, hf_kwargs={"force_text_causal": True})), \
          patch("isb.sweep.score.score_runs") as score:
         _import(tmp_path)
     assert not score.called
@@ -97,12 +102,9 @@ def test_baseline_single_transformers_run_and_marker_override(tmp_path):
 
 def test_overview_cards_carry_rollup_of_the_scored_run(tmp_path):
     _collection(tmp_path)
-    SPECS["xs"] = _spec()
-    try:
+    with _current(_spec()):
         _import(tmp_path)
         page = manager.render_overview(str(tmp_path), inbox=str(tmp_path / "inbox"))
-    finally:
-        del SPECS["xs"]
     # every cell of cand is wrong on p1, so nothing passes -> the rollup is SILENTLY_WRONG
     # (assert the rendered chip, not the stylesheet: the CSS also contains state names)
     assert ">SILENTLY_WRONG</span>" in page
@@ -112,12 +114,9 @@ def test_overview_cards_carry_rollup_of_the_scored_run(tmp_path):
 
 def test_method_page_is_the_model_x_backend_matrix(tmp_path):
     _collection(tmp_path)
-    SPECS["xs"] = _spec()
-    try:
+    with _current(_spec()):
         _import(tmp_path)
         page = manager.render_method(str(tmp_path), "m", inbox=str(tmp_path / "inbox"))
-    finally:
-        del SPECS["xs"]
     assert "Model × backend" in page
     assert "/spec/xs" in page                                      # matrix row links the model
     assert ">SILENTLY_WRONG</span>" in page                        # the model x backend rollup
@@ -125,12 +124,9 @@ def test_method_page_is_the_model_x_backend_matrix(tmp_path):
 
 def test_spec_page_shows_states_metrics_and_stack(tmp_path):
     _collection(tmp_path)
-    SPECS["xs"] = _spec()
-    try:
+    with _current(_spec()):
         _import(tmp_path)
         page = manager.render_spec(str(tmp_path), "xs", inbox=str(tmp_path / "inbox"))
-    finally:
-        del SPECS["xs"]
     assert ">NUMERICAL_MISMATCH</span>" in page                    # unresolved numerical difference
     assert " ms</span>" in page                                 # measurement remains visible
     assert "top1=" in page and "tv=" in page                       # oracle metrics per cell
@@ -142,12 +138,9 @@ def test_spec_page_shows_states_metrics_and_stack(tmp_path):
 
 def test_spec_page_has_operating_point_figure(tmp_path):
     _collection(tmp_path)
-    SPECS["xs"] = _spec()
-    try:
+    with _current(_spec()):
         _import(tmp_path)
         page = manager.render_spec(str(tmp_path), "xs", inbox=str(tmp_path / "inbox"))
-    finally:
-        del SPECS["xs"]
     assert "<svg" in page and "median latency (ms)" in page
     # cand has two timed cells (interactive + batched) -> two points
     assert page.count("<circle") >= 2 + 1                          # points + one legend swatch
@@ -193,12 +186,9 @@ def test_lone_construct_run_is_never_the_fallback_baseline(tmp_path):
 
 def test_overview_matches_the_reviewed_design(tmp_path):
     _collection(tmp_path)
-    SPECS["xs"] = _spec()
-    try:
+    with _current(_spec()):
         _import(tmp_path)
         page = manager.render_overview(str(tmp_path), inbox=str(tmp_path / "inbox"))
-    finally:
-        del SPECS["xs"]
     assert "How to read the map" in page                           # legend panel
     assert "setup of the runs in this directory" in page           # backends table
     assert "HF-nnsight" in page and "vllm-nnsight" in page
@@ -271,7 +261,7 @@ def test_perf_micro_runs_render_op_cost_tables(tmp_path):
 def test_run_without_registered_spec_shows_no_verdict(tmp_path):
     entries = _collection(tmp_path)
     baselines = manager.baselines_of(str(tmp_path), entries)
-    results = manager.dir_results(str(tmp_path), entries, baselines)  # "xs" not in SPECS
+    results = manager.dir_results(str(tmp_path), entries, baselines)  # "xs" has no current definition
     assert results == {"base": None, "cand": None}
     page = manager.render_overview(str(tmp_path), inbox=str(tmp_path / "inbox"))
     assert "no scored runs" in page
@@ -327,12 +317,9 @@ def test_repo_pages_render(tmp_path=None):
 
 def test_export_is_selfcontained_and_link_rewritten(tmp_path):
     _collection(tmp_path)
-    SPECS["xs"] = _spec()
-    try:
+    with _current(_spec()):
         _import(tmp_path)
         page = manager.export_html(str(tmp_path), inbox=str(tmp_path / "inbox"))
-    finally:
-        del SPECS["xs"]
     assert "/spec/xs" in page and "/model/llama" in page and "/data/factual" in page
     assert "href='/" not in page                                   # every link is hash-routed
     assert "<form" not in page                                     # read-only export

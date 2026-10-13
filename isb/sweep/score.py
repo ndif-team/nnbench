@@ -90,14 +90,15 @@ def score_runs(spec, out_dir: str, candidate: str, reference: str | None,
                           latency_s=(m.get("median_latency_ms") or 0) / 1000.0 or None,
                           error=m.get("error"), value=cand_out.get((workload_kind, label)),
                           workload=workload_kind)
-        ref_key = (("batched_perprompt", label) if workload_kind == "batched"
-                   else (workload_kind, label))
+        row = m.get("row", label)        # an alternative realization scores against its row
+        ref_key = (("batched_perprompt", row) if workload_kind == "batched"
+                   else (workload_kind, row))
         ref_val = ref_out.get(ref_key)
         if reference:
             evaluate([cell], control=control, ref_override=ref_val)
             if ctl_out is not None and control == "hf":
                 disambiguate_precision([cell], ref_val,
-                                       lambda c, k=(workload_kind, label): ctl_out.get(k))
+                                       lambda c, k=(workload_kind, row): ctl_out.get(k))
         else:
             cell.value = None            # evaluate() would have released the tensor
         results.append(cell)

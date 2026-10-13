@@ -20,7 +20,7 @@ import isb.methodologies  # noqa: F401,E402  (registers cells)
 from isb.backends import IMPLS, VLLMServeBackend  # noqa: E402
 from isb.methodologies.registry import get_cell  # noqa: E402
 from isb.runs import DeploymentConfig, EngineConfig, RunConfig, make_backend  # noqa: E402
-from isb.specs import SPECS  # noqa: E402
+from isb.workloads import case  # noqa: E402
 
 
 def test_registered_in_impls():
@@ -116,7 +116,7 @@ def test_teardown_is_clean_noop():
 
 
 def test_serve_deployment_maps_to_serve_backend_and_no_host_guard():
-    spec = next(iter(SPECS.values()))
+    spec = case("logit_lens/gpt2")
     run = RunConfig(engine=EngineConfig("vllm"),
                     deployment=DeploymentConfig(kind="serve", host="http://server:6677"))
     be = make_backend(run, spec)

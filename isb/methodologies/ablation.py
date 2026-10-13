@@ -57,11 +57,10 @@ def ablation_hf(be, model, m, prompts, *, layer=6, target="mlp", residual="plain
     return be.run(model, prompts, build)
 
 
-@cell("ablation", family="*", backend="vllm_async")
+@cell("ablation", family="*", backend="vllm_async", realizations=[{"residual": "plain"}])
 def ablation_vllm(be, model, m, prompts, *, layer=6, target="mlp", residual=None):
     # Default to the family's vLLM denotation: fused-residual families (Llama/Qwen) read the
-    # hidden+residual sum. An explicit residual= still overrides (the Qwen parallelism specs pass
-    # "plain", scoring vLLM against vLLM).
+    # hidden+residual sum. The declared alternative reads the plain stream (the naive port).
     residual = residual if residual is not None else m.default_residual(be.name)
     record_resolved(residual=residual)
     blk = m.blocks(model)[layer]

@@ -3,7 +3,8 @@
 A run is a fully described execution in its own process. It ALWAYS writes ONE self-contained
 file, <out_dir>/<run_name>.pt (isb/runfile.py), holding:
 
-    outputs      {(regime_kind, label): cpu tensor} — every cell's warm output, plus
+    outputs      {(regime_kind, label): cpu tensor} — every cell's warm output (a declared
+                 alternative realization is its own label, `<row> [k=v]`, design.md §12.16), plus
                  ("batched_perprompt", label): the per-prompt stack for each batched task, so ANY
                  run can later serve as the reference for a padded-batch comparison; plus
                  ("__meta__",): per-cell perf/errors and the params each case ran with.
@@ -22,7 +23,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 
 from ..methodologies.observations import capture_choices
-from ..methodologies.registry import Unsupported, get_cell
+from ..methodologies.registry import Unsupported, get_cell, get_realizations
 from ..perf.timing import time_cell
 from ..runfile import save_run
 from ..runs import RunConfig, cell_interface, make_backend, resolve_provenance, spec_coordinates
@@ -219,6 +220,33 @@ def _run_coordinates(spec, interface: str) -> dict:
     return spec_coordinates(spec, interface)
 
 
+def alternative_label(label: str, realization: dict) -> str:
+    return f"{label} [{', '.join(f'{k}={v}' for k, v in sorted(realization.items()))}]"
+
+
+def _cases(spec, interface: str):
+    """(label, params, alternative) per executed case: each row with the system's documented
+    realization and, when the run asks for them, each alternative the cell declares (§12.16)."""
+    alternatives = (get_realizations(spec.methodology, spec.family, interface)
+                    if spec.realizations == "all" else ())
+    for task in spec.tasks:
+        yield task.label, task.params, None
+        for realization in alternatives:
+            yield (alternative_label(task.label, realization), {**task.params, **realization},
+                   {"row": task.label, "alternative": realization})
+
+
+def _layer_count(model):
+    """The loaded model's decoder layer count from its config, or None when it does not say."""
+    config = getattr(model, "config", None)
+    for source in (getattr(config, "text_config", None), config):
+        for name in ("num_hidden_layers", "n_layer"):
+            value = getattr(source, name, None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+    return None
+
+
 def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
                 release_findings: list | None = None, debug: bool = False,
                 backend=None, interface=None, provenance=None) -> str:
@@ -237,6 +265,9 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
     twin = None
     try:
         model = be.load(spec.repo)
+        count = _layer_count(model) if spec.n_layers is not None else None
+        if count is not None and count != spec.n_layers:
+            raise ValueError(f"{spec.repo} has {count} layers; the model row says {spec.n_layers}")
         if provenance is not None:
             import hashlib
             import json
@@ -284,11 +315,11 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
             vanilla_timing = _time_vanilla(spec, regime, r_be, r_model, timed_prompts,
                                            meta.setdefault(("__vanilla__", regime.kind), {}))
 
-            for task in spec.tasks:
-                key = (regime.kind, task.label)
-                case = meta[key] = {}
+            for label, params, alternative in _cases(spec, iface):
+                key = (regime.kind, label)
+                case = meta[key] = dict(deepcopy(alternative) or {})
                 try:
-                    call = _bind_case(spec, r_iface, _task_params(regime, task.params), case)
+                    call = _bind_case(spec, r_iface, _task_params(regime, params), case)
                     timing, warm = time_cell(
                         lambda: call.prepare(r_be, r_model, timed_prompts),
                         warmup=spec.warmup, n_trials=spec.n_trials)

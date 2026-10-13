@@ -101,11 +101,10 @@ def patch_hf(be, model, m, prompts, *, layer=6, residual="plain", patch=True, po
                        positions=positions)
 
 
-@cell("activation_patching", family="*", backend="vllm_async")
+@cell("activation_patching", family="*", backend="vllm_async", realizations=[{"residual": "plain"}])
 def patch_vllm(be, model, m, prompts, *, layer=6, residual=None, patch=True, positions="all"):
     # Default to the family's vLLM denotation: fused-residual families (Llama/Qwen) read and write
-    # the hidden+residual sum. An explicit residual= still overrides (the Qwen parallelism specs
-    # pass "plain", scoring vLLM against vLLM).
+    # the hidden+residual sum. The declared alternative reads the plain stream (the naive port).
     residual = residual if residual is not None else m.default_residual(be.name)
     record_resolved(residual=residual)
     return _patch_cell(be, model, m, prompts, layer=layer, residual=residual, patch=patch,

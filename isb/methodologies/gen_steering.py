@@ -59,7 +59,8 @@ def _check_bound(bound):
         raise ValueError(f"unknown iteration bound {bound!r} (expected 'bounded' or 'unbounded')")
 
 
-@cell("gen_steering", family="*", backend="hf")
+# alternative: the documented unbounded iter[:] (drops every per-step save on vLLM)
+@cell("gen_steering", family="*", backend="hf", realizations=[{"bound": "unbounded"}])
 def gen_steering_hf(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0,
                     bound="bounded", new_tokens=8, scale_by="mean_norm"):
     _check_bound(bound)
@@ -75,7 +76,7 @@ def gen_steering_hf(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0
                        bounded=(bound == "bounded"))
 
 
-@cell("gen_steering", family="*", backend="vllm_async")
+@cell("gen_steering", family="*", backend="vllm_async", realizations=[{"bound": "unbounded"}])
 def gen_steering_vllm(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0,
                       bound="bounded", new_tokens=8, residual=None, scale_by="mean_norm"):
     _check_bound(bound)

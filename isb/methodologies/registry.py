@@ -22,10 +22,12 @@ from __future__ import annotations
 
 import functools
 import inspect
+from copy import deepcopy
 
 from ..profiles import PROFILES
 
 CELLS = {}  # (methodology, family, backend) -> fn(be, model, prompts, **params)
+REALIZATIONS = {}  # same key -> alternative realization params, in declaration order
 
 # nnsight's own vLLM interfaces, which share the vllm_async cells. A foreign system on vLLM
 # (e.g. vllm_lens) never inherits nnsight intervention code (design.md §12.14).
@@ -37,12 +39,42 @@ class Unsupported(Exception):
     capability. Recorded as UNSUPPORTED, distinct from ERROR (design.md §12.14)."""
 
 
-def cell(methodology: str, family: str, backend: str):
+def cell(methodology: str, family: str, backend: str, realizations=()):
+    """Register a cell. `realizations` lists this system's alternative spellings of every row, as
+    realization params (`{"mode": "inplace"}`); the cell's own defaults are the documented
+    realization, and the alternatives run when a run asks for them (design.md §12.16)."""
+    from ..protocol import protocol_for
+
+    protocol = protocol_for(methodology)
+    for alternative in realizations:
+        if not alternative or (protocol is not None
+                               and set(alternative) - set(protocol.realization_params)):
+            raise ValueError(f"{methodology}/{family}/{backend}: realization {alternative!r} must set "
+                             "only the methodology's realization params")
+
     def deco(fn):
         CELLS[(methodology, family, backend)] = fn
+        REALIZATIONS[(methodology, family, backend)] = tuple(dict(a) for a in realizations)
         return fn
 
     return deco
+
+
+def _registered(methodology: str, family: str, backend: str):
+    """The (methodology, family, backend) key a lookup resolves to, or None."""
+    for fam in (family, "*"):
+        if fam == "*" and PROFILES.get(family) is None:
+            break
+        for name in (backend, "vllm_async") if backend in NNSIGHT_VLLM_VARIANTS else (backend,):
+            if (methodology, fam, name) in CELLS:
+                return methodology, fam, name
+    return None
+
+
+def get_realizations(methodology: str, family: str, backend: str) -> tuple:
+    """The alternative realizations declared by the cell `get_cell` resolves to."""
+    key = _registered(methodology, family, backend)
+    return deepcopy(REALIZATIONS.get(key, ())) if key else ()
 
 
 def get_cell(methodology: str, family: str, backend: str):

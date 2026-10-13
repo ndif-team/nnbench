@@ -9,7 +9,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from isb.protocol import CAUSALAB_REFERENCE, COMPONENTS, PROTOCOLS, InterventionSpec  # noqa: E402
-from isb.specs import SPECS  # noqa: E402
+from isb.suites import SUITES, suite_cases  # noqa: E402
+
+SPECS = {s.name: s for suite in SUITES for s in suite_cases(suite)}
 from isb.sweep.spec import BaselineSpec, CellConfig, ExecutionRegime, TaskSpec  # noqa: E402
 
 
@@ -46,16 +48,16 @@ def test_invalid_write_component_descriptions_are_rejected(kwargs):
         InterventionSpec(**kwargs)
 
 
-def test_every_registered_spec_has_protocol_semantics():
+def test_every_suite_case_has_protocol_semantics():
     missing = [name for name, spec in SPECS.items() if spec.protocol is None]
     assert missing == []
 
 
 def test_protocol_coordinate_is_family_independent_and_method_specific():
-    assert (SPECS["logit_lens_gpt2"].protocol.coordinate()
-            == SPECS["logit_lens_qwen"].protocol.coordinate())
-    assert (SPECS["logit_lens_gpt2"].protocol.coordinate()
-            != SPECS["steering_gpt2"].protocol.coordinate())
+    assert (SPECS["logit_lens/gpt2"].protocol.coordinate()
+            == SPECS["logit_lens/qwen2.5-14b"].protocol.coordinate())
+    assert (SPECS["logit_lens/gpt2"].protocol.coordinate()
+            != SPECS["steering/gpt2"].protocol.coordinate())
 
 
 def test_unknown_protocol_vocabulary_and_unclassified_params_are_loud():
@@ -85,7 +87,7 @@ def test_all_registered_cell_keyword_options_can_be_classified():
 
 
 def test_spec_params_outside_the_protocol_fail_at_construction():
-    spec = SPECS["steering_gpt2"]
+    spec = SPECS["steering/gpt2"]
     with pytest.raises(ValueError, match="unclassified"):
         replace(spec, tasks=[({"alpah": 0.0}, "typo")])
     with pytest.raises(ValueError, match="unclassified"):
@@ -95,9 +97,9 @@ def test_spec_params_outside_the_protocol_fail_at_construction():
 
 
 @pytest.mark.parametrize("name,params", [
-    ("das_gpt2", {"train": 0, "layer": 9, "k": 32, "seed": 7}),
-    ("jacobian_lens_gpt2", {"position": "last", "residual": "plain"}),
-    ("jacobian_collect_gpt2", {"dim_batch": 32, "skip_first": 4}),
+    ("das/gpt2", {"train": 0, "layer": 9, "k": 32, "seed": 7}),
+    ("jacobian_lens/gpt2", {"position": "last", "residual": "plain"}),
+    ("jacobian_collect/gpt2", {"dim_batch": 32, "skip_first": 4}),
 ])
 def test_supported_custom_cases_keep_exact_cell_parameters(name, params):
     spec = replace(SPECS[name], tasks=[(params, "custom")])
@@ -120,4 +122,4 @@ def test_unknown_method_requires_descriptor_or_explicit_reason(reason):
 
 def test_described_method_rejects_absence_reason():
     with pytest.raises(ValueError, match="described methods"):
-        replace(SPECS["steering_gpt2"], protocol_absence_reason="skip metadata")
+        replace(SPECS["steering/gpt2"], protocol_absence_reason="skip metadata")

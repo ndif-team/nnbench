@@ -1,15 +1,20 @@
-"""Declarative benchmark spec (design.md §12): one CellConfig per methodology.
+"""Benchmark definitions (design.md §12.16).
 
-``InterventionSpec`` describes the methodology; ``ExecutionRegime`` describes its inputs;
-``TaskSpec`` names one case and the params its cell receives. Python specs bind these to explicit
-cells, a model, and the execution settings the Docker worker consumes.
+Authoring form: a ``Workload`` (methodology, semantic ``Row`` s, ``Regime`` s with default data,
+baseline, ``Effect``) names no model and no system. ``instantiate(workload, model)`` resolves it on
+one ``isb.models.Model`` into a ``CellConfig``, the resolved record the job contract freezes:
+``InterventionSpec`` describes the methodology, ``ExecutionRegime`` the inputs, and ``TaskSpec`` one
+case and the params its cell receives.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Optional
 
 from ..protocol import InterventionSpec, protocol_for
+
+REALIZATION_MODES = ("default", "all")
 
 
 @dataclass
@@ -82,7 +87,7 @@ class TaskSpec:
 
 @dataclass
 class CellConfig:
-    name: str                                   # spec id for the CLI: `bench.py --spec <name>`
+    name: str                                   # `<workload>/<model>` (+ `@<data>`), generated
     methodology: str
     family: str
     repo: str
@@ -95,11 +100,18 @@ class CellConfig:
     n_trials: int = 7
     hf_kwargs: dict = field(default_factory=dict)
     vllm_kwargs: dict = field(default_factory=dict)
+    # checked against the loaded model when set (instantiate sets it from the model row)
+    n_layers: int | None = None
+    # "default": each row runs the system's documented realization only; "all": also every
+    # alternative the system's cell registration declares (design.md §12.16)
+    realizations: str = "default"
     protocol: InterventionSpec | None = None    # defaults to the methodology's PROTOCOLS entry
     protocol_absence_reason: str | None = None  # required when no protocol describes the methodology
     protocol_source: str = field(default="authored", compare=False, repr=False)
 
     def __post_init__(self):
+        if self.realizations not in REALIZATION_MODES:
+            raise ValueError(f"realizations must be one of {REALIZATION_MODES}")
         if self.protocol_source not in {"authored", "restored"}:
             raise ValueError(f"unknown protocol source {self.protocol_source!r}")
         if self.protocol_source == "authored" and self.protocol is None:
@@ -160,3 +172,186 @@ def spec_with_data(spec: CellConfig, ref) -> CellConfig:
                                            data_knobs=dict(knobs), data_name=ref.name))
     return dataclasses.replace(
         spec, name=f"{spec.name}@{ref.name.replace('/', '-')}", regimes=rebound)
+
+
+# ---- workloads (design.md §12.16) ---------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Depth:
+    """A layer at fraction `f` of the model's depth: `round(f * n_layers)`, clamped to the last layer."""
+    f: float
+
+    def __post_init__(self):
+        if not 0.0 <= self.f <= 1.0:
+            raise ValueError("depth fraction must be within [0, 1]")
+
+    def resolve(self, n_layers: int) -> int:
+        return min(int(round(self.f * n_layers)), n_layers - 1)
+
+
+@dataclass(frozen=True)
+class Asset:
+    """A field of a fitted artifact bound to the model (`Model.assets[name][key]`). A row that
+    references one requires the model to carry that asset."""
+    name: str
+    key: str
+
+
+@dataclass(frozen=True)
+class Row:
+    """One workload case: a label saying what it does, semantic params, and the block components
+    it needs beyond what its params reference (`attn`, `mlp`, `mixer`)."""
+    label: str
+    params: dict = field(default_factory=dict)
+    requires: tuple = ()
+
+
+@dataclass(frozen=True)
+class Regime:
+    """An input regime template; `data` is a DataRef or a literal unit list."""
+    kind: str
+    data: object
+    new_tokens: int = 0
+    aggregate: bool = True
+
+
+@dataclass(frozen=True)
+class Effect:
+    """The non-vacuity guard. `perturbed` lists candidate rows in order; the first one the model
+    can express is used."""
+    baseline: dict
+    perturbed: tuple
+    tv_floor: float = 0.2
+    top1_ceiling: float = 0.5
+
+
+@dataclass(frozen=True)
+class Workload:
+    name: str
+    methodology: str
+    rows: tuple
+    regimes: tuple
+    baseline: dict
+    effect: Optional[Effect] = None
+    warmup: int = 3
+    n_trials: int = 7
+
+    def __post_init__(self):
+        # Workload params are semantics only; a realization belongs to the system (§12.16).
+        protocol = protocol_for(self.methodology)
+        declared = [row.params for row in self.rows] + [self.baseline]
+        if self.effect is not None:
+            declared += [self.effect.baseline] + [row.params for row in self.effect.perturbed]
+        labels = [row.label for row in self.rows]
+        if not labels or len(labels) != len(set(labels)):
+            raise ValueError(f"workload {self.name!r}: row labels must be nonempty and unique")
+        if protocol is None:
+            return
+        for params in declared:
+            semantics, realization = protocol.classify(params)
+            if realization:
+                raise ValueError(f"workload {self.name!r} passes realization params {sorted(realization)}; "
+                                 "declare them on the system's cell registration instead")
+
+
+class NotApplicable(Exception):
+    """The model cannot express this row (a component or asset it lacks)."""
+
+
+def _resolve(value, model, needs: set):
+    if isinstance(value, Depth):
+        return value.resolve(model.n_layers)
+    if isinstance(value, Asset):
+        needs.add(f"asset:{value.name}")
+        if value.name not in model.assets:
+            raise NotApplicable(f"{model.key} has no {value.name!r} asset")
+        return deepcopy(model.assets[value.name][value.key])
+    if isinstance(value, dict):
+        return {k: _resolve(v, model, needs) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_resolve(v, model, needs) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_resolve(v, model, needs) for v in value)
+    return value
+
+
+def _check_layers(params, model):
+    n = model.n_layers
+    indices = [params["layer"]] if isinstance(params.get("layer"), int) else []
+    if isinstance(params.get("layers"), list):
+        indices += [i for i in params["layers"] if isinstance(i, int)]
+    for i in indices:
+        if not -n <= i < n:
+            raise ValueError(f"layer {i} is out of range for {model.key} ({n} layers)")
+
+
+def _bind(params, requires, model):
+    from ..models import FAMILIES
+
+    missing = sorted(set(requires) - FAMILIES[model.family].components)
+    if missing:
+        raise NotApplicable(f"{model.key} has no {', '.join(missing)} block component")
+    resolved = _resolve(params, model, set())
+    _check_layers(resolved, model)
+    return resolved
+
+
+def _regime(template, data=None, size=None):
+    from ..data import DataRef
+
+    source = data if data is not None else template.data
+    if isinstance(source, DataRef) and size is not None:
+        source = DataRef(source.name, min(size, 16) if template.kind == "batched" else size)
+    return ExecutionRegime(template.kind, source, new_tokens=template.new_tokens,
+                           aggregate=template.aggregate)
+
+
+def instantiate(workload: Workload, model, *, data=None, size=None, regimes=None,
+                realizations="default", warmup=None, n_trials=None):
+    """Resolve `workload` on `model` (an isb.models.Model or its key). Returns the CellConfig and
+    the rows the model cannot express, as [{"label", "reason"}]. `data` (a DataRef) rebinds every
+    regime's source, `size` resizes each regime's default source, `regimes` keeps a subset of kinds."""
+    from ..models import MODELS
+
+    if isinstance(model, str):
+        if model not in MODELS:
+            raise ValueError(f"unknown model {model!r}; available: {', '.join(MODELS)}")
+        model = MODELS[model]
+    tasks, skipped = [], []
+    for row in workload.rows:
+        try:
+            tasks.append(TaskSpec(row.label, _bind(row.params, row.requires, model)))
+        except NotApplicable as reason:
+            skipped.append({"label": row.label, "reason": str(reason)})
+    if not tasks:
+        raise NotApplicable(f"{model.key} can express no row of {workload.name!r}: "
+                            + "; ".join(s["reason"] for s in skipped))
+    effect = None
+    if workload.effect is not None:
+        for candidate in workload.effect.perturbed:
+            try:
+                perturbed = _bind(candidate.params, candidate.requires, model)
+            except NotApplicable:
+                continue
+            effect = EffectSpec(_bind(workload.effect.baseline, (), model), perturbed,
+                                tv_floor=workload.effect.tv_floor,
+                                top1_ceiling=workload.effect.top1_ceiling)
+            break
+        else:
+            raise NotApplicable(f"{model.key} can express no effect check of {workload.name!r}")
+    kept = [r for r in workload.regimes if regimes is None or r.kind in regimes]
+    if not kept:
+        raise ValueError(f"workload {workload.name!r} has none of the regimes {sorted(regimes)}")
+    spec = CellConfig(
+        name=f"{workload.name}/{model.key}", methodology=workload.methodology,
+        family=model.family, repo=model.repo,
+        regimes=[_regime(r, None, size) for r in kept],
+        tasks=tasks, baseline=BaselineSpec(_bind(workload.baseline, (), model)), effect=effect,
+        dtype_control=model.dtype_control,
+        warmup=workload.warmup if warmup is None else warmup,
+        n_trials=workload.n_trials if n_trials is None else n_trials,
+        hf_kwargs=deepcopy(model.hf_kwargs), vllm_kwargs=deepcopy(model.vllm_kwargs),
+        n_layers=model.n_layers, realizations=realizations)
+    if data is not None:
+        spec = spec_with_data(spec, data)
+    return spec, skipped

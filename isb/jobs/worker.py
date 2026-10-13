@@ -58,7 +58,10 @@ def main(create_backend, job=Path("/job"), output=Path("/output")):
             metadata = outputs.get(("__meta__",), {})
             cells = []
             requested = expected_cells(experiment)
-            for key in sorted(requested):
+            # Alternative realizations the system declared are cells of their own (§12.16).
+            alternatives = {key for key, info in metadata.items()
+                            if isinstance(info, dict) and (key[0], info.get("row")) in requested}
+            for key in sorted(requested) + sorted(alternatives):
                 info = dict(metadata.get(key, {}))
                 error = info.get("error")
                 if info.get("unsupported"):
@@ -71,7 +74,8 @@ def main(create_backend, job=Path("/job"), output=Path("/output")):
                 metadata[key] = info
                 cells.append({"workload": key[0], "label": key[1], "state": state, **info})
             auxiliary_calls = [{"key": list(key), "record": info}
-                               for key, info in metadata.items() if key not in requested]
+                               for key, info in metadata.items()
+                               if key not in requested and key not in alternatives]
             outputs[("__meta__",)] = metadata
             torch.save(artifact, partial / "result.pt")
             os.replace(partial / "result.pt", output / "result.pt")

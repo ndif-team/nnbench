@@ -123,8 +123,10 @@ def score_experiment(directory, backends, reference=None, comparison="correctnes
             elif not ref:
                 row.update(state="NO_REFERENCE", error=failures.get(reference))
             else:
-                refkey = (("batched_perprompt", key[1]) if key[0] == "batched"
-                          and comparison == "correctness" else key)
+                # An alternative realization is scored against the reference's default for its row.
+                row_label = cell.get("row", cell["label"])
+                refkey = (("batched_perprompt", row_label) if key[0] == "batched"
+                          and comparison == "correctness" else (key[0], row_label))
                 expected = ref[1]["outputs"].get(refkey)
                 actual = artifact["outputs"].get(key)
                 effect = ref[1]["outputs"].get(("__meta__",), {}).get(("__effect__", key[0]))
@@ -175,10 +177,13 @@ def score_run(directory):
     reports = [score_experiment(directory / "experiments" / name, plan["backends"],
                                 plan["reference"], plan["comparison"])
                for name in plan["experiments"]]
-    report = {"version": PLAN_VERSION, "run": directory.name, "experiments": reports}
+    report = {"version": PLAN_VERSION, "run": directory.name, "experiments": reports,
+              "not_applicable": plan.get("not_applicable", [])}
     write_json(directory / "report.json", report)
     for experiment in reports:
         for row in experiment["cells"]:
             print(f"{experiment['spec']} | {row['backend']} | {row.get('workload', '-')} | "
                   f"{row.get('label', '-')} | {row['state']}")
+    for row in report["not_applicable"]:
+        print(f"{row['case']} | - | - | {row['label']} | NOT_APPLICABLE ({row['reason']})")
     return report

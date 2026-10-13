@@ -80,22 +80,32 @@ throughput. Timing and numerical verdicts are recorded separately.
 
 ## Implemented scope
 
-Specs cover logit lens, steering, ablation, activation patching, attention-pattern reads,
+Workloads cover logit lens, steering, ablation, activation patching, attention-pattern reads,
 attribution patching, generation steering and patching, DAS, Jacobian collection and Jacobian
-lens. Model configurations include GPT-2, Llama-family models, Qwen2.5, Qwen3.5 and Nemotron hybrids.
+lens. Models include GPT-2, SmolLM2 (Llama), Qwen2.5, Qwen3.5 and Nemotron hybrids.
 
-The [spec registry](isb/specs/__init__.py) is the authoritative inventory. Each spec defines the
-available method/model combinations; the inventory is not a claim that every combination passes.
-`--spec all` selects the small default corpus. Larger model configurations are selected by name.
+Definitions come in four independent layers ([design §12.16](docs/design.md)):
+
+- a **workload** ([`isb/workloads/`](isb/workloads/), one per methodology) holds the intervention
+  semantics, data, regimes and effect check, and names no model and no system;
+- a **model** ([`isb/models.py`](isb/models.py)) is a checkpoint with its architecture, layer
+  count and load options; workload layers are depth fractions resolved against it;
+- a **realization** is how one system spells a row (nnsight's in-place vs replacement write, the
+  naive plain-residual port), declared on that system's cell registration;
+- a **suite** ([`isb/suites.py`](isb/suites.py)) is a run recipe: workloads × models, backends,
+  reference, data size and realizations.
+
+A case is named `<workload>/<model>`. A row a model cannot express (attention ablation on a
+single-mixer block) is reported as not applicable. The inventory is not a claim that every
+combination passes.
 See [measured findings](docs/findings.md) and the
 [primitive status inventory](docs/interp-methods-catalog.md) for results tied to tested stacks.
 
 ## Cross-system comparison
 
-The `cmp_*` specs (logit lens, steering, generation steering, activation patching, ablation on
-Qwen2.5-7B-Instruct; the `comparison` suite in [`isb/specs/suites.py`](isb/specs/suites.py)) run one workload
-through several interpretability systems on vLLM, each a system directory with one config per
-variant:
+The `cross-system` suite runs logit lens, steering, generation steering, activation patching and
+ablation on Qwen2.5-7B-Instruct through several interpretability systems on vLLM, each in its
+documented realization. Each system is a directory with one config per variant:
 
 | System | Backends |
 |---|---|
@@ -127,15 +137,15 @@ image and implementation; each config inside it (`<system>/<config>`) owns its o
 
 ```bash
 python scripts/bench.py list backends
-python scripts/bench.py list specs
+python scripts/bench.py list workloads   # also: models, suites
 python scripts/bench.py build nnsight-hf/default nnsight-vllm/default
 
 # Compare vLLM with an explicit HF reference.
-python scripts/bench.py run --spec logit_lens_gpt2 --data factual:2 \
+python scripts/bench.py run --workload logit_lens --model gpt2 --data factual:2 \
   --backends nnsight-hf/default nnsight-vllm/default --reference nnsight-hf/default --gpu 0
 
-# Collect the small default corpus on HF.
-python scripts/bench.py run --spec all --backends nnsight-hf/default --gpu 0
+# The small default corpus: every workload on gpt2, nnsight on HF and vLLM.
+python scripts/bench.py run --suite smoke --gpu 0
 
 # Re-score an existing run.
 python scripts/bench.py score runs/REPLACE_WITH_RUN_ID
@@ -157,7 +167,7 @@ Apptainer definition and a `.sif` image, and `run` maps the `runner` service ont
 ```bash
 export ISB_LAUNCHER=apptainer ISB_APPTAINER_DIR=$PWD/.apptainer
 python scripts/bench.py build nnsight-vllm/default vllm-lens/default
-HF_HUB_OFFLINE=1 python scripts/bench.py run --spec cmp_steering \
+HF_HUB_OFFLINE=1 python scripts/bench.py run --suite cross-system --workload steering \
   --backends nnsight-hf/fp32 nnsight-vllm/default vllm-lens/default vllm-plain/0-19-1 \
   --reference nnsight-hf/fp32 --gpu 0
 ```

@@ -1,4 +1,4 @@
-"""interp-engine cells for the comparison specs (design.md §12.14).
+"""interp-engine cells for the cross-system workloads (design.md §12.14).
 
 Denotation, from interp-engine 1.12.0 source (`interp_engine/vllm_capture/requests.py`,
 `vllm_capture/steering.py`): on vLLM's fused-residual layers `resid_post.L` reads

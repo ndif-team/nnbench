@@ -10,6 +10,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from isb.suites import cases
+
 from .contract import PLAN_VERSION, prepare, write_json
 from . import apptainer
 from .local import (LAUNCHERS, ROOT, backend_file, canonical, compose, configuration, default_launcher,
@@ -23,46 +25,72 @@ def _positive(value):
     return number
 
 
-def _specs(names, data):
-    from isb.data import DataRef
-    from isb.specs import SPECS, default_specs
-    from isb.sweep.spec import spec_with_data
+def _recipe(args):
+    """The suite (or ad-hoc combination) the run executes, with command-line overrides applied.
+    Returns (suite name or None, entries, settings)."""
+    from isb.suites import SUITES, Entry, parse_data
 
-    selected = default_specs() if names == ["all"] else names
-    if "all" in selected or len(selected) != len(set(selected)):
-        raise ValueError("select unique spec names, or 'all' alone")
-    ref = None
-    if data:
-        name, separator, count = data.partition(":")
-        if separator and (not count.isdigit() or int(count) < 1):
-            raise ValueError("dataset count must be positive")
-        ref = DataRef(name, int(count) if separator else None)
-    results = []
-    for name in selected:
-        if name not in SPECS:
-            raise ValueError(f"unknown spec {name!r}; available: {', '.join(SPECS)}")
-        results.append(spec_with_data(SPECS[name], ref) if ref else SPECS[name])
-    return results
+    parse_data(args.data)                            # fail on a malformed source early
+
+    if args.suite:
+        if args.suite not in SUITES:
+            raise ValueError(f"unknown suite {args.suite!r}; available: {', '.join(SUITES)}")
+        suite = SUITES[args.suite]
+        settings = {"backends": list(suite.backends), "reference": suite.reference,
+                    "realizations": suite.realizations, "comparison": suite.comparison,
+                    "timeout": suite.timeout}
+        # --workload/--model with a suite keep only those of its cases
+        entries = [Entry(tuple(w for w in e.workloads if not args.workload or w in args.workload),
+                         tuple(m for m in e.models if not args.model or m in args.model),
+                         size=e.size, data=e.data, regimes=e.regimes) for e in suite.entries]
+        entries = [e for e in entries if e.workloads and e.models]
+        if not entries:
+            raise ValueError(f"suite {args.suite!r} has no case among the selected workloads/models")
+    else:
+        if not args.workload or not args.model:
+            raise ValueError("select --suite, or --workload and --model")
+        settings = {"backends": None, "reference": None, "realizations": "all",
+                    "comparison": "correctness", "timeout": 1800}
+        entries = [Entry(tuple(args.workload), tuple(args.model))]
+    for key in settings:
+        if getattr(args, key) is not None:
+            settings[key] = getattr(args, key)
+    if not settings["backends"]:
+        raise ValueError("select --backends")
+    if args.data or args.regimes:
+        entries = [Entry(e.workloads, e.models, size=e.size, data=args.data or e.data,
+                         regimes=tuple(args.regimes) if args.regimes else e.regimes) for e in entries]
+    return args.suite, entries, settings
 
 
 def parser():
     ap = argparse.ArgumentParser(description=__doc__)
     commands = ap.add_subparsers(dest="command", required=True)
     listing = commands.add_parser("list")
-    listing.add_argument("kind", choices=["backends", "specs"])
+    listing.add_argument("kind", choices=["backends", "workloads", "models", "suites"])
     build = commands.add_parser("build")
     build.add_argument("backends", nargs="+")
     build.add_argument("--launcher", choices=LAUNCHERS, default=None,
                        help="docker or apptainer (default: ISB_LAUNCHER, else docker)")
-    run = commands.add_parser("run")
-    run.add_argument("--spec", nargs="+", required=True)
-    run.add_argument("--data")
-    run.add_argument("--backends", nargs="+", required=True,
+    run = commands.add_parser("run", description="Run a suite (isb/suites.py), or workloads x models. "
+                              "With --suite, other options override the suite's settings and "
+                              "--workload/--model keep only those of its cases.")
+    run.add_argument("--suite")
+    run.add_argument("--workload", nargs="+", help="workload names (isb/workloads/)")
+    run.add_argument("--model", nargs="+", help="model keys (isb/models.py)")
+    run.add_argument("--data", help="SOURCE[:N]: rebind every regime to a registered data source")
+    run.add_argument("--regimes", nargs="+", choices=["interactive", "batched", "generation"],
+                     help="keep only these regime kinds")
+    run.add_argument("--realizations", choices=["default", "all"],
+                     help="each system's documented realization only, or also every alternative its "
+                          "cells declare (ad-hoc default: all)")
+    run.add_argument("--backends", nargs="+",
                      help="config names, <system>/<config>; a bare system name means <system>/default")
-    run.add_argument("--reference", help="one of --backends; omit to collect without scoring")
-    run.add_argument("--comparison", choices=["correctness", "equivalence"], default="correctness")
+    run.add_argument("--reference", help="one of --backends; omit (or '' with --suite) to collect "
+                                         "without scoring")
+    run.add_argument("--comparison", choices=["correctness", "equivalence"])
     run.add_argument("--gpu", default="0", help="host GPU index or UUID; passed to backend Compose")
-    run.add_argument("--timeout", type=_positive, default=1800, help="seconds per backend job")
+    run.add_argument("--timeout", type=_positive, help="seconds per backend job (default 1800)")
     run.add_argument("--seed", type=int, default=0)
     run.add_argument("--launcher", choices=LAUNCHERS, default=None,
                      help="docker or apptainer (default: ISB_LAUNCHER, else docker)")
@@ -82,16 +110,18 @@ def _score(directory, strict):
 
 
 def _run(args):
+    suite, entries, settings = _recipe(args)
     # Records carry only full config names; a bare system name means its default config.
-    args.backends = [canonical(name) for name in args.backends]
-    args.reference = canonical(args.reference) if args.reference else None
+    args.backends = [canonical(name) for name in settings["backends"]]
+    args.reference = canonical(settings["reference"]) if settings["reference"] else None
+    args.comparison, args.timeout = settings["comparison"], settings["timeout"]
     if len(args.backends) != len(set(args.backends)):
         raise ValueError("backend names must be unique")
     if args.reference and args.reference not in args.backends:
         raise ValueError("reference must be one of --backends")
     if not args.gpu or "," in args.gpu:
         raise ValueError("select one GPU index/UUID; multi-GPU settings belong in backend Compose")
-    specs = _specs(args.spec, args.data)
+    specs, skipped = cases(entries, settings["realizations"])
     launcher = args.launcher or default_launcher()
     for name in args.backends:
         env = environment(name, args.out, args.out, args.gpu)
@@ -104,9 +134,13 @@ def _run(args):
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     directory = args.out.resolve() / f"{stamp}-{uuid.uuid4().hex[:8]}"
     directory.mkdir(parents=True, exist_ok=False)
-    plan = {"version": PLAN_VERSION, "backends": args.backends, "reference": args.reference,
-            "comparison": args.comparison, "gpu": args.gpu, "launcher": launcher, "experiments": [],
+    plan = {"version": PLAN_VERSION, "suite": suite, "backends": args.backends,
+            "reference": args.reference, "comparison": args.comparison,
+            "realizations": settings["realizations"], "gpu": args.gpu, "launcher": launcher,
+            "experiments": [], "cases": [spec.name for spec in specs], "not_applicable": skipped,
             "status": "preparing"}
+    for row in skipped:
+        print(f"not applicable: {row['case']} | {row['label']} | {row['reason']}", flush=True)
     jobs = []
     for index, spec in enumerate(specs):
         # Preparation uses an index until the content identity is known, then renames atomically.
@@ -143,9 +177,16 @@ def main(argv=None):
         if args.command == "list":
             if args.kind == "backends":
                 print("\n".join(discover()))
+            elif args.kind == "workloads":
+                from isb.workloads import WORKLOADS
+                print("\n".join(WORKLOADS))
+            elif args.kind == "models":
+                from isb.models import MODELS
+                print("\n".join(f"{m.key}\t{m.repo}\t{m.family}\t{m.n_layers} layers"
+                                for m in MODELS.values()))
             else:
-                from isb.specs import SPECS
-                print("\n".join(sorted(SPECS)))
+                from isb.suites import SUITES
+                print("\n".join(SUITES))
             return 0
         if args.command == "build":
             # Resolve all names before the first build; do not partially act on a typo.

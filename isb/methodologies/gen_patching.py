@@ -79,7 +79,7 @@ def _check_bound(bound):
         raise ValueError(f"unknown iteration bound {bound!r} (expected 'bounded' or 'unbounded')")
 
 
-@cell("gen_patching", family="*", backend="hf")
+@cell("gen_patching", family="*", backend="hf", realizations=[{"bound": "unbounded"}])
 def gen_patching_hf(be, model, m, prompts, *, layer=9, residual="plain",
                     bound="bounded", new_tokens=8, patch=True):
     _check_bound(bound)
@@ -108,7 +108,7 @@ def gen_patching_hf(be, model, m, prompts, *, layer=9, residual="plain",
                              build_step=step, new_tokens=new_tokens, bounded=(bound == "bounded"))
 
 
-@cell("gen_patching", family="*", backend="vllm_async")
+@cell("gen_patching", family="*", backend="vllm_async", realizations=[{"bound": "unbounded"}])
 def gen_patching_vllm(be, model, m, prompts, *, layer=9, residual="plain",
                       bound="bounded", new_tokens=8, patch=True):
     _check_bound(bound)

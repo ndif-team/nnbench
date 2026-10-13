@@ -1,4 +1,4 @@
-"""TransformerLens 4.0 vLLM-bridge cells for the comparison specs (design.md §12.14).
+"""TransformerLens 4.0 vLLM-bridge cells for the cross-system workloads (design.md §12.14).
 
 Denotation, from transformer-lens 4.0.0 source (`model_bridge/sources/vllm/overlays/decoder_only.py`,
 `plugin.py`): on vLLM's fused-residual layers `blocks.{i}.hook_out` reads `hidden + residual` and a

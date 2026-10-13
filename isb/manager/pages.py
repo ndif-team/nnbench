@@ -615,8 +615,8 @@ def models(col: Collection) -> str:
 
 
 def model_page(col: Collection, family: str) -> str:
+    from ..models import MODELS
     from ..profiles import PROFILES
-    from ..specs import SPECS
 
     p = PROFILES[family]
     facts = kv_table([
@@ -626,9 +626,9 @@ def model_page(col: Collection, family: str) -> str:
         ("attn / mlp names", esc(str((p.attn_name, p.mlp_name)))),
         ("vLLM tree prefix", esc(p.vllm_prefix or "-")),
     ])
-    specs = "".join(f"<li>{esc(s.name)} "
-                    f"<span class='note'>{esc(s.repo)}</span></li>"
-                    for s in SPECS.values() if s.family == family) or "<li>none</li>"
+    models = "".join(f"<li>{esc(m.key)} "
+                     f"<span class='note'>{esc(m.repo)}, {m.n_layers} layers</span></li>"
+                     for m in MODELS.values() if m.family == family) or "<li>none</li>"
     recorded = "".join(f"<li>{link(f'/spec/{group}', group)}</li>"
                        for group, names in col.by_spec().items()
                        if col.entries[names[0]][1]["coordinates"]["family"] == family) if col else ""
@@ -637,8 +637,8 @@ def model_page(col: Collection, family: str) -> str:
         eyebrow("Model family"),
         heading(1, esc(family)),
         facts,
-        heading(2, "Specs on this family"),
-        f"<ul>{specs}</ul>", heading(2, "Recorded experiments"),
+        heading(2, "Models of this family"),
+        f"<ul>{models}</ul>", heading(2, "Recorded experiments"),
         f"<ul>{recorded or '<li>none</li>'}</ul>")
 
 

@@ -290,3 +290,114 @@ def test_vanilla_request_is_timed_beside_the_cells(tmp_path, monkeypatch, has_pl
     else:
         assert "has no plain request" in record["unavailable"]
         assert cell["overhead_vs_vanilla"] is None
+
+
+@pytest.mark.parametrize("realizations", ["default", "all"])
+def test_declared_alternative_realizations_run_and_score_against_the_row(tmp_path, monkeypatch,
+                                                                        realizations):
+    """design.md §12.16: a cell's declared alternatives run as rows of their own when the run asks
+    for them, and each is scored against the reference's default realization of the same row."""
+    import isb.runs
+    from isb.jobs.score import score_experiment
+
+    method = "realization_fixture"
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(timing, "force_gc", lambda: None)
+    monkeypatch.setattr(isb.runs, "resolve_provenance", lambda run: {
+        "engine": {"kind": run.engine.kind}, "client": {}, "host": {}, "deployment": {}})
+    monkeypatch.setattr(registry, "CELLS", dict(registry.CELLS))
+    monkeypatch.setattr(registry, "REALIZATIONS", dict(registry.REALIZATIONS))
+
+    def onehot(i):
+        out = torch.zeros(1, 4)
+        out[0, i] = 12.0
+        return out
+
+    @registry.cell(method, family="gpt2", backend="ref_sys")
+    def reference(be, model, prompts, *, layer=0, mode="replace"):
+        return onehot(layer)
+
+    # the candidate's in-place spelling is wrong: it reads the next index
+    @registry.cell(method, family="gpt2", backend="cand_sys", realizations=[{"mode": "inplace"}])
+    def candidate(be, model, prompts, *, layer=0, mode="replace"):
+        return onehot(layer + (mode == "inplace"))
+
+    def backend(interface):
+        class Backend:
+            name = interface
+
+            def load(self, repo):
+                return SimpleNamespace(config=SimpleNamespace(_commit_hash="rev", num_hidden_layers=12),
+                                       tokenizer=SimpleNamespace(get_vocab=lambda: {"x": 0}))
+
+            def teardown(self, model):
+                pass
+        return Backend()
+
+    spec = CellConfig(
+        "realization_fixture/gpt2", method, "gpt2", "test/model",
+        [ExecutionRegime("interactive", ["p"], aggregate=False)],
+        [TaskSpec("layer 1", {"layer": 1})], BaselineSpec({}), None, warmup=0, n_trials=1,
+        n_layers=12, realizations=realizations,
+        protocol_absence_reason="CPU fixture for realization alternatives")
+    run_dir = tmp_path / "attempt"
+    job = run_dir / "experiments" / "exp"
+    experiment = contract.prepare(spec, job)
+    for name, interface in (("ref/default", "ref_sys"), ("cand/default", "cand_sys")):
+        monkeypatch.setenv("ISB_BACKEND", name)
+        worker.main(lambda restored, i=interface: (backend(i), RunConfig(engine=EngineConfig("vllm"))),
+                    job=job, output=job / name)
+        contract.write_json(job / name / "execution.json", {
+            "status": "completed", "source": "s", "backend": name, "experiment_id": experiment["id"]})
+        contract.validate_result(job / name, experiment, name)
+
+    report = score_experiment(job, ["ref/default", "cand/default"], "ref/default")
+    rows = {(row["backend"], row["label"]): row for row in report["cells"]}
+    assert rows[("cand/default", "layer 1")]["state"] == "SUPPORTED"
+    alternative = ("cand/default", "layer 1 [mode=inplace]")
+    if realizations == "default":
+        assert alternative not in rows
+        return
+    assert rows[alternative]["row"] == "layer 1"
+    assert rows[alternative]["alternative"] == {"mode": "inplace"}
+    assert rows[alternative]["state"] == "NUMERICAL_MISMATCH"
+    assert ("ref/default", "layer 1 [mode=inplace]") not in rows   # the reference declares none
+
+    # the manager browses the alternative rows from the saved JSON
+    backends = ["ref/default", "cand/default"]
+    contract.write_json(run_dir / "plan.json", {
+        "version": contract.PLAN_VERSION, "experiments": ["exp"], "backends": backends,
+        "reference": "ref/default", "comparison": "correctness", "status": "completed"})
+    contract.write_json(run_dir / "report.json", {
+        "version": contract.PLAN_VERSION, "run": run_dir.name, "experiments": [report]})
+    collection = Collection(str(tmp_path))
+    assert not [w for w in collection.warnings if "invalid" in w or "unavailable" in w], collection.warnings
+    states = {cell.label: cell.state for cell in collection.results["attempt/exp/cand/default"]}
+    assert states == {"layer 1": "SUPPORTED", "layer 1 [mode=inplace]": "NUMERICAL_MISMATCH"}
+
+
+def test_a_model_with_a_different_layer_count_fails_the_job(tmp_path, monkeypatch):
+    import isb.runs
+
+    monkeypatch.setenv("ISB_BACKEND", "layers/default")
+    monkeypatch.setattr(isb.runs, "resolve_provenance", lambda run: {
+        "engine": {"kind": run.engine.kind}, "client": {}, "host": {}, "deployment": {}})
+
+    class Backend:
+        name = "hf"
+
+        def load(self, repo):
+            return SimpleNamespace(config=SimpleNamespace(_commit_hash="rev", n_layer=6),
+                                   tokenizer=SimpleNamespace(get_vocab=lambda: {"x": 0}))
+
+        def teardown(self, model):
+            pass
+
+    spec = CellConfig("x/gpt2", "custom", "gpt2", "test/model", [ExecutionRegime("interactive", ["p"])],
+                      [TaskSpec("t", {})], BaselineSpec({}), warmup=0, n_trials=1, n_layers=12,
+                      protocol_absence_reason="CPU fixture")
+    job = tmp_path / "exp"
+    contract.prepare(spec, job)
+    with pytest.raises(ValueError, match="6 layers"):
+        worker.main(lambda restored: (Backend(), RunConfig(engine=EngineConfig("vllm"))),
+                    job=job, output=job / "out")

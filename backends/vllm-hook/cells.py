@@ -1,4 +1,4 @@
-"""vLLM-Hook cells for the comparison specs (design.md §12.14), built-in workers only.
+"""vLLM-Hook cells for the cross-system workloads (design.md §12.14), built-in workers only.
 
 Denotation, from IBM/vLLM-Hook 0e34fdd source:
 - `probe_hidden_states` hooks every decoder layer and, on vLLM's fused-residual layers, records

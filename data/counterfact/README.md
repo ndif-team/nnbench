@@ -17,5 +17,5 @@ records in upstream order.
   (e.g. per-item steering toward `target_new`).
 
 Consumed via `isb/data.py` as the `counterfact` prompt source — the default feed
-for the logit-lens and steering specs and the family probe workloads
+for the logit-lens and steering workloads and the family probe workloads
 (gen-steering, Qwen, Nemotron).

@@ -80,6 +80,8 @@ bitwise-identical outputs mean the gap belongs to the engine, not to either inte
 
 ## 7. Changing a default
 
-Find every spec that relies on the old default and pass the old value explicitly where that spec
-needs it. The Qwen parallelism specs score vLLM against vLLM; a shared wrong reading cancels
-there, so those specs never test fidelity to HF.
+A cell default is the system's documented realization of every workload row, so changing it changes
+what every case of that methodology measures on that system. Keep the old spelling measurable by
+declaring it as an alternative on the registration (`realizations=`, design.md §12.16), never by
+writing it into a workload. The `parallel` suite scores vLLM against vLLM; a shared wrong reading
+cancels there, so it never tests fidelity to HF.

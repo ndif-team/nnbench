@@ -7,7 +7,9 @@ import pytest
 from isb.methodologies.registry import CELLS, get_cell
 from isb.sweep.execute import BoundCell, _bind_case, _effective_params, _task_params
 from isb.sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
-from isb.specs import SPECS
+from isb.suites import SUITES, suite_cases
+
+CASES = {s.name: s for suite in SUITES for s in suite_cases(suite)}
 
 
 def test_binding_includes_named_defaults_and_variadic_keywords():
@@ -122,9 +124,9 @@ def test_classification_failure_preserves_attempted_and_effective_settings(monke
     assert record["error_stage"] == "classify"
 
 
-@pytest.mark.parametrize("name", sorted(SPECS))
-def test_existing_specs_bind_with_matching_semantics_across_backends(name):
-    spec = SPECS[name]
+@pytest.mark.parametrize("name", sorted(CASES))
+def test_suite_cases_bind_with_matching_semantics_across_backends(name):
+    spec = CASES[name]
     params = [task.params for task in spec.tasks] + [spec.baseline.params]
     if spec.effect is not None:
         params += [spec.effect.baseline_params, spec.effect.perturbed_params]

@@ -149,12 +149,14 @@ def load_bundle(directory, prefix):
                 cells(scored["cells"])
                 for row in scored["cells"]:
                     key = (row["backend"], row.get("workload", "job"), row.get("label", "job"))
-                    if (row["backend"] not in names or key in scored_rows
-                            or key[1:] not in expected | {("job", "job")}):
+                    known = (key[1:] in expected | {("job", "job")} if "row" not in row
+                             else (key[1], row["row"]) in expected)    # an alternative realization
+                    if row["backend"] not in names or key in scored_rows or not known:
                         raise ValueError("duplicate or unknown backend/cell in report")
                     scored_rows[key] = row
                 for backend in names:
-                    reported = {key[1:] for key in scored_rows if key[0] == backend}
+                    reported = {key[1:] for key, row in scored_rows.items()
+                                if key[0] == backend and "row" not in row}
                     if reported not in (expected, {("job", "job")}):
                         raise ValueError("report does not cover every requested cell")
             except (ValueError, KeyError, TypeError) as error:
@@ -197,9 +199,13 @@ def load_bundle(directory, prefix):
                             raise ValueError("completed job has no complete artifact")
                         raw = result["cells"]
                         cells(raw)
-                        raw_keys = [(r["workload"], r["label"]) for r in raw]
+                        raw_keys = [(r["workload"], r["label"]) for r in raw if "row" not in r]
                         if set(raw_keys) != expected or len(raw_keys) != len(expected):
                             raise ValueError("result does not cover requested cells")
+                        alternatives = [(r["workload"], r["label"]) for r in raw if "row" in r]
+                        if (len(set(alternatives)) != len(alternatives) or set(alternatives) & expected
+                                or any((r["workload"], r["row"]) not in expected for r in raw if "row" in r)):
+                            raise ValueError("an alternative realization must name a requested row")
                         rows = []
                         for item in raw:
                             saved = scored_rows.get((backend, item["workload"], item["label"]))
