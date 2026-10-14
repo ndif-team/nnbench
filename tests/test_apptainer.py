@@ -82,6 +82,40 @@ def test_compose_maps_to_apptainer_exec(tmp_path, monkeypatch):
     assert extra["APPTAINERENV_HF_TOKEN"] == ""
 
 
+def test_extends_resolves_paths_against_the_base_and_merges_overrides(tmp_path):
+    system = tmp_path / "repo" / "backends" / "probe-system"
+    config = system / "tuned" / "deep"
+    config.mkdir(parents=True)
+    (system / "shared-runner.yml").write_text("""\
+services:
+  worker:
+    image: probe-system:local
+    build: {context: ., args: {ENGINE_IMAGE: example/engine:v1, PROBE_REF: abc}}
+    entrypoint: [python3, /backend/run.py]
+    environment: {PROBE_CACHE: /tmp/c, ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16"}'}
+    volumes: [../..:/workspace:ro, "${ISB_OUTPUT_DIR:-./out}:/output"]
+""")
+    (config / "compose.yml").write_text("""\
+services:
+  runner:
+    extends: {file: ../../shared-runner.yml, service: worker}
+    image: probe-system-v2:local
+    build: {args: {ENGINE_IMAGE: example/engine:v2}}
+    environment: {ISB_ENGINE_OPTIONS: '{"dtype":"float32"}'}
+    volumes: [./scratch:/output]
+volumes:
+  weights: {name: probe-weights}
+""")
+    service, volumes = apptainer.load_service(config / "compose.yml", {})
+    assert service["image"] == "probe-system-v2:local"
+    assert service["build"] == {"context": str(system),
+                                "args": {"ENGINE_IMAGE": "example/engine:v2", "PROBE_REF": "abc"}}
+    assert service["environment"] == {"PROBE_CACHE": "/tmp/c", "ISB_ENGINE_OPTIONS": '{"dtype":"float32"}'}
+    assert service["volumes"] == [f"{tmp_path / 'repo'}:/workspace:ro", f"{config / 'scratch'}:/output"]
+    assert service["entrypoint"] == ["python3", "/backend/run.py"] and "extends" not in service
+    assert volumes == {"weights": {"name": "probe-weights"}}
+
+
 def test_supporting_services_need_docker(tmp_path):
     (tmp_path / "compose.yml").write_text(
         "services:\n  runner: {image: a, entrypoint: [x]}\n  cache: {image: b}\n")

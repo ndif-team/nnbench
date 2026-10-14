@@ -11,8 +11,10 @@ backends/<system>/
   Dockerfile         the system's image; configs choose its build args (versions)
   backend.py         the system's backend object and create_backend(spec)
   cells.py           the system's workload implementation, one per system
+  compose.base.yml   the shared runner service (mounts, environment, GPU, default options)
   <config>/
-    compose.yml      options (ISB_ENGINE_OPTIONS), image tag, build args
+    compose.yml      extends compose.base.yml; sets only what differs: options
+                     (ISB_ENGINE_OPTIONS), image tag, build args
     backend.py       only when this config wires the engine differently
     cells.py         only when this config needs its own workload implementation
     <config>/        a config that shares its parent config's implementation
@@ -20,10 +22,13 @@ backends/<system>/
 
 A config's code is the **nearest** `backend.py` / `cells.py` on its own path, searched from its
 directory up to the system directory (`isb/jobs/layout.py`); a config never reads a sibling's
-files, and its compose builds from its system directory only. For example, `nnsight-vllm/fp32` runs
-the system's `backend.py`; `nnsight-vllm/opt` has its own `backend.py` and `cells.py` (installed
-edits); `nnsight-vllm/opt/taps` adds CUDA-graph taps and a newer vLLM image to that same
-implementation. The bundled configs start `python3 -m isb.jobs.entry`, which resolves `ISB_BACKEND`
+files, and its compose builds from its system directory only. Each config's `compose.yml` uses
+Compose `extends` on its system's `compose.base.yml`, so the resolved configuration is the base
+plus the config's overrides (`docker compose -f backends/<system>/<config>/compose.yml config`
+prints it). Compose `extends` does not import top-level `volumes:`, so each config also declares
+the `model-cache` volume. For example, `nnsight-vllm/fp32` runs the system's `backend.py`;
+`nnsight-vllm/opt` has its own `backend.py` and `cells.py` (installed edits);
+`nnsight-vllm/opt/taps` adds CUDA-graph taps and a newer vLLM image to that same implementation. The bundled configs start `python3 -m isb.jobs.entry`, which resolves `ISB_BACKEND`
 this way and runs the shared worker. The nnsight systems keep no `cells.py`: their cells are the
 `hf` / `vllm_async` registrations in `isb/methodologies/`, shared with the tests and the micro tier.
 
@@ -79,15 +84,17 @@ For an fp32 variant of the same vLLM implementation:
 ```bash
 mkdir backends/nnsight-vllm/fp32
 cp backends/nnsight-vllm/default/compose.yml backends/nnsight-vllm/fp32/
-# In the new compose.yml, change ISB_ENGINE_OPTIONS dtype to float32 and the ISB_BACKEND default.
+# In the new compose.yml, change the ISB_BACKEND default and add the ISB_ENGINE_OPTIONS override:
+#   ISB_ENGINE_OPTIONS: '{"dtype":"float32","gpu_memory_utilization":0.85,"enable_prefix_caching":false}'
 python scripts/bench.py run --workload logit_lens --model gpt2 --data factual:2 \
   --backends nnsight-hf/default nnsight-vllm/fp32 --reference nnsight-hf/default --gpu 0
 ```
 
 No Python registration or launcher edit is needed. A runtime-only variant can reuse the image. If
-changing dependencies, set build args and a distinct image tag in the new Compose file before
-building it. A config that needs a different implementation adds its own `cells.py` (and
-`backend.py` if the engine wiring differs) in its directory; a config-level `backend.py` reuses the
+changing dependencies, set `build: {args: ...}` and a distinct `image:` tag in the new Compose file
+before building it; the build context stays the base's (the system directory). A config that
+needs a different implementation adds its own `cells.py` (and `backend.py` if the engine wiring
+differs) in its directory; a config-level `backend.py` reuses the
 system's through a relative import (`from ..backend import ...`). The bundled `backend.py` files
 translate the model row's load options (`hf_kwargs`, `vllm_kwargs` in `isb/models.py`, frozen into the
 experiment) and reject conflicts with configured options; the host launcher does not interpret them.

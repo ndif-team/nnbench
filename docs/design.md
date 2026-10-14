@@ -1410,9 +1410,10 @@ engine's absolute latency depends on host CPU load.
 engine (`nnsight-vllm`, `interp-engine-vllm`, `vllm-plain`); a directory inside it holding a
 `compose.yml` is one config, and the backend name is that path (`nnsight-vllm/fp32`). The system
 directory owns the image (`Dockerfile`, with versions as build args a config sets), the backend
-object (`backend.py`) and the workload implementation (`cells.py`). A config owns its options and
-image tag, and carries its own `backend.py` / `cells.py` only when it needs a separate
-implementation (`*/opt`, `nnsight-vllm/sync`). Code resolves to the nearest file on the config's
+object (`backend.py`), the workload implementation (`cells.py`) and the runner service
+(`compose.base.yml`), which each config's `compose.yml` follows with Compose `extends`. A config
+owns its options, image tag and build args, and carries its own `backend.py` / `cells.py` only
+when it needs a separate implementation (`*/opt`, `nnsight-vllm/sync`). Code resolves to the nearest file on the config's
 own path (`isb/jobs/layout.py`); a config that shares another config's implementation nests under
 it (`nnsight-vllm/opt/taps`). No config mounts or builds from a sibling, so the files a config runs
 are exactly the ones on its path. Before this, each config was a flat top-level directory and

@@ -1,4 +1,5 @@
 """The bundled backend tree (backends/README.md): `<system>/<config>`, code from the config's own path."""
+import json
 import sys
 from pathlib import Path
 
@@ -7,7 +8,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from isb.jobs import entry, layout  # noqa: E402
+from isb.jobs import apptainer, entry, layout  # noqa: E402
 
 BACKENDS = layout.ROOT / "backends"
 
@@ -36,16 +37,28 @@ def test_a_config_uses_the_nearest_implementation():
 @pytest.mark.parametrize("name", layout.discover())
 def test_compose_reads_only_its_system_directory_and_the_repository(name):
     directory = layout.config_dir(name)
-    service = yaml.safe_load((directory / "compose.yml").read_text())["services"]["runner"]
+    # Resolved as the launchers see it: `extends` followed into the system's compose.base.yml.
+    service, _ = apptainer.load_service(directory / "compose.yml", {})
     system = BACKENDS / name.split("/")[0]
-    build = service["build"]
-    context = build if isinstance(build, str) else build["context"]
-    assert (directory / context).resolve() == system.resolve(), name
+    assert Path(service["build"]["context"]) == system.resolve(), name
     assert (system / "Dockerfile").is_file()
     assert service["entrypoint"] == ["python3", "-m", "isb.jobs.entry"]
-    sources = [v.split(":")[0] for v in service["volumes"] if not v.startswith(("$", "model-cache"))]
-    assert [(directory / s).resolve() for s in sources] == [layout.ROOT.resolve()], name
-    assert service["environment"]["ISB_BACKEND"] == f"${{ISB_BACKEND:-{name}}}"
+    workspace = [v.split(":")[0] for v in service["volumes"] if v.split(":")[1] == "/workspace"]
+    assert [Path(s) for s in workspace] == [layout.ROOT.resolve()], name
+    assert service["environment"]["ISB_BACKEND"] == name
+    raw = yaml.safe_load((directory / "compose.yml").read_text())["services"]["runner"]
+    assert raw["environment"]["ISB_BACKEND"] == f"${{ISB_BACKEND:-{name}}}"
+
+
+def test_one_image_per_build():
+    """Configs that differ only in runtime options share one image, and an image tag is never built
+    two ways (whichever config built it last would decide what the others run)."""
+    tag_of, build_of = {}, {}
+    for name in layout.discover():
+        service, _ = apptainer.load_service(layout.config_dir(name) / "compose.yml", {})
+        build = json.dumps(service["build"], sort_keys=True)
+        assert tag_of.setdefault(build, service["image"]) == service["image"], name
+        assert build_of.setdefault(service["image"], build) == build, name
 
 
 def test_entry_resolves_without_importing_engine_code():

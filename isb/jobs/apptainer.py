@@ -42,12 +42,58 @@ def base_dir(root):
     return Path(os.environ.get("ISB_APPTAINER_DIR") or Path(root) / ".apptainer")
 
 
-def load_service(compose_file, env):
-    """The interpolated `runner` service and the top-level named volumes of one compose.yml."""
+def _absolute_paths(service, directory):
+    """The service with its build context and relative bind sources resolved against `directory`."""
+    service = dict(service)
+    build = service.get("build")
+    if build is not None:
+        build = {"context": build} if isinstance(build, str) else dict(build)
+        if "context" in build:          # an extending service that sets only args keeps the base's
+            build["context"] = str((directory / build["context"]).resolve())
+        service["build"] = build
+    if service.get("volumes"):
+        service["volumes"] = [str((directory / v.split(":")[0]).resolve()) + v[len(v.split(":")[0]):]
+                              if v.startswith(".") else v for v in service["volumes"]]
+    return service
+
+
+def _merge(base, override):
+    """Compose's `extends` merge: mappings merge key by key, volumes by container path, and any
+    other value of the extending service replaces the base's."""
+    merged = dict(base)
+    for key, value in override.items():
+        if key == "volumes":
+            by_target = {v.split(":")[1]: v for v in [*base.get("volumes", []), *value]}
+            merged[key] = list(by_target.values())
+        elif isinstance(value, dict) and isinstance(base.get(key), dict):
+            merged[key] = _merge(base[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _services(compose_file, env):
+    """The interpolated services of one compose file with `extends` resolved. Paths become absolute
+    against the file that wrote them, as Compose resolves them."""
     import yaml
 
-    config = interpolate(yaml.safe_load(Path(compose_file).read_text()), env)
-    services = config.get("services", {})
+    compose_file = Path(compose_file)
+    config = interpolate(yaml.safe_load(compose_file.read_text()), env)
+    services = {}
+    for name, service in (config.get("services") or {}).items():
+        service = _absolute_paths(service, compose_file.parent)
+        extends = service.pop("extends", None)
+        if extends is not None:
+            source = compose_file.parent / extends.get("file", compose_file.name)
+            service = _merge(_services(source, env)[0][extends["service"]], service)
+        services[name] = service
+    return services, config
+
+
+def load_service(compose_file, env):
+    """The interpolated `runner` service and the top-level named volumes of one compose.yml. An
+    `extends` base contributes its service only; named volumes are the compose.yml's own."""
+    services, config = _services(compose_file, env)
     if set(services) != {"runner"}:
         raise ValueError(f"{compose_file}: the apptainer launcher runs a single 'runner' service; "
                          f"supporting services ({sorted(set(services) - {'runner'})}) need Docker")

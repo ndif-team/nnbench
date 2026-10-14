@@ -222,7 +222,7 @@ isb/
   oracle/                  numerical comparison
   perf/                    timing and microbenchmarks
   manager/                 saved-report browser and HTML export
-backends/                  <system>/{Dockerfile,backend.py,cells.py} + <system>/<config>/compose.yml
+backends/                  <system>/{Dockerfile,compose.base.yml,backend.py,cells.py} + <system>/<config>/compose.yml
 slurm/                     batch scripts for the Apptainer path on Slurm clusters
 scripts/                   benchmark CLI, alignment checker, manager and standalone tools
 docs/                      design, alignment audit, guides and measured findings
