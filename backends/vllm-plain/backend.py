@@ -23,8 +23,9 @@ class PlainModel:
 class PlainVLLMBackend(Backend):
     name = "vllm_plain"
 
-    def __init__(self, **engine_options):
-        self.engine_options = engine_options
+    def __init__(self, *, enforce_eager, **engine_options):
+        # Every config states the mode (compose.base.yml): attach_plain_vllm pairs baselines on it.
+        self.engine_options = {**engine_options, "enforce_eager": enforce_eager}
 
     def load(self, repo: str):
         from transformers import AutoConfig
@@ -45,6 +46,5 @@ class PlainVLLMBackend(Backend):
 
 def create_backend(spec):
     params = merge_requirements(spec.vllm_kwargs, options())
-    run = RunConfig(EngineConfig("vllm", mode="plain", params={
-        **params, "enforce_eager": bool(params.get("enforce_eager", False))}))
-    return PlainVLLMBackend(**params), run
+    backend = PlainVLLMBackend(**params)
+    return backend, RunConfig(EngineConfig("vllm", mode="plain", params=backend.engine_options))

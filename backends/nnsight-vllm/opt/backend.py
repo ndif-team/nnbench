@@ -74,7 +74,7 @@ def spec_taps(spec):
     params = [t.params for t in spec.tasks] + [spec.baseline.params]
     if spec.effect is not None:
         params += [spec.effect.baseline_params, spec.effect.perturbed_params]
-    last = 27                          # Qwen2.5-7B: 28 decoder layers
+    last = spec.n_layers - 1           # the model row's depth, checked against the loaded model
     if spec.methodology == "logit_lens":
         return ["model.layers.*.output"]
     if spec.methodology in ("steering", "gen_steering"):
@@ -85,7 +85,7 @@ def spec_taps(spec):
     if spec.methodology == "ablation":
         sub = {"mlp": "mlp", "attn": "self_attn"}
         return sorted({f"model.layers.{p['layer']}.{sub[p['target']]}.output"
-                       for p in params if p.get("target") in sub})
+                       for p in params if p["target"] in sub})
     return []
 
 

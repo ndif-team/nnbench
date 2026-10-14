@@ -19,7 +19,7 @@ services:
       HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
       TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-0}
       VLLM_CACHE_ROOT: /tmp/vllm
-      ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","gpu_memory_utilization":0.85,"enable_prefix_caching":false}'
+      ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","gpu_memory_utilization":0.85,"enable_prefix_caching":false,"enforce_eager":false}'
     volumes:
       - ../..:/workspace:ro
       - ${ISB_JOB_DIR:-../../runs/manual/job}:/job:ro

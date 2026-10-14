@@ -53,7 +53,8 @@ class InterpEngineBackend(Backend):
 
 def create_backend(spec):
     params = merge_requirements(spec.vllm_kwargs, options())
+    backend = InterpEngineBackend(**params)
     run = RunConfig(EngineConfig("vllm", mode="interp-engine", params={
-        **params, "enforce_eager": params.get("backend", "vllm") == "vllm",
+        **params, "enforce_eager": backend.backend == "vllm",
         "interp_engine": metadata.version("interp-engine")}))
-    return InterpEngineBackend(**params), run
+    return backend, run
