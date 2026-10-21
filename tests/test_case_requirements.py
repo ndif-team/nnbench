@@ -11,6 +11,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from isb.backends.base import Backend, FormError  # noqa: E402
 from isb.methodologies.registry import get_cell  # noqa: E402
 from isb.methodologies.requirements import (  # noqa: E402
     CASE_DESCRIPTIONS, case_description, describe_case,
@@ -58,7 +59,9 @@ class GradientObserved(Exception):
     pass
 
 
-class BackendSpy:
+class BackendSpy(Backend):
+    """Records which primitive a cell called. Inherits the form check (`one()`), so a cell that
+    hands a one-unit primitive several units fails here, with no GPU, as it would on vLLM."""
     name = "hf"
 
     def __init__(self):
@@ -73,14 +76,17 @@ class BackendSpy:
 
     def patch(self, model, clean, corrupted, *, capture, patch):
         self.calls.append("patch")
+        self.one(clean, "patch"), self.one(corrupted, "patch")
         return patch(capture())
 
     def generate(self, model, prompts, step, *, new_tokens, bounded):
         self.calls.append("generate")
+        self.one(prompts, "generate")
         return torch.cat([step() for _ in range(new_tokens)])
 
     def generate_patch(self, model, clean, corrupted, *, capture, build_step, new_tokens, bounded):
         self.calls.append("generate_patch")
+        self.one(clean, "generate_patch"), self.one(corrupted, "generate_patch")
         value = capture()
         return torch.cat([build_step(value) for _ in range(new_tokens)])
 
@@ -95,6 +101,42 @@ class BackendSpy:
     def vjp_batch(self, *args, **kwargs):
         self.calls.append("vjp_batch")
         raise GradientObserved
+
+
+@pytest.mark.parametrize("backend_module, cls", [
+    ("isb.backends.hf", "HFBackend"), ("isb.backends.vllm_async", "VLLMAsyncBackend"),
+    ("isb.backends.vllm_sync", "VLLMSyncBackend")])
+@pytest.mark.parametrize("primitive", ["patch", "generate", "generate_patch", "attribute"])
+def test_one_unit_primitives_refuse_several_units_before_touching_the_engine(backend_module, cls,
+                                                                          primitive):
+    """Every backend checks the form first: two units to a one-unit primitive raise the harness
+    FormError, with no model and no engine, instead of the engine's own refusal (or a silent
+    first-prompt pick) on one backend only."""
+    import importlib
+
+    backend_cls = getattr(importlib.import_module(backend_module), cls)
+    be = backend_cls.__new__(backend_cls)              # no engine construction
+    be.name = cls
+    fn = getattr(be, primitive)
+    if fn.__func__ is getattr(Backend, primitive):
+        pytest.skip(f"{cls} has no {primitive}")
+    two = ["one prompt", "another prompt"]
+    args = {"patch": (None, two, "base", None, None), "generate": (None, two, None),
+            "generate_patch": (None, two, "base", None, None),
+            "attribute": (None, two, "base", None, None, 1)}
+    kwargs = {"generate": {"new_tokens": 2}, "generate_patch": {"new_tokens": 2}}.get(primitive, {})
+    with pytest.raises(FormError, match=f"{cls}.{primitive} takes one unit per side; the cell passed 2"):
+        fn(*args[primitive], **kwargs)
+    assert be.one(["only"], primitive) == "only" and be.one("only", primitive) == "only"
+
+
+def test_a_cell_that_hands_a_one_unit_primitive_several_units_fails_without_a_gpu():
+    """The no-GPU fake inherits the form check, so a cell passing a batch to `generate` fails in
+    the test suite, where before only the vLLM run would have shown it."""
+    fn = get_cell("gen_steering", "gpt2", "hf")
+    with pytest.raises(FormError, match="generate takes one unit per side; the cell passed 2"):
+        fn(BackendSpy(), model_fixture(), ["p one", "p two"], layer=0, target="x", alpha=1.0,
+           new_tokens=2)
 
 
 def bound_case(methodology, *, backend="hf", family="gpt2", **overrides):

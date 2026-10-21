@@ -107,6 +107,7 @@ class VLLMSyncBackend(VLLMBackend):
     def patch(self, model, clean_prompt, corrupted_prompt, capture, patch):
         """Two-trace activation patching: capture from a clean single-prompt trace, inject in a
         corrupted one. Two sequential sync traces (like HF), so no multi-invoke/barrier needed."""
+        clean_prompt, corrupted_prompt = self.one(clean_prompt, "patch"), self.one(corrupted_prompt, "patch")
         with model.trace(clean_prompt, **_SAMPLING):
             ca = capture().save()
         clean_act = ca.detach().float().cpu()
@@ -122,6 +123,7 @@ class VLLMSyncBackend(VLLMBackend):
         through and returned raw activations); see the async twin for the full rationale."""
         import torch
 
+        clean_prompt, corrupt_prompt = self.one(clean_prompt, "attribute"), self.one(corrupt_prompt, "attribute")
         clean = [None] * n
         with model.trace(clean_prompt, **_SAMPLING):
             a = acts_of(model)
@@ -152,7 +154,7 @@ class VLLMSyncBackend(VLLMBackend):
         realizations collect `new_tokens` rows here."""
         import torch
 
-        prompt = prompts[0] if isinstance(prompts, (list, tuple)) else prompts
+        prompt = self.one(prompts, "generate")
         with model.trace(prompt, temperature=0.0, top_p=1, max_tokens=new_tokens) as tracer:
             rows = list().save()
             steps = tracer.iter[0:new_tokens] if bounded else tracer.iter[:]

@@ -109,7 +109,8 @@ def _das_cell(be, model, m, prompts, *, layer, k, train, heldout, lr, seed, resi
             clean, corrupted, answers = train_units[i % len(train_units)]
             target_id = model.tokenizer.encode(answers[1])[0]
 
-            def step(src):  # loss at the OUTPUT of the intervened forward -> backward reaches R
+            def step(src, rows):  # loss at the OUTPUT of the intervened forward -> backward reaches R
+                # one pair per call, so `rows` is [0] in every backend's form
                 logits = _interchange_read(blocks, ln_f, head, layer=layer, src=src,
                                            R=R, k=k, residual=residual, grad=True)
                 return F.cross_entropy(logits[None, :], torch.tensor([target_id],

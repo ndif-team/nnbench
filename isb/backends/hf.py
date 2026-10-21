@@ -44,6 +44,7 @@ class HFBackend(Backend):
         return saved.detach().float().cpu()
 
     def patch(self, model, clean_prompt, corrupted_prompt, capture, patch):
+        clean_prompt, corrupted_prompt = self.one(clean_prompt, "patch"), self.one(corrupted_prompt, "patch")
         with model.trace(clean_prompt):     # trace 1: snapshot the clean activation
             ca = capture().save()
         clean_act = ca.detach().float().cpu()
@@ -51,25 +52,30 @@ class HFBackend(Backend):
             res = patch(clean_act).save()
         return res.detach().float().cpu()
 
-    def train_patch(self, model, source_prompt, base_prompt, capture, step):
-        with model.trace(source_prompt):     # trace 1: source (counterfactual) activation, no grad
+    def train_patch(self, model, source_prompts, base_prompts, capture, step):
+        """HF's form: each side is one left-padded batch, so every pair is in both traces."""
+        sources, bases = self.many(source_prompts), self.many(base_prompts)
+        rows = list(range(len(sources)))
+        with model.trace(sources):           # trace 1: source (counterfactual) activations, no grad
             s = capture().save()
         src = s.detach().float().cpu()
-        with model.trace(base_prompt):       # trace 2: intervened forward + backward on the loss
-            loss = step(src)
+        with model.trace(bases):             # trace 2: intervened forward + backward on the loss
+            loss = step(src, rows)
             lv = loss.save()
             with loss.backward():
                 pass                         # grads land on step's external trainables
         return lv.detach().float().cpu()
 
     def vjp_batch(self, model, prompts, acts_of, target_of, make_cotangent, n):
+        """HF's form: the prompts as one padded batch, every row in one trace."""
+        prompts = self.many(prompts)
         grads = [None] * n
         with model.trace(prompts):
             a = acts_of(model)
             for L in range(n):
                 a[L].requires_grad_(True)            # retain grad on the intermediate residuals
             target = target_of(model)
-            cot = make_cotangent(target)
+            cot = make_cotangent(target, list(range(len(prompts))))
             metric = (target * cot).sum()            # (target * one-hot cotangents) -> VJP
             with metric.backward():
                 for L in range(n - 1, -1, -1):       # grads in REVERSE module order
@@ -79,6 +85,9 @@ class HFBackend(Backend):
 
     def attribute(self, model, clean_prompt, corrupt_prompt, acts_of, metric_of, n):
         import torch
+
+        clean_prompt = self.one(clean_prompt, "attribute")
+        corrupt_prompt = self.one(corrupt_prompt, "attribute")
 
         # Pre-create the result lists OUTSIDE the trace and index-assign inside: the trace body is
         # compiled into a separate function, so rebinding a name inside it (`clean = [...]`) is local
@@ -112,7 +121,7 @@ class HFBackend(Backend):
     def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
         import torch
 
-        prompt = prompts[0] if isinstance(prompts, (list, tuple)) else prompts
+        prompt = self.one(prompts, "generate")
         it = slice(0, new_tokens) if bounded else slice(None)   # unbounded: stop bound comes from
         with model.generate(prompt, max_new_tokens=new_tokens,  # max_new_tokens via default_all
                             do_sample=False) as tracer:
@@ -128,6 +137,8 @@ class HFBackend(Backend):
                        *, new_tokens, bounded=True):
         import torch
 
+        source_prompt = self.one(source_prompt, "generate_patch")
+        base_prompt = self.one(base_prompt, "generate_patch")
         with model.trace(source_prompt):            # trace 1: snapshot the source activation
             ca = capture().save()
         clean_act = ca.detach().float().cpu()       # materialized; closed over by trace 2's steps

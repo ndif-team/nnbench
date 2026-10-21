@@ -119,6 +119,7 @@ class VLLMServeBackend(VLLMBackend):
         # (no barrier shared across invokes). The clean activation comes back as a materialized CPU
         # tensor and is closed over by the corrupt trace's `patch(...)`, which serializes it into the
         # second request's intervention.
+        clean_prompt, corrupted_prompt = self.one(clean_prompt, "patch"), self.one(corrupted_prompt, "patch")
         with model.trace(clean_prompt, serve=self.host, temperature=0.0, top_p=1, max_tokens=1):
             ca = capture().save()
         clean_act = ca.detach().float().cpu()
@@ -132,6 +133,7 @@ class VLLMServeBackend(VLLMBackend):
         # activations: it raises on the worker and surfaces here as a clean per-cell ERROR. Forward-only
         # (no `.backward()` over the wire) so it fails fast with no hang risk — recording that the
         # `grad` primitive is unavailable over serve, same as in-process vLLM.
+        corrupt_prompt = self.one(corrupt_prompt, "attribute")
         with model.trace(corrupt_prompt, serve=self.host, temperature=0.0, top_p=1, max_tokens=1):
             acts = acts_of(model)
             for a in acts:

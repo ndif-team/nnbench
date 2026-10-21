@@ -60,15 +60,15 @@ def _collect_cell(be, model, m, prompts, *, dim_batch, skip_first, grad, residua
         for start in range(0, d, dim_batch):
             B = min(dim_batch, d - start)
 
-            def make_cotangent(t):  # runs INSIDE the trace; t is the target residual —
-                # [B, seq, d] on HF's replicated batch, [seq, d] on vLLM's single-prompt trace,
-                # so the probe-row count comes from the tensor (per-dim when there is no batch)
-                nb = t.shape[0] if t.dim() == 3 else 1
-                flat = t.reshape(nb, -1, t.shape[-1])
+            def make_cotangent(t, rows):  # runs INSIDE the trace; t is the target residual —
+                # [B, seq, d] on HF's replicated batch, [seq, d] on vLLM's single-prompt trace;
+                # `rows` names which of the B copies this trace holds, so copy b probes output
+                # dim start + rows[b] in either form
+                flat = t.reshape(len(rows), -1, t.shape[-1])
                 cot = torch.zeros_like(flat)
                 pos = valid_slice(flat.shape[1], skip_first)
-                for b in range(nb):                      # copy b probes output dim start+b
-                    cot[b, pos, start + b] = 1.0
+                for b, row in enumerate(rows):
+                    cot[b, pos, start + row] = 1.0
                 return cot.reshape(t.shape)
 
             grads = be.vjp_batch(model, [prompt] * B, acts_of, target_of,
