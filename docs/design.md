@@ -1581,8 +1581,9 @@ which workloads take which pattern is `docs/request-patterns.md`.
 **Declared per workload.** Each workload lists the load patterns that match how its methodology is
 used (`Workload.load_patterns`): `offline` for dataset studies (lenses, ablation, the patching
 methods, activation harvesting), `offline`, `concurrent` and `open` for interventions that also run
-on live traffic (steering, steered generation, per-step capture), and none for the methods whose
-one call over the data is the whole study (attention pattern, DAS training, Jacobian collection). A
+on live traffic (steering, steered generation, per-step capture), and none for DAS and Jacobian
+collection (one call whose result depends on all its units together) and the attention pattern
+(per-prompt outputs of different lengths cannot be stacked and scored, and vLLM cannot read it). A
 suite's load applies only to the workloads that declare it; the others report it as a skipped row
 with the reason, so no run times a combination nobody uses.
 

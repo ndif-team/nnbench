@@ -14,5 +14,6 @@ attention_pattern = Workload(
     rows=(Row("every layer", {"layers": "all"}),),
     regimes=(Regime("interactive", ["The Eiffel Tower is in the city of"], aggregate=False),),
     baseline={"layers": [0]},
-    # load_patterns: none (its single call over the prompts is the whole study; no load pattern)
+    # load_patterns: none (per-prompt outputs differ in length, so a sweep's units cannot be
+    # stacked and scored; vLLM has no probability matrix to read)
 )

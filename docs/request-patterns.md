@@ -239,12 +239,17 @@ request shape, decode included.
 | Steering | both | one prompt; a batch of prompts | offline, concurrent, open |
 | Steered generation | both | one prompt, decoded 8 steps | offline (B = 1), concurrent, open |
 | Per-step capture | both | one prompt, decoded 8 steps | offline (B = 1), concurrent, open |
-| Attention pattern | dataset study | one call over all prompts | none |
+| Attention pattern | dataset study | one prompt; output length follows the prompt | none |
 | DAS (train and apply) | dataset study | one training call over the dataset | none |
 | Jacobian collection | dataset study | one fitting call over the corpus | none |
 
-The last three have no load pattern: their single call over the data is the whole study, and
-splitting it into requests would time something no user runs. Dataset-study workloads take no
+The last three have no load pattern. DAS trains one rotation over the training units and checks it
+on held-out units, and Jacobian collection averages its maps over every prompt: each is one call
+whose result depends on all its units together, so splitting it into per-unit requests would change
+what it computes. How their cost grows with data is measured by the size of that one call. The
+attention pattern is `[layers, heads, prompt length]` per prompt, so outputs of different prompts
+cannot be stacked into one scored sweep, and vLLM has no attention probabilities to read, so a
+sweep would record only errors there. Dataset-study workloads take no
 concurrent or open load: live traffic does not run them. Every workload keeps its own single-call
 regimes (`interactive`, `batched`, `generation`): the notebook user's view and the per-call
 overhead. Each is one point of a load pattern timed on one repeated input: `batched` is an offline
