@@ -16,6 +16,7 @@
 #   versions-perf MODEL  suite nnsight-versions on one model (submit on gpuH200x8)
 #   versions-fill MODEL WORKLOAD BACKEND...  one workload again, beside the HF 0.8.1 reference
 #   load SUITE MODEL  a load-pattern suite (nnsight-load-offline | nnsight-load-concurrent)
+#   load-fill SUITE MODEL WORKLOAD BACKEND...  one workload again, beside the HF 0.8.1 reference
 #   versions-awq      whether each nnsight-versions backend loads Qwen2.5-72B-Instruct-AWQ
 #   optimal WORKLOAD ... each system's general cells beside its fastest documented realization
 #                     (the */opt configs, nnsight-vllm/opt/taps, interp-engine-vllm/static), plain vLLM
@@ -353,6 +354,16 @@ load)
     # nnsight-load-offline or nnsight-load-concurrent.
     shift
     bench run --suite "$1" --model "$2" --gpu 0 --out runs/nnsight-load
+    exit $?
+    ;;
+load-fill)
+    # One workload of a load-pattern suite again, beside the HF 0.8.1 reference:
+    # load-fill SUITE MODEL WORKLOAD BACKEND...
+    shift
+    suite=$1 model=$2 workload=$3; shift 3
+    bench run --suite "$suite" --model "$model" --workload "$workload" \
+        --backends nnsight-hf/sdpa/0-8-1 "$@" --reference nnsight-hf/sdpa/0-8-1 --gpu 0 \
+        --out runs/nnsight-load
     exit $?
     ;;
 versions-awq)

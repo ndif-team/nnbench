@@ -305,3 +305,21 @@ def test_offline_candidate_scored_against_reference_per_unit_outputs(tmp_path):
     assert set(by) == {("offline/b4", "t"), ("concurrent/c3", "t")}
     assert by[("offline/b4", "t")].state == "NUMERICAL_MISMATCH"     # p1 is among the scored units
     assert by[("concurrent/c3", "t")].state == "NUMERICAL_MISMATCH"
+
+
+def test_coordinates_rebuilt_from_a_frozen_record_keep_load_regimes_apart(tmp_path):
+    """The manager rebuilds submitted coordinates from the experiment record, whose load regimes
+    carry their settings as flat fields; two offline regimes must stay distinct regimes."""
+    from isb.jobs.contract import prepare, read_experiment, wire_spec
+    from isb.runs import run_coordinates
+
+    spec, _ = instantiate(WORKLOADS["steering"], "gpt2", size=4, regimes=("offline",),
+                          loads=(Offline(8, (4, None)),))
+    experiment = prepare(spec, tmp_path / "exp")
+    record = wire_spec(read_experiment(tmp_path / "exp"))
+    coordinates = run_coordinates(
+        spec=record["name"], methodology=record["methodology"], family=record["family"],
+        repo=record["repo"], interface="hf",
+        regimes=[{**w, "data": w.get("data_name")} for w in record["regimes"]],
+        cases=record["tasks"], inputs_sha256=experiment["inputs_sha256"])
+    assert [r["load"]["batch_size"] for r in coordinates["regimes"]] == [4, None]

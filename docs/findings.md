@@ -975,3 +975,29 @@ last-token logits; medians of 10, no profiler unless noted.
   other requests meanwhile. The remote request itself (`RequestModel.serialize`) pickles once per
   trace. Whether NDIF's production vLLM path goes through `_attach_mediators` is unchecked.
 - **Upstream finding (nnsight), not a cell fix.**
+
+## Load patterns — offline and concurrent, nnsight 0.8.1 HF vs vLLM, Qwen2.5-7B (2026-10-21)
+
+Suites `nnsight-load-offline` / `nnsight-load-concurrent` (design.md §12.17) on an A100-40GB; runs
+`runs/nnsight-load/20261021T020325Z-26e2426b`, `…020333Z-d612624c`, and the three cases rerun after
+a source-identity rejection, `…025923Z-0f7fdd66`, `…025956Z-68a4af7e`, `…025959Z-cfd76a9a`; page
+`nnsight-load.html`. Units/s; request latency p50. Every scored vLLM cell is SUPPORTED
+(top-1 0.94–1.00).
+
+| Case | HF | vLLM sync | vLLM async |
+|---|---|---|---|
+| steering, offline, 1 / 16 / 64 / all 256 per call | 37 / 473 / 768 / 789 | 33 / 83 / 95 / 89 | — |
+| ablation, offline, same | 37 / 376 / 514 / 538 | 34 / 83 / 92 / 89 | — |
+| logit lens, offline, 1 / 16 / 64 per call | 23 / 155 / 189 | 18 / 21 / 22 | — |
+| steering, concurrent, 1 / 4 / 16 / 64 clients | 36 / 35 / 35 / 35 | 33 / 33 / 33 / 33 | 33 / 64 / 97 / 110 |
+| activation patching, concurrent, same | 17 / 17 / 17 / 17 | 17 / 17 / 17 / 17 | 17 / 29 / 47 / 57 |
+| steered generation (8 tokens), concurrent, same | 5 / 5 / 5 / 5 | 6 / 6 / 6 / 6 | 6 / 17 / 43 / 58 |
+
+- **Offline favours HF.** A chunk is one padded forward on HF; on vLLM each unit is an invoke that
+  pays the per-invoke serialization of the section above, so the sync engine levels off near
+  90 units/s whatever the chunk size. All 256 at once runs out of GPU memory on both engines for the
+  all-layer logit lens.
+- **Concurrency favours the async engine.** HF and the sync engine take one request at a time: flat
+  throughput, latency growing with the clients (steered generation p50 13.6 s on HF at 64). The
+  async engine overlaps them: 110 units/s for steering at 64 clients (p50 491 ms), 10× HF on steered
+  generation.

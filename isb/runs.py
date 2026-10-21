@@ -303,6 +303,15 @@ def _validate_coordinates(c):
         raise ValueError("invalid coordinate effect configuration")
 
 
+def _load_settings(regime: dict) -> dict:
+    """A load regime's settings, given as a `load` object (coordinates) or as the flat fields of
+    a frozen spec record (the manager rebuilds submitted coordinates from that record)."""
+    load = regime.get("load")
+    if load is None:
+        load = {key: regime[key] for key in LOAD_FIELDS if key in regime}
+    return dict(load)
+
+
 def run_coordinates(*, spec: str, methodology: str, family: str, repo: str, interface: str,
                     regimes=(), cases=(), protocol: dict | None = None,
                     protocol_coverage: dict | None = None, inputs_sha256: str | None = None,
@@ -317,7 +326,7 @@ def run_coordinates(*, spec: str, methodology: str, family: str, repo: str, inte
                 "new_tokens": r.get("new_tokens", 0), "aggregate": r.get("aggregate", True),
                 "data_knobs": dict(r.get("data_knobs") or {}),
                 # a load pattern's settings (design.md §12.17); other regimes carry none
-                **({"load": dict(r["load"])} if r.get("load") is not None else {})}
+                **({"load": _load_settings(r)} if r["kind"] in LOAD_KINDS else {})}
                for r in regimes]
     coordinates = deepcopy({
         "schema": COORDINATES_SCHEMA,
