@@ -22,17 +22,24 @@ def _acts(prompt):
                          for j, w in enumerate(prompt.split())])
 
 
-class _Model:
-    def __init__(self):
-        self.trunk = type("Trunk", (), {})()
-        self.trunk.decoder_blocks = [type("Block", (), {})() for _ in range(2)]
+class _Tokenizer:
+    def __init__(self, padding_side):
+        self.padding_side = padding_side
 
-    def tokenizer(self, text):
+    def __call__(self, text):
         return {"input_ids": text.split()}
 
 
+class _Model:
+    def __init__(self, padding_side="left"):
+        self.trunk = type("Trunk", (), {})()
+        self.trunk.decoder_blocks = [type("Block", (), {})() for _ in range(2)]
+        self.tokenizer = _Tokenizer(padding_side)
+
+
 class _HF:
-    """One padded batch, left-padded as nnsight pads a causal decoder; pad positions hold values."""
+    """One padded batch on the tokenizer's padding side (nnsight left-pads a causal decoder); pad
+    positions hold values."""
     name = "hf"
 
     def __init__(self, extra_pad=0):
@@ -41,7 +48,9 @@ class _HF:
     def run(self, model, prompts, build):
         acts = [_acts(p) for p in prompts]
         width = max(len(a) for a in acts) + self.extra_pad
-        batch = torch.stack([torch.cat([torch.full((width - len(a), D), 1e4), a]) for a in acts])
+        pad = lambda a: torch.full((width - len(a), D), 1e4)    # noqa: E731
+        left = model.tokenizer.padding_side == "left"
+        batch = torch.stack([torch.cat([pad(a), a] if left else [a, pad(a)]) for a in acts])
         model.trunk.decoder_blocks[1].output = (batch, "attention weights")
         return build().detach().float().cpu()
 
@@ -68,6 +77,14 @@ def test_hf_exports_every_valid_token_in_prompt_order():
 def test_hf_refuses_a_batch_its_token_counts_do_not_describe():
     with pytest.raises(ValueError, match="padded to 5 positions"):
         HF(_HF(extra_pad=1), _Model(), PROFILE, ["the cat sat", "a quick brown fox"], layer=1)
+
+
+def test_hf_refuses_a_right_padded_batch():
+    prompts = ["the cat sat", "a quick brown fox"]
+    with pytest.raises(ValueError, match="pads on the right"):
+        HF(_HF(), _Model(padding_side="right"), PROFILE, prompts, layer=1)
+    alone = HF(_HF(), _Model(padding_side="right"), PROFILE, prompts[:1], layer=1)
+    assert torch.equal(alone, _acts(prompts[0]))           # one prompt has no padding to locate
 
 
 def test_vllm_exports_the_summed_stream_on_a_fused_residual_family():

@@ -34,6 +34,9 @@ from .registry import cell
 @cell("activation_harvest", family="*", backend="hf")
 def activation_harvest_hf(be, model, m, prompts, *, layer, export=True, residual="plain"):
     counts = [len(model.tokenizer(p)["input_ids"]) for p in prompts]
+    if len(prompts) > 1 and model.tokenizer.padding_side != "left":
+        raise ValueError(f"the tokenizer pads on the {model.tokenizer.padding_side}; valid tokens are "
+                         f"located as each row's last positions, which needs left padding")
 
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
         if not export:
