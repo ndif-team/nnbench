@@ -65,6 +65,21 @@ def test_single_unit_cells_sweep_offline_at_b1_and_serve_from_their_single_unit_
                                   "at B=1 only"}]
 
 
+def test_a_whole_list_cell_that_declares_offline_sweeps_one_unit_per_call():
+    # Jacobian collection's one regime hands every prompt to one call; declaring offline says the
+    # per-prompt work is independent, so the sweep issues one prompt per call and nothing larger
+    spec, skipped = instantiate(WORKLOADS["jacobian_collect"], "gpt2", size=4,
+                                loads=(Offline(8, (1, 4)),))
+    assert [r.name for r in spec.regimes] == ["interactive", "offline/b1"]
+    assert len(spec.regimes[1].prompts) == 8 and not spec.regimes[0].aggregate
+    assert [row["reason"] for row in skipped] == \
+        ["this workload's cells take one unit per call, so offline runs at B=1 only"]
+    # DAS has the same whole-list regime but declares nothing: a fit's steps depend on each other
+    spec, skipped = instantiate(WORKLOADS["das"], "gpt2", loads=(Offline(8, (1,)),))
+    assert [r.name for r in spec.regimes] == ["interactive"]
+    assert "its load patterns: none" in skipped[-1]["reason"]
+
+
 def test_regimes_filter_keeps_only_the_load_patterns():
     spec, _ = instantiate(WORKLOADS["logit_lens"], "gpt2", size=4, regimes=("offline",),
                           loads=(Offline(16, (4,)), Concurrent(8)))

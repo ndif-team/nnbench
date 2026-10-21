@@ -1579,19 +1579,24 @@ issue requests is `docs/inference-benchmark-survey.md`; the background, what eac
 which workloads take which pattern is `docs/request-patterns.md`.
 
 **Declared per workload.** Each workload lists the load patterns that match how its methodology is
-used (`Workload.load_patterns`): `offline` for dataset studies (lenses, ablation, the patching
-methods, activation harvesting), `offline`, `concurrent` and `open` for interventions that also run
-on live traffic (steering, steered generation, per-step capture), and none for DAS and Jacobian
-collection (one call whose result depends on all its units together) and the attention pattern
-(per-prompt outputs of different lengths cannot be stacked and scored, and vLLM cannot read it). A
-suite's load applies only to the workloads that declare it; the others report it as a skipped row
-with the reason, so no run times a combination nobody uses.
+used (`Workload.load_patterns`), by who controls the arrival process: `offline` for research jobs,
+where the researcher's own loop over a held dataset is a closed loop (lenses, ablation, the patching
+methods, activation harvesting, Jacobian collection); `concurrent` and `open` only where a
+deployment runs the method once per live request (steering, steered generation, per-step capture);
+and none for a job that is one sequential computation (DAS: each step needs the previous step's
+rotation, and upstream sweeps train one fit after another) or whose per-prompt outputs cannot be
+stacked and scored (the attention pattern, which vLLM also cannot read). Those run single stream in
+their own `interactive` regime. A suite's load applies only to the workloads that declare it; the
+others report it as a skipped row with the reason, so no run times a combination nobody uses. The
+evidence for each declaration is in `docs/request-patterns.md`.
 
 **Derived, not authored.** A load pattern names no data of its own. A suite entry (or `bench run
 --offline UNITS:B,... --concurrent UNITS:C,... --open UNITS:R,...`) lists `Offline` /
 `Concurrent` / `Open` loads, and `instantiate` derives the regimes from the workload's own: offline
 from its batched regime (cells that take several units per call) or, for a workload whose cells
-take one unit per call, from its single-unit interactive, else generation, regime at B=1 only;
+take one unit per call, from its single-unit interactive, else generation, regime at B=1 only (a
+workload that declares offline with only a whole-list interactive regime, Jacobian collection,
+sweeps that regime one unit per call, the per-prompt maps being independent);
 concurrent and open from that single-unit regime (decode length kept). The derived regime reuses
 the template's data source at the load's unit count. Regimes without load settings freeze to the
 same experiment record as before, and each load regime records only its own pattern's settings

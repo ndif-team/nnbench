@@ -14,6 +14,7 @@ attention_pattern = Workload(
     rows=(Row("every layer", {"layers": "all"}),),
     regimes=(Regime("interactive", ["The Eiffel Tower is in the city of"], aggregate=False),),
     baseline={"layers": [0]},
-    # load_patterns: none (per-prompt outputs differ in length, so a sweep's units cannot be
-    # stacked and scored; vLLM has no probability matrix to read)
+    # load_patterns: none (docs/request-patterns.md): single stream only. Per-prompt outputs differ
+    # in length, so a sweep's units cannot be stacked and scored; vLLM has no probability matrix to
+    # read, so every pattern there would repeat the same ERROR.
 )

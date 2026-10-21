@@ -453,10 +453,14 @@ def _load_regimes(workload: Workload, load):
     if kind == "offline":
         batched = next((r for r in workload.regimes if r.kind == "batched"), None)
         template, sizes, reason = batched, load.batch_sizes, None
-        if batched is None and single is None:
-            return [], "offline needs a batched or single-unit regime"
         if batched is None:
-            template, sizes = single, tuple(b for b in load.batch_sizes if b == 1)
+            # a workload that declares offline but whose only regime hands the whole unit list to
+            # one call (Jacobian collection: the corpus mean of independent per-prompt maps) sweeps
+            # that regime one unit per call
+            template = single or next((r for r in workload.regimes if r.kind == "interactive"), None)
+            if template is None:
+                return [], "offline needs a batched or single-unit regime"
+            sizes = tuple(b for b in load.batch_sizes if b == 1)
             if len(sizes) < len(load.batch_sizes):
                 reason = "this workload's cells take one unit per call, so offline runs at B=1 only"
         return [ExecutionRegime("offline", _resized(template.data, load.units), batch_size=b,

@@ -19,7 +19,10 @@ das = Workload(
               {"layer": _HALF, "train": 24})),
     regimes=(Regime("interactive", DataRef("mib/ioi_labeled", 24), aggregate=False),),
     baseline={"layer": _HALF, "train": 0},
-    # load_patterns: none (training is one call over the dataset; no load pattern)
+    # load_patterns: none (docs/request-patterns.md). A fit is one sequential job: each step needs
+    # the rotation the previous step updated, and the upstream sweeps (pyvene's IOI tutorial,
+    # causalab) train one fit after another, never several in one forward. The job runs single
+    # stream as the interactive regime's one call; no deployment runs a fit per live request.
     # the train row runs 24 steps x 2 traces per timing trial; keep trials small
     warmup=1, n_trials=3,
 )

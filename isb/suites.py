@@ -94,7 +94,11 @@ SUITES = {s.name: s for s in (
                          ("qwen2.5-7b", "qwen3-32b"), regimes=("offline",),
                          loads=(Offline(256, (1, 16, 64, None)),)),
                    Entry(("activation_patching", "gen_steering"), ("qwen2.5-7b", "qwen3-32b"),
-                         regimes=("offline",), loads=(Offline(64, (1,)),))),
+                         regimes=("offline",), loads=(Offline(64, (1,)),)),
+                   # one prompt per call is ceil(d_model/dim_batch) backward passes (512 at d=4096):
+                   # few units, B=1 only (how jacobian-lens shards a corpus)
+                   Entry(("jacobian_collect",), ("qwen2.5-7b", "qwen3-32b"),
+                         regimes=("offline",), loads=(Offline(8, (1,)),))),
           backends=("nnsight-hf/sdpa/0-8-1", "nnsight-vllm/sync/0-8-1"),
           reference="nnsight-hf/sdpa/0-8-1", timeout=7200),
     # Closed-loop serving (`vllm bench serve --max-concurrency`, AIPerf's concurrency sweep): 128

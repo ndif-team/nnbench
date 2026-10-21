@@ -212,13 +212,26 @@ request deadline, so an overloaded system drains its queue after the last arriva
 
 ## Which workloads run under which pattern
 
-A workload's methodology is used in one of two settings. In a dataset study (circuit discovery,
-feature training, evaluation sweeps) a researcher prototypes on single calls, then runs the method
-over a dataset; the speed that matters is the sweep's throughput. In runtime interpretability
-(monitors, probes and steering on live traffic) the method runs inside requests users send, and what
-matters is latency and throughput under that traffic. Each workload declares the load patterns of
-its settings (`load_patterns` in `isb/workloads/`), and a suite's load runs only on the workloads
-that declare it, so no run times a combination nobody uses.
+A workload's methodology is used in one of two settings. In a research job (circuit discovery,
+feature training, evaluation sweeps, lens fitting) the researcher holds the data and writes the loop
+that issues the calls: the next call goes out when the previous one returns, nobody waits on one
+unit's answer, and the number that matters is how long the whole job takes. In deployment (steered
+chat, monitors and probes on served generations) the method runs inside requests that users send at
+times the system does not control, and what matters is latency at an offered rate. Each workload
+declares the load patterns of its settings (`load_patterns` in `isb/workloads/`), and a suite's load
+runs only on the workloads that declare it, so no run times a combination nobody uses.
+
+The declaration follows from who controls the arrival process:
+
+- `offline` when the method is run over a dataset the researcher holds. The researcher's loop is a
+  closed loop by construction, so throughput at a chosen chunk size is the whole question.
+- `concurrent` and `open` only when a deployment runs the method once per live request. The closed
+  loop shows whether the engine overlaps requests; the open loop shows latency at a rate the users
+  set, including overload. A research job never produces that arrival process, so pushing a lens or
+  a patching sweep at a Poisson rate would measure a situation no user is in.
+- none of the three when the job is one sequential computation whose calls depend on each other.
+  There is no stream of independent requests to shape; the job runs as single stream, one job per
+  call, which is the workload's own `interactive` regime.
 
 Two axes are involved. The request shape is the workload's own regime: one unit per call
 (`interactive`), several units per call (`batched`), or one unit decoded for several steps
@@ -229,31 +242,53 @@ request shape, decode included.
 
 | Workload | Setting | Request shape (own regimes) | Load patterns |
 |---|---|---|---|
-| Logit lens | dataset study | one prompt; a batch of prompts | offline (B = 1, 16, 64, all) |
-| Jacobian lens | dataset study | one prompt | offline (B = 1) |
-| Ablation | dataset study | one prompt; a batch of prompts | offline (B = 1, 16, 64, all) |
-| Activation patching | dataset study | one clean/corrupted pair | offline (B = 1) |
-| Generation patching | dataset study | one pair, decoded 5 steps | offline (B = 1) |
-| Attribution patching | dataset study | one labeled pair (forward and backward) | offline (B = 1) |
-| Activation harvesting | dataset study | a batch of passages | offline (B = 1, 16, 64, all) |
+| Logit lens | research job | one prompt; a batch of prompts | offline (B = 1, 16, 64, all) |
+| Jacobian lens | research job | one prompt | offline (B = 1) |
+| Ablation | research job | one prompt; a batch of prompts | offline (B = 1, 16, 64, all) |
+| Activation patching | research job | one clean/corrupted pair | offline (B = 1) |
+| Generation patching | research job | one pair, decoded 5 steps | offline (B = 1) |
+| Attribution patching | research job | one labeled pair (forward and backward) | offline (B = 1) |
+| Activation harvesting | research job | a batch of passages | offline (B = 1, 16, 64, all) |
+| Jacobian collection | research job | the corpus in one call; one prompt per call under load | offline (B = 1) |
 | Steering | both | one prompt; a batch of prompts | offline, concurrent, open |
 | Steered generation | both | one prompt, decoded 8 steps | offline (B = 1), concurrent, open |
 | Per-step capture | both | one prompt, decoded 8 steps | offline (B = 1), concurrent, open |
-| Attention pattern | dataset study | one prompt; output length follows the prompt | none |
-| DAS (train and apply) | dataset study | one training call over the dataset | none |
-| Jacobian collection | dataset study | one fitting call over the corpus | none |
+| Attention pattern | research job | one prompt; output length follows the prompt | single stream only |
+| DAS (train and apply) | research job | one fit: the training loop and its held-out check | single stream only |
 
-The last three have no load pattern. DAS trains one rotation over the training units and checks it
-on held-out units, and Jacobian collection averages its maps over every prompt: each is one call
-whose result depends on all its units together, so splitting it into per-unit requests would change
-what it computes. How their cost grows with data is measured by the size of that one call. The
-attention pattern is `[layers, heads, prompt length]` per prompt, so outputs of different prompts
-cannot be stacked into one scored sweep, and vLLM has no attention probabilities to read, so a
-sweep would record only errors there. Dataset-study workloads take no
-concurrent or open load: live traffic does not run them. Every workload keeps its own single-call
-regimes (`interactive`, `batched`, `generation`): the notebook user's view and the per-call
-overhead. Each is one point of a load pattern timed on one repeated input: `batched` is an offline
-call at B = 16, `interactive` and `generation` a closed loop at C = 1.
+The last rows follow how the upstream code runs these methods.
+
+- **DAS** is one sequential job. Each training step needs the rotation the previous step updated,
+  and the reference implementations run a sweep as one fit after another: pyvene's IOI tutorial
+  (`tutorials/advanced_tutorials/tutorial_ioi_utils.py`, `find_variable_at`) builds one
+  `IntervenableModel` per (position, layer) and trains it for 10 epochs at 20 pairs per step before
+  the next; causalab (`methods/trained_subspace/train.py`) trains one target after another at 32
+  pairs per step and parallelises a sweep across slurm jobs. Fits are not batched into one forward.
+  Our cell's call is one fit, timed single stream in the `interactive` regime.
+- **Jacobian collection** upstream (`anthropics/jacobian-lens`, `jlens/fitting.py`) runs prompts one
+  at a time, 8 cotangent rows per backward, and parallelises by fitting disjoint prompt slices and
+  merging the lenses. That is one prompt per call with the mean on the client: the offline sweep at
+  B = 1. The batch axis is spent on cotangent rows, so B > 1 per call is not the upstream shape.
+- **Attention pattern** output is `[layers, heads, prompt length]` per prompt, so outputs of
+  different prompts cannot be stacked into one scored sweep, and vLLM has no attention
+  probabilities to read, so every pattern there would record the same error.
+
+Every workload keeps its own single-call regimes (`interactive`, `batched`, `generation`): the
+notebook user's view and the per-call overhead. Each is one point of a load pattern timed on one
+repeated input: `batched` is an offline call at B = 16, `interactive` and `generation` a closed loop
+at C = 1.
+
+Known gaps, recorded here rather than built:
+
+- The DAS cell trains at 1 pair per step; pyvene uses 20 and causalab 32. The step is the unit of
+  work being timed, so the cell understates it. Raising it is a workload change with new numbers.
+- The DAS and Jacobian collection cells issue their traces from a Python loop. nnsight documents
+  `model.session()` for a multi-trace job (one serialized request, one queue wait on NDIF); the
+  cells should take that form once a GPU check confirms the numbers do not move.
+- A multi-tenant research server (NDIF) receives whole jobs at times its users choose: an open loop
+  whose unit is a job (a fit, a 256-prompt lens sweep), not a prompt. That is not implemented. The
+  engine behaviour it would expose, overlapping whole sessions, is nearest to what steering under
+  the concurrent pattern shows at request level.
 
 ## Choosing and comparing
 
