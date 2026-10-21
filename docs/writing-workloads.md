@@ -72,11 +72,34 @@ Add one unit test per read and write denotation. Use a fake `(hidden, residual)`
 elements differ, and assert the stream downstream of the cell. A test that passes the naive
 reading explicitly checks nothing about the default.
 
-## 6. Smoke against the reference before recording a finding
+## 5a. Hand the backend units, never an engine form
 
-Run the new cell against `nnsight-hf/default` on a few inputs. On a mismatch, repeat steps 1 to 3 before
-writing it up. For cross-system rows, a second system on the same engine locates the difference:
-bitwise-identical outputs mean the gap belongs to the engine, not to either interpretability layer.
+A cell hands each backend primitive the units of one call and nothing about how the engine takes
+them (`isb/backends/base.py`, design.md §12.13 "Unit form"). `patch`, `generate`, `generate_patch`
+and `attribute` take one unit per side; every backend checks that through `Backend.one()` and
+raises `FormError` on more, and the test spy inherits the check, so a cell that passes a batch
+to one of them fails in the no-GPU suite. `run`, `train_patch` and `vjp_batch` take lists: HF
+runs them as one padded batch, the async vLLM engine as one request per trace, and the closure
+receives `rows`, the indices of the units the current trace holds, to pick its targets. A cell
+that indexes `prompts[0]`, or passes a list because HF would batch it, has chosen a form for the
+engine; on vLLM the recorded error then names the harness's form instead of the engine's limit.
+The DAS train step on PR #17 (2026-10-21) did this: 16-prompt lists to `train_patch`, whose
+contract took one pair, so the async vLLM row recorded "Multiple prompts per invoke are not
+supported" in place of the inference-mode gradient refusal the row exists to record.
+
+## 6. Run every backend that registers the cell before writing anything
+
+Run the new cell on gpt2 on every backend that registers it (or that it falls back to),
+against `nnsight-hf/default`, before any sentence about what it shows. `scripts/execute.py`
+runs one cell on one engine without Docker; `scripts/row_diff.py` prints each row's status,
+recorded error text, latency and output difference between two runs. On a mismatch, repeat
+steps 1 to 3 before writing it up. For cross-system rows, a second system on the same engine
+locates the difference: bitwise-identical outputs mean the gap belongs to the engine, not to
+either interpretability layer.
+
+An error on a backend is reported in this order: what the cell passed, what the primitive takes
+(quote `base.py`), what the engine's message asked for. The words "engine limit", "finding" and
+"frontier marker" come after the cell is in the documented form on every backend, never before.
 
 ## 7. Changing a default
 
@@ -85,3 +108,17 @@ what every case of that methodology measures on that system. Keep the old spelli
 declaring it as an alternative on the registration (`realizations=`, design.md §12.16), never by
 writing it into a workload. The `parallel` suite scores vLLM against vLLM; a shared wrong reading
 cancels there, so it never tests fidelity to HF.
+
+## 8. Changing a cell or a backend primitive
+
+A change to a cell or to a primitive it calls repeats step 6 for every backend that registers
+the cell, with the run before the change as the reference:
+
+1. Record the runs before the change (the main tree, or the last job's run files).
+2. Make the change; run the no-GPU suite (it catches a one-unit primitive handed several units,
+   nothing more about form).
+3. Run the cell on gpt2 on every registered backend and `scripts/row_diff.py` each pair.
+4. A row whose output changed needs the reason in the commit message (a new default, a
+   batching change). A row whose recorded error text changed is a cell-form change until the
+   commit message says otherwise: the engine's message usually names the form it takes.
+5. Push, with the row-diff summary in the pull request.
