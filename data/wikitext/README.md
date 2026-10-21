@@ -10,5 +10,5 @@ wikitext, so the jacobian-collection workload measures on the same distribution.
 Every prompt tokenizes well past position 16, which the collection estimator's
 attention-sink skip requires.
 
-Consumed via `isb/data.py` as the `wikitext` prompt source — the default feed for
-the jacobian_collect spec.
+Consumed via `isb/data.py` as the `wikitext` prompt source: the default feed for
+the jacobian_collect and activation_harvest workloads.

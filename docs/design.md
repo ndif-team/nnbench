@@ -1496,7 +1496,7 @@ keep only those of its cases. Initial suites:
 | `smoke` | every workload × `gpt2`, `logit_lens` × `smollm2-135m` | `nnsight-hf/default`, `nnsight-vllm/default` | all |
 | `parallel` | `logit_lens`, `steering`, `ablation`, `activation_patching`, `gen_steering` × `qwen2.5-14b` | `nnsight-vllm/default` as the reference; the TP/PP config is added with `--backends` (GT2, §12.2; multi-GPU settings belong in a backend config) | all |
 | `nemotron` | `logit_lens`, `steering`, `ablation` × `nemotron3-nano-4b` (the 30B needs a multi-GPU config) | nnsight HF and vLLM | all |
-| `cross-system` | `logit_lens`, `steering`, `gen_steering`, `activation_patching`, `ablation` × `qwen2.5-7b` | every system (§12.14) | default |
+| `cross-system` | `logit_lens`, `steering`, `gen_steering`, `activation_patching`, `ablation`, `activation_harvest`, `gen_capture` × `qwen2.5-7b` | every system (§12.14) | default |
 | `fitted-jlens` | `jacobian_lens` × `qwen3.5-4b` | nnsight HF and vLLM | default |
 | `nnsight-versions` | `logit_lens`, `steering`, `ablation`, `gen_steering`, `activation_patching` × `qwen2.5-7b`, `qwen3-32b` | nnsight 0.8.1 and 0.7 on HF sdpa and the vLLM sync engine; 0.4.6 on HF | default |
 | `nnsight-load-offline`, `nnsight-load-concurrent` | load patterns only (§12.17) × `qwen2.5-7b`, `qwen3-32b` | nnsight 0.8.1 on HF and vLLM (sync; async for concurrent) | default |
@@ -1515,6 +1515,8 @@ keep only those of its cases. Initial suites:
 | `gen_patching` | depth 3/4, every step | `bound=unbounded` |
 | `ablation` | layer 1 and depth 1/2 × attention and MLP sublayer (requires the split); depth 1/3 and 2/3 × mixer (requires a mixer) | `residual=plain` on vLLM |
 | `attention_pattern`, `attribution_patching`, `das`, `jacobian_collect` | as before, with DAS at depth 1/2 | — |
+| `activation_harvest` (added 2026-10-20) | depth 1/2, every valid prompt token of one batch, copied to host memory | none |
+| `gen_capture` (added 2026-10-20) | depth 1/2, the newest position at every decode step, copied to host memory | `bound=unbounded` |
 
 Some measured cases move: GPT-2 steering ran at layer 8 (depth 2/3) and now runs at 3 and 6; the
 14B rows move from layers 8/16/24 to their depth fractions; the 14B and Nemotron rows that pinned

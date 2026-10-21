@@ -4,10 +4,12 @@
 resolved case is named `<workload>/<model>` (plus `@<data>` when the data is rebound).
 """
 from .ablation import ablation
+from .activation_harvest import activation_harvest
 from .activation_patching import activation_patching
 from .attention_pattern import attention_pattern
 from .attribution_patching import attribution_patching
 from .das import das
+from .gen_capture import gen_capture
 from .gen_patching import gen_patching
 from .gen_steering import gen_steering
 from .jacobian_collect import jacobian_collect
@@ -17,7 +19,7 @@ from .steering import steering
 
 WORKLOADS = {w.name: w for w in (
     logit_lens, jacobian_lens, steering, gen_steering, activation_patching, gen_patching, ablation,
-    attention_pattern, attribution_patching, das, jacobian_collect,
+    attention_pattern, attribution_patching, das, jacobian_collect, activation_harvest, gen_capture,
 )}
 
 

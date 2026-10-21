@@ -215,6 +215,18 @@ PROTOCOLS: dict[str, InterventionSpec] = {
         capabilities=("full_logits",), extensions=("linear_transport",),
         semantic_params=("transport", "layers", "position"), realization_params=("unembed", "residual"),
     ),
+    # export=False (the baseline) reads only the greedy token; requirements.py describes each case
+    "activation_harvest": _p(
+        components=("block_output", "lm_head"), operations=("read",),
+        capabilities=("full_logits",), extensions=("activation_export",),
+        semantic_params=("layer", "export"), realization_params=("residual",),
+    ),
+    "gen_capture": _p(
+        components=("block_output", "lm_head"), operations=("read",),
+        position_frames=("prompt", "generated"), capabilities=("full_logits", "generate"),
+        extensions=("activation_export",),
+        semantic_params=("layer", "export", "new_tokens"), realization_params=("bound", "residual"),
+    ),
 }
 
 

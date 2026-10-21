@@ -144,6 +144,18 @@ def _jacobian_lens(params, *, template, family):
     return template
 
 
+@case_description("activation_harvest", template=PROTOCOLS["activation_harvest"])
+@case_description("gen_capture", template=PROTOCOLS["gen_capture"])
+def _export(params, *, template, family):
+    if "export" not in params:
+        return None
+    if params["export"]:
+        return replace(template, components=("block_output",),
+                       capabilities=tuple(set(template.capabilities) - {"full_logits"}))
+    return replace(template, components=("lm_head",),
+                   extensions=tuple(set(template.extensions) - {"activation_export"}))
+
+
 @case_description("logit_lens", template=PROTOCOLS["logit_lens"])
 @case_description("attention_pattern", template=PROTOCOLS["attention_pattern"])
 def _constant(params, *, template, family):

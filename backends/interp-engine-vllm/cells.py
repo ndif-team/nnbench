@@ -160,3 +160,49 @@ def ablation(be, model, prompts, *, layer=6, target="mlp"):
                           f"one direction (add, orthogonal rescale, projection cap, lens ablate); "
                           f"zeroing the whole output would take d_model single-direction removals")
     return _final_logits(model, _ids(model, prompts[0]))
+
+
+@cell("activation_harvest", family="llama", backend="interp_engine")
+def activation_harvest(be, model, prompts, *, layer, export=True):
+    """The documented batch capture, `run_with_cache` over a padded batch and its mask
+    (`interp_engine/capture.py`): on vLLM each row runs unpadded as its own `capture` request, the
+    requests run concurrently for the scheduler to batch, and each returns on CPU; the Cache pads
+    them to [batch, seq, d_model]. The valid rows are concatenated in prompt order. `export=False`
+    sends the same concurrent requests through `generate_text` for one greedy token, since
+    `run_with_cache` needs a capture point."""
+    import asyncio
+
+    from interp_engine import run_with_cache
+
+    ids = [_ids(model, p) for p in prompts]
+    if not export:
+        async def plain():
+            m = model.engine.model
+            return await asyncio.gather(*(m.generate_text(row, max_tokens=1, temperature=0.0)
+                                          for row in ids))
+        return model.engine.runner.run(plain())
+    width = max(map(len, ids))
+    tokens = torch.tensor([row + [0] * (width - len(row)) for row in ids])
+    mask = (torch.arange(width) < torch.tensor([len(row) for row in ids])[:, None]).long()
+    point = f"resid_post.{layer}"
+    acts = run_with_cache(model.engine.model, tokens, [point], attention_mask=mask)[point]
+    return torch.cat([acts[b, :len(row)] for b, row in enumerate(ids)])       # [tokens, d_model]
+
+
+@cell("gen_capture", family="llama", backend="interp_engine")
+def gen_capture(be, model, prompts, *, layer, new_tokens, export=True):
+    """`capture_generation` returns the point at prompt and generated positions,
+    [prompt_len + generated_len - 1, d_model] on CPU (`protocol.py`); the rows from the last prompt
+    token on are the newest position of each decode step. `export=False` is the same greedy decode
+    through `generate_text`."""
+    from interp_engine import to_address
+
+    ids = _ids(model, prompts[0])
+    if not export:
+        return model.engine.generate_text(ids, max_tokens=new_tokens, temperature=0.0)
+    point = f"resid_post.{layer}"
+    _, acts = model.engine.capture_generation(ids, [point], max_tokens=new_tokens, temperature=0.0)
+    rows = acts[to_address(point)][len(ids) - 1:]
+    if len(rows) != new_tokens:     # an early EOS shortens the decode
+        raise RuntimeError(f"collected {len(rows)} per-step rows, expected {new_tokens}")
+    return rows                                                                # [new_tokens, d_model]

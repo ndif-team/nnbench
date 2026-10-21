@@ -170,3 +170,40 @@ def ablation(be, model, prompts, *, layer=6, target="mlp"):
         ctx.saved.setdefault("rows", []).append(_readout(ctx, h))
 
     return _rows(_hooked(model, prompts[0], read, [last]), 1)[0]
+
+
+def _captured(model, prompts, layer, max_tokens, export):
+    """One generate call for `prompts`; with `export`, vLLM-Lens's activation capture at `layer`."""
+    from vllm import SamplingParams
+
+    extra = {"output_residual_stream": [layer]} if export else None
+    params = SamplingParams(max_tokens=max_tokens, **_GREEDY, extra_args=extra)
+    return model.llm.generate(list(prompts), params, use_tqdm=False)
+
+
+@cell("activation_harvest", family="llama", backend="vllm_lens")
+def activation_harvest(be, model, prompts, *, layer, export=True):
+    """The documented activation capture, `output_residual_stream`, on one generate call for the
+    whole batch. At every forward the worker copies each request's slice of the summed stream
+    (hidden + residual after the layer) to host memory (`_worker_ext.py`, `_hook_inner` phase 3),
+    and the plugin returns it as `[1, n_prompt, d]` per request at max_tokens=1
+    (`_activations_plugin.py`, `_finalize_offline_outputs`). vLLM's `LLM.generate` returns outputs
+    in prompt order. `export=False` runs the same call without capture and returns the greedy
+    tokens."""
+    outs = _captured(model, prompts, layer, 1, export)
+    if not export:
+        return torch.tensor([out.outputs[0].token_ids[0] for out in outs])
+    return torch.cat([out.activations["residual_stream"][0] for out in outs])   # [tokens, d]
+
+
+@cell("gen_capture", family="llama", backend="vllm_lens")
+def gen_capture(be, model, prompts, *, layer, new_tokens, export=True):
+    """The same capture over a greedy decode: it appends every decode step's row and is trimmed to
+    n_prompt + n_gen - 1 positions (`_finalize_offline_outputs`). The rows from the last prompt
+    token on are the newest position of each step, the rows the nnsight cell reads."""
+    (out,) = _captured(model, prompts[:1], layer, new_tokens, export)
+    rows = (out.activations["residual_stream"][0][len(out.prompt_token_ids) - 1:] if export
+            else torch.tensor(out.outputs[0].token_ids))
+    if len(rows) != new_tokens:     # an early EOS shortens the decode
+        raise RuntimeError(f"collected {len(rows)} per-step rows, expected {new_tokens}")
+    return rows                                                                 # [new_tokens, d]

@@ -327,7 +327,8 @@ def test_cli_suite_settings_and_overrides():
     assert settings["realizations"] == "all" and settings["reference"] == "nnsight-hf/default"
     specs, skipped = cases(entries, settings["realizations"])
     assert {s.name for s in specs} == {f"{w}/qwen2.5-7b" for w in (
-        "logit_lens", "steering", "ablation", "gen_steering", "activation_patching")}
+        "logit_lens", "steering", "ablation", "gen_steering", "activation_patching",
+        "activation_harvest", "gen_capture")}
     assert all(s.realizations == "all" for s in specs)
     _, entries, _ = _recipe(parser().parse_args(["run", "--suite", "cross-system", "--workload", "steering"]))
     assert [s.name for s in cases(entries)[0]] == ["steering/qwen2.5-7b"]

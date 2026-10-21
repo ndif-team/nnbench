@@ -121,3 +121,21 @@ def ablation(be, model, prompts, *, layer=6, target="mlp"):
     if target == "none":
         return _final_logits(model, prompts[0])
     return _final_logits(model, prompts[0], {f"blocks.{layer}.{target}.hook_out": {"op": "suppress"}})
+
+
+@cell("activation_harvest", family="llama", backend="transformer_lens")
+def activation_harvest(be, model, prompts, *, layer, export=True):
+    """The compiled vLLM driver takes one prompt per forward (`driver.py`, `_normalize_input_ids`:
+    batch_size=1 only), so the batch runs as one `run_with_cache` call per prompt. The worker copies
+    the `blocks.{layer}.hook_out` buffer to host memory as wire bytes (`worker_extension.py`,
+    `tl_read_captures`). `export=False` runs the same forwards with no capture and no logit
+    rebuild, the backend's plain request, which returns no output."""
+    name = f"blocks.{layer}.hook_out"
+    caches = [_run(model, prompt, [name] if export else [], logits=False)[1] for prompt in prompts]
+    return torch.cat([cache[name][0] for cache in caches]) if export else None   # [tokens, d_model]
+
+
+@cell("gen_capture", family="llama", backend="transformer_lens")
+def gen_capture(be, model, prompts, *, layer, new_tokens, export=True):
+    raise Unsupported("the vLLM driver runs one forward per call (max_new_tokens=1 only) and the "
+                      "bridge has no generate(); a read at every decode step is not expressible")
