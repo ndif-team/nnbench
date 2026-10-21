@@ -203,6 +203,8 @@ Status: ✓ = already an nnbench cell. **frontier** = exercises a primitive wher
 | **Tuned lens** | logit lens with a *trained* affine probe per layer (better-calibrated early layers) | base · `block_output` + `lm_head` · read · prompt; trained affine artifact | needs a tuned-lens checkpoint per model | TODO |
 | **Linear probing** | train a linear classifier on activations to test if a concept is linearly decodable | base · `block_output` · read, grad · prompt · `grad`; trained probe artifact | any model; probe is per-model/per-concept (cheap to train) | TODO |
 | **Direct logit attribution (DLA)** | decompose the final logit into additive per-component contributions | base · `attention_output` + `mlp_output` + `lm_head` · read · prompt | decoder-only; per-head needs access to head outputs before `W_O` | TODO (read-only, exact) |
+| **Activation harvesting** | copy a layer's residual stream at every prompt token of a batch to host memory (the collection step behind SAE training and probing) | base · `block_output` · read · prompt · `activation_export` extension; residual realization | any decoder-only LM; HF drops left-padding positions, vLLM serves each request's tokens unpadded | ✓ |
+| **Per-step activation capture** | copy a layer's residual stream at the newest position of every decode step to host memory | base · `block_output` · read · prompt + generated · `generate`; `activation_export` extension; bounded/unbounded and residual realizations | any decoder-only LM | ✓ |
 
 ## 2. Causal interventions (change something, watch the output)
 

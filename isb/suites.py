@@ -37,7 +37,7 @@ class Suite:
 
 _SMALL = ("logit_lens", "jacobian_lens", "steering", "gen_steering", "activation_patching",
           "gen_patching", "ablation", "attention_pattern", "attribution_patching", "das",
-          "jacobian_collect")
+          "jacobian_collect", "activation_harvest", "gen_capture")
 _NNSIGHT = ("nnsight-hf/default", "nnsight-vllm/default")
 
 SUITES = {s.name: s for s in (
@@ -71,7 +71,8 @@ SUITES = {s.name: s for s in (
     Suite("cross-system",
           entries=(Entry(("logit_lens", "steering", "ablation"), ("qwen2.5-7b",), size=32,
                          regimes=("interactive",)),
-                   Entry(("gen_steering", "activation_patching"), ("qwen2.5-7b",), size=16)),
+                   Entry(("gen_steering", "activation_patching", "activation_harvest", "gen_capture"),
+                         ("qwen2.5-7b",), size=16)),
           backends=("nnsight-hf/default", "nnsight-vllm/default", "vllm-lens/default",
                     "interp-engine-vllm/default", "transformer-lens-vllm/default",
                     "vllm-plain/0-19-1", "vllm-plain/0-20-2", "vllm-plain/0-28-0"),

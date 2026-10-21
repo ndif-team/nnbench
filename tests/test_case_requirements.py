@@ -21,10 +21,11 @@ from isb.protocol import PROTOCOLS, InterventionSpec  # noqa: E402
 class OutputSpy:
     def __init__(self, output):
         self._output = output
-        self.writes = 0
+        self.reads = self.writes = 0
 
     @property
     def output(self):
+        self.reads += 1
         return self._output
 
     @output.setter
@@ -202,6 +203,21 @@ def test_gradient_requirements_follow_backend_gradient_entrypoints(methodology, 
     observed_grad = any(call in {"attribute", "vjp_batch"} for call in backend.calls)
     assert observed_grad == grad == ("grad" in protocol["operations"])
     assert ("grad" in protocol["capabilities"]) == grad
+
+
+@pytest.mark.parametrize("methodology", ["activation_harvest", "gen_capture"])
+@pytest.mark.parametrize("export", [False, True])
+def test_export_requirements_follow_the_site_the_cell_reads(methodology, export):
+    overrides = {"export": export, "layer": 0}
+    if methodology == "gen_capture":
+        overrides["new_tokens"] = 2
+    fn, params, protocol = bound_case(methodology, backend="vllm_async", **overrides)
+    model = model_fixture()
+    fn(BackendSpy(), model, ["prompt"], **params)
+    read_block = model.transformer.h[0].reads > 0
+    assert read_block == export == ("activation_export" in protocol["extensions"])
+    assert protocol["components"] == (["block_output"] if export else ["lm_head"])
+    assert ("full_logits" in protocol["capabilities"]) == (not export)
 
 
 def test_missing_bound_values_retain_template_scope_without_guessing_defaults():
