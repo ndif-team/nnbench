@@ -132,6 +132,12 @@ MODELS = {m.key: m for m in (
     # A100 (fp32 14B is ~56GB).
     Model("qwen2.5-7b", "Qwen/Qwen2.5-7B-Instruct", "llama", 28),
     Model("qwen2.5-14b", "Qwen/Qwen2.5-14B-Instruct", "llama", 48, dtype_control="bfloat16"),
+    # Qwen3 keeps the Llama tree (q/k norms sit inside self_attn). The 32B is the largest cached
+    # checkpoint with full-precision weights (~65 GB in bf16: one 141 GB H200, or an 80 GB card).
+    Model("qwen3-32b", "Qwen/Qwen3-32B", "llama", 64, dtype_control="bfloat16"),
+    # 4-bit AWQ (GEMM, group 128); the only 72B weights in the cache (the full-precision repo holds
+    # config and tokenizer only). Loading it on HF needs an AWQ kernel package.
+    Model("qwen2.5-72b-awq", "Qwen/Qwen2.5-72B-Instruct-AWQ", "llama", 80, dtype_control="bfloat16"),
     # Text-only checkpoint of a multimodal-wrapper arch: transformers auto-routes it to the text-only
     # ForCausalLM, but nnsight's LanguageModel refuses the repo by model_type (the guard exempts
     # explicit automodels; see HFBackend).

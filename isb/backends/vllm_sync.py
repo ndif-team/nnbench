@@ -56,6 +56,15 @@ class VLLMSyncBackend(VLLMBackend):
             [prompt], SamplingParams(temperature=0.0, top_p=1, max_tokens=new_tokens),
             use_tqdm=False)
 
+    def vanilla_many(self, model, prompts, *, new_tokens):
+        """`vanilla` over several prompts in one `generate` call, which the engine schedules
+        together (`vllm bench throughput`'s request; design.md §12.17)."""
+        from vllm import SamplingParams
+
+        model.vllm_entrypoint.generate(
+            list(prompts), SamplingParams(temperature=0.0, top_p=1, max_tokens=new_tokens),
+            use_tqdm=False)
+
     def run(self, model, prompts, build):
         """Single synchronous trace; the saved value binds in-frame (the sync engine
         push_variables the worker's saves back into the trace frame). N prompts -> the

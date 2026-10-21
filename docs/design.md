@@ -480,8 +480,10 @@ Subspace addresses remain derived-tier Level-1 citizens (§3.2). See
 - **Interactive probe** — 1 trace, 1 prompt (notebook shape)
 - **Batched analysis** — 1 motif × N prompts (patching/probing over a dataset)
 - **Generation-time intervention** — steering across a multi-token decode (serving shape)
-- **Bulk harvesting** — CACHE-many × large corpus, throughput-bound (SAE data collection)
-- **Multi-tenant / concurrent** — many independent traces vs one engine (nnsight-serve / NDIF)
+- **Bulk harvesting** — CACHE-many × large corpus, throughput-bound (SAE data collection);
+  implemented as the `offline` load pattern (§12.17)
+- **Multi-tenant / concurrent** — many independent traces vs one engine (nnsight-serve / NDIF);
+  implemented as the closed-loop `concurrent` load pattern (§12.17)
 
 Regimes are context (§3.6), not protocol semantics — a regime can change *verdicts* (the batched
 absolute-position model-side law failure, formerly "regime effect"), which is why each regime
@@ -1496,6 +1498,8 @@ keep only those of its cases. Initial suites:
 | `nemotron` | `logit_lens`, `steering`, `ablation` × `nemotron3-nano-4b` (the 30B needs a multi-GPU config) | nnsight HF and vLLM | all |
 | `cross-system` | `logit_lens`, `steering`, `gen_steering`, `activation_patching`, `ablation` × `qwen2.5-7b` | every system (§12.14) | default |
 | `fitted-jlens` | `jacobian_lens` × `qwen3.5-4b` | nnsight HF and vLLM | default |
+| `nnsight-versions` | `logit_lens`, `steering`, `ablation`, `gen_steering`, `activation_patching` × `qwen2.5-7b`, `qwen3-32b` | nnsight 0.8.1 and 0.7 on HF sdpa and the vLLM sync engine; 0.4.6 on HF | default |
+| `nnsight-load-offline`, `nnsight-load-concurrent` | load patterns only (§12.17) × `qwen2.5-7b`, `qwen3-32b` | nnsight 0.8.1 on HF and vLLM (sync; async for concurrent) | default |
 
 `slurm/delta-compare.slurm` calls suites; it does not list cases.
 
@@ -1526,3 +1530,62 @@ citing the old names with their run directories.
 `Workload` and `instantiate` beside `CellConfig` in `isb/sweep/spec.py`; `isb/specs/` is removed.
 Out of scope here: the micro tier, `scripts/perf.py` and `isb/tasks/`, which keep their own entry
 points.
+
+### 12.17 Load patterns: how requests are issued (2026-10-20)
+
+**Problem.** Every timed regime so far is one call repeated. `interactive` is MLPerf's SingleStream
+(one unit per call, the next call after the previous returns); `batched` is `vllm bench latency` or
+MLPerf's MultiStream (one fixed batch, repeated). Neither issues requests the way inference-engine
+benchmarks do, and they are the patterns where a serving engine has least to schedule: a 16-prompt,
+one-token call is a single prefill on either engine (measured 38 ms plain vLLM, 32 ms plain HF on
+Qwen2.5-7B, A100). §5 already listed bulk harvesting and multi-tenant serving as regimes; this
+section adds them as the two standard patterns.
+
+**Patterns.** Two regime kinds, keyed by kind plus setting so a run holds several:
+
+| Regime | Standard counterpart | Issue | Recorded |
+|---|---|---|---|
+| `offline/b<B>`, `offline/all` | MLPerf Offline; `vllm bench throughput` (`LLM.generate(all prompts)`); SGLang `bench_offline_throughput` | `units` units as one sweep, `B` per call (all at once for `all`), calls back to back | units/s over the median pass; pass time (`median_latency_ms`); per-call latency |
+| `concurrent/c<C>` | closed-loop serving: `vllm bench serve --max-concurrency`, SGLang `bench_serving`, AIPerf's concurrency sweep | `units` single-unit calls from `C` clients, each issuing its next as soon as its previous returns | units/s; request latency p50 (`median_latency_ms`), p90, p99, mean |
+
+Open-loop arrivals (MLPerf Server, `--request-rate` Poisson/gamma) are not implemented. The survey
+of how these tools issue requests is `docs/inference-benchmark-survey.md`.
+
+**Derived, not authored.** A load pattern names no data of its own. A suite entry (or `bench run
+--offline UNITS:B,... --concurrent UNITS:C,...`) lists `Offline` / `Concurrent` loads, and
+`instantiate` derives the regimes from the workload's own: offline from its batched regime (cells
+that take several units per call), concurrent from its single-unit interactive, else generation,
+regime (decode length kept). The derived regime reuses the template's data source at the load's
+unit count. A workload without the template reports the load as a skipped row with the reason, so
+workloads are unchanged and existing suites run what they ran. Regimes without load settings
+freeze to the same experiment record as before (`LOAD_FIELDS` are dropped from them), and
+coordinates carry a `load` object only on load regimes.
+
+**Timing.** One untimed warm-up (a full pass offline; one request per client concurrently), then
+`passes` timed sweeps (offline 3, concurrent 1: a sweep of `units` requests is the latency
+sample, as the standard tools run one pass of N ≥ 5C requests). A pass is timed between CUDA syncs,
+a request from issue to return; parameter copies are made before the clock as in §12.13
+(`isb/perf/load.py`). The baseline and the plain system (`vanilla_many` offline, `vanilla` per unit
+concurrently) run under the same pattern, giving `overhead_vs_baseline` and `overhead_vs_vanilla`.
+
+**Concurrency and the serial server.** A backend that declares `concurrent_requests` opens a
+session in which every client submits at once: nnsight's async vLLM backend moves its persistent
+event loop to a thread and schedules each call's coroutine there, so a trace is built and submitted
+before its first await and two traces never interleave on the model's one interleaver (the same
+property nnsight's own server relies on). Any other backend (HF, the sync engine) is driven
+through one lock, which is what a serial server does with concurrent clients: queueing counts toward
+request latency, and the result records `serial: true`. The executor never interleaves calls a
+backend has not declared safe.
+
+**Correctness.** The outputs of the first `score_units` (16) units of the last pass are kept and
+scored; the rest are timed only, since a sweep's full outputs can exceed host memory (an all-layer
+logit lens over 256 prompts is 17 GB). For correctness, an offline cell is scored against the
+reference's per-unit outputs (`offline_perprompt`, recorded once per run like `batched_perprompt`);
+a concurrent cell's calls are single-unit, so it is scored against the reference's same regime.
+Load regimes run no effect guard: the write's non-vacuity is checked in the workload's own regimes.
+
+**Suites.** `nnsight-load-offline` (steering, logit lens, ablation; 256 units, B = 1, 16, 64, all;
+HF against the sync engine) and `nnsight-load-concurrent` (steering, activation patching, steered
+generation; 128 requests, C = 1, 4, 16, 64; HF, the sync engine and the async engine), both on
+nnsight 0.8.1 with HF as the reference. The async engine stays out of offline: its multi-unit calls
+would run on a second, sync engine (§12.14), which does not fit beside a large model.

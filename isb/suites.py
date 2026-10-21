@@ -7,17 +7,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .sweep.spec import Concurrent, Offline
+
 
 @dataclass(frozen=True)
 class Entry:
     """Workloads × models, with optional data settings for this entry: `size` resizes each regime's
     default source (batched regimes stay at most 16), `data` ("source[:n]") rebinds every regime,
-    `regimes` keeps a subset of regime kinds."""
+    `regimes` keeps a subset of regime kinds, `loads` adds load patterns (isb.sweep.spec Offline /
+    Concurrent, design.md §12.17) derived from each workload's own regimes."""
     workloads: tuple
     models: tuple
     size: int | None = None
     data: str | None = None
     regimes: tuple | None = None
+    loads: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -72,11 +76,63 @@ SUITES = {s.name: s for s in (
                     "interp-engine-vllm/default", "transformer-lens-vllm/default",
                     "vllm-plain/0-19-1", "vllm-plain/0-20-2", "vllm-plain/0-28-0"),
           reference="nnsight-hf/default", timeout=3600),
+    # nnsight releases on HF and on vLLM, same rows, batch sizes and precision on both sides: 0.7.0
+    # and 0.8.1 each on HF against vLLM, and 0.4.6 (2025-04-24) against 0.8.1 on HF. HF runs sdpa
+    # attention in bf16; vLLM runs nnsight's documented default, the sync engine, eager. Timings
+    # cover the request only: every engine loads once per job, before warm-up.
+    # Standard request patterns (design.md §12.17) on nnsight 0.8.1, HF against vLLM. Offline is
+    # `vllm bench throughput` / MLPerf Offline: 256 units as one sweep, B per call, B=all handing
+    # vLLM every unit at once (HF pads them into one batch, which may not fit: a finding). The
+    # async engine is left out: its offline calls would run on a second, sync engine (§12.14).
+    Suite("nnsight-load-offline",
+          entries=(Entry(("steering", "logit_lens", "ablation"), ("qwen2.5-7b", "qwen3-32b"),
+                         regimes=("offline",), loads=(Offline(256, (1, 16, 64, None)),)),),
+          backends=("nnsight-hf/sdpa/0-8-1", "nnsight-vllm/sync/0-8-1"),
+          reference="nnsight-hf/sdpa/0-8-1", timeout=7200),
+    # Closed-loop serving (`vllm bench serve --max-concurrency`, AIPerf's concurrency sweep): 128
+    # single-unit requests from C clients. HF and the sync engine take one request at a time (a
+    # serial server); the async engine takes them together.
+    Suite("nnsight-load-concurrent",
+          entries=(Entry(("steering", "activation_patching", "gen_steering"),
+                         ("qwen2.5-7b", "qwen3-32b"), regimes=("concurrent",),
+                         loads=(Concurrent(128, (1, 4, 16, 64)),)),),
+          backends=("nnsight-hf/sdpa/0-8-1", "nnsight-vllm/sync/0-8-1", "nnsight-vllm/0-8-1"),
+          reference="nnsight-hf/sdpa/0-8-1", timeout=7200),
+    Suite("nnsight-versions",
+          entries=(Entry(("logit_lens", "steering", "ablation"), ("qwen2.5-7b", "qwen3-32b"),
+                         size=32),
+                   Entry(("gen_steering", "activation_patching"), ("qwen2.5-7b", "qwen3-32b"),
+                         size=16)),
+          backends=("nnsight-hf/sdpa/0-8-1", "nnsight-vllm/sync/0-8-1",
+                    "nnsight-hf/sdpa/0-7", "nnsight-vllm/sync/0-7",
+                    "nnsight-hf/sdpa/0-4-6", "nnsight-hf/sdpa/0-4-6/era"),
+          reference="nnsight-hf/sdpa/0-8-1", timeout=3600),
     # Qwen3.5-4B with the upstream fitted Jacobian lens (its `jlens` asset).
     Suite("fitted-jlens",
           entries=(Entry(("jacobian_lens",), ("qwen3.5-4b",)),),
           backends=_NNSIGHT, reference="nnsight-hf/default"),
 )}
+
+
+def parse_load(kind: str, text: str):
+    """`UNITS:S[,S...]` -> an Offline (S = units per call, or `all`) or Concurrent (S = clients)."""
+    from .sweep.spec import Concurrent, Offline
+
+    units, separator, settings = text.partition(":")
+    if not units.isdigit() or int(units) < 1 or not separator or not settings:
+        raise ValueError(f"--{kind} takes UNITS:S[,S...] with UNITS positive")
+    values = []
+    for item in settings.split(","):
+        if kind == "offline" and item == "all":
+            values.append(None)
+        elif item.isdigit() and int(item) >= 1:
+            values.append(int(item))
+        else:
+            raise ValueError(f"--{kind} setting {item!r} must be a positive integer"
+                             + (" or 'all'" if kind == "offline" else ""))
+    if kind == "offline":
+        return Offline(int(units), tuple(values))
+    return Concurrent(int(units), tuple(values))
 
 
 def parse_data(text):
@@ -109,7 +165,7 @@ def cases(entries, realizations="default"):
                 try:
                     spec, rows = instantiate(WORKLOADS[workload], model, data=parse_data(entry.data),
                                              size=entry.size, regimes=entry.regimes,
-                                             realizations=realizations)
+                                             realizations=realizations, loads=entry.loads)
                 except NotApplicable as reason:
                     skipped.append({"case": f"{workload}/{model}", "label": "*", "reason": str(reason)})
                     continue

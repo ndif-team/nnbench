@@ -1,0 +1,14 @@
+services:
+  runner:
+    extends: {file: ../../compose.base.yml, service: runner}
+    image: isb-nnsight-hf-0-7:local
+    build:
+      args:
+        NNSIGHT_REF: 884bd1c7b0dbd53be01ade6a18843078d90367b4   # tag v0.7.0
+    environment:
+      ISB_BACKEND: ${ISB_BACKEND:-nnsight-hf/sdpa/0-7}
+      # transformers' default attention (sdpa) in bf16, for timing against vLLM
+      ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","attn_implementation":"sdpa"}'
+volumes:
+  model-cache:
+    name: ${ISB_MODEL_CACHE:-isb-model-cache}

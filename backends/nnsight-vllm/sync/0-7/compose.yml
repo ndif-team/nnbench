@@ -1,0 +1,13 @@
+services:
+  runner:
+    extends: {file: ../../compose.base.yml, service: runner}
+    image: isb-nnsight-vllm-0-7:local
+    build:
+      args:
+        VLLM_IMAGE: vllm/vllm-openai:v0.15.1   # nnsight 0.7's validated vLLM
+        NNSIGHT_REF: 884bd1c7b0dbd53be01ade6a18843078d90367b4   # tag v0.7.0
+    environment:
+      ISB_BACKEND: ${ISB_BACKEND:-nnsight-vllm/sync/0-7}
+volumes:
+  model-cache:
+    name: ${ISB_MODEL_CACHE:-isb-model-cache}

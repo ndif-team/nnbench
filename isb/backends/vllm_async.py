@@ -43,13 +43,16 @@ class VLLMAsyncBackend(VLLMBackend):
         # fraction (e.g. 0.9) just to hold its weights alongside the (max_model_len-capped) KV.
         self.gpu_memory_utilization = gpu_memory_utilization
         self._loop = None
+        self._loop_thread = None         # set while a concurrent session runs the loop
 
     def __getstate__(self):
         # The build closure captures `self.last` (a bound method), so this backend is serialized into
         # the mediator sent to the worker. The persistent event loop is not picklable (it holds a
-        # `_contextvars.Context`) and the worker never needs it — drop it from the pickle.
+        # `_contextvars.Context`) and the worker never needs it — drop it, and the thread a
+        # concurrent session runs it on, from the pickle.
         state = self.__dict__.copy()
         state["_loop"] = None
+        state["_loop_thread"] = None
         return state
 
     def _run_coro(self, coro):
@@ -67,7 +70,38 @@ class VLLMAsyncBackend(VLLMBackend):
 
         if self._loop is None or self._loop.is_closed():
             self._loop = asyncio.new_event_loop()
+        if self._loop_thread is not None:            # a concurrent session: the loop runs there
+            return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
         return contextvars.copy_context().run(self._loop.run_until_complete, coro)
+
+    # Several client threads may submit at once (design.md §12.17): AsyncLLM is a serving engine.
+    concurrent_requests = True
+
+    @contextlib.contextmanager
+    def concurrent_session(self):
+        """Run the persistent loop on its own thread while clients submit from theirs. Each
+        call's coroutine is scheduled from the client thread, so it runs in a copy of that
+        thread's context (as `run_until_complete` above does). A trace's body runs inside its
+        coroutine up to the `with` exit, which submits it before the first await, so two
+        clients' traces never interleave on the model's one interleaver (nnsight's own server
+        relies on the same property, `nnsight/modeling/vllm/serve/server.py`)."""
+        import asyncio
+        import threading
+
+        if self._loop_thread is not None:
+            raise RuntimeError("a concurrent session is already open")
+        if self._loop is None or self._loop.is_closed():
+            self._loop = asyncio.new_event_loop()
+        loop = self._loop
+        thread = threading.Thread(target=loop.run_forever, name="isb-vllm-loop", daemon=True)
+        thread.start()
+        self._loop_thread = thread
+        try:
+            yield
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join()
+            self._loop_thread = None
 
     def load(self, repo: str, gpu_memory_utilization: float | None = None):
         from nnsight.modeling.vllm import VLLM
@@ -366,6 +400,24 @@ class VLLMAsyncBackend(VLLMBackend):
         async def _go():
             async for _ in model.vllm_entrypoint.generate(prompt, params, uuid.uuid4().hex):
                 pass
+
+        self._run_coro(_go())
+
+    def vanilla_many(self, model, prompts, *, new_tokens):
+        """`vanilla` over several prompts submitted together, which the engine batches."""
+        import asyncio
+        import uuid
+
+        from vllm import SamplingParams
+
+        params = SamplingParams(temperature=0.0, top_p=1, max_tokens=new_tokens)
+
+        async def one(prompt):
+            async for _ in model.vllm_entrypoint.generate(prompt, params, uuid.uuid4().hex):
+                pass
+
+        async def _go():
+            await asyncio.gather(*(one(p) for p in prompts))
 
         self._run_coro(_go())
 

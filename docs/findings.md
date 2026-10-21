@@ -918,3 +918,60 @@ vLLM-Lens general cells in the same job) and `runs/micro-delta/perf/delta_perf_v
   forward (`p[cache_key][layer][tensor_key][0]`): decode steps are captured on the GPU, then silently
   dropped from what the caller receives (batch-4 decode bytes equal batch-4 prefill bytes). The
   second is a silent data loss in vLLM-Hook's batched rpc path.
+
+## Client tier — nnsight 0.4.6 / 0.7.0 / 0.8.1 on HF and vLLM, and the per-invoke serialization cost (2026-10-20)
+
+Suite `nnsight-versions` (`isb/suites.py`): HF sdpa bf16 and vLLM's sync engine (eager, prefix
+caching off) at each release, nnsight 0.4.6 (2025-04-24) on HF on the current stack and on its own
+(torch 2.6, transformers 4.51), HF 0.8.1 the reference. Qwen2.5-7B-Instruct on an A100-40GB,
+Qwen3-32B on an H200. Runs `runs/nnsight-versions-perf/20261020T195742Z-b61d9448` (7B),
+`…195848Z-6eefb2f4` (32B), `…205318Z-4be797a1` / `…205620Z-0dd7f6d9` (0.4.6 beside 0.8.1),
+`…212148Z-a142c1a4` / `…212452Z-35654681` (two cases rerun after a source-change guard rejected
+them); page `nnsight-versions-perf.html`. Medians of 7 warm calls; engine load excluded.
+
+- **Every cell ran; nothing scored worse than NUMERICAL_MISMATCH.** vLLM drifts on two of four
+  steered-generation rows (top-1 0.67–0.96), bf16 decode divergence. Interactive ablation is
+  INVALID_REFERENCE on every backend: on the timed prompt the reference's own ablation barely moves
+  the output, so the effect guard rejects the reference.
+- **One prompt per call: HF ≤ vLLM at each release** (7B steering 28.5 vs 33.4 ms at 0.8.1, 34.9 vs
+  38.6 at 0.7). **Generation: vLLM 20–30% faster** (7B, 8 steered tokens: 162 vs 209 ms).
+  **Batch of 16: HF 4–8× faster** (7B steering 35–40 vs 191 ms at 0.8.1, 358 ms at 0.7); see below.
+- **0.4.6 vs 0.8.1 on HF:** 0.8.1 is 1.3–1.6× faster on single-prompt calls (7B steering 28.5 vs
+  46.3 ms) and within 5–30% on batches and generation; 0.4.6's own stack is another 5–10% slower.
+  Outputs match 0.8.1 at the reference's precision on the current stack. 0.4.6 opens `nnsight.log`
+  in its package directory at import, which fails in a read-only image; `backends/nnsight-hf/Dockerfile`
+  points the file at /tmp.
+- **The largest cached checkpoint, Qwen2.5-72B-Instruct-AWQ (4-bit), loads on vLLM 0.8.1 only.**
+  HF needs `gptqmodel` (transformers 5) or `autoawq` (4.51), absent from the images; vLLM 0.15.1
+  (nnsight 0.7) fails in AWQ-Marlin weight setup on a meta-device tensor. The shared cache
+  (`/work/nvme/bdnh/shared/hf_cache/hub`) also holds Llama-3.1-405B and Qwen2.5-72B in bf16; neither
+  fits one GPU, and the backends take no multi-GPU settings yet.
+
+### vLLM's batch cost is nnsight serializing every invoke with the whole envoy tree
+
+`slurm/diag_batch.py`, `diag_cost.py`, `diag_hf_invokes.py`; `runs/nnsight-versions-diag/{batch,cost,byref}`.
+Qwen2.5-7B, A100, nnsight 0.8.1 / vLLM 0.27.1, 16 CounterFact prompts, one invoke each saving
+last-token logits; medians of 10, no profiler unless noted.
+
+- **Plain vLLM is not slow:** 16 prompts, one token, 38.9 ms (HF plain 31.9 ms); an empty
+  16-invoke trace adds 4 ms. Saving per invoke takes it to 165–170 ms (0.7: 602 ms).
+- **Client side, about 90 ms:** `VLLM._attach_mediators` pickles each invoke's mediator into its
+  request's `extra_args` (`modeling/vllm/vllm.py:1067`), 45 KB and 5.7 ms each. The body
+  references `model`, so the pickle carries all 317 envoys of the tree; torch modules travel as
+  persistent ids (`envoy.py:331`) but each envoy's state is serialized.
+- **Engine side, about 35 ms over plain** (split with the engine in-process): unpickling 16.4 ms
+  (`GPUModelRunner.py:224`, one `loads` per request rebuilding the tree), saves pickled back 5 ms,
+  hooks 2.5 ms; the rest is the 730 KB moved to the engine process.
+- **HF pays none of it:** 16 invokes cost 39.0 ms against 35.0 ms for one invoke over the 16 prompts.
+- **Prototype, envoys by reference** (`slurm/patches/envoy_byref`, persistent id `Envoy:<path>`
+  resolved to the receiver's envoy at that path): payload 45 KB → 325 B; 16 invokes 165 → 60 ms in
+  vLLM's own process layout (4 invokes 68 → 27 ms). In-process A/B logits are bit-identical; across
+  two engine launches they agree on top-1 everywhere with TV ≤ 0.028 (bf16 drift; launch-to-launch
+  noise not separately measured). Untested where client and engine envoy state can differ
+  (`model.edit`, client-side aliases) and on NDIF's remote path.
+- **Where it applies:** local vLLM pickles per invoke; nnsight's vLLM server (`serve/server.py:177`)
+  rebuilds the tracer once and then calls the same `_attach_mediators`, so a served vLLM model pays
+  it per invoke on the server, synchronously before the request's first await, blocking admission of
+  other requests meanwhile. The remote request itself (`RequestModel.serialize`) pickles once per
+  trace. Whether NDIF's production vLLM path goes through `_attach_mediators` is unchecked.
+- **Upstream finding (nnsight), not a cell fix.**

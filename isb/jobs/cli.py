@@ -28,9 +28,11 @@ def _positive(value):
 def _recipe(args):
     """The suite (or ad-hoc combination) the run executes, with command-line overrides applied.
     Returns (suite name or None, entries, settings)."""
-    from isb.suites import SUITES, Entry, parse_data
+    from isb.suites import SUITES, Entry, parse_data, parse_load
 
     parse_data(args.data)                            # fail on a malformed source early
+    loads = tuple(parse_load(kind, text) for kind in ("offline", "concurrent")
+                  for text in getattr(args, kind) or ())
 
     if args.suite:
         if args.suite not in SUITES:
@@ -42,7 +44,8 @@ def _recipe(args):
         # --workload/--model with a suite keep only those of its cases
         entries = [Entry(tuple(w for w in e.workloads if not args.workload or w in args.workload),
                          tuple(m for m in e.models if not args.model or m in args.model),
-                         size=e.size, data=e.data, regimes=e.regimes) for e in suite.entries]
+                         size=e.size, data=e.data, regimes=e.regimes, loads=e.loads)
+                   for e in suite.entries]
         entries = [e for e in entries if e.workloads and e.models]
         if not entries:
             raise ValueError(f"suite {args.suite!r} has no case among the selected workloads/models")
@@ -57,9 +60,10 @@ def _recipe(args):
             settings[key] = getattr(args, key)
     if not settings["backends"]:
         raise ValueError("select --backends")
-    if args.data or args.regimes:
+    if args.data or args.regimes or loads:
         entries = [Entry(e.workloads, e.models, size=e.size, data=args.data or e.data,
-                         regimes=tuple(args.regimes) if args.regimes else e.regimes) for e in entries]
+                         regimes=tuple(args.regimes) if args.regimes else e.regimes,
+                         loads=loads or e.loads) for e in entries]
     return args.suite, entries, settings
 
 
@@ -79,8 +83,16 @@ def parser():
     run.add_argument("--workload", nargs="+", help="workload names (isb/workloads/)")
     run.add_argument("--model", nargs="+", help="model keys (isb/models.py)")
     run.add_argument("--data", help="SOURCE[:N]: rebind every regime to a registered data source")
-    run.add_argument("--regimes", nargs="+", choices=["interactive", "batched", "generation"],
+    run.add_argument("--regimes", nargs="+",
+                     choices=["interactive", "batched", "generation", "offline", "concurrent"],
                      help="keep only these regime kinds")
+    run.add_argument("--offline", action="append", metavar="UNITS:B[,B...]",
+                     help="add the offline load pattern (design.md §12.17): UNITS units of each "
+                          "workload's batched data, B units per call (or 'all'); replaces the "
+                          "suite's load patterns")
+    run.add_argument("--concurrent", action="append", metavar="UNITS:C[,C...]",
+                     help="add the closed-loop concurrent load pattern: UNITS single-unit requests "
+                          "from C clients; replaces the suite's load patterns")
     run.add_argument("--realizations", choices=["default", "all"],
                      help="each system's documented realization only, or also every alternative its "
                           "cells declare (ad-hoc default: all)")
