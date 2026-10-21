@@ -17,6 +17,7 @@ compares, so results can be re-scored, cross-compared, and audited without re-ru
 """
 from __future__ import annotations
 
+import contextlib
 import inspect
 import traceback
 from copy import deepcopy
@@ -28,6 +29,7 @@ from ..perf.timing import time_cell
 from ..runfile import save_run
 from ..runs import RunConfig, cell_interface, make_backend, resolve_provenance, spec_coordinates
 from ..sweep.guards import compute_effect_size
+from ..sweep.spec import LOAD_KINDS
 
 
 # ---- cell-call helpers (shared with tests; formerly the sweep driver's) -----------------------
@@ -117,10 +119,10 @@ def _success(record):
 
 def _task_params(regime, params):
     """Per-call cell params = dataset knobs (per-source defaults, e.g. the upstream readout-position
-    rule) UNDER the task's explicit params (a task param always wins), plus the generation regime's
-    decode-step count from the ExecutionRegime (the regime axis lives there, not in every task dict)."""
+    rule) UNDER the task's explicit params (a task param always wins), plus the regime's decode-step
+    count when it has one (the regime axis lives there, not in every task dict)."""
     merged = {**regime.data_knobs, **params} if regime.data_knobs else params
-    if regime.kind == "generation":
+    if regime.new_tokens > 0:              # generation, or a load pattern derived from it
         return {**merged, "new_tokens": regime.new_tokens}
     return merged
 
@@ -187,6 +189,148 @@ def _time_vanilla(spec, regime, be, model, timed_prompts, record):
         return None
     record.update(median_latency_ms=timing.median_ms, std_latency_ms=timing.std_ms, error=None)
     return timing
+
+
+# ---- load patterns (design.md §12.17) ---------------------------------------------------------
+
+def _stack(mats):
+    """Per-unit outputs -> one tensor, the same concat rule as `_per_prompt_stack`."""
+    import torch
+
+    mats = [m for m in mats if m is not None]
+    if not mats:
+        return None
+    return torch.cat(mats, dim=-2) if mats[0].dim() >= 2 else torch.stack(mats)
+
+
+def _first_units(tensor, keep):
+    """The first `keep` units of a stacked output (units run along dim -2, or dim 0 for 1-D rows)."""
+    if tensor is None:
+        return None
+    return tensor.narrow(-2 if tensor.dim() >= 2 else 0, 0, keep)
+
+
+@contextlib.contextmanager
+def _concurrency(be, regime):
+    """Whether a concurrent regime's requests run together on this backend: a backend that
+    declares `concurrent_requests` opens its session for them (the async vLLM engine moves its
+    event loop to a thread every client submits to); any other backend is driven serially."""
+    together = regime.concurrency > 1 and getattr(be, "concurrent_requests", False)
+    if not together:
+        yield False
+        return
+    with be.concurrent_session():
+        yield True
+
+
+def _run_load(regime, prepare_units, be):
+    """Drive one bound call under `regime`'s load pattern. `prepare_units(units)` returns a fresh
+    zero-argument call over that unit list. Returns (LoadResult, scored output): the stacked
+    output of the first `score_units` units of the last pass."""
+    from ..perf.load import run_concurrent, run_offline
+
+    keep = min(regime.score_units, len(regime.prompts))
+    if regime.kind == "offline":
+        size = regime.batch_size or len(regime.prompts)
+        chunks = [regime.prompts[i:i + size] for i in range(0, len(regime.prompts), size)]
+        result, outs = run_offline(prepare_units, chunks, passes=regime.passes, keep=keep)
+        return result, _first_units(_stack([outs[i] for i in sorted(outs)]), keep)
+    with _concurrency(be, regime) as together:
+        result, outs = run_concurrent(lambda unit: prepare_units(_unit(unit)), regime.prompts,
+                                      concurrency=regime.concurrency, passes=regime.passes,
+                                      keep=keep, serial=not together)
+    return result, _stack([outs[i] for i in sorted(outs)])
+
+
+def _load_record(regime, result):
+    """A load-pattern record's timing: `median_latency_ms` is the median time of a whole offline
+    pass, or the median request latency under concurrency; `throughput` is units/s either way."""
+    latency = result.median_pass_ms if regime.kind == "offline" else result.percentile(50)
+    return {"median_latency_ms": latency, "std_latency_ms": None, "peak_mem_mb": result.peak_mem_mb,
+            "throughput": result.throughput, "load": result.summary()}
+
+
+def _time_vanilla_load(regime, be, model, record):
+    """The plain system under the same load pattern: offline sends each chunk as one plain
+    request (`vanilla_many`), concurrent sends each unit's plain request from the same clients."""
+    first = (lambda unit: unit[0] if isinstance(unit, tuple) else unit)
+    new_tokens = regime.new_tokens or 1
+    record["new_tokens"] = new_tokens
+    if regime.kind == "offline":
+        many = getattr(be, "vanilla_many", None)
+        if many is None:
+            record["unavailable"] = f"{getattr(be, 'name', 'backend')} has no plain multi-prompt request"
+            return None
+
+        def prepare(units):
+            return lambda: many(model, [first(u) for u in units], new_tokens=new_tokens)
+    else:
+        def prepare(units):
+            return lambda: be.vanilla(model, first(units[0]), new_tokens=new_tokens)
+    try:
+        result, _ = _run_load(regime, prepare, be)
+    except NotImplementedError as error:
+        record.update(unavailable=str(error), error=None)
+        return None
+    except Exception as error:
+        _failure(record, error)
+        return None
+    record.update(_load_record(regime, result), error=None)
+    return result
+
+
+def _execute_load(spec, regime, iface, r_iface, be, model, meta, outputs):
+    """One load-pattern regime (design.md §12.17): the baseline, the plain system and every case
+    under the same pattern, each recorded like a regime cell. An offline regime also records the
+    per-unit outputs of its scored units once (`offline_perprompt`), the reference an offline
+    candidate is scored against; a concurrent regime's calls are single-unit already."""
+    name = regime.name
+
+    def bound(params, record):
+        call = _bind_case(spec, r_iface, _task_params(regime, params), record)
+        return call, (lambda units: call.prepare(be, model, units))
+
+    base = None
+    baseline = meta[("__baseline__", name)] = {}
+    try:
+        _, prepare = bound(spec.baseline.params, baseline)
+        base, _ = _run_load(regime, prepare, be)
+        baseline.update(_load_record(regime, base))
+        _success(baseline)
+    except Exception as e:
+        _failure(baseline, e)
+    plain = _time_vanilla_load(regime, be, model, meta.setdefault(("__vanilla__", name), {}))
+
+    for label, params, alternative in _cases(spec, iface):
+        key = (name, label)
+        case = meta[key] = dict(deepcopy(alternative) or {})
+        try:
+            _, prepare = bound(params, case)
+            result, scored = _run_load(regime, prepare, be)
+            outputs[key] = scored
+            latency = _load_record(regime, result)
+            case.update(latency)
+            case.update({
+                "overhead_vs_baseline": latency["median_latency_ms"] / _load_record(regime, base)["median_latency_ms"]
+                if base else None,
+                "overhead_vs_vanilla": latency["median_latency_ms"] / _load_record(regime, plain)["median_latency_ms"]
+                if plain else None,
+            })
+            _success(case)
+        except Exception as e:              # isolated: engine survives, later cells run
+            _failure(case, e)
+
+    if regime.kind == "offline" and not any(k[0] == "offline_perprompt" for k in meta):
+        keep = min(regime.score_units, len(regime.prompts))
+        for task in spec.tasks:
+            key = ("offline_perprompt", task.label)
+            record = meta[key] = {}
+            try:
+                call, _ = bound(task.params, record)
+                outputs[key] = _per_prompt_stack(call, be, model, regime.prompts[:keep])
+                _success(record)
+            except Exception as e:
+                _failure(record, e)
 
 
 def _load_sync_twin(be, repo):
@@ -286,7 +430,7 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
             # Everything else in the loop (interactive/generation cells, effect guard)
             # keeps the run's own backend.
             r_iface, r_be, r_model = iface, be, model
-            if regime.kind == "batched" and iface == "vllm_async":
+            if regime.kind in ("batched", "offline") and iface == "vllm_async":
                 if twin is None:
                     try:
                         twin = _load_sync_twin(be, spec.repo)
@@ -295,6 +439,10 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
                 if twin is not None:
                     r_iface, (r_be, r_model) = "vllm_sync", twin
                     prov["coordinates"]["batched_interface"] = r_iface
+
+            if regime.kind in LOAD_KINDS:
+                _execute_load(spec, regime, iface, r_iface, r_be, r_model, meta, outputs)
+                continue
 
             timed_prompts = ([regime.prompts[0]] if regime.aggregate
                              else regime.prompts)

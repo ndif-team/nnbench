@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 
 from .contract import PLAN_VERSION, read_experiment, unpack, validate_result, write_json
+from isb.sweep.spec import reference_key
 from isb.validation import POLICY_VERSION, performance_eligible
 
 
@@ -125,8 +126,7 @@ def score_experiment(directory, backends, reference=None, comparison="correctnes
             else:
                 # An alternative realization is scored against the reference's default for its row.
                 row_label = cell.get("row", cell["label"])
-                refkey = (("batched_perprompt", row_label) if key[0] == "batched"
-                          and comparison == "correctness" else (key[0], row_label))
+                refkey = reference_key(key[0], row_label, comparison)
                 expected = ref[1]["outputs"].get(refkey)
                 actual = artifact["outputs"].get(key)
                 effect = ref[1]["outputs"].get(("__meta__",), {}).get(("__effect__", key[0]))

@@ -31,6 +31,8 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from importlib import metadata
 
+from .sweep.spec import LOAD_FIELDS, LOAD_KINDS, regime_name
+
 
 @dataclass(frozen=True)
 class EngineConfig:
@@ -266,9 +268,13 @@ def _validate_coordinates(c):
                 or type(regime["aggregate"]) is not bool or not isinstance(regime["data_knobs"], dict)
                 or regime["data"] is not None and not isinstance(regime["data"], str)):
             raise ValueError("invalid coordinate regime settings")
-        if complete and (regime["kind"] in kinds or regime["kind"] == "generation" and regime["new_tokens"] == 0):
+        load = regime.get("load")
+        if load is not None and (not isinstance(load, dict) or set(load) != set(LOAD_FIELDS)):
+            raise ValueError("invalid coordinate load settings")
+        name = regime_name(regime["kind"], (load or {}).get("batch_size"), (load or {}).get("concurrency", 0))
+        if complete and (name in kinds or regime["kind"] == "generation" and regime["new_tokens"] == 0):
             raise ValueError("duplicate regime or missing generation length")
-        kinds.add(regime["kind"])
+        kinds.add(name)
     for case in c["cases"]:
         if (not isinstance(case, dict) or not isinstance(case.get("label"), str) or not case["label"]
                 or not isinstance(case.get("params"), dict)):
@@ -309,7 +315,10 @@ def run_coordinates(*, spec: str, methodology: str, family: str, repo: str, inte
     meta, next to its timing."""
     regimes = [{"kind": r["kind"], "units": r["units"], "data": r.get("data"),
                 "new_tokens": r.get("new_tokens", 0), "aggregate": r.get("aggregate", True),
-                "data_knobs": dict(r.get("data_knobs") or {})} for r in regimes]
+                "data_knobs": dict(r.get("data_knobs") or {}),
+                # a load pattern's settings (design.md §12.17); other regimes carry none
+                **({"load": dict(r["load"])} if r.get("load") is not None else {})}
+               for r in regimes]
     coordinates = deepcopy({
         "schema": COORDINATES_SCHEMA,
         "spec": spec, "methodology": methodology, "family": family, "repo": repo,
@@ -339,7 +348,9 @@ def spec_coordinates(spec, interface: str, *, inputs_sha256=None, config=None) -
         spec=spec.name, methodology=spec.methodology, family=spec.family, repo=spec.repo,
         interface=interface,
         regimes=[{"kind": r.kind, "units": len(r.prompts), "data": r.data_name,
-                  "new_tokens": r.new_tokens, "aggregate": r.aggregate, "data_knobs": r.data_knobs}
+                  "new_tokens": r.new_tokens, "aggregate": r.aggregate, "data_knobs": r.data_knobs,
+                  **({"load": {k: getattr(r, k) for k in LOAD_FIELDS}} if r.kind in LOAD_KINDS
+                     else {})}
                  for r in spec.regimes],
         cases=[{"label": t.label, "params": t.params} for t in spec.tasks],
         protocol=spec.protocol.coordinate() if spec.protocol is not None else None,
@@ -363,7 +374,8 @@ def procedure(coordinates: dict) -> tuple | None:
         return None
     identity = {"inputs_sha256": c["inputs_sha256"], "data": c["data"],
                 "config": {key: c["config"][key] for key in _COMPARISON_CONFIG_FIELDS},
-                "regimes": [{k: r[k] for k in ("kind", "units", "data", "new_tokens", "aggregate", "data_knobs")}
+                "regimes": [{k: r[k] for k in ("kind", "units", "data", "new_tokens", "aggregate", "data_knobs", "load")
+                             if k in r}
                             for r in c["regimes"]],
                 "cases": [{"label": case["label"], "params": case["params"]} for case in c["cases"]]}
     return (c["spec"], c["methodology"], c["family"], c["repo"], canonical(pack(identity)))

@@ -8,6 +8,7 @@ case and the params its cell receives.
 """
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Optional
@@ -39,6 +40,14 @@ class ExecutionRegime:
                               # maps).
     data_knobs: dict = field(default_factory=dict)
     data_name: str | None = None
+    # Load patterns (design.md §12.17). offline: the units issued as one sweep, `batch_size` units
+    # per call (None = every unit in one call). concurrent: `concurrency` clients each issuing one
+    # unit per call until the units run out. Both keep the outputs of the first `score_units`
+    # units for scoring; the rest are timed only.
+    batch_size: int | None = None
+    concurrency: int = 0
+    score_units: int = 16
+    passes: int = 1           # load patterns: timed sweeps over all units, after one warm-up
 
     def __post_init__(self):
         from ..data import DataRef, load_data
@@ -50,10 +59,63 @@ class ExecutionRegime:
             self.data_name = ref.name
         if self.kind == "generation" and self.new_tokens <= 0:
             raise ValueError("generation regime needs new_tokens>0")
-        if self.kind not in ("interactive", "batched", "generation"):
-            raise ValueError(f"execution regime {self.kind!r} not implemented in v1")
-        if self.aggregate and self.kind == "batched":
-            self.aggregate = False    # batched runs ONE padded trace by definition; never per-prompt
+        if self.kind not in REGIME_KINDS:
+            raise ValueError(f"execution regime {self.kind!r} not implemented")
+        if self.aggregate and self.kind in ("batched", "offline"):
+            self.aggregate = False    # one call consumes several units; never per-prompt
+        if self.kind == "offline" and self.batch_size is not None and self.batch_size < 1:
+            raise ValueError("offline batch_size must be positive, or None for every unit at once")
+        if self.kind == "concurrent" and self.concurrency < 1:
+            raise ValueError("concurrent regime needs concurrency>=1")
+        if self.kind in ("offline", "concurrent") and (self.score_units < 1 or self.passes < 1):
+            raise ValueError("score_units and passes must be positive")
+
+    @property
+    def name(self) -> str:
+        """The regime's key in outputs and records (see `regime_name`)."""
+        return regime_name(self.kind, self.batch_size, self.concurrency)
+
+
+REGIME_KINDS = ("interactive", "batched", "generation", "offline", "concurrent")
+LOAD_KINDS = ("offline", "concurrent")
+# ExecutionRegime fields only the load patterns use; other regimes' records leave them out, so
+# their experiment identity is unchanged by the load patterns' existence.
+LOAD_FIELDS = ("batch_size", "concurrency", "score_units", "passes")
+_LOAD_NAME = re.compile(r"(offline/(all|b[1-9][0-9]*)|concurrent/c[1-9][0-9]*)")
+
+
+def regime_name(kind: str, batch_size: int | None = None, concurrency: int = 0) -> str:
+    """A regime's key: its kind, plus the load setting for a load pattern, so one run can hold
+    several (`offline/b16`, `offline/all`, `concurrent/c4`; design.md §12.17)."""
+    if kind == "offline":
+        return f"offline/{'all' if batch_size is None else f'b{batch_size}'}"
+    if kind == "concurrent":
+        return f"concurrent/c{concurrency}"
+    return kind
+
+
+def is_load_regime(name) -> bool:
+    """Whether a regime key (ExecutionRegime.name) names a load pattern."""
+    return isinstance(name, str) and _LOAD_NAME.fullmatch(name) is not None
+
+
+def scored_regime(name) -> bool:
+    """Whether an output/record key's first element names a scored regime."""
+    return isinstance(name, str) and (name in ("interactive", "batched", "generation")
+                                      or is_load_regime(name))
+
+
+def reference_key(name: str, row: str, comparison: str = "correctness") -> tuple:
+    """The reference output a candidate cell `(name, row)` is scored against. For correctness, a
+    call that consumed several units at once (batched, offline) is scored against the reference's
+    per-unit outputs, never its own multi-unit batch (left padding is part of what is checked);
+    everything else, and every equivalence comparison, against the same regime's output."""
+    if comparison == "correctness":
+        if name == "batched":
+            return ("batched_perprompt", row)
+        if name.startswith("offline/"):
+            return ("offline_perprompt", row)
+    return (name, row)
 
 
 @dataclass
@@ -166,6 +228,12 @@ def spec_with_data(spec: CellConfig, ref) -> CellConfig:
         if w.kind == "batched":
             rebound.append(ExecutionRegime("batched", units[:16],
                                            data_knobs=dict(knobs), data_name=ref.name))
+        elif w.kind in ("offline", "concurrent"):     # a load pattern keeps its unit count
+            rebound.append(ExecutionRegime(w.kind, list(units[:len(w.prompts)]),
+                                           new_tokens=w.new_tokens, aggregate=w.aggregate,
+                                           data_knobs=dict(knobs), data_name=ref.name,
+                                           batch_size=w.batch_size, concurrency=w.concurrency,
+                                           score_units=w.score_units, passes=w.passes))
         else:
             rebound.append(ExecutionRegime(w.kind, list(units), new_tokens=w.new_tokens,
                                            aggregate=w.aggregate,
@@ -213,6 +281,27 @@ class Regime:
     data: object
     new_tokens: int = 0
     aggregate: bool = True
+
+
+@dataclass(frozen=True)
+class Offline:
+    """MLPerf Offline / `vllm bench throughput` (design.md §12.17): `units` units of the workload's
+    batched regime's data issued as one sweep, `batch_size` units per call (None = every unit in
+    one call, the engine schedules them). One regime per entry of `batch_sizes`."""
+    units: int
+    batch_sizes: tuple = (None,)
+    passes: int = 3
+
+
+@dataclass(frozen=True)
+class Concurrent:
+    """Closed-loop serving (`vllm bench serve --max-concurrency`, AIPerf's concurrency sweep;
+    design.md §12.17): `units` units of the workload's single-unit regime (interactive, else
+    generation), with `c` clients each issuing one unit per call until none are left. One regime
+    per entry of `concurrency`."""
+    units: int
+    concurrency: tuple = (1,)
+    passes: int = 1           # one sweep of `units` requests gives the latency distribution
 
 
 @dataclass(frozen=True)
@@ -306,11 +395,43 @@ def _regime(template, data=None, size=None):
                            aggregate=template.aggregate)
 
 
+def _resized(data, units):
+    from ..data import DataRef
+
+    return DataRef(data.name, units) if isinstance(data, DataRef) else list(data)[:units]
+
+
+def _load_regimes(workload: Workload, load):
+    """The regimes a load pattern derives from `workload`'s own regimes, or the reason it has none.
+    Offline needs a batched regime (cells that take several units per call); concurrent needs a
+    single-unit regime (interactive, else generation). The derived regime keeps the template's data
+    source, resized to the load's unit count, and its decode length."""
+    if isinstance(load, Offline):
+        template = next((r for r in workload.regimes if r.kind == "batched"), None)
+        if template is None:
+            return [], "offline needs a batched regime (this workload's cells take one unit per call)"
+        return [ExecutionRegime("offline", _resized(template.data, load.units), batch_size=b,
+                                passes=load.passes)
+                for b in load.batch_sizes], None
+    if isinstance(load, Concurrent):
+        template = next((r for kind in ("interactive", "generation") for r in workload.regimes
+                         if r.kind == kind and r.aggregate), None)
+        if template is None:
+            return [], "concurrent needs a single-unit interactive or generation regime"
+        return [ExecutionRegime("concurrent", _resized(template.data, load.units),
+                                new_tokens=template.new_tokens, concurrency=c,
+                                passes=load.passes)
+                for c in load.concurrency], None
+    raise TypeError(f"unknown load pattern {load!r}")
+
+
 def instantiate(workload: Workload, model, *, data=None, size=None, regimes=None,
-                realizations="default", warmup=None, n_trials=None):
+                realizations="default", warmup=None, n_trials=None, loads=()):
     """Resolve `workload` on `model` (an isb.models.Model or its key). Returns the CellConfig and
     the rows the model cannot express, as [{"label", "reason"}]. `data` (a DataRef) rebinds every
-    regime's source, `size` resizes each regime's default source, `regimes` keeps a subset of kinds."""
+    regime's source, `size` resizes each regime's default source, `regimes` keeps a subset of kinds,
+    and `loads` (Offline / Concurrent) adds the load-pattern regimes derived from the workload's
+    own (design.md §12.17); a load the workload cannot take is reported as a skipped row."""
     from ..models import MODELS
 
     if isinstance(model, str):
@@ -339,13 +460,18 @@ def instantiate(workload: Workload, model, *, data=None, size=None, regimes=None
             break
         else:
             raise NotApplicable(f"{model.key} can express no effect check of {workload.name!r}")
-    kept = [r for r in workload.regimes if regimes is None or r.kind in regimes]
+    kept = [_regime(r, None, size) for r in workload.regimes if regimes is None or r.kind in regimes]
+    for load in loads:
+        derived, reason = _load_regimes(workload, load)
+        if reason is not None:
+            skipped.append({"label": f"[{type(load).__name__.lower()} load]", "reason": reason})
+        kept += [r for r in derived if regimes is None or r.kind in regimes]
     if not kept:
         raise ValueError(f"workload {workload.name!r} has none of the regimes {sorted(regimes)}")
     spec = CellConfig(
         name=f"{workload.name}/{model.key}", methodology=workload.methodology,
         family=model.family, repo=model.repo,
-        regimes=[_regime(r, None, size) for r in kept],
+        regimes=kept,
         tasks=tasks, baseline=BaselineSpec(_bind(workload.baseline, (), model)), effect=effect,
         dtype_control=model.dtype_control,
         warmup=workload.warmup if warmup is None else warmup,

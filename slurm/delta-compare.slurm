@@ -13,6 +13,10 @@
 #   perf-read         the perf read cells again (plans/delta_perf_read_*.json)
 #   vllm-hook         IBM vLLM-Hook (built-in workers, rpc and disk-st-async storage) through every
 #                     comparison workload beside nnsight and vLLM-Lens, then its perf microbenchmark cells
+#   versions-perf MODEL  suite nnsight-versions on one model (submit on gpuH200x8)
+#   versions-fill MODEL WORKLOAD BACKEND...  one workload again, beside the HF 0.8.1 reference
+#   load SUITE MODEL  a load-pattern suite (nnsight-load-offline | nnsight-load-concurrent)
+#   versions-awq      whether each nnsight-versions backend loads Qwen2.5-72B-Instruct-AWQ
 #   optimal WORKLOAD ... each system's general cells beside its fastest documented realization
 #                     (the */opt configs, nnsight-vllm/opt/taps, interp-engine-vllm/static), plain vLLM
 #                     eager and compiled per version, scored vs HF fp32
@@ -149,6 +153,84 @@ overhead)
     done
     exit $rc
     ;;
+diag-batch)
+    # Batch-size scaling of nnsight's sync vLLM engine (slurm/diag_batch.py) in each image named.
+    # Usage: sbatch slurm/delta-compare.slurm diag-batch IMAGE [...]
+    shift
+    out=runs/nnsight-versions-diag/batch
+    mkdir -p $out
+    inputs=$(ls runs/nnsight-versions-perf/*/experiments/*/inputs.jsonl | xargs grep -l '"unit":"The mother tongue of Danielle' | head -1)
+    cp "$inputs" $out/inputs.jsonl
+    rc=0
+    for img in "$@"; do
+        echo "### $(date -Is) diag-batch $img"
+        timeout 1800 apptainer exec --nv --cleanenv --no-home --pwd /workspace \
+            --bind $PWD:/workspace:ro --bind $PWD/$out:/out \
+            --bind $ISB_APPTAINER_DIR/volumes/isb-model-cache:/models \
+            --env PYTHONPATH=/workspace,PYTHONDONTWRITEBYTECODE=1,USER=isb,HF_HOME=/models,HF_HUB_CACHE=/models/hub \
+            --env HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1,XDG_CACHE_HOME=/tmp/cache,VLLM_CACHE_ROOT=/tmp/vllm \
+            --env TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor,TRITON_CACHE_DIR=/tmp/triton \
+            --env FLASHINFER_WORKSPACE_BASE=/tmp,CUDA_VISIBLE_DEVICES=0 \
+            .apptainer/images/isb-${img}_local.sif python3 slurm/diag_batch.py /out/inputs.jsonl /out/$img.json \
+            > $out/$img.log 2>&1 || { echo "diag-batch $img failed rc=$?"; rc=1; }
+        sleep 20
+    done
+    exit $rc
+    ;;
+diag-cost)
+    # Client vs engine cost of a 16-invoke trace (slurm/diag_cost.py: vLLM's own process layout,
+    # then the engine in-process with engine-side timers, a profile and the envoy-by-reference
+    # prototype), and the same trace shapes on HF (slurm/diag_hf_invokes.py), all on nnsight 0.8.1.
+    shift
+    out=runs/nnsight-versions-diag/cost
+    mkdir -p $out
+    cp runs/nnsight-versions-diag/batch/inputs.jsonl $out/inputs.jsonl
+    rc=0
+    run_in() {  # IMAGE LOG ARGS...
+        local img=$1 log=$2; shift 2
+        echo "### $(date -Is) diag-cost $img $*"
+        timeout 1800 apptainer exec --nv --cleanenv --no-home --pwd /workspace \
+            --bind $PWD:/workspace:ro --bind $PWD/$out:/out \
+            --bind $ISB_APPTAINER_DIR/volumes/isb-model-cache:/models \
+            --env PYTHONPATH=/workspace,PYTHONDONTWRITEBYTECODE=1,USER=isb,HF_HOME=/models,HF_HUB_CACHE=/models/hub \
+            --env HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1,XDG_CACHE_HOME=/tmp/cache,VLLM_CACHE_ROOT=/tmp/vllm \
+            --env TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor,TRITON_CACHE_DIR=/tmp/triton \
+            --env FLASHINFER_WORKSPACE_BASE=/tmp,CUDA_VISIBLE_DEVICES=0 \
+            .apptainer/images/isb-${img}_local.sif python3 "$@" > $out/$log.log 2>&1 \
+            || { echo "diag-cost $log failed rc=$?"; rc=1; }
+        sleep 20
+    }
+    run_in nnsight-vllm-0-8-1 vllm-mp slurm/diag_cost.py mp /out/inputs.jsonl /out/vllm-mp.json
+    run_in nnsight-vllm-0-8-1 vllm-inproc slurm/diag_cost.py inproc /out/inputs.jsonl /out/vllm-inproc.json
+    run_in nnsight-hf-0-8-1 hf slurm/diag_hf_invokes.py /out/inputs.jsonl /out/hf.json
+    exit $rc
+    ;;
+diag-byref)
+    # The envoy-by-reference prototype (slurm/patches/envoy_byref) in vLLM's own process layout:
+    # slurm/diag_cost.py mp without, then with, the patch loaded in client and EngineCore alike.
+    shift
+    out=runs/nnsight-versions-diag/byref
+    mkdir -p $out
+    cp runs/nnsight-versions-diag/batch/inputs.jsonl $out/inputs.jsonl
+    rc=0
+    for variant in stock byref; do
+        pp=/workspace; flag=0
+        [ $variant = byref ] && { pp=/workspace/slurm/patches/envoy_byref:/workspace; flag=1; }
+        echo "### $(date -Is) diag-byref $variant"
+        timeout 1800 apptainer exec --nv --cleanenv --no-home --pwd /workspace \
+            --bind $PWD:/workspace:ro --bind $PWD/$out:/out \
+            --bind $ISB_APPTAINER_DIR/volumes/isb-model-cache:/models \
+            --env PYTHONPATH=$pp,NNSIGHT_ENVOY_BYREF=$flag,PYTHONDONTWRITEBYTECODE=1,USER=isb \
+            --env HF_HOME=/models,HF_HUB_CACHE=/models/hub,HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1 \
+            --env XDG_CACHE_HOME=/tmp/cache,VLLM_CACHE_ROOT=/tmp/vllm,TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor \
+            --env TRITON_CACHE_DIR=/tmp/triton,FLASHINFER_WORKSPACE_BASE=/tmp,CUDA_VISIBLE_DEVICES=0 \
+            .apptainer/images/isb-nnsight-vllm-0-8-1_local.sif \
+            python3 slurm/diag_cost.py mp /out/inputs.jsonl /out/$variant.json > $out/$variant.log 2>&1 \
+            || { echo "diag-byref $variant failed rc=$?"; rc=1; }
+        sleep 20
+    done
+    exit $rc
+    ;;
 fair)
     # Fairness-controlled rerun: prefix caching off on every vLLM engine, an eager and a compiled
     # plain vLLM per version (overhead matched to each system's execution mode), nnsight through
@@ -237,6 +319,51 @@ optimal)
                    vllm-plain/0-15-1 vllm-plain/0-19-1 vllm-plain/0-20-2 vllm-plain/0-28-0 \
                    vllm-plain/eager-0-15-1 vllm-plain/eager-0-19-1 vllm-plain/eager-0-20-2 vllm-plain/eager-0-28-0 \
         --reference nnsight-hf/fp32 --gpu 0 --timeout 3600 --out runs/optimal-delta
+    exit $?
+    ;;
+versions-perf)
+    # Suite nnsight-versions on one model (qwen2.5-7b | qwen3-32b): nnsight 0.7.0 and 0.8.1 each on
+    # HF (sdpa) and on vLLM (sync engine), plus 0.4.6 on HF on the current and on its own stack, all
+    # in one run on one card. Submit on an H200: sbatch --partition=gpuH200x8 --mem=240G ...
+    # (gpue01 is NDIF-H200's node and stays excluded).
+    shift
+    bench run --suite nnsight-versions --model "$1" --gpu 0 --out runs/nnsight-versions-perf
+    exit $?
+    ;;
+versions-046)
+    # The nnsight 0.4.6 side of the suite alone, beside its HF 0.8.1 reference on the same card.
+    shift
+    bench run --suite nnsight-versions --model "$1" \
+        --backends nnsight-hf/sdpa/0-8-1 nnsight-hf/sdpa/0-4-6 nnsight-hf/sdpa/0-4-6/era \
+        --reference nnsight-hf/sdpa/0-8-1 --gpu 0 --out runs/nnsight-versions-perf
+    exit $?
+    ;;
+versions-fill)
+    # Rerun one workload of the suite on one model for the named backends, beside the HF 0.8.1
+    # reference: versions-fill MODEL WORKLOAD BACKEND...
+    shift
+    model=$1 workload=$2; shift 2
+    bench run --suite nnsight-versions --model "$model" --workload "$workload" \
+        --backends nnsight-hf/sdpa/0-8-1 "$@" --reference nnsight-hf/sdpa/0-8-1 --gpu 0 \
+        --out runs/nnsight-versions-perf
+    exit $?
+    ;;
+load)
+    # A load-pattern suite (design.md §12.17) on one model: load SUITE MODEL, where SUITE is
+    # nnsight-load-offline or nnsight-load-concurrent.
+    shift
+    bench run --suite "$1" --model "$2" --gpu 0 --out runs/nnsight-load
+    exit $?
+    ;;
+versions-awq)
+    # Whether each engine loads the largest cached checkpoint, the 4-bit AWQ Qwen2.5-72B: one
+    # steering case on four prompts per backend, no scoring.
+    # Ad hoc rather than --suite: the suite's cases name only its two models.
+    bench run --workload steering --model qwen2.5-72b-awq --data counterfact:4 --regimes interactive \
+        --realizations default \
+        --backends nnsight-hf/sdpa/0-8-1 nnsight-vllm/sync/0-8-1 nnsight-hf/sdpa/0-7 nnsight-vllm/sync/0-7 \
+                   nnsight-hf/sdpa/0-4-6 nnsight-hf/sdpa/0-4-6/era \
+        --gpu 0 --timeout 3600 --out runs/nnsight-versions-perf/awq-probe
     exit $?
     ;;
 *) echo "unknown stage $1"; exit 2 ;;

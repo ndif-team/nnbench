@@ -7,7 +7,8 @@ from .base import Backend
 class HFBackend(Backend):
     name = "hf"
 
-    def __init__(self, force_text_causal: bool = False, dtype: str | None = None):
+    def __init__(self, force_text_causal: bool = False, dtype: str | None = None,
+                 attn_implementation: str = "eager"):
         # force_text_causal: load via AutoModelForCausalLM even when the architecture registers as
         # ImageTextToText. Needed for TEXT-ONLY checkpoints of multimodal-wrapper architectures
         # (Qwen/Qwen3.5-4B: no vision weights in the repo, transformers auto-routes its config to
@@ -17,6 +18,9 @@ class HFBackend(Backend):
         # class object) opts out of the second-guessing. Arrives via spec.hf_kwargs.
         self.force_text_causal = force_text_causal
         self.dtype = dtype          # None loads the checkpoint's own dtype
+        # eager by default (the oracle control); a config may choose transformers' own default,
+        # sdpa, for timing comparisons
+        self.attn_implementation = attn_implementation
 
     def load(self, repo: str, device: str = "cuda:0"):
         import torch
@@ -31,7 +35,7 @@ class HFBackend(Backend):
 
             kw["automodel"] = _TextCausal
         return LanguageModel(
-            repo, device_map=device, dispatch=True, attn_implementation="eager", **kw
+            repo, device_map=device, dispatch=True, attn_implementation=self.attn_implementation, **kw
         )
 
     def run(self, model, prompts, build):
@@ -143,6 +147,18 @@ class HFBackend(Backend):
         import torch
 
         inputs = model.tokenizer(prompt, return_tensors="pt").to(model._module.device)
+        with torch.no_grad():
+            if new_tokens == 1:
+                model._module(**inputs)
+            else:
+                model._module.generate(**inputs, max_new_tokens=new_tokens, do_sample=False)
+
+    def vanilla_many(self, model, prompts, *, new_tokens):
+        """`vanilla` over several prompts as one left-padded batch: the plain system's own
+        multi-prompt request, the offline load pattern's denominator (design.md §12.17)."""
+        import torch
+
+        inputs = model.tokenizer(list(prompts), return_tensors="pt", padding=True).to(model._module.device)
         with torch.no_grad():
             if new_tokens == 1:
                 model._module(**inputs)

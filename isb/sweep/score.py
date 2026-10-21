@@ -19,6 +19,7 @@ from ..runfile import load_run
 from ..runner.run import CellResult, disambiguate_precision, evaluate
 from ..report import print_map
 from ..runs import procedure, spec_coordinates
+from .spec import reference_key, scored_regime
 
 
 def _load(out_dir: str, run_name: str):
@@ -79,10 +80,8 @@ def score_runs(spec, out_dir: str, candidate: str, reference: str | None,
     results = []
     # union of output keys and meta keys: an errored cell has NO output entry (execute stores
     # outputs only on success), and it must still appear in the map as its ERROR row
-    keys = ({k for k in cand_out if isinstance(k, tuple) and len(k) == 2
-             and k[0] in {"interactive", "batched", "generation"}}
-            | {k for k in meta if isinstance(k, tuple) and len(k) == 2
-               and k[0] in {"interactive", "batched", "generation"}})
+    keys = ({k for k in cand_out if isinstance(k, tuple) and len(k) == 2 and scored_regime(k[0])}
+            | {k for k in meta if isinstance(k, tuple) and len(k) == 2 and scored_regime(k[0])})
     for workload_kind, label in sorted(keys):
         m = meta.get((workload_kind, label), {})
         cell = CellResult(spec.methodology, spec.family, candidate, label,
@@ -91,8 +90,7 @@ def score_runs(spec, out_dir: str, candidate: str, reference: str | None,
                           error=m.get("error"), value=cand_out.get((workload_kind, label)),
                           workload=workload_kind)
         row = m.get("row", label)        # an alternative realization scores against its row
-        ref_key = (("batched_perprompt", row) if workload_kind == "batched"
-                   else (workload_kind, row))
+        ref_key = reference_key(workload_kind, row)
         ref_val = ref_out.get(ref_key)
         if reference:
             evaluate([cell], control=control, ref_override=ref_val)
