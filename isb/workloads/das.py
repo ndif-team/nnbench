@@ -19,6 +19,7 @@ das = Workload(
               {"layer": _HALF, "train": 24})),
     regimes=(Regime("interactive", DataRef("mib/ioi_labeled", 24), aggregate=False),),
     baseline={"layer": _HALF, "train": 0},
+    # load_patterns: none (training is one call over the dataset; no load pattern)
     # the train row runs 24 steps x 2 traces per timing trial; keep trials small
     warmup=1, n_trials=3,
 )

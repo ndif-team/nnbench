@@ -5,17 +5,23 @@ per chunk, chunks back to back. `run_concurrent` is the closed-loop serving patt
 serve --max-concurrency`, AIPerf's concurrency sweep): `concurrency` clients each issue one unit
 per call and the next as soon as theirs returns, until the units run out. A backend that cannot
 take concurrent requests is driven through one lock, the way a serial server queues them; the time
-a request waits for the lock counts toward its latency, as a client would see it.
+a request waits for the lock counts toward its latency, as a client would see it. `run_open` is the
+open-loop pattern (MLPerf Server, `vllm bench serve --request-rate`): each unit arrives at a fixed
+time of a seeded Poisson process and is issued then on its own thread, whatever the system is doing,
+so above capacity the requests queue and their latency grows.
 
-Both run one untimed warm-up (a full pass offline; one request per client concurrently), then
-`passes` timed sweeps. A pass is timed between CUDA syncs; a request from issue to return. Call
+All run one untimed warm-up (a full pass offline; one request per client concurrently; one request
+open loop), then `passes` timed sweeps. A pass is timed between CUDA syncs; a request from issue to
+return, or open loop from its scheduled arrival, so a late issue counts against the system. Call
 preparation (the fresh parameter copy) happens outside both. The outputs of the first `keep` units
 of the last pass are returned for scoring.
 """
 from __future__ import annotations
 
+import random
 import statistics
 import threading
+import time
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, Callable
@@ -27,11 +33,13 @@ from .timing import force_gc, peak_mem_mb, reset_peak_mem, sync_cuda
 class LoadResult:
     units: int                       # units per pass
     calls: int                       # calls per pass
-    concurrency: int                 # clients (1 offline)
+    concurrency: int                 # clients (1 offline, 0 open loop)
     serial: bool                     # requests were serialized through one lock
     pass_ms: list = field(default_factory=list)
     request_ms: list = field(default_factory=list)
     peak_mem_mb: float = 0.0
+    offered_rate: float | None = None   # open loop: arrivals per second
+    max_in_flight: int | None = None    # open loop: most requests issued and not yet returned
 
     @property
     def median_pass_ms(self) -> float:
@@ -53,7 +61,9 @@ class LoadResult:
                 "pass_ms": list(self.pass_ms), "median_pass_ms": self.median_pass_ms,
                 "request_p50_ms": self.percentile(50), "request_p90_ms": self.percentile(90),
                 "request_p99_ms": self.percentile(99),
-                "request_mean_ms": statistics.fmean(self.request_ms)}
+                "request_mean_ms": statistics.fmean(self.request_ms),
+                **({"offered_rate": self.offered_rate, "max_in_flight": self.max_in_flight}
+                   if self.offered_rate is not None else {})}
 
 
 def run_offline(prepare: Callable[[list], Callable[[], Any]], chunks: list, *, passes: int,
@@ -151,5 +161,90 @@ def run_concurrent(prepare: Callable[[Any], Callable[[], Any]], units: list, *, 
     reset_peak_mem()
     for _ in range(passes):
         outputs = sweep(list(range(len(units))), timed=True)
+    result.peak_mem_mb = peak_mem_mb()
+    return result, outputs
+
+
+def arrival_offsets(count: int, rate: float, seed: int = 0) -> list:
+    """Seconds from the start of a pass at which each of `count` requests arrives: a Poisson
+    process at `rate` per second (exponential gaps), the first at 0, the same for every pass."""
+    rng = random.Random(seed)
+    offsets, t = [], 0.0
+    for _ in range(count):
+        offsets.append(t)
+        t += rng.expovariate(rate)
+    return offsets
+
+
+def run_open(prepare: Callable[[Any], Callable[[], Any]], units: list, *, rate: float, passes: int,
+             keep: int, serial: bool):
+    """Open loop: unit i is issued at `arrival_offsets(...)[i]` on a thread of its own, whether or
+    not earlier requests have returned. Returns (LoadResult, outputs), `outputs` mapping unit index
+    -> output for the first `keep` units of the last pass. The first error a request meets stops
+    further arrivals and is raised once the issued requests have returned."""
+    if passes < 1 or rate <= 0 or not units:
+        raise ValueError("open loop needs passes>=1, rate>0 and at least one unit")
+    result = LoadResult(units=len(units), calls=len(units), concurrency=0, serial=serial,
+                        offered_rate=rate, max_in_flight=0)
+    gate = threading.Lock() if serial else None
+    offsets = arrival_offsets(len(units), rate)
+
+    def sweep():
+        calls = [prepare(unit) for unit in units]               # outside the pass timer
+        count = threading.Lock()
+        errors, latencies, produced, state = [], [], {}, {"in_flight": 0, "peak": 0}
+
+        def request(index, due):
+            try:
+                if gate is None:
+                    out = calls[index]()
+                else:
+                    with gate:
+                        out = calls[index]()
+                latencies.append((perf_counter() - due) * 1000.0)
+                if index < keep:
+                    produced[index] = out
+            except BaseException as error:          # stop further arrivals; re-raised below
+                errors.append(error)
+            finally:
+                with count:
+                    state["in_flight"] -= 1
+
+        # ponytail: one thread per request, so a pass holds at most len(units) threads; a worker
+        # pool would be needed only for sweeps far larger than the suites' 128 units
+        threads = []
+        sync_cuda()
+        start = perf_counter()
+        for index, offset in enumerate(offsets):
+            if errors:
+                break
+            due = start + offset
+            delay = due - perf_counter()
+            if delay > 0:
+                time.sleep(delay)
+            with count:
+                state["in_flight"] += 1
+                state["peak"] = max(state["peak"], state["in_flight"])
+            thread = threading.Thread(target=request, args=(index, due),
+                                      name=f"isb-arrival-{index}", daemon=True)
+            thread.start()
+            threads.append(thread)
+        for thread in threads:
+            thread.join()
+        sync_cuda()
+        elapsed = (perf_counter() - start) * 1000.0
+        if errors:
+            raise errors[0]
+        return elapsed, latencies, produced, state["peak"]
+
+    prepare(units[0])()                                         # warm-up, untimed
+    force_gc()
+    reset_peak_mem()
+    outputs = {}
+    for _ in range(passes):
+        elapsed, latencies, outputs, peak = sweep()
+        result.pass_ms.append(elapsed)
+        result.request_ms.extend(latencies)
+        result.max_in_flight = max(result.max_in_flight, peak)
     result.peak_mem_mb = peak_mem_mb()
     return result, outputs

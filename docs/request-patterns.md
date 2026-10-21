@@ -3,7 +3,7 @@
 nnbench times every workload under one or more request patterns: how calls are issued to the
 system, how many at once, and what is measured. This document gives the performance background the
 patterns rest on and says, for each, what it isolates, what it cannot show, and how to read its
-numbers. The implementation contract is design.md §12.5 and §12.17; how the standard benchmarks
+numbers, and which workloads run under which pattern. The implementation contract is design.md §12.5 and §12.17; how the standard benchmarks
 issue requests is surveyed in `docs/inference-benchmark-survey.md`; measured results are in
 `docs/findings.md`.
 
@@ -89,7 +89,7 @@ timed: each job loads once, warms up, then measures.
 | Generation | `generation` | single-stream decode | one prompt per call, several decode steps, intervention every step |
 | Offline | `offline/b<B>`, `offline/all` | MLPerf Offline, `vllm bench throughput` | a sweep over M units, B per call: a dataset job |
 | Concurrent (closed loop) | `concurrent/c<C>` | `vllm bench serve --max-concurrency`, AIPerf | C clients each sending single-unit calls: a shared server |
-| Open loop | not implemented | MLPerf Server, `vllm bench serve --request-rate` | arrivals at a set rate: a server under offered load |
+| Open loop | `open/r<R>` | MLPerf Server, `vllm bench serve --request-rate` | single-unit calls arriving at R per second: a server under offered load |
 
 ### Single stream (`interactive`)
 
@@ -178,16 +178,77 @@ Compare backends at equal C, and read throughput together with p99. A higher C t
 throughput but much latency is past the knee.
 
 **Cannot show** behaviour under a fixed offered load. A closed loop slows its own arrivals when the
-system slows, so it never overloads it.
+system slows, so it never overloads it, and a stall delays the requests that would have arrived
+during it, so its tail latency understates what users would see (coordinated omission).
 
-### Open loop (not implemented)
+### Open loop (`open/r<R>`)
 
-**Would issue** requests at a target rate (Poisson, or gamma for burstiness) regardless of
-completions, and report latency percentiles against the rate, or the highest rate meeting a latency
-target (MLPerf Server's pass criterion). **Would test** a production server under real traffic,
-including overload, where queues and tail latency grow without bound. The closed-loop pattern is the
-first step. An open loop needs the same concurrent engine plus an arrival generator and a request
-deadline.
+**Issues** M single-unit calls (128) at arrival times drawn from a Poisson process at R per second
+(4, 16, 64), each on a thread of its own as soon as it arrives, whether or not earlier requests have
+returned. The arrival times come from a fixed seed, so every pass and every backend sees the same
+schedule. A backend that can take concurrent requests gets them together; any other queues them
+behind one lock, as in the closed loop. **Timed:** one warm-up request, then one pass. Each request
+is timed from its scheduled arrival to its return, so waiting in a queue, or for the system to accept
+it, counts. Reports achieved units/s, request latency p50, p90, p99 and mean, the offered rate, and
+the most requests in flight at once. **Scored:** the first 16 units, against the reference's same
+regime.
+
+**Tests** a production server under real traffic, including overload. Below capacity, latency stays
+near the single-request time and achieved throughput tracks the offered rate (a little under
+it, since a pass also waits for its last request). Above it, requests
+pile up: the most in flight grows toward M, latency grows through the pass, and achieved throughput
+levels off at capacity. That pile-up is where problems that a closed loop cannot reach appear: saved
+values and KV cache held for every request in flight, client-side trace serialization (about 6 ms
+per invoke for nnsight 0.8.1 on vLLM) becoming the limit before the GPU, and failures or stalls under
+overload.
+
+**Reading it:** read p99 against the offered rate. The highest rate whose p99 stays within a latency
+target is the server's usable capacity (MLPerf Server's pass criterion). On a serial backend (HF, the
+sync engine) the open loop is a single-server queue, so its latency follows from the single-request
+time; the suite runs it only on HF, the reference, and the async engine.
+
+**Cannot show** bursty traffic or abandoned requests: arrivals are Poisson only, and a pass has no
+request deadline, so an overloaded system drains its queue after the last arrival.
+
+## Which workloads run under which pattern
+
+A workload's methodology is used in one of two settings. In a dataset study (circuit discovery,
+feature training, evaluation sweeps) a researcher prototypes on single calls, then runs the method
+over a dataset; the speed that matters is the sweep's throughput. In runtime interpretability
+(monitors, probes and steering on live traffic) the method runs inside requests users send, and what
+matters is latency and throughput under that traffic. Each workload declares the load patterns of
+its settings (`load_patterns` in `isb/workloads/`), and a suite's load runs only on the workloads
+that declare it, so no run times a combination nobody uses.
+
+Two axes are involved. The request shape is the workload's own regime: one unit per call
+(`interactive`), several units per call (`batched`), or one unit decoded for several steps
+(`generation`). The load pattern says how those requests are issued. Offline sweeps a workload with
+several-unit calls at any B, and a workload whose cells take one unit per call at B=1, which is how
+a researcher loops over a dataset with a one-unit API. Concurrent and open issue the single-unit
+request shape, decode included.
+
+| Workload | Setting | Request shape (own regimes) | Load patterns |
+|---|---|---|---|
+| Logit lens | dataset study | one prompt; a batch of prompts | offline (B = 1, 16, 64, all) |
+| Jacobian lens | dataset study | one prompt | offline (B = 1) |
+| Ablation | dataset study | one prompt; a batch of prompts | offline (B = 1, 16, 64, all) |
+| Activation patching | dataset study | one clean/corrupted pair | offline (B = 1) |
+| Generation patching | dataset study | one pair, decoded 5 steps | offline (B = 1) |
+| Attribution patching | dataset study | one labeled pair (forward and backward) | offline (B = 1) |
+| Activation harvesting | dataset study | a batch of passages | offline (B = 1, 16, 64, all) |
+| Steering | both | one prompt; a batch of prompts | offline, concurrent, open |
+| Steered generation | both | one prompt, decoded 8 steps | offline (B = 1), concurrent, open |
+| Per-step capture | both | one prompt, decoded 8 steps | offline (B = 1), concurrent, open |
+| Attention pattern | dataset study | one call over all prompts | none |
+| DAS (train and apply) | dataset study | one training call over the dataset | none |
+| Jacobian collection | dataset study | one fitting call over the corpus | none |
+
+The last three have no load pattern: their single call over the data is the whole study, and
+splitting it into requests would time something no user runs. Dataset-study workloads take no
+concurrent or open load: live traffic does not run them. Every workload keeps its own single-call
+regimes (`interactive`, `batched`, `generation`): the notebook user's view and the per-call
+overhead. Each is one point of a load pattern timed on one repeated input: `batched` is an offline
+call at B = 16, `interactive` and `generation` a closed loop at C = 1.
 
 ## Choosing and comparing
 
@@ -196,6 +257,7 @@ deadline.
 - **A dataset job's speed:** offline, the best B for each backend. HF needs a client-chosen B; a
   serving engine should not.
 - **Serving many users:** concurrent, throughput against p99 at each C.
+- **A server under real traffic, and overload:** open loop, p99 against the offered rate.
 - **Decode-time interventions:** generation, and concurrent on a generation workload.
 
 Comparisons need the same workload, data, pattern settings and hardware. Results on different cards

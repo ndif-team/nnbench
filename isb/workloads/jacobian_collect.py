@@ -15,6 +15,7 @@ jacobian_collect = Workload(
     rows=(Row("collect the per-layer Jacobians (batched VJPs per prompt)", {"grad": True}),),
     regimes=(Regime("interactive", DataRef("wikitext", 4), aggregate=False),),
     baseline={"grad": False},
+    # load_patterns: none (fitting is one call over the corpus; no load pattern)
     # each timing trial runs the full backward sweep; keep trials small
     warmup=1, n_trials=3,
 )

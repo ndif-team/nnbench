@@ -31,7 +31,7 @@ def _recipe(args):
     from isb.suites import SUITES, Entry, parse_data, parse_load
 
     parse_data(args.data)                            # fail on a malformed source early
-    loads = tuple(parse_load(kind, text) for kind in ("offline", "concurrent")
+    loads = tuple(parse_load(kind, text) for kind in ("offline", "concurrent", "open")
                   for text in getattr(args, kind) or ())
 
     if args.suite:
@@ -84,15 +84,18 @@ def parser():
     run.add_argument("--model", nargs="+", help="model keys (isb/models.py)")
     run.add_argument("--data", help="SOURCE[:N]: rebind every regime to a registered data source")
     run.add_argument("--regimes", nargs="+",
-                     choices=["interactive", "batched", "generation", "offline", "concurrent"],
+                     choices=["interactive", "batched", "generation", "offline", "concurrent", "open"],
                      help="keep only these regime kinds")
     run.add_argument("--offline", action="append", metavar="UNITS:B[,B...]",
                      help="add the offline load pattern (design.md §12.17): UNITS units of each "
-                          "workload's batched data, B units per call (or 'all'); replaces the "
-                          "suite's load patterns")
+                          "workload's data, B units per call (or 'all'; B=1 only for workloads whose "
+                          "cells take one unit per call); replaces the suite's load patterns")
     run.add_argument("--concurrent", action="append", metavar="UNITS:C[,C...]",
                      help="add the closed-loop concurrent load pattern: UNITS single-unit requests "
                           "from C clients; replaces the suite's load patterns")
+    run.add_argument("--open", action="append", metavar="UNITS:R[,R...]",
+                     help="add the open-loop load pattern: UNITS single-unit requests arriving at R "
+                          "per second (seeded Poisson); replaces the suite's load patterns")
     run.add_argument("--realizations", choices=["default", "all"],
                      help="each system's documented realization only, or also every alternative its "
                           "cells declare (ad-hoc default: all)")

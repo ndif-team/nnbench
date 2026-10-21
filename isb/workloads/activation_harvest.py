@@ -19,4 +19,6 @@ activation_harvest = Workload(
     rows=(Row("half depth residual stream, all valid tokens", {"layer": _HALF, "export": True}),),
     regimes=(Regime("batched", DataRef("wikitext", 16)),),
     baseline={"layer": _HALF, "export": False},
+    # corpus-scale collection for SAE training and probing
+    load_patterns=("offline",),
 )

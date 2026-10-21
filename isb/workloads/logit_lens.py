@@ -17,4 +17,6 @@ logit_lens = Workload(
     regimes=(Regime("interactive", DataRef("counterfact", 100)),
              Regime("batched", DataRef("counterfact", 16))),
     baseline={"layers": [-1]},
+    # a dataset study: notebook calls, then corpus sweeps
+    load_patterns=("offline",),
 )

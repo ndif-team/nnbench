@@ -269,9 +269,10 @@ def _validate_coordinates(c):
                 or regime["data"] is not None and not isinstance(regime["data"], str)):
             raise ValueError("invalid coordinate regime settings")
         load = regime.get("load")
-        if load is not None and (not isinstance(load, dict) or set(load) != set(LOAD_FIELDS)):
+        if load is not None and (not isinstance(load, dict) or regime["kind"] not in LOAD_FIELDS
+                                 or set(load) != set(LOAD_FIELDS[regime["kind"]])):
             raise ValueError("invalid coordinate load settings")
-        name = regime_name(regime["kind"], (load or {}).get("batch_size"), (load or {}).get("concurrency", 0))
+        name = regime_name(regime["kind"], load)
         if complete and (name in kinds or regime["kind"] == "generation" and regime["new_tokens"] == 0):
             raise ValueError("duplicate regime or missing generation length")
         kinds.add(name)
@@ -308,7 +309,7 @@ def _load_settings(regime: dict) -> dict:
     a frozen spec record (the manager rebuilds submitted coordinates from that record)."""
     load = regime.get("load")
     if load is None:
-        load = {key: regime[key] for key in LOAD_FIELDS if key in regime}
+        load = {key: regime[key] for key in LOAD_FIELDS[regime["kind"]] if key in regime}
     return dict(load)
 
 
@@ -358,7 +359,7 @@ def spec_coordinates(spec, interface: str, *, inputs_sha256=None, config=None) -
         interface=interface,
         regimes=[{"kind": r.kind, "units": len(r.prompts), "data": r.data_name,
                   "new_tokens": r.new_tokens, "aggregate": r.aggregate, "data_knobs": r.data_knobs,
-                  **({"load": {k: getattr(r, k) for k in LOAD_FIELDS}} if r.kind in LOAD_KINDS
+                  **({"load": {k: getattr(r, k) for k in LOAD_FIELDS[r.kind]}} if r.kind in LOAD_KINDS
                      else {})}
                  for r in spec.regimes],
         cases=[{"label": t.label, "params": t.params} for t in spec.tasks],
