@@ -2,7 +2,8 @@
 
 The survey behind the load patterns of design.md §12.17. It covers how the standard LLM serving
 benchmarks send requests, not their datasets; nnbench keeps its own workload data (CounterFact,
-MIB) and borrows only the request patterns.
+MIB) and borrows only the request patterns. What each pattern tests, and the performance
+background, is in `docs/request-patterns.md`.
 
 ## The four request patterns
 

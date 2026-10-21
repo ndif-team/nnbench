@@ -1551,7 +1551,8 @@ section adds them as the two standard patterns.
 | `concurrent/c<C>` | closed-loop serving: `vllm bench serve --max-concurrency`, SGLang `bench_serving`, AIPerf's concurrency sweep | `units` single-unit calls from `C` clients, each issuing its next as soon as its previous returns | units/s; request latency p50 (`median_latency_ms`), p90, p99, mean |
 
 Open-loop arrivals (MLPerf Server, `--request-rate` Poisson/gamma) are not implemented. The survey
-of how these tools issue requests is `docs/inference-benchmark-survey.md`.
+of how these tools issue requests is `docs/inference-benchmark-survey.md`; the background and what
+each pattern tests is `docs/request-patterns.md`.
 
 **Derived, not authored.** A load pattern names no data of its own. A suite entry (or `bench run
 --offline UNITS:B,... --concurrent UNITS:C,...`) lists `Offline` / `Concurrent` loads, and
