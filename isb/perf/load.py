@@ -104,6 +104,7 @@ def run_concurrent(prepare: Callable[[Any], Callable[[], Any]], units: list, *, 
     outputs = {}
 
     def sweep(indices, timed):
+        calls = {index: prepare(units[index]) for index in indices}   # outside the pass timer
         pending = iter(indices)
         take = threading.Lock()
         errors, latencies, produced = [], [], {}
@@ -115,13 +116,12 @@ def run_concurrent(prepare: Callable[[Any], Callable[[], Any]], units: list, *, 
                 if index is None:
                     return
                 try:
-                    call = prepare(units[index])
                     t0 = perf_counter()
                     if gate is None:
-                        out = call()
+                        out = calls[index]()
                     else:
                         with gate:
-                            out = call()
+                            out = calls[index]()
                     latencies.append((perf_counter() - t0) * 1000.0)
                     if index < keep:
                         produced[index] = out

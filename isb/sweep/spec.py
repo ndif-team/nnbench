@@ -466,8 +466,9 @@ def instantiate(workload: Workload, model, *, data=None, size=None, regimes=None
         if reason is not None:
             skipped.append({"label": f"[{type(load).__name__.lower()} load]", "reason": reason})
         kept += [r for r in derived if regimes is None or r.kind in regimes]
-    if not kept:
-        raise ValueError(f"workload {workload.name!r} has none of the regimes {sorted(regimes)}")
+    if not kept:                # e.g. a load pattern the workload cannot take, and no other regime
+        reasons = "".join(f"; {row['reason']}" for row in skipped if row["label"].endswith(" load]"))
+        raise NotApplicable(f"workload {workload.name!r} has none of the regimes {sorted(regimes)}{reasons}")
     spec = CellConfig(
         name=f"{workload.name}/{model.key}", methodology=workload.methodology,
         family=model.family, repo=model.repo,

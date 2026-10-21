@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import isb.sweep.execute as execute_mod  # noqa: E402
 from isb.perf.load import run_concurrent, run_offline  # noqa: E402
 from isb.runs import EngineConfig, RunConfig  # noqa: E402
-from isb.suites import parse_load  # noqa: E402
+from isb.suites import Entry, cases, parse_load  # noqa: E402
 from isb.sweep.execute import execute_run  # noqa: E402
 from isb.sweep.score import score_runs  # noqa: E402
 from isb.sweep.spec import (BaselineSpec, CellConfig, Concurrent, ExecutionRegime,  # noqa: E402
@@ -58,6 +58,14 @@ def test_regimes_filter_keeps_only_the_load_patterns():
     spec, _ = instantiate(WORKLOADS["logit_lens"], "gpt2", size=4, regimes=("offline",),
                           loads=(Offline(16, (4,)), Concurrent(8)))
     assert [r.name for r in spec.regimes] == ["offline/b4"]
+
+
+def test_a_workload_left_with_no_regime_is_skipped_with_the_load_reason():
+    specs, skipped = cases([Entry(("steering", "gen_steering"), ("gpt2",), size=4,
+                                         regimes=("offline",), loads=(Offline(16, (4,)),))])
+    assert [s.name for s in specs] == ["steering/gpt2"]
+    [whole] = [row for row in skipped if row["label"] == "*"]
+    assert whole["case"] == "gen_steering/gpt2" and "offline needs a batched regime" in whole["reason"]
 
 
 def test_regime_names_and_validation():
@@ -157,6 +165,15 @@ def test_serial_backend_takes_one_request_at_a_time_and_queues_the_rest():
     assert probe.peak == 1 and result.serial
     # Queueing for the lock counts toward latency: the slowest request waited for the others.
     assert result.percentile(99) > 2 * result.percentile(0)
+
+
+def test_concurrent_pass_time_excludes_call_preparation():
+    def prepare(unit):
+        time.sleep(0.02)
+        return lambda: None
+    result, _ = run_concurrent(prepare, list(range(8)), concurrency=1, passes=1, keep=0,
+                               serial=True)
+    assert result.pass_ms[0] < 8 * 20 / 2      # eight preparations would add 160 ms
 
 
 def test_a_client_error_stops_the_sweep_and_is_raised():
