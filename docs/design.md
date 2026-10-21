@@ -1548,7 +1548,8 @@ section adds them as the two standard patterns.
 | `offline/b<B>`, `offline/all` | MLPerf Offline; `vllm bench throughput` (`LLM.generate(all prompts)`); SGLang `bench_offline_throughput` | `units` units as one sweep, `B` per call (all at once for `all`), calls back to back | units/s over the median pass; pass time (`median_latency_ms`); per-call latency |
 | `concurrent/c<C>` | closed-loop serving: `vllm bench serve --max-concurrency`, SGLang `bench_serving`, AIPerf's concurrency sweep | `units` single-unit calls from `C` clients, each issuing its next as soon as its previous returns | units/s; request latency p50 (`median_latency_ms`), p90, p99, mean |
 
-Open-loop arrivals (MLPerf Server, `--request-rate` Poisson/gamma) are not implemented.
+Open-loop arrivals (MLPerf Server, `--request-rate` Poisson/gamma) are not implemented. The survey
+of how these tools issue requests is `docs/inference-benchmark-survey.md`.
 
 **Derived, not authored.** A load pattern names no data of its own. A suite entry (or `bench run
 --offline UNITS:B,... --concurrent UNITS:C,...`) lists `Offline` / `Concurrent` loads, and
