@@ -8,9 +8,13 @@ with `tracer.iter[...]` as a context manager whose body runs once per step (its 
 apply unchanged (design.md §12.14). 0.5's model runner reads a mediator from every request's
 sampling params (model_runners/GPUModelRunner.py, `process_new_reqs`), so a plain request through
 its engine raises in the worker and takes the engine down: the plain-engine timing is unavailable.
+0.5 returns each invoke's saves by variable name: its README's form, one named `.save()` per
+invoke, works for invokes written out one by one, while a loop of invokes filling one list (the
+0.7 and 0.8 form) comes back empty, so a call over a variable number of prompts is unsupported.
 """
 from isb.backends.vllm_sync import VLLMSyncBackend
 from isb.jobs.worker import merge_requirements, options
+from isb.methodologies.registry import Unsupported
 from isb.runs import EngineConfig, RunConfig
 
 
@@ -24,6 +28,10 @@ class NNsight05SyncBackend(VLLMSyncBackend):
         if self.tensor_parallel_size > 1:
             kw["tensor_parallel_size"] = self.tensor_parallel_size
         return VLLM(repo, dispatch=True, gpu_memory_utilization=gpu_memory_utilization, **kw)
+
+    def run_batched(self, model, prompts, build):
+        raise Unsupported("nnsight 0.5's vLLM path returns each invoke's saves by variable name, "
+                          "so one call cannot gather a variable number of prompts")
 
     def vanilla(self, model, prompt, *, new_tokens):
         raise NotImplementedError("nnsight 0.5's vLLM engine serves only traced requests")
