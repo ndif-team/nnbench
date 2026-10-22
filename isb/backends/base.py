@@ -12,8 +12,10 @@ the async vLLM engine runs one request per trace, the sync engine one invoke per
 primitive that takes one unit per side (`patch`, `generate`, `generate_patch`, `attribute`)
 checks that through `one()` and raises `FormError` on more, so a cell that passes a list where
 the engine takes one prompt fails in every backend and in the no-GPU test fakes, not only on vLLM.
-Primitives that take several units (`run`, `train_patch`, `vjp_batch`) tell the cell's closure
-which units the current trace holds (`rows`) so the closure can pick the matching targets.
+`run` takes several prompts; its `build()` closure takes no arguments and the backend runs it in
+its form (HF: one padded batch; vLLM: one invoke per prompt). `train_patch` and `vjp_batch` take
+several units and tell the cell's closure which units the current trace holds (`rows`) so the
+closure can pick the matching targets.
 """
 from __future__ import annotations
 
@@ -44,6 +46,15 @@ class Backend:
         one."""
         return list(prompts) if isinstance(prompts, (list, tuple)) else [prompts]
 
+    def paired(self, sources, bases, primitive):
+        """Both sides of a several-pair primitive as lists (`many()`); unequal sides raise
+        `FormError`, since a source without a base has no pair to run."""
+        sources, bases = self.many(sources), self.many(bases)
+        if len(sources) != len(bases):
+            raise FormError(f"{self.name}.{primitive} takes one base per source; the cell passed "
+                            f"{len(sources)} source and {len(bases)} base prompts.")
+        return sources, bases
+
     def load(self, repo: str, **kw):
         raise NotImplementedError
 
@@ -65,15 +76,19 @@ class Backend:
 
     def train_patch(self, model, source_prompts, base_prompts, capture, step):
         """One gradient step over the (source, base) pairs `zip(source_prompts, base_prompts)` (a
-        single prompt per side is one pair). The backend runs the pairs in its engine's form: HF
-        pads each side into one batch, two traces in all; the async vLLM engine runs one pair per
-        pair of traces and accumulates the gradients. Trace 1 captures the source activation
+        single prompt per side is one pair; unequal sides raise `FormError`, `paired()`). The
+        backend runs the pairs in its engine's form: HF pads each side into one batch, two traces
+        in all; the async vLLM engine runs one pair per pair of traces and accumulates the
+        gradients. Trace 1 captures the source activation
         (materialized to CPU); trace 2 calls `step(src, rows)` -> a scalar loss proxy inside the
         trace and runs its backward. `src` holds the captured activations of the pairs `rows`
         (indices into the lists passed, in the backend's batch layout), so `step` selects the
-        targets of those pairs. Gradients land on any external trainable tensors `step` closes
-        over (the DAS rotation); the CALLER owns the optimizer (step/zero outside). Returns the
-        summed loss as a CPU scalar tensor."""
+        targets of those pairs. `step` returns the SUM of the per-pair losses of `rows` (a cell
+        that wants the mean divides each by the number of pairs it passed), so the gradient and
+        the returned loss are the same whether the backend runs the pairs in one trace or one
+        pair per trace. Gradients land on any external trainable tensors `step` closes over (the
+        DAS rotation); the CALLER owns the optimizer (step/zero outside). Returns the loss summed
+        over all pairs as a CPU scalar tensor."""
         raise NotImplementedError
 
     def vjp_batch(self, model, prompts, acts_of, target_of, make_cotangent, n):

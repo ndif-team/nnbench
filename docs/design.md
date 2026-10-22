@@ -1309,9 +1309,10 @@ in the test fakes, so a cell in the wrong form fails in the no-GPU suite rather 
 engine error on one backend. Several-unit primitives (`train_patch`, `vjp_batch`) pass the
 cell's closure the indices of the units the current trace holds (`rows`), so the closure selects
 targets per unit and the same cell runs batched on HF and one unit per trace on the async engine.
-An engine error recorded for a cell is therefore the engine's answer to its documented form;
-`scripts/row_diff.py` compares the recorded error text and outputs of two runs row by row, the
-check a cell change runs on every backend that registers it before the change is pushed.
+`train_patch`'s step returns the loss summed over its rows, so the gradient is the same whichever
+way the backend splits the pairs into traces; unequal sides raise `FormError`. An engine error
+recorded for a cell is therefore the engine's answer to its documented form;
+`scripts/row_diff.py` compares two runs row by row (`docs/writing-workloads.md` §8).
 
 **What gets saved.** Successful effective-call records contain bound parameters, their semantic and
 realization split when available, and a case-level protocol description or explicit template-level
@@ -1369,7 +1370,7 @@ Acceptance checks:
 |---|---|
 | Effective calls | Real signature binding, generic-family binding, defaults with `**kwargs`, isolated invalid cases, baseline/effect/reference records |
 | Concrete requirements | Branch-behavior tests for no-write and no-gradient cases, plus a custom description hook |
-| Unit form | One-unit primitives raise `FormError` on several units in every backend and the test fake; the DAS and Jacobian closures take `rows` |
+| Unit form | One-unit primitives raise `FormError` on several units in every backend and the test fake, and `train_patch` on unequal sides; the DAS and Jacobian closures take `rows` |
 | Ownership and timing | Nested mutation across warmups/trials/reference calls cannot alter snapshots; preparation occurs before the clock |
 | Comparison | Parameter, input, decode-length, aggregation, effect, and model-load changes reject comparison; timing-only changes compare; incomplete identity stays unverified |
 | File boundaries | Current jobs round-trip with saved coverage; historical and future versions fail clearly; malformed current artifacts fail validation |

@@ -212,17 +212,17 @@ class VLLMAsyncBackend(VLLMBackend):
 
     def train_patch(self, model, source_prompts, base_prompts, capture, step):
         """The REAL train step in the async engine's form: one request per trace, so one pair per
-        pair of traces, the gradients of the pairs accumulating on `step`'s trainables (the same
-        gradient as HF's padded batch up to the loss's mean scaling). On today's vLLM it dies at
-        the engine's own first refusal and that error is the recorded verdict: the dev line raises
-        at the first grad-tracking op on an inference tensor; the 0.8 line tolerates
-        `requires_grad_` and refuses at the backward session ("forward runs under
+        pair of traces, the gradients of the pairs accumulating on `step`'s trainables (`step` sums
+        the losses of its rows, so the accumulated gradient is HF's padded-batch gradient). On
+        today's vLLM it dies at the engine's own first refusal and that error is the recorded
+        verdict: the dev line raises at the first grad-tracking op on an inference tensor; the 0.8
+        line tolerates `requires_grad_` and refuses at the backward session ("forward runs under
         torch.inference_mode"). Attempting the real computation (not a probe) keeps the recorded
         error the engine's own words on every client line, and a line that does support grad
         would simply work."""
         import torch
 
-        pairs = list(zip(self.many(source_prompts), self.many(base_prompts)))
+        pairs = list(zip(*self.paired(source_prompts, base_prompts, "train_patch")))
 
         async def _go():
             total = torch.zeros(())

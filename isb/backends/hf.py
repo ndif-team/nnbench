@@ -54,7 +54,7 @@ class HFBackend(Backend):
 
     def train_patch(self, model, source_prompts, base_prompts, capture, step):
         """HF's form: each side is one left-padded batch, so every pair is in both traces."""
-        sources, bases = self.many(source_prompts), self.many(base_prompts)
+        sources, bases = self.paired(source_prompts, base_prompts, "train_patch")
         rows = list(range(len(sources)))
         with model.trace(sources):           # trace 1: source (counterfactual) activations, no grad
             s = capture().save()

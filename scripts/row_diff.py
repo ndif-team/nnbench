@@ -2,8 +2,8 @@
 
     python scripts/row_diff.py runs/inbox das-before das-after
 
-The check a cell change runs before it is pushed, on every backend that registers the cell
-(design.md §12.13 "Unit form"): a row whose recorded error text changed is a cell-form change
+The check a cell change runs before it is pushed, on the backends whose code the change touches
+(docs/writing-workloads.md §8): a row whose recorded error text changed is a cell-form change
 until the commit message says why. Runs come from `scripts/execute.py` (one cell, one engine,
 one file) or from a job's exported run files.
 """

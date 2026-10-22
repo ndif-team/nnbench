@@ -130,6 +130,21 @@ def test_one_unit_primitives_refuse_several_units_before_touching_the_engine(bac
     assert be.one(["only"], primitive) == "only" and be.one("only", primitive) == "only"
 
 
+@pytest.mark.parametrize("backend_module, cls", [
+    ("isb.backends.hf", "HFBackend"), ("isb.backends.vllm_async", "VLLMAsyncBackend")])
+def test_train_patch_refuses_unequal_sides_before_touching_the_engine(backend_module, cls):
+    """Two sources against one base would give HF a row with no base and lose a source to
+    `zip` on the async engine; the form check refuses both first."""
+    import importlib
+
+    backend_cls = getattr(importlib.import_module(backend_module), cls)
+    be = backend_cls.__new__(backend_cls)              # no engine construction
+    be.name = cls
+    with pytest.raises(FormError, match=f"{cls}.train_patch takes one base per source; the cell "
+                                        f"passed 2 source and 1 base prompts"):
+        be.train_patch(None, ["source one", "source two"], ["base"], None, None)
+
+
 def test_a_cell_that_hands_a_one_unit_primitive_several_units_fails_without_a_gpu():
     """The no-GPU fake inherits the form check, so a cell passing a batch to `generate` fails in
     the test suite, where before only the vLLM run would have shown it."""
