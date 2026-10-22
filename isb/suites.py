@@ -176,6 +176,14 @@ SUITES = {s.name: s for s in (
           backends=("nnsight-hf/sdpa/0-8-1/gpu4", "nnsight-hf/sdpa/0-7/gpu4",
                     "nnsight-vllm/0-8-1/tp4", "nnsight-vllm/0-7/tp4"),
           reference="nnsight-hf/sdpa/0-8-1/gpu4", timeout=10800),
+    # Open loop on HF and the async engine (docs/request-patterns.md): 128 steering requests arriving
+    # at 4, 16 and 64 per second, below, between and above the two engines' closed-loop capacity.
+    Suite("llama70b-open",
+          entries=(Entry(("steering",), ("llama3.3-70b",), regimes=("open",),
+                         loads=(Open(128, (4, 16, 64)),)),),
+          backends=("nnsight-hf/sdpa/0-8-1/gpu4", "nnsight-hf/sdpa/0-7/gpu4",
+                    "nnsight-vllm/0-8-1/tp4", "nnsight-vllm/0-7/tp4"),
+          reference="nnsight-hf/sdpa/0-8-1/gpu4", timeout=10800),
     # Coverage: every load pattern the five workloads declare, 16 units each, on nnsight 0.8.1, 0.7
     # and 0.5.15 (2026-01-13). 0.5 has only the sync vLLM engine, so it also serves the serving
     # patterns, one request at a time like HF.
