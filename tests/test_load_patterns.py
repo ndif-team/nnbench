@@ -259,7 +259,9 @@ def test_open_loop_on_a_serial_backend_queues_and_latency_counts_from_arrival():
 def test_open_loop_below_capacity_keeps_latency_near_the_service_time():
     probe = _InFlight()
     result, _ = run_open(probe.call, list(range(6)), rate=20.0, passes=1, keep=0, serial=True)
-    assert result.percentile(99) < 40.0                 # 10 ms calls, arrivals ~50 ms apart
+    # 10 ms calls, arrivals ~50 ms apart: no queue forms, so latency is the call plus thread start.
+    # Issuing only after returns, or timing from the pass start, would give 200 ms or more.
+    assert result.percentile(99) < 100.0
 
 
 def test_an_open_loop_error_is_raised():

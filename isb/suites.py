@@ -95,7 +95,8 @@ SUITES = {s.name: s for s in (
                          loads=(Offline(256, (1, 16, 64, None)),)),
                    Entry(("activation_patching", "gen_steering"), ("qwen2.5-7b", "qwen3-32b"),
                          regimes=("offline",), loads=(Offline(64, (1,)),)),
-                   # one prompt per call is ceil(d_model/dim_batch) backward passes (512 at d=4096):
+                   # one prompt per call is ceil(d_model/dim_batch) backward passes (43 at d=4096,
+                   # dim_batch 96):
                    # few units, B=1 only (how jacobian-lens shards a corpus)
                    Entry(("jacobian_collect",), ("qwen2.5-7b", "qwen3-32b"),
                          regimes=("offline",), loads=(Offline(8, (1,)),))),
@@ -105,7 +106,7 @@ SUITES = {s.name: s for s in (
     # single-unit requests from C clients. HF and the sync engine take one request at a time (a
     # serial server); the async engine takes them together.
     Suite("nnsight-load-concurrent",
-          entries=(Entry(("steering", "gen_steering", "gen_capture"),
+          entries=(Entry(("steering", "logit_lens", "gen_steering", "gen_capture"),
                          ("qwen2.5-7b", "qwen3-32b"), regimes=("concurrent",),
                          loads=(Concurrent(128, (1, 4, 16, 64)),)),),
           backends=("nnsight-hf/sdpa/0-8-1", "nnsight-vllm/sync/0-8-1", "nnsight-vllm/0-8-1"),
@@ -116,7 +117,7 @@ SUITES = {s.name: s for s in (
     # steered generation about 5 and 58). The sync engine is left out: it serves one request at a
     # time like HF, so its open-loop latency follows from its single-request time.
     Suite("nnsight-load-open",
-          entries=(Entry(("steering", "gen_steering", "gen_capture"),
+          entries=(Entry(("steering", "logit_lens", "gen_steering", "gen_capture"),
                          ("qwen2.5-7b", "qwen3-32b"), regimes=("open",),
                          loads=(Open(128, (4, 16, 64)),)),),
           backends=("nnsight-hf/sdpa/0-8-1", "nnsight-vllm/0-8-1"),

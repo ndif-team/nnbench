@@ -200,7 +200,11 @@ pile up: the most in flight grows toward M, latency grows through the pass, and 
 levels off at capacity. That pile-up is where problems that a closed loop cannot reach appear: saved
 values and KV cache held for every request in flight, client-side trace serialization (about 6 ms
 per invoke for nnsight 0.8.1 on vLLM) becoming the limit before the GPU, and failures or stalls under
-overload.
+overload. One caveat on that serialization limit: the arrival threads, the issuing loop and
+nnsight's per-invoke pickling share one Python process and its GIL, so a late issue (charged to
+the system, the right side to err on) can be the client's own contention. The ceiling it sets is a
+one-process ceiling that N client processes would not share; a sweep whose achieved rate stops at
+the client should be repeated from several processes before it is read as an engine limit.
 
 **Reading it:** read p99 against the offered rate. The highest rate whose p99 stays within a latency
 target is the server's usable capacity (MLPerf Server's pass criterion). On a serial backend (HF, the
@@ -227,11 +231,16 @@ The declaration follows from who controls the arrival process:
   closed loop by construction, so throughput at a chosen chunk size is the whole question.
 - `concurrent` and `open` only when a deployment runs the method once per live request. The closed
   loop shows whether the engine overlaps requests; the open loop shows latency at a rate the users
-  set, including overload. A research job never produces that arrival process, so pushing a lens or
-  a patching sweep at a Poisson rate would measure a situation no user is in.
+  set, including overload. A research job never produces that arrival process, so pushing a
+  patching sweep at a Poisson rate would measure a situation no user is in. The logit lens is the
+  read under load: a last-position read on a served request is the runtime monitor or probe, so it
+  declares all three.
 - none of the three when the job is one sequential computation whose calls depend on each other.
   There is no stream of independent requests to shape; the job runs as single stream, one job per
   call, which is the workload's own `interactive` regime.
+- none, for a harness or engine reason rather than a usage one, when a sweep could not be scored:
+  the attention pattern's per-prompt outputs have different lengths, so they cannot be stacked
+  against a per-unit reference, and vLLM has no attention probabilities to read.
 
 Two axes are involved. The request shape is the workload's own regime: one unit per call
 (`interactive`), several units per call (`batched`), or one unit decoded for several steps
@@ -242,7 +251,7 @@ request shape, decode included.
 
 | Workload | Setting | Request shape (own regimes) | Load patterns |
 |---|---|---|---|
-| Logit lens | research job | one prompt; a batch of prompts | offline (B = 1, 16, 64, all) |
+| Logit lens | both | one prompt; a batch of prompts | offline (B = 1, 16, 64, all), concurrent, open |
 | Jacobian lens | research job | one prompt | offline (B = 1) |
 | Ablation | research job | one prompt; a batch of prompts | offline (B = 1, 16, 64, all) |
 | Activation patching | research job | one clean/corrupted pair | offline (B = 1) |
@@ -281,19 +290,25 @@ at C = 1.
 The DAS and Jacobian collection cells take the form nnsight documents for a multi-trace job: the
 whole fit, or the whole sweep, runs inside one `model.session()` (`be.session`, which on vLLM runs
 the job's traces as they are reached, since nnsight documents sessions for transformers and remote
-models only). A DAS step trains on a minibatch of 16 pairs, the train split (pyvene's IOI sweep
-steps on 20, causalab on 32): one left-padded batch, the rotated interchange at every row's last
-position, cross-entropy over the rows. Measured on gpt2 (HF, A100, nnsight dev line) against the
+models only). A DAS step trains on all 16 pairs of the train split at once, a full-batch step
+(pyvene's IOI sweep steps on minibatches of 20, causalab of 32): one left-padded batch, the rotated
+interchange at every row's last position, cross-entropy over the rows. Measured on gpt2 (HF, A100, nnsight dev line) against the
 1-pair step: the apply row's output is unchanged bit for bit (seeded rotation, 154 ms against
 182 ms per call), the train row goes from 1011 ms to 1385 ms per 24-step fit for 16 times the pairs
 per step, and its held-out guard still passes. Jacobian collection's output is unchanged bit for
 bit under the session (10.0 s against 11.0 s per 4-prompt sweep, one sample each on a shared
 card; cause of the difference not determined).
 
-Known gap, recorded here rather than built: a multi-tenant research server (NDIF) receives whole
-jobs at times its users choose, an open loop whose unit is a job (a fit, a 256-prompt lens sweep),
-not a prompt. That is not implemented. The engine behaviour it would expose, overlapping whole
-sessions, is nearest to what steering under the concurrent pattern shows at request level.
+Known gaps, recorded here rather than built:
+
+- A multi-tenant research server (NDIF) receives whole jobs at times its users choose, an open loop
+  whose unit is a job (a fit, a 256-prompt lens sweep), not a prompt. That is not implemented. The
+  engine behaviour it would expose, overlapping whole sessions, is nearest to what steering under
+  the concurrent pattern shows at request level.
+- Only the async vLLM engine declares `concurrent_requests`; every other backend is driven through
+  the serial lock. For the nnsight suites here that is the fact being measured (HF and the sync
+  engine serve one request at a time). A cross-system concurrent or open-loop row would need each
+  system's backend to declare whether it takes concurrent requests, or it would time the lock.
 
 ## Choosing and comparing
 

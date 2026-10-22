@@ -53,9 +53,9 @@ class HFBackend(Backend):
         return res.detach().float().cpu()
 
     def session(self, model, build):
-        out = [None]                     # index-assign: the session body is compiled, a rebinding
-        with model.session():            # inside it would be local to that body
-            out[0] = build()
+        out = [None]                     # index-assign: the session body is compiled; whether a
+        with model.session():            # rebinding inside it is pushed back to this frame (0.8.1)
+            out[0] = build()             # or dropped (the dev line), the list is shared
         return out[0]
 
     def train_patch(self, model, source_prompts, base_prompts, capture, step):

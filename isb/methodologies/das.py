@@ -9,8 +9,9 @@ methodology has two realizations split by the `train` param:
   matrix on both backends). COMPUTE (two matmuls) ∘ replacement-WRITE ∘ READ: the DAS program
   shape without the gradient loop, so it ports wherever activation patching does. A trained-R
   checkpoint would drop in the same way.
-- `train=N` (the gradient loop): N AdamW steps on R, each over a minibatch of `batch` training
-  pairs (16, the train split; pyvene's IOI sweep steps on 20, causalab on 32). Each step is one
+- `train=N` (the gradient loop): N AdamW steps on R, each over `batch` training pairs at once
+  (16: the whole train split, so the default step is full-batch; pyvene's IOI sweep steps on
+  minibatches of 20, causalab of 32). Each step is one
   `be.train_patch` — capture the counterfactual activations (one row per pair), run the base batch
   with the rotated interchange at every row's last position, cross-entropy toward each pair's
   counterfactual answer token (the unit's stored label), backward. HF left-pads a causal batch
@@ -103,7 +104,7 @@ def _das_cell(be, model, m, prompts, *, layer, k, train, batch, heldout, lr, see
             iia_seeded = iia(R)
             opt = torch.optim.AdamW([R], lr=lr)
             for i in range(train):
-                # minibatch i: `batch` consecutive training pairs, wrapping around the split
+                # step i: `batch` consecutive training pairs, wrapping around the split
                 step_units = [train_units[(i * batch + j) % len(train_units)] for j in range(batch)]
                 clean = [u[0] for u in step_units]
                 corrupted = [u[1] for u in step_units]
