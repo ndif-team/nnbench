@@ -155,6 +155,45 @@ SUITES = {s.name: s for s in (
           backends=("nnsight-hf/sdpa/0-8-1/gpu2", "nnsight-vllm/0-8-1/tp2",
                     "nnsight-vllm/0-8-1/byref/tp2", "nnsight-hf/sdpa/0-4-6/gpu2"),
           reference="nnsight-hf/sdpa/0-8-1/gpu2", timeout=10800),
+    # Llama-3.3-70B-Instruct in bf16 on four 80 GB A100s: HF splits its layers across them
+    # (device_map="auto", the */gpu4 configs), vLLM shards each layer (tensor parallel, */tp4).
+    # Speed: each workload under the load patterns that match how it is used
+    # (docs/request-patterns.md), nnsight 0.8.1 and 0.7 on each engine. The sync engine takes the
+    # offline pattern; the async engine, which takes concurrent requests, the serving patterns.
+    Suite("llama70b-offline",
+          entries=(Entry(("logit_lens",), ("llama3.3-70b",), regimes=("offline",),
+                         loads=(Offline(256, (1, 16, 64)),)),
+                   Entry(("activation_patching",), ("llama3.3-70b",), regimes=("offline",),
+                         loads=(Offline(64, (1,)),))),
+          backends=("nnsight-hf/sdpa/0-8-1/gpu4", "nnsight-hf/sdpa/0-7/gpu4",
+                    "nnsight-vllm/sync/0-8-1/tp4", "nnsight-vllm/sync/0-7/tp4"),
+          reference="nnsight-hf/sdpa/0-8-1/gpu4", timeout=10800),
+    Suite("llama70b-concurrent",
+          entries=(Entry(("steering",), ("llama3.3-70b",), regimes=("concurrent",),
+                         loads=(Concurrent(128, (1, 16, 64)),)),
+                   Entry(("gen_steering",), ("llama3.3-70b",), regimes=("concurrent",),
+                         loads=(Concurrent(64, (1, 16, 64)),))),
+          backends=("nnsight-hf/sdpa/0-8-1/gpu4", "nnsight-hf/sdpa/0-7/gpu4",
+                    "nnsight-vllm/0-8-1/tp4", "nnsight-vllm/0-7/tp4"),
+          reference="nnsight-hf/sdpa/0-8-1/gpu4", timeout=10800),
+    # Coverage: every load pattern the five workloads declare, 16 units each, on nnsight 0.8.1, 0.7
+    # and 0.5.15 (2026-01-13). 0.5 has only the sync vLLM engine, so it also serves the serving
+    # patterns, one request at a time like HF.
+    Suite("llama70b-coverage-offline",
+          entries=(Entry(("logit_lens", "steering", "ablation", "activation_patching", "gen_steering"),
+                         ("llama3.3-70b",), regimes=("offline",), loads=(Offline(16, (1, 16)),)),),
+          backends=("nnsight-hf/sdpa/0-8-1/gpu4", "nnsight-hf/sdpa/0-7/gpu4",
+                    "nnsight-hf/sdpa/0-5-15/gpu4", "nnsight-vllm/sync/0-8-1/tp4",
+                    "nnsight-vllm/sync/0-7/tp4", "nnsight-vllm/sync/0-5-15/tp4"),
+          reference="nnsight-hf/sdpa/0-8-1/gpu4", timeout=7200),
+    Suite("llama70b-coverage-serving",
+          entries=(Entry(("logit_lens", "steering", "gen_steering"), ("llama3.3-70b",),
+                         regimes=("concurrent", "open"),
+                         loads=(Concurrent(16, (4,)), Open(16, (4.0,)))),),
+          backends=("nnsight-hf/sdpa/0-8-1/gpu4", "nnsight-hf/sdpa/0-7/gpu4",
+                    "nnsight-hf/sdpa/0-5-15/gpu4", "nnsight-vllm/0-8-1/tp4",
+                    "nnsight-vllm/0-7/tp4", "nnsight-vllm/sync/0-5-15/tp4"),
+          reference="nnsight-hf/sdpa/0-8-1/gpu4", timeout=7200),
     # Qwen3.5-4B with the upstream fitted Jacobian lens (its `jlens` asset).
     Suite("fitted-jlens",
           entries=(Entry(("jacobian_lens",), ("qwen3.5-4b",)),),

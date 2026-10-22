@@ -1,0 +1,22 @@
+services:
+  runner:
+    extends: {file: ../../../compose.base.yml, service: runner}
+    image: isb-nnsight-vllm-0-7:local
+    build:
+      args:
+        VLLM_IMAGE: vllm/vllm-openai:v0.15.1
+        NNSIGHT_REF: 884bd1c7b0dbd53be01ade6a18843078d90367b4   # tag v0.7.0
+    environment:
+      ISB_BACKEND: ${ISB_BACKEND:-nnsight-vllm/sync/0-7/tp4}
+      # sync/0-7 with tensor parallelism over four GPUs, for a model one GPU cannot hold
+      ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","gpu_memory_utilization":0.85,"enable_prefix_caching":false,"tensor_parallel_size":4}'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${ISB_GPU}", "${ISB_GPU_1}", "${ISB_GPU_2}", "${ISB_GPU_3}"]   # four GPUs from --gpu (backends/README.md)
+              capabilities: [gpu]
+volumes:
+  model-cache:
+    name: ${ISB_MODEL_CACHE:-isb-model-cache}

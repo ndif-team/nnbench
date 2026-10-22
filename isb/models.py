@@ -140,6 +140,10 @@ MODELS = {m.key: m for m in (
     # the */gpu2 and */tp2 configs, with ISB_MODEL_CACHE naming a volume linked to that cache.
     Model("qwen2.5-72b", "Qwen/Qwen2.5-72B-Instruct", "llama", 80, dtype_control="bfloat16"),
     Model("qwen2.5-72b-awq", "Qwen/Qwen2.5-72B-Instruct-AWQ", "llama", 80, dtype_control="bfloat16"),
+    # Llama-3.3-70B-Instruct in bf16 (132 GiB) from the group's shared cache: four 80 GB A100s,
+    # the */gpu4 and */tp4 configs. Qwen3-8B (same family, one GPU) checks a config before it.
+    Model("llama3.3-70b", "meta-llama/Llama-3.3-70B-Instruct", "llama", 80, dtype_control="bfloat16"),
+    Model("qwen3-8b", "Qwen/Qwen3-8B", "llama", 36, dtype_control="bfloat16"),
     # Text-only checkpoint of a multimodal-wrapper arch: transformers auto-routes it to the text-only
     # ForCausalLM, but nnsight's LanguageModel refuses the repo by model_type (the guard exempts
     # explicit automodels; see HFBackend).
