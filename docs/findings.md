@@ -1223,3 +1223,173 @@ plain engines from each backend's `__vanilla__` call.
   edit rows pass.
 - **Budget:** 1 h 31 min for both jobs on two H200s, most of it six loads of the 145 GB checkpoint.
 - Handoff for rerunning this elsewhere, with the open lens diagnosis: `docs/large-model-handoff.md`.
+
+## Llama-3.3-70B on four A100s: request patterns on HF and vLLM, nnsight 0.5.15, 0.7.0 and 0.8.1 (2026-10-22)
+
+Llama-3.3-70B-Instruct in bf16 (snapshot `6f6073b4`, from the group's model cache) on hakone,
+four A100-SXM4-80GB per job, under the request patterns of `docs/request-patterns.md` (design.md
+§12.17). HF runs accelerate `device_map="auto"` over the four GPUs (`nnsight-hf/sdpa/<version>/gpu4`;
+torch 2.11.0, transformers 5.12.1). vLLM runs with `tensor_parallel_size=4`,
+`gpu_memory_utilization` 0.85 and no prefix caching: the sync engine for the offline pattern
+(`nnsight-vllm/sync/<version>/tp4`), the async engine for the concurrent and open-loop ones
+(`nnsight-vllm/<version>/tp4`). Each nnsight release runs on the vLLM it is installed with: 0.8.1
+(`de7fec4d`) on vLLM 0.27.1, 0.7.0 (`884bd1c7`) on 0.15.1, 0.5.15 (`79e18487`) on 0.13.0. Docker's
+disk on this host is full, so the jobs ran under the repo's rootless Apptainer launcher
+(`ISB_LAUNCHER=apptainer`), with CUDA's forward-compatibility libraries first on the vLLM images'
+library path (driver 570, CUDA 12.8). Suites `llama70b-*` in `isb/suites.py` on branch
+`eval/llama70b-patterns` (221f76c configs and suites; ea4c01e, 879110e and de3eb0c the nnsight 0.5.15
+forms; 4ca6b60 open loop). Runs under `/disk/u/zikai/isb-runs/llama70b/`: offline
+`20261022T201215Z-99c41be4`, concurrent `20261022T212312Z-c840be9d`, open loop
+`20261022T230125Z-0806cc04`, the vLLM 0.7.0 lens rerun `20261022T233350Z-9c003561`; coverage
+`20261022T211132Z-2d707fa1` (offline) and `20261022T224619Z-47432573` (serving). The speed suites
+send 256 units offline in chunks of 1, 16 or 64 per call, 3 passes (activation patching: 64 units,
+one per call); 128 single-unit requests from 1, 16 or 64 closed-loop clients (steered generation:
+64); and 128 steering requests at 4, 16 or 64 per second (seeded Poisson). HF and the sync engine
+serve one request at a time, the async engine takes them together. Every pattern scores its first 16
+units against HF 0.8.1.
+
+**Speed where both sides run the pattern.** Units/s, the median over the workload's rows
+(activation patching 4, logit lens 1, steering 8, steered generation 4 rows of 8 tokens).
+
+| Workload, pattern | HF 0.7.0 | HF 0.8.1 | vLLM 0.7.0 | vLLM 0.8.1 | vLLM ÷ HF, 0.8.1 | 0.8.1 ÷ 0.7.0, HF | 0.8.1 ÷ 0.7.0, vLLM |
+|---|---|---|---|---|---|---|---|
+| Activation patching, offline, 1 per call | 4.09 | 4.14 | 8.31 | 8.76 | 2.12 | 1.01 | 1.05 |
+| Logit lens, offline, 1 per call | 4.25 | 4.24 | engine stalled | 5.50 | 1.30 | 1.00 | |
+| Logit lens, offline, 16 per call | 22.38 | 22.24 | engine stalled | 5.46 | 0.25 | 0.99 | |
+| Logit lens, offline, 64 per call | 27.53 | 27.49 | engine stalled | 5.40 | 0.20 | 1.00 | |
+| Steering, 1 client | 8.85 | 9.12 | 14.36 | 18.09 | 1.98 | 1.03 | 1.26 |
+| Steering, 16 clients | 8.90 | 9.11 | 35.28 | 47.04 | 5.16 | 1.02 | 1.33 |
+| Steering, 64 clients | 8.88 | 9.09 | 37.15 | 53.14 | 5.85 | 1.02 | 1.43 |
+| Steered generation, 1 client | 1.17 | 1.18 | 2.58 | 3.23 | 2.74 | 1.01 | 1.25 |
+| Steered generation, 16 clients | 1.17 | 1.18 | 3.75 | 20.37 | 17.3 | 1.01 | 5.43 |
+| Steered generation, 64 clients | 1.15 | 1.15 | out of memory on 3 of 4 rows | 32.94 | 28.6 | 1.00 | |
+
+Without nnsight, under the same patterns (each backend's `__vanilla__` call): HF serves 9.2 steering
+and 1.19 generation requests/s at every client count; vLLM 0.15.1 serves 31, 185 and 389 steering
+requests/s at 1, 16 and 64 clients and 4.3, 47 and 144 generations/s, vLLM 0.27.1 30, 154 and 338 and
+4.0, 48 and 144.
+
+Open loop, steering: request latency p50 / p99 in ms. The seeded schedule offers 3.5, 13.9 and
+54.5–54.9 requests/s over its span (plain vLLM's throughput under it).
+
+| Arrival rate | HF 0.7.0 | HF 0.8.1 | vLLM 0.7.0 | vLLM 0.8.1 |
+|---|---|---|---|---|
+| 4 per second | 113 / 272 | 111 / 266 | 64 / 720 | 61 / 117 |
+| 16 per second | 2,743 / 5,237 | 2,553 / 4,931 | 101 / 518 | 73 / 154 |
+| 64 per second | 6,207 / 12,130 | 5,984 / 11,726 | 1,790 / 2,471 | 318 / 531 |
+| Units/s served at 64 per second | 8.83 | 9.09 | 38.70 | 51.42 |
+
+- **vLLM over HF at 0.8.1.** vLLM is faster wherever a call carries one prompt or requests overlap:
+  1.30× on the lens and 2.12× on patching at one prompt per call, 1.98× on steering and 2.74× on
+  steered generation at one client, 5.2–5.9× on steering and 17–29× on steered generation at 16 and
+  64 clients, where HF still serves one request at a time (9.1 steering requests/s at every client
+  count) and the async engine overlaps them. Under open-loop arrivals vLLM answers in 61 ms against
+  HF's 111 at 4 per second; at 16 and 64 per second HF is past its capacity and its requests queue
+  for seconds while vLLM 0.8.1 keeps its p50 at 73 and 318 ms. vLLM is slower on the batched logit
+  lens, 0.25× at 16 per call and 0.20× at 64. HF runs a chunk as one padded forward; the vLLM path
+  runs each prompt as its own invoke (`isb/backends/vllm_sync.py`, `run_batched`), so the 80-layer
+  read runs once per prompt and throughput stays at 5.4–5.5 units/s at every chunk size while plain
+  vLLM goes from 30 to 374. The workload's baseline row, a one-layer lens, reaches 18.7, 38.6 and 40.7
+  units/s, so most of the gap is the per-prompt layer reads. The 7B offline curves of "Load patterns"
+  above flatten the same way.
+- **0.8.1 over 0.7.0 on HF: 0.99–1.03×.** Both versions run steering and steered generation within
+  4% of the plain forward.
+- **0.8.1 over 0.7.0 on vLLM.** 1.05× on offline patching (sync engine). On the async engine
+  1.25–1.26× at one client, 1.33× and 1.43× on steering at 16 and 64 clients, 5.43× on steered
+  generation at 16 clients; at 64 clients 0.7.0 runs out of memory on 3 of the 4 generation rows. In
+  open loop at 64 per second 0.7.0 serves 38.7 of the offered 54.9 requests/s with p50 1.8 s, 0.8.1
+  serves 51.4 with p50 318 ms. The engine underneath is slower on 0.8.1 (vLLM 0.27.1 alone serves 154
+  and 338 steering requests/s at 16 and 64 clients against 0.15.1's 185 and 389), so as a share of its
+  plain engine nnsight's async throughput rose from 46, 19 and 10% to 60, 31 and 16% on steering, and
+  from 60, 8 and 0.6% to 81, 43 and 23% on steered generation (0.7.0's 0.6% is the one generation row
+  that completed at 64 clients).
+- **What limits the async engine.** On 0.8.1 the baseline row (the same trace with the write
+  switched off) runs within 4% of the workload: 53.7 against 53.1 steering requests/s and 33.9
+  against 32.9 generations/s at 64 clients. The cost against plain vLLM is the traced request itself,
+  and the intervention adds little. On 0.7.0 the baseline row of steered generation, which saves the
+  same per-step logits without writing, collapses with the workload (3.8 generations/s at 16 clients,
+  0.81 at 64). 0.7.0's worker pickles each request's saves with `pickle.dumps`
+  (`modeling/vllm/model_runners/GPUModelRunner.py`), which writes the whole storage behind a saved
+  view, and the client unpickles them onto its own GPU (`modeling/vllm/async_backend.py`); 0.8.1
+  copies each saved tensor that views a larger storage before pickling (`modeling/vllm/collect.py`,
+  `dumps_compact`). Measured on Qwen3-8B on one A100 with the same images, 16 single-prompt traces
+  submitted together to the async engine, each saving `model.logits[-1:, :]` (a 303,872-byte bf16
+  row), reading `untyped_storage().nbytes()` of each returned tensor: on 0.7.0, 13 of the 16 saves
+  arrived with a 3,950,336-byte storage, the rows of all 13 requests in their step, 2 with two rows
+  and 1 with its own row, and the client held 50.4 MiB on its GPU; on 0.8.1 all 16 arrived with their
+  own row and the client held 4.6 MiB. At 64 clients on the 70B, 0.7.0's client process held 10.6 GB
+  on GPU 0 beside tensor-parallel rank 0's 70.3 GB when "CUDA out of memory. Tried to allocate 16.00
+  MiB. GPU 0 has a total capacity of 79.25 GiB of which 5.69 MiB is free" ended three of the rows.
+  How much of 0.7.0's throughput collapse the returned storage accounts for was not measured.
+- **HF latency above one client is not compared across versions.** HF requests pass through the
+  driver's lock (`isb/perf/load.py`, a `threading.Lock`), which admits waiting clients in no fixed
+  order, so at the same throughput HF's p50 differs between runs (steering at 64 clients: 1.5 s on
+  0.8.1, 6.9 s on 0.7.0).
+- **vLLM 0.7.0 stalls in the logit lens sweep.** In the offline run and again in the rerun, the sync
+  engine stopped on the 573rd 80-layer lens request at one prompt per call, after the 16 reference
+  requests and the 1,024 requests of the one-layer baseline row: vLLM logged "No available shared
+  memory broadcast block found in 60 seconds" four times, then "TimeoutError: RPC call to
+  sample_tokens timed out.", and the engine died, failing the 16 and 64 per call patterns with it.
+  The cell unembeds each layer with `model.logits_processor(model.lm_head, normed)`, which gathers
+  the vocabulary shards across the four ranks inside the trace. That form is documented from 0.8.1
+  (`docs/models/vllm-parallelism.md`); 0.7.0's `docs/patterns/logit-lens.md` calls
+  `model.lm_head(...)`, which vLLM's `ParallelLMHead.forward` refuses ("LMHead's weights should be
+  used in the sampler."), and its `docs/models/vllm.md` describes tensor parallelism as transparent
+  to intervention code. 0.8.1 runs the same sweep to the end, and 0.7.0 runs the cell correctly at
+  16 units (below). Cause not determined. Under tensor parallelism 0.7.0 documents no
+  full-vocabulary unembedding inside a trace; 0.8.1 documents one and runs it.
+
+**Which patterns each version runs, and how fast at 16 units.** Suites `llama70b-coverage-offline`
+and `llama70b-coverage-serving`: every pattern each workload declares, 16 units, 3 passes for
+offline, scored against HF 0.8.1; offline at 1 and 16 per call (activation patching and steered
+generation take one unit per call), concurrent at 4 clients, open loop at 4 per second. vLLM's
+serving patterns run on the async engine for 0.7.0 and 0.8.1 and on the sync engine for 0.5.15, which
+has no async engine. HF and vLLM 0.5.15 serve the concurrent and open-loop patterns one request at a
+time; vLLM 0.7.0 and 0.8.1 take them together. Units/s, or p50 ms for open loop; "unsupported" means
+the backend refused the pattern.
+
+| Workload, pattern | HF 0.5.15 | HF 0.7.0 | HF 0.8.1 | vLLM 0.5.15 | vLLM 0.7.0 | vLLM 0.8.1 |
+|---|---|---|---|---|---|---|
+| Logit lens, offline, 1 per call | 4.26 | 4.23 | 4.23 | 5.73 | 5.06 | 5.29 |
+| Logit lens, offline, 16 per call | 21.47 | 22.72 | 22.17 | unsupported | 4.42 | 5.20 |
+| Logit lens, 4 clients | 4.22 | 4.29 | 4.30 | 6.48 | 7.87 | 7.80 |
+| Logit lens, open loop 4 per second, p50 ms | 491 | 489 | 488 | 170 | 227 | 197 |
+| Steering, offline, 1 per call | 8.71 | 8.87 | 9.11 | 13.11 | 16.32 | 17.84 |
+| Steering, offline, 16 per call | 56.44 | 59.37 | 67.64 | unsupported | 18.88 | 37.13 |
+| Steering, 4 clients | 8.64 | 8.76 | 9.08 | 15.71 | 21.92 | 29.89 |
+| Steering, open loop 4 per second, p50 ms | 115 | 114 | 111 | 64 | 66 | 59 |
+| Ablation, offline, 1 per call | 7.86 | 8.06 | 8.33 | 13.98 | 17.32 | 17.56 |
+| Ablation, offline, 16 per call | 40.21 | 41.58 | 50.21 | unsupported | 18.61 | 36.24 |
+| Activation patching, offline, 1 per call | 4.08 | 4.12 | 4.18 | 7.36 | 8.78 | 8.77 |
+| Steered generation, offline, 1 per call | 1.18 | 1.18 | 1.19 | 2.73 | 2.67 | 3.23 |
+| Steered generation, 4 clients | 1.18 | 1.18 | 1.18 | 2.76 | 3.87 | 8.65 |
+| Steered generation, open loop 4 per second, p50 ms | 5,822 | 5,851 | 5,957 | 1,514 | 783 | 417 |
+| Patterns run, of 14 | 14 | 14 | 14 | 11 | 14 | 14 |
+
+- **nnsight 0.5.15 on vLLM** runs one prompt per call. Its saves come back by variable name, one
+  per invoke as in its README, and a loop of invokes filling one list (the 0.7 and 0.8 form) comes
+  back empty, so a call over a variable number of prompts is unsupported: every offline pattern at
+  16 per call. It has only the sync engine, so it serves the concurrent and open-loop patterns one
+  request at a time (steering at 4 clients: 15.7 units/s against 0.8.1's 29.9). Its runner reads a
+  mediator from every request, so a plain request through its engine raises in the worker and takes
+  the engine down: the plain-engine timing is unavailable. It needs vLLM 0.13.0 or later: on 0.12.0
+  its worker raises "'GPUModelRunner' object has no attribute 'finish_nnsight'". On HF it runs every
+  pattern, stepping generation with `with tracer.iter[...]`.
+- **nnsight 0.7.0 and 0.8.1** run all 14 patterns on both engines at 16 units. Under the speed
+  suites' load 0.7.0 fails two of them: steered generation at 64 clients runs out of memory, and the
+  80-layer lens stalls on its 573rd request.
+- **Across versions at 16 units.** On vLLM at 16 per call 0.8.1 runs steering and ablation at 1.97×
+  and 1.95× 0.7.0 (37.1 against 18.9, 36.2 against 18.6 units/s) and the lens at 1.18×; at one
+  prompt per call 0.8.1 is 1.00–1.21× 0.7.0, and 0.5.15 0.80–1.13×. Steered generation at 4 clients
+  is 2.2× 0.7.0 on 0.8.1 (8.65 against 3.87) and 3.1× 0.5.15's one-at-a-time engine. On HF at 16 per
+  call 0.8.1 runs steering at 1.14× and ablation at 1.21× 0.7.0, its plain forward unchanged (69.2
+  against 69.0 units/s on the steering jobs); elsewhere on HF the three versions are within 6% of
+  each other.
+- **Numerical mismatches** (correctness unresolved, design.md §8.1). The two alpha-0.5 steered
+  generation rows on vLLM, plain and scaled by each token's norm: one or both in 0.5.15, 0.7.0 and
+  0.8.1, offline and under every serving pattern (top-1 0.86–0.95, TV 0.05–0.11), as at 72B. And the
+  "alpha 0.1" steering row at 16 per call on HF 0.7.0 and 0.5.15 (top-1 0.875, TV 0.156): offline
+  cells are scored against the reference's one-prompt-per-call outputs (`isb/sweep/spec.py`,
+  `reference_key`), and HF 0.8.1's own left-padded batch of 16 moves that row by the same amount,
+  unscored because it is the reference. The other seven steering rows move by TV ≤ 0.013 in HF's
+  batch, and vLLM's batch of 16, which has no padding, moves this row by 0.007.
