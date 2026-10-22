@@ -59,20 +59,20 @@ configs load the prototype from `backends/nnsight-vllm/envoy_byref` through `PYT
    findings, per-workload bar charts (plain engine, general cell, fastest realization per engine),
    the all-rows table with ratios, the realization descriptions, and the correctness table.
 
-## 3. Code: which checkout has what
+## 3. Code: the branch to start from
 
-The 72B run came from `/work/nvme/bdnh/zwang83/nnbench-l72opt`, a copy of the repo carrying work
-that is not yet on `main` (several copies were needed because the source guard fails a running job
-when `isb/` or `backends/` change under it). Before anything else, consolidate that copy into a
-branch; `diff -rq nnbench nnbench-l72opt -x runs -x .apptainer -x .git` lists the differences.
-What it adds over `main`:
+Everything the comparison ran on is on branch `feat/large-model-realizations` of
+`ndif-team/nnbench` (one commit on top of `main`, 58 files; the no-GPU suite passes, 618 tests).
+Check it out, then copy `scripts/report/` from this branch (`docs/large-model-handoff`) next to it,
+or merge the two. What the branch adds over `main`:
 
 - `backends/nnsight-hf/sdpa/0-8-1/{gpu2,tp2}` and `backends/nnsight-hf/sdpa/0-4-6/gpu2`: the
   two-GPU HF configs. `tp2` needs the HF image built with `TRANSFORMERS_VERSION=5.19.0`,
   `CLICK_VERSION=8.4.2`, `REMOVE_PACKAGES=spin` (see its `compose.yml`; the Dockerfile grew those
   build args).
 - `backends/nnsight-vllm/opt/0-8-1/{byref,taps/byref}` and their `tp2` variants,
-  `backends/nnsight-vllm/sync/0-8-1/byref/tp2`, `backends/vllm-plain/0-28-0/tp2`.
+  `backends/nnsight-vllm/sync/0-8-1/byref/tp2`, `backends/vllm-plain/0-28-0/tp2`. The
+  envoy-by-reference prototype they load lives in `backends/nnsight-vllm/envoy_byref`.
 - `backends/nnsight-vllm/opt/{backend.py,cells.py}`: the installed-edit cells made TP-safe (the
   steering direction is read from the checkpoint, not from a vocab-sharded `lm_head.weight`;
   `tensor_parallel_size` passed through).
@@ -81,9 +81,12 @@ What it adds over `main`:
   directory), `isb/methodologies/readout.py` (`head_direction`: a DTensor head falls back to the
   checkpoint), `isb/sweep/execute.py` (`_cached_revision`: transformers 5.18+ drops
   `config._commit_hash`, so the model-identity check reads the cache snapshot), `isb/models.py`
-  (the `qwen2.5-72b` entry), the `large-opt` stage in `slurm/delta-compare.slurm`.
-- The report generator is in `scripts/report/` of the main checkout (`build.py`, `assets/`,
-  `opt7b.py`; `optlarge.py` for the 72B layout). Not committed yet.
+  (the `qwen2.5-72b` entry), the `large-opt`, `hftp-smoke` and `hftp-min` stages in
+  `slurm/delta-compare.slurm`, and the findings sections of 2026-10-21 and 2026-10-22.
+- The report generator (`build.py`, `assets/`, `opt7b.py`, `optlarge.py`) is in `scripts/report/`
+  on this branch.
+
+The Delta working copies (`nnbench-l72opt` and the others) are superseded by the branch.
 
 ## 4. Host setup with Docker
 
@@ -239,5 +242,3 @@ minutes once the engine is up):
   both GPUs, not a single-GPU run. Every HF number at 72B is over two cards.
 - Stock nnsight 0.8.1 (without the byref prototype) was not run at 72B; the 7B stock-vs-byref
   numbers are in `docs/findings.md` (2026-10-21).
-- The report generator was reconstructed from a session transcript and lives in `scripts/report/`
-  uncommitted; commit it with the branch.
