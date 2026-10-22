@@ -105,6 +105,21 @@ def load_service(compose_file, env):
     return service, config.get("volumes") or {}
 
 
+def gpus(service, env, compose_file=""):
+    """The GPUs the runner service reserves (`deploy.resources.reservations.devices[].device_ids`,
+    interpolated), else the selected one. A config declares several GPUs by listing
+    `${ISB_GPU}`, `${ISB_GPU_1}`, ...; those exist only when `--gpu` is an index."""
+    devices = (((service.get("deploy") or {}).get("resources") or {}).get("reservations")
+               or {}).get("devices") or []
+    ids = [str(i) for d in devices for i in (d.get("device_ids") or [])]
+    if not ids:
+        return [env["ISB_GPU"]]
+    if not all(ids) or len(set(ids)) != len(ids):
+        raise ValueError(f"{compose_file}: declares {len(ids)} GPUs, which needs --gpu to be an "
+                         f"index with that many GPUs from it (got {ids})")
+    return ids
+
+
 def sif_path(root, image):
     return base_dir(root) / "images" / (re.sub(r"[^A-Za-z0-9_.-]", "_", image) + ".sif")
 
@@ -197,7 +212,7 @@ def command(compose_file, root, env):
         binds += ["--bind", ":".join([str(host), destination, *mode])]
     environment = {key: str(value) for key, value in
                    (service.get("environment") or {}).items()}
-    environment["CUDA_VISIBLE_DEVICES"] = env["ISB_GPU"]
+    environment["CUDA_VISIBLE_DEVICES"] = ",".join(gpus(service, env, compose_file))
     argv = ["apptainer", "exec", "--nv", "--cleanenv", "--no-home",
             "--pwd", service.get("working_dir", "/"), *binds, str(image), *service["entrypoint"]]
     return argv, {f"APPTAINERENV_{key}": value for key, value in environment.items()}

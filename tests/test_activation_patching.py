@@ -24,12 +24,17 @@ class _Block:
 
 
 class _Head:
-    def __init__(self):
-        self.weight = torch.eye(HID, HID)
+    """The model's head: `.output` is its [B, S, vocab] logits (the HF read site)."""
+
+    def __init__(self, output=None):
+        self.output = torch.zeros(1, 2, HID) if output is None else output
 
 
-def _last(t):
-    return t[-1:, :]
+class _Model:
+    """`.logits` is the engine's [tokens, vocab] logits (the vLLM read site)."""
+
+    def __init__(self, logits=None):
+        self.logits = torch.zeros(2, HID) if logits is None else logits
 
 
 def test_cells_registered():
@@ -59,30 +64,34 @@ def test_fused_patch_leaves_the_clean_stream_downstream():
     hidden, corrupt_residual = torch.ones(2, HID), torch.full((2, HID), 3.0)
     block = _Block((hidden, corrupt_residual))
     clean_stream = torch.arange(2 * HID, dtype=torch.float32).reshape(2, HID)
-    read = _patch_and_read([block], lambda x: x, _Head(), layer=0, clean_act=clean_stream,
-                           residual="fused", last_fn=_last)
+    _patch_and_read([block], _Model(), _Head(), layer=0, clean_act=clean_stream,
+                    residual="fused", site="engine")
     patched_hidden, kept_residual = block.output
     assert torch.equal(patched_hidden + kept_residual, clean_stream)
     assert torch.equal(kept_residual, corrupt_residual)
-    assert torch.equal(read, clean_stream[-1:])
 
 
 def test_patch_replaces_target_layer_residual():
     blocks = [_Block((torch.zeros(2, HID), "kv")), _Block(torch.ones(2, HID))]  # patch 0, read 1
     clean = torch.full((2, HID), 5.0)
-    _patch_and_read(blocks, lambda x: x, _Head(),
-                    layer=0, clean_act=clean, residual="plain", last_fn=_last)
+    _patch_and_read(blocks, _Model(), _Head(),
+                    layer=0, clean_act=clean, residual="plain", site="head")
     assert torch.equal(blocks[0].output[0], clean)   # transplanted
     assert blocks[0].output[1] == "kv"               # tuple tail preserved
 
 
-def test_patch_reads_final_block_logits():
-    final = torch.tensor([[0.0, 0, 0, 0], [7.0, 0, 0, 0]])
-    blocks = [_Block((torch.zeros(2, HID), "kv")), _Block(final)]
-    out = _patch_and_read(blocks, lambda x: x, _Head(),
-                          layer=0, clean_act=torch.ones(2, HID), residual="plain", last_fn=_last)
+def test_patch_reads_the_documented_site():
+    blocks = [_Block((torch.zeros(2, HID), "kv")), _Block(torch.ones(2, HID))]
+    head = _Head(torch.tensor([[[0.0, 0, 0, 0], [7.0, 0, 0, 0]]]))     # HF: lm_head.output
+    out = _patch_and_read(blocks, _Model(), head,
+                          layer=0, clean_act=torch.ones(2, HID), residual="plain", site="head")
     assert out.shape == (1, HID)
-    assert out[0, 0].item() == 7.0                   # identity norm + eye head -> last-token row
+    assert out[0, 0].item() == 7.0                   # the head's last-token row
+    engine = _Model(torch.tensor([[0.0, 0, 0, 0], [0.0, 0, 5.0, 0]]))  # vLLM: model.logits
+    blocks = [_Block((torch.zeros(2, HID), "kv")), _Block(torch.ones(2, HID))]
+    out = _patch_and_read(blocks, engine, _Head(),
+                          layer=0, clean_act=torch.ones(2, HID), residual="plain", site="engine")
+    assert out.shape == (1, HID) and out[0, 2].item() == 5.0
 
 
 def test_patch_shape_mismatch_raises():
@@ -90,8 +99,8 @@ def test_patch_shape_mismatch_raises():
     clean = torch.zeros(3, HID)                       # clean/corrupted length mismatch
     raised = False
     try:
-        _patch_and_read(blocks, lambda x: x, _Head(),
-                        layer=0, clean_act=clean, residual="plain", last_fn=_last)
+        _patch_and_read(blocks, _Model(), _Head(),
+                        layer=0, clean_act=clean, residual="plain", site="head")
     except ValueError:
         raised = True
     assert raised, "a clean/corrupted length mismatch must fail loud, not silently broadcast"
@@ -113,8 +122,8 @@ def test_last_position_fused_patch_changes_only_the_last_row_of_the_stream():
     hidden, corrupt_residual = torch.ones(3, HID), torch.full((3, HID), 2.0)
     block = _Block((hidden, corrupt_residual))
     clean_stream = torch.arange(3 * HID, dtype=torch.float32).reshape(3, HID)
-    _patch_and_read([block], lambda x: x, _Head(), layer=0, clean_act=clean_stream,
-                    residual="fused", last_fn=_last, positions="last")
+    _patch_and_read([block], _Model(), _Head(), layer=0, clean_act=clean_stream,
+                    residual="fused", site="head", positions="last")
     stream = block.output[0] + block.output[1]
     assert torch.equal(stream[:-1], (hidden + corrupt_residual)[:-1])   # corrupt rows kept
     assert torch.equal(stream[-1], clean_stream[-1])                    # last row from the clean run

@@ -35,6 +35,7 @@ import torch
 import torch.nn.functional as F
 
 from ..profiles import _resid
+from .readout import final_logits
 from .registry import cell
 
 
@@ -63,7 +64,7 @@ def _capture_last(blocks, layer, residual):
         return _rows(h)[:, -1, :].clone()
 
 
-def _interchange_read(blocks, norm, head, *, layer, src, R, k, residual, grad):
+def _interchange_read(blocks, model, head, *, layer, src, R, k, residual, grad, site):
     """Rotated interchange at (layer, last position) of every row, then the patched run's final
     logits [B, vocab]. `src` is [B, d], one source row per prompt. Runs INSIDE a trace.
     `grad=False` wraps everything in no_grad (the apply/eval path); `grad=True` leaves the graph
@@ -81,19 +82,17 @@ def _interchange_read(blocks, norm, head, *, layer, src, R, k, residual, grad):
         new = torch.cat([rows[:, :-1, :], (mixed @ Rd.T)[:, None, :]], dim=1).reshape(h.shape)
         blocks[layer].output = (new, *out[1:]) if is_tuple else new  # whole-tuple replace
 
-        normed = norm(_resid(blocks[-1].output, residual))      # patched run's final readout
-        logits = F.linear(normed, head.weight)                  # portable unembed
-        return _rows(logits)[:, -1, :]
+        return final_logits(model, head, site)      # patched run's next-token logits [B, vocab]
 
 
-def _das_cell(be, model, m, prompts, *, layer, k, train, batch, heldout, lr, seed, residual):
+def _das_cell(be, model, m, prompts, *, layer, k, train, batch, heldout, lr, seed, residual, site):
     units = list(prompts)                    # labeled units: (clean, corrupted, (correct, incorrect))
     if len(units) <= heldout:
         raise ValueError(f"need more than heldout={heldout} units, got {len(units)}")
     if batch < 1:
         raise ValueError(f"batch must be >= 1, got {batch}")
     train_units, eval_units = units[:-heldout], units[-heldout:]
-    blocks, ln_f, head = m.blocks(model), m.norm(model), m.head(model)
+    blocks, head = m.blocks(model), m.head(model)
     R = torch.nn.Parameter(_seeded_orthogonal(_d_model(model), seed))
 
     def answer_id(unit):
@@ -114,8 +113,8 @@ def _das_cell(be, model, m, prompts, *, layer, k, train, batch, heldout, lr, see
                     # `rows`: the step's pairs in this trace (all of them in HF's padded batch, one
                     # per trace on the async engine); summed over them (train_patch's contract)
                     # and divided by the pairs passed, so the step's loss is their mean
-                    logits = _interchange_read(blocks, ln_f, head, layer=layer, src=src,
-                                               R=R, k=k, residual=residual, grad=True)
+                    logits = _interchange_read(blocks, model, head, layer=layer, src=src,
+                                               R=R, k=k, residual=residual, grad=True, site=site)
                     return F.cross_entropy(logits, targets[rows].to(logits.device),
                                            reduction="sum") / len(step_units)
                 be.train_patch(model, corrupted, clean, capture=capture, step=step)
@@ -135,8 +134,8 @@ def _das_cell(be, model, m, prompts, *, layer, k, train, batch, heldout, lr, see
         clean, corrupted, _answers = unit
 
         def apply_fn(src):  # rotated interchange with a FIXED rotation, no grad
-            return _interchange_read(blocks, ln_f, head, layer=layer, src=src,
-                                     R=rot, k=k, residual=residual, grad=False)
+            return _interchange_read(blocks, model, head, layer=layer, src=src,
+                                     R=rot, k=k, residual=residual, grad=False, site=site)
         return be.patch(model, corrupted, clean, capture=capture, patch=apply_fn)
 
     def iia(rot):
@@ -153,7 +152,7 @@ def _das_cell(be, model, m, prompts, *, layer, k, train, batch, heldout, lr, see
 def das_hf(be, model, m, prompts, *, layer=6, k=64, train=0, batch=16, heldout=8,
            lr=1e-3, seed=0, residual="plain"):
     return _das_cell(be, model, m, prompts, layer=layer, k=k, train=train, batch=batch,
-                     heldout=heldout, lr=lr, seed=seed, residual=residual)
+                     heldout=heldout, lr=lr, seed=seed, residual=residual, site="head")
 
 
 @cell("das", family="*", backend="vllm_async")
@@ -163,4 +162,4 @@ def das_vllm(be, model, m, prompts, *, layer=6, k=64, train=0, batch=16, heldout
     # needs the backward, which the backend's train_patch surfaces as the inference-tensor
     # requires_grad error — the `grad` frontier in its training-loop realization.
     return _das_cell(be, model, m, prompts, layer=layer, k=k, train=train, batch=batch,
-                     heldout=heldout, lr=lr, seed=seed, residual=residual)
+                     heldout=heldout, lr=lr, seed=seed, residual=residual, site="engine")

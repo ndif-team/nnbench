@@ -963,7 +963,7 @@ last-token logits; medians of 10, no profiler unless noted.
   (`GPUModelRunner.py:224`, one `loads` per request rebuilding the tree), saves pickled back 5 ms,
   hooks 2.5 ms; the rest is the 730 KB moved to the engine process.
 - **HF pays none of it:** 16 invokes cost 39.0 ms against 35.0 ms for one invoke over the 16 prompts.
-- **Prototype, envoys by reference** (`slurm/patches/envoy_byref`, persistent id `Envoy:<path>`
+- **Prototype, envoys by reference** (`backends/nnsight-vllm/envoy_byref`, persistent id `Envoy:<path>`
   resolved to the receiver's envoy at that path): payload 45 KB → 325 B; 16 invokes 165 → 60 ms in
   vLLM's own process layout (4 invokes 68 → 27 ms). In-process A/B logits are bit-identical; across
   two engine launches they agree on top-1 everywhere with TV ≤ 0.028 (bf16 drift; launch-to-launch
@@ -1001,3 +1001,225 @@ a source-identity rejection, `…025923Z-0f7fdd66`, `…025956Z-68a4af7e`, `…0
   throughput, latency growing with the clients (steered generation p50 13.6 s on HF at 64). The
   async engine overlaps them: 110 units/s for steering at 64 clients (p50 491 ms), 10× HF on steered
   generation.
+
+## Envoys by reference through the benchmark — stock vs prototype nnsight 0.8.1 on vLLM, Qwen2.5-7B (2026-10-21)
+
+The prototype of the 2026-10-20 section as backend configs (`nnsight-vllm/sync/0-8-1/byref`,
+`nnsight-vllm/0-8-1/byref`: the stock 0.8.1 image with `backends/nnsight-vllm/envoy_byref` on
+`PYTHONPATH`), run beside stock 0.8.1 and HF 0.8.1 in the same job, on one A100-SXM4-40GB per job
+(gpua079, gpua077, gpua052). Runs: `runs/nnsight-byref/20261021T060429Z-6f6d2531` (fixed shapes),
+`…060429Z-c20ebf1a` (offline), `…060746Z-24bd158f` (concurrent), `…090405Z-cb562a0c` (logit-lens
+offline without `all`). Stock → byref; HF for scale.
+
+- **Correctness unchanged:** every vLLM cell's top-1/TV against HF is identical stock and byref,
+  with the same states (SUPPORTED; ablation interactive INVALID and two generation rows
+  NUMERICAL_MISMATCH on both).
+- **Fixed shapes (ms):** steering batch of 16 190 → 85 (HF 35); ablation batch 186 → 81 (HF 43);
+  logit lens batch 746 → 641 (HF 104). Single prompt: steering 32.7 → 25.6 (HF 29.2), patching
+  61 → 48 (HF 58), so one-prompt vLLM now beats HF. Steered generation 168 → 159 (HF 204).
+- **Offline, 256 units (units/s at B = 1, 16, 64, all):** steering sync 33, 85, 94, 90 → 43, 193,
+  273, 294 (HF 36, 481, 780, 798); ablation 34, 84, 93, 90 → 44, 198, 252, 271 (HF 37, 374, 523,
+  551). Logit lens at B = 1, 16, 64: 17, 22, 22 → 19, 24, 26 (HF 23, 155, 185).
+- **Concurrent, 128 single-unit requests (units/s at C = 1, 4, 16, 64):** steering async 34, 63,
+  100, 109 → 43, 83, 192, 276 (p50 at 64 clients 489 → 215 ms; HF flat 36); patching async 17, 29,
+  49, 58 → 22, 43, 95, 142 (HF 17–18); steered generation async 6, 18, 42, 59 → 6, 19, 46, 83 (HF 5).
+  The sync engine stays flat under the lock (steering 33 → 43).
+- **Reading it:** removing the envoy tree from each invoke's payload roughly triples offline
+  throughput and multiplies async throughput at 64 clients by 2.5, but HF's padded batch is still
+  2.7× faster offline for steering. What remains per invoke is the mediator itself and the engine's
+  per-request work. The logit lens hardly moves: its cost is the `layers × vocab` values saved per
+  prompt and returned, not the request payload.
+- **Robustness, both engines:** the all-layer lens over 256 prompts in one call runs out of memory
+  on HF and stock vLLM (a cell error). With byref the call ran its warm-up and three timed passes,
+  then a later call ran out of memory inside EngineCore's forward; the engine shut down and the
+  worker never returned, so the job waited out its 7200 s timeout. An engine death that leaves the
+  client blocked is a harness/nnsight finding (to classify), not specific to the prototype.
+
+## Cell readouts unembedded every position; saved slices do not ship their storage (2026-10-21)
+
+- **The waste.** The all-layer logit lens (`logit_lens._lens_proxy`, the 0.4.6 `cells.py`) ran the
+  final norm and unembedding over every position at every layer and kept the last row; the steering,
+  ablation, activation-patching, attribution-patching and DAS readouts (and 0.4.6 `_final_logits`)
+  did the same once on the final block. The values were right (both ops act per position) but the
+  work was not the workload's: about `seq`× the unembedding needed, and on HF a second full-sequence
+  unembedding beside the model's own head. The lens also kept each layer's `[B, seq, vocab]` tensor
+  alive behind its last-row view until the stack, about 0.9 GB per layer at 256 prompts on
+  Qwen2.5-7B: the out-of-memory at `offline/all` on both engines.
+- **Fix:** take the last token's residual first, then norm and unembed (`be.last` before `norm`),
+  in every nnsight cell. Timings of these workloads before this change overstate their cost and are
+  not comparable with later ones; the logit lens most (one unembedding per layer).
+- **Saved views on vLLM** (`slurm/diag_view_save.py`, `runs/nnsight-versions-diag/view-save`,
+  stock 0.8.1 sync engine, Qwen2.5-7B, A100): a saved `[1, vocab]` view of `[seq, vocab]` reaches
+  the client with a 304 KB storage, the row only, at 9 and 576 tokens; nnsight's return path does
+  not ship the whole storage (a CPU `pickle` of the same view would, 3.6 MB at 12 tokens). Readout
+  first vs view: 16 invokes of 576 tokens 690 → 654 ms; at 9 tokens no difference.
+
+## Qwen2.5-72B over two GPUs: smoke (2026-10-21)
+
+`runs/nnsight-large/smoke/20261021T181821Z-53fbcf8d` (worktree run), steering on 4 prompts, two
+H200s. Every config loads and runs; two failures stopped scoring, both **cell bugs** (the cells were
+off nnsight 0.8.1's documented forms), not nnsight findings:
+
+- **HF `device_map="auto"`:** steering at quarter depth raised `Expected all tensors to be on the
+  same device ... cuda:0 and cuda:1`: the cell took its direction from `lm_head.weight` (last GPU)
+  inside the trace and added it at a layer on the first. Documented: build the vector outside and
+  move it onto the stream (`docs/patterns/steering.md`, `docs/models/vllm.md`).
+- **vLLM tensor parallel:** every output was `[4, 76032]`, half the vocabulary: the cells unembedded
+  with `head.weight`, which nnsight 0.8.1 documents as this rank's slice
+  (`docs/models/vllm-parallelism.md`); the steering row was rank-local too (" Rome" is 21718, so the
+  second rank would read global row 97750). Documented: read `model.logits`, lens through
+  `model.logits_processor`.
+- **Fix:** every nnsight cell now reads the model's own next-token logits at the documented site (HF
+  `lm_head.output[:, -1]`, vLLM `model.logits`); the lens uses `head(norm(h))` on HF and
+  `logits_processor(lm_head, norm(h))` on vLLM; the steering direction is built before the trace
+  (HF from the loaded head, vLLM from the checkpoint) and moved onto the stream in the block
+  (`isb/methodologies/readout.py`). The weight-matmul unembed remains a declared alternative. These
+  reads also drop the second full-sequence unembedding of the section above.
+
+## Where nnsight's vLLM time goes: prompts × sites (2026-10-21)
+
+`slurm/diag_scaling.py`, `runs/nnsight-versions-diag/scaling` (worktree), Qwen2.5-7B bf16, one A100,
+nnsight 0.8.1, short CounterFact prompts, one token; median ms. Per prompt, the body reads the
+last-token residual of the first K blocks and saves the last-token logits; vLLM runs one invoke per
+prompt.
+
+| | N=1 | 4 | 16 | 64 |
+|---|---|---|---|---|
+| vLLM plain `generate` | 18.3 | 34.8 | 38.5 | 66.7 |
+| vLLM empty trace | 20.0 | 38.1 | 42.6 | 75.7 |
+| vLLM stock, K=0 | 28.3 | 70.2 | 167.4 | 599.8 |
+| vLLM stock, K=28 | 30.5 | 77.2 | 188.3 | 654.4 |
+| vLLM byref, K=0 | 21.5 | 43.1 | 62.5 | 164.4 |
+| vLLM byref, K=28 | 23.7 | 50.1 | 82.1 | 217.6 |
+| HF empty trace (≈ plain) | 29.8 | 34.0 | 35.2 | 59.8 |
+| HF one batched invoke, K=28 | 31.3 | 36.6 | 37.2 | 60.4 |
+| HF one invoke per prompt, K=28 | 31.4 | 41.5 | 60.3 | 133.0 |
+
+- **The engines follow the usual rules.** A short-prompt one-token batch is bound by reading the
+  weights: plain vLLM and HF both stay near 35–40 ms up to 16 prompts and reach 60–67 ms at 64.
+- **Stock nnsight on vLLM pays about 8.5 ms per invoke that has a body**, whatever the body does:
+  K=0 and K=28 differ by under 1 ms per invoke. That is the per-invoke request (the mediator pickled
+  with the envoy tree, 2026-10-20). Envoys by reference cut it to about 1.4 ms.
+- **Reads are cheap on both engines:** about 0.04–0.05 ms per read per invoke (vLLM byref K=28 vs
+  K=0 at N=64; HF per-prompt invokes the same).
+- **HF's batched invoke pays per batch, not per prompt:** 28 reads over 64 prompts cost under 1 ms.
+- So on vLLM the trace's cost grows with prompts × (fixed request cost + sites), on HF's batch with
+  sites only; nnsight's request cost, not the engine, sets the batched and offline gaps. The
+  per-invoke cost also grows with the module tree (about 3× from 7B to 72B, as the layer count).
+- The `plain` HF row errored in the script (`AttributeError`); the empty trace stands in for it.
+## nnsight 0.8.1's fastest realizations, with envoys by reference, Delta (2026-10-21)
+
+The 2026-10-02 best-realization comparison rerun for nnsight 0.8.1 after the cell rewrite to the
+documented read sites, with the envoy-by-reference prototype as the vLLM baseline. General cells
+(`nnsight-vllm/sync/0-8-1/byref`), installed named edits (`opt/0-8-1/byref`) and edits with taps
+(`opt/0-8-1/taps/byref`, vLLM 0.27.1 breakable CUDA graphs) beside plain vLLM 0.28.0 compiled
+and eager, all in one job per workload group on gpua027 (A100-40GB), Qwen2.5-7B-Instruct bf16, prefix
+caching off, scored vs `nnsight-hf/fp32`. Runs (worktree copy `nnbench-opt081b`):
+`runs/optimal-081-byref/20261021T220946Z-93154ec5` (lens, steering, ablation) and `-02b84a0a`
+(generation steering, patching). Stock-envoy runs of the same configs: `nnbench-opt081`
+`runs/optimal-081/20261021T213324Z-08f9a206`, `-20261021T213504Z-b356805e` (gpua006/gpua046).
+
+| Workload (median ms) | HF fp32 (reference, not a timing peer) | general | edits | edits + taps | plain vLLM compiled / eager | taps ÷ plain |
+|---|---|---|---|---|---|---|
+| Logit lens, all layers | 89.3 | 53.5 | 45.3 | 41.6 | 15.8 / 18.0 | 2.6× |
+| Steering (8 rows) | 43.4 | 25.5 | 23.8 | 18.4 | 15.8 / 19.1 | 1.17× |
+| Ablation (4 rows) | 43.0 | 24.6 | 23.2 | 18.5 | 15.4 / 18.8 | 1.20× |
+| Gen steering, 8 tokens | 240.4 | 160.7 | 157.9 | 113.2 | 101.3 / 135.0 | 1.12× |
+| Patching (2 forwards) | 86.0 | 48.2 | 46.6 | 39.3 | 2 × 15.8 | 1.24× |
+
+- HF runs fp32 here because it is the correctness reference; every vLLM column is bf16, so the HF
+  column is not a timing comparison. The bf16 comparison is the next table.
+- Correctness: every lens, steering and patching row NUMERICAL_CHECK_PASSED on all three nnsight
+  realizations; gen steering passes its two alpha-6 rows, the alpha-0.5 rows stay unresolved (as on
+  the general cells). Ablation is unresolved everywhere, including HF ("missing or weak intervention
+  effect", predates the rewrite).
+- Byref vs stock on the same configs: the general cells gain 8–11 ms per single-forward call
+  (steering 33.0 → 25.5, lens 64.2 → 53.5, patching 61.6 → 48.2) and 9 ms on generation; edits and
+  taps change by ≤ 2 ms except patching (54.0 → 46.6, 46.1 → 39.3), whose two traces each pay the
+  per-invoke cost. Installed edits already avoid most of what byref removes.
+- Taps are the realization that matters: 1.1–1.25× compiled plain vLLM on everything except the
+  logit lens, which still reads and projects 28 layers per call.
+- The lens is slower than the 2026-10-02 nnsight build (260c555, edits 39.0 / taps 34.5 there; the
+  same build measured 34.5 / 32.7 on gpua013 today, `nnbench-mgpu runs/optimal-delta/20261021T210805Z-e1bc02c2`).
+  Confounded: nnsight version and vLLM 0.27.1 vs 0.19.1 (edits) / 0.28.0 (taps), on different
+  nodes. Not isolated.
+- Not covered on 0.8.1: activation harvest and generation capture (opt registers no cell for
+  them; the general cells' results are in the 2026-10-21 optimal-delta run above).
+
+Same configs rerun with HF bf16 sdpa (`nnsight-hf/sdpa/0-8-1`) timed beside them, reference still HF
+fp32, one job per group on gpua013: `nnbench-opt081b runs/optimal-081-byref-bf16/20261022T012754Z-18a616ea`
+(lens, steering, ablation) and `-494cf1e1` (generation steering, patching). All columns bf16.
+
+| Workload (median ms) | plain HF | nnsight HF | nnsight vLLM general | edits | edits + taps | plain vLLM compiled / eager |
+|---|---|---|---|---|---|---|
+| Logit lens, all layers | 26.1 | 47.5 | 60.4 | 46.8 | 38.6 | 15.3 / 17.9 |
+| Steering (8 rows) | 26.1 | 27.5 | 24.6 | 23.7 | 19.1 | 16.2 / 18.7 |
+| Ablation (4 rows) | 26.2 | 27.6 | 24.7 | 23.3 | 19.2 | 16.7 / 17.8 |
+| Gen steering, 8 tokens | 194.9 | 205.4 | 163.5 | 159.5 | 112.1 | 101.7 / 134.0 |
+| Patching (2 forwards) | 2 × 26.0 | 55.8 | 48.0 | 46.0 | 38.8 | 2 × 16.0 |
+
+- At batch 1 on 7B, nnsight's general vLLM cells are 10–15% faster than nnsight HF on single
+  forwards, 1.27× slower on the lens, and 1.26× faster on 8-token generation. Edits + taps make vLLM
+  1.2–1.45× faster than nnsight HF on single forwards and 1.8× on generation; the gap to plain vLLM
+  compiled is then 1.1–1.2×, except the lens (2.5×).
+- nnsight's own HF overhead is small (1.05× plain HF) except the lens (1.8×); plain HF bf16 is 26 ms
+  per forward against plain vLLM's 15–16 ms compiled.
+- HF bf16 passes the numerical check against HF fp32 on the same rows as the vLLM realizations.
+
+
+## nnsight 0.8.1's fastest realizations at 72B over two H200s, bf16 (2026-10-22)
+
+The 7B comparison of the previous section repeated on Qwen2.5-72B-Instruct, every column bf16 over
+two H200s (gpue02, job 23110478, `nnbench-l72opt`; runs `runs/large-opt/20261022T151806Z-460acb26`
+for lens, steering, ablation and steered generation, `runs/large-opt/20261022T163216Z-9037ebc0` for
+patching; one prompt per call, 16 units scored; page `optimal-72b-report.html`,
+`scripts/report/optlarge.py`). HF is run two ways: accelerate `device_map="auto"`
+(`nnsight-hf/sdpa/0-8-1/gpu2`, the reference) and nnsight's transformers tensor parallelism
+(`nnsight-hf/sdpa/0-8-1/tp2`, transformers 5.19, `torchrun` with one rank per GPU). vLLM 0.27.1 runs
+with `tensor_parallel_size=2` and envoys by reference: the general cell
+(`nnsight-vllm/sync/0-8-1/byref/tp2`), installed edits (`opt/0-8-1/byref/tp2`) and edits with taps
+(`opt/0-8-1/taps/byref/tp2`); plain vLLM 0.28.0 compiled TP2 for the engine alone. Medians in ms;
+plain engines from each backend's `__vanilla__` call.
+
+| Workload | HF device_map, no trace | nnsight HF, device_map | nnsight HF, TP | vLLM general | edits | edits + taps | plain vLLM TP2 |
+|---|---|---|---|---|---|---|---|
+| Logit lens, every layer | 49.3 | 111.0 | 141.2 | 131.9 | 158.4 | 154.2 | 26.2 |
+| Steering, half depth | 50.9 | 49.7 | 64.8 | 37.1 | 39.2 | 31.3 | 26.2 |
+| Ablation, MLP at layer 1 | 48.8 | 49.4 | 63.6 | 35.7 | 35.1 | 31.2 | 26.1 |
+| Gen steering, 8 tokens, every step | 381.3 | 384.2 | 460.5 | 271.0 | 276.3 | 245.4 | 168.2 |
+| Patching, last token, quarter depth (2 fwd) | 2 × 58.3 | 139.3 | 253.9 | 80.7 | 77.1 | 62.5 | 2 × 26.5 |
+
+- **At 72B the general cells favour vLLM.** vLLM's general cell runs at 0.58–0.81× HF device_map on
+  the single-forward rows (steering 0.69–0.81, ablation 0.72–0.73, patching 0.58–0.62) and 0.71× on
+  8-token generation; the logit lens is the exception at 1.19× (131.9 against 111.0 ms). At 7B the
+  same cells were 0.83–0.93× HF.
+- **Taps widen it:** 0.45–0.63× HF on single forwards, 0.61–0.64× on generation (245 against
+  384 ms), and within 1.16–1.20× of plain compiled vLLM on single forwards, 1.41–1.46× on
+  generation. On the lens taps are slower than the general cell (154.2 against 131.9 ms, 5.9× plain
+  vLLM): the graph is broken at each of the 80 read sites and one forward has nothing to replay.
+- **nnsight's HF tensor parallelism is slower than device_map at this size:** 1.17–1.36× on steering
+  and ablation, 1.49–1.84× on patching, 1.18–1.20× on generation, 1.27× on the lens; its plain forward
+  is 60.4 ms against 50.9 on the steering job (83.7 against 49.3 on the lens job). A single prompt gains nothing
+  from splitting each layer across two cards while paying a collective per layer; vLLM's TP forward on
+  the same cards is 26.2 ms. As at 7B, TP is the path for a model that does not fit one card, not a
+  speed-up.
+- **nnsight's own cost on HF** (device_map column over its plain forward): 0.98–1.05× on steering,
+  1.01–1.02× on ablation and generation, 1.07–1.19× on patching (two forwards), 2.25× on the lens
+  (80 layers read and projected).
+- **Installed edits alone gain nothing with envoys by reference:** 0.91–1.11× the general cell on
+  single forwards, 1.01–1.04× on generation, 1.20× on the lens. The gain of the `opt` configs is the
+  taps.
+- **Correctness.** Lens and steering pass on every column against HF device_map (top-1 0.94–1.00,
+  TV ≤ 0.017; HF TP 0.97/0.017 on the lens, so bf16 rounding between the two HF paths is of that
+  size). Ablation is unresolved on every column, HF TP included (effect too weak to score). The two
+  alpha-0.5 generation rows are unresolved on the vLLM columns (top-1 0.90–0.94, TV 0.07–0.11) and
+  pass on HF TP (0.95–0.98). Patching: the general cell passes all four rows (top-1 0.94–1.00) and
+  HF TP passes all four; the installed-edit realizations pass only "last-token residual at quarter
+  depth" (1.00/0.030) and are wrong on the other three (last token at three quarters 0.69/0.263; the
+  full-residual rows 0.25/0.62), identically with and without taps. The same `opt` cells pass all
+  four rows at 7B on one GPU, so this is the installed-edit patching cell's in-place write under
+  vLLM tensor parallelism, a finding to classify (nnsight TP transparency, or the cell's write form
+  under TP), not a cell to patch here. 17 of 21 HF TP rows, 15 of 21 vLLM general rows and 12 of 21
+  edit rows pass.
+- **Budget:** 1 h 31 min for both jobs on two H200s, most of it six loads of the 145 GB checkpoint.
+- Handoff for rerunning this elsewhere, with the open lens diagnosis: `docs/large-model-handoff.md`.

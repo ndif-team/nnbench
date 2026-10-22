@@ -148,7 +148,7 @@ element that works in that context.
 | element | hf recipe | vllm recipe |
 |---|---|---|
 | write | in-place or replacement | in-place or replacement; in-place writes work on nnsight 260c555 (0.8.0rc1) with vLLM 0.19.1: GPT-2 steering `mode=inplace` scored SUPPORTED against HF (run 20260929T033215Z-d98b90af); earlier nnsight versions raised; skip-with-value realization UNTESTED (data-op table) |
-| meta-compute (unembed) | `lm_head(h)` or weight matmul | weight matmul ONLY (`ParallelLMHead.forward` guarded) — the guarded lm_head call |
+| meta-compute (unembed) | `lm_head(h)` or weight matmul | `model.logits_processor(model.lm_head, h)` (nnsight 0.8.1 docs, whole under TP); `lm_head(h)` raises (`ParallelLMHead.forward` guarded); a weight matmul is a rank slice under TP |
 | meta-compute (aux) | bare | under `torch.no_grad()` — the inference-tensor no_grad requirement |
 | step quantifier | bounded or unbounded | bounded `iter[0:N]` ONLY (unbounded drops all loop-carried saves) — the unbounded-iteration saves-drop; `tracer.next()` realization UNTESTED (control table) |
 | run↔run transfer | two single-prompt traces (barrier works, measured) | two single-prompt traces ONLY (barrier broken upstream) — the barrier sync/async split; un-barriered realization UNTESTED (cross-edge table) |

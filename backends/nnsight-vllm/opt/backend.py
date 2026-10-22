@@ -36,6 +36,8 @@ class NnsightOptBackend(VLLMSyncBackend):
         from nnsight.modeling.vllm import VLLM
 
         kw = self._engine_kwargs()
+        if self.tensor_parallel_size > 1:
+            kw["tensor_parallel_size"] = self.tensor_parallel_size
         if self.taps:
             kw["taps"] = list(self.taps)
         return VLLM(repo, mode="sync", dispatch=True,
@@ -74,14 +76,12 @@ def spec_taps(spec):
     params = [t.params for t in spec.tasks] + [spec.baseline.params]
     if spec.effect is not None:
         params += [spec.effect.baseline_params, spec.effect.perturbed_params]
-    last = spec.n_layers - 1           # the model row's depth, checked against the loaded model
     if spec.methodology == "logit_lens":
         return ["model.layers.*.output"]
     if spec.methodology in ("steering", "gen_steering"):
         return sorted({f"model.layers.{p['layer']}.output" for p in params if "layer" in p})
-    if spec.methodology == "activation_patching":
-        return sorted({f"model.layers.{p['layer']}.output" for p in params if "layer" in p}
-                      | {f"model.layers.{last}.output"})
+    if spec.methodology == "activation_patching":     # the readout is the engine's `model.logits`
+        return sorted({f"model.layers.{p['layer']}.output" for p in params if "layer" in p})
     if spec.methodology == "ablation":
         sub = {"mlp": "mlp", "attn": "self_attn"}
         return sorted({f"model.layers.{p['layer']}.{sub[p['target']]}.output"

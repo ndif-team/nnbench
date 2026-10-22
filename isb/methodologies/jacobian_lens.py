@@ -9,7 +9,7 @@ read at a PER-ITEM prompt position (the token preceding the would-be answer; ups
 Upstream, J_l is the fitted average input-output Jacobian E[dh_final/dh_l]; fitting needs autograd
 (offline, HF-side — on vLLM `grad` is ERROR, the known frontier). The BENCH question is not the
 map's faithfulness but whether the serving backend reproduces the readout: read-at-position +
-transport matmul (meta-compute) + norm + portable unembed, HF vs vLLM, on the real J-lens datasets
+transport matmul (meta-compute) + norm + unembed, HF vs vLLM, on the real J-lens datasets
 (`data/jlens/`, workload `jacobian_lens`).
 
 `transport` selects the map, in order of realism:
@@ -28,7 +28,8 @@ transport matmul (meta-compute) + norm + portable unembed, HF vs vLLM, on the re
 
 Variances (params): `layers` ("all" | list) — the read band; `position` ("last" | "last_newline",
 the upstream per-dataset readout rules, resolved per item via the tokenizer); `unembed`
-("module" idiomatic | "weight" portable — vLLM guards lm_head.forward); `residual` (None -> the
+("module", the HF form; "logits_processor", the vLLM form, whole under TP — vLLM guards
+lm_head.forward; "weight", a matmul with this rank's slice under TP); `residual` (None -> the
 family's per-engine denotation; "plain"/"fused" override); `transport` (above).
 """
 from __future__ import annotations
@@ -79,7 +80,7 @@ def _load_fitted(spec: str) -> Mapping:
     return torch.load(path, map_location="cpu", weights_only=False)["J"]
 
 
-def _jlens_proxy(blocks, norm, head, *, layers, pos, unembed, residual, transport):
+def _jlens_proxy(blocks, norm, head, *, layers, pos, unembed, residual, transport, processor=None):
     """Stack the J-lens readout at `pos` over the band. Runs INSIDE a trace. The per-backend caller
     passes `take(h_full)` semantics via pos: hf tensors are [B, S, D], vllm flat [S, D]; both keep
     the seq dim at -2, so integer `pos` indexes the token uniformly and unsqueeze restores a row
@@ -104,7 +105,10 @@ def _jlens_proxy(blocks, norm, head, *, layers, pos, unembed, residual, transpor
                     Ji = J
                 h = h @ Ji.to(device=h.device, dtype=h.dtype).T
             normed = norm(h)
-            rows.append(F.linear(normed, head.weight) if unembed == "weight" else head(normed))
+            if unembed == "logits_processor":   # vLLM's logits path, whole under TP (logit_lens.py)
+                rows.append(processor(head, normed))
+            else:
+                rows.append(F.linear(normed, head.weight) if unembed == "weight" else head(normed))
     return torch.stack(rows, dim=0)             # [n_band_layers, 1-or-B, vocab]
 
 
@@ -122,9 +126,10 @@ def jacobian_lens_hf(be, model, m, prompts, *, layers="all", position="last",
     return be.run(model, prompts, build)
 
 
-@cell("jacobian_lens", family="*", backend="vllm_async", realizations=[{"unembed": "module"}])
+@cell("jacobian_lens", family="*", backend="vllm_async",
+      realizations=[{"unembed": "module"}, {"unembed": "weight"}])
 def jacobian_lens_vllm(be, model, m, prompts, *, layers="all", position="last",
-                       unembed="weight", residual=None, transport=None):
+                       unembed="logits_processor", residual=None, transport=None):
     if isinstance(transport, str):                        # fitted-lens spec -> per-layer map (cached)
         transport = _load_fitted(transport)
     residual = residual if residual is not None else m.default_residual(be.name)
@@ -134,5 +139,6 @@ def jacobian_lens_vllm(be, model, m, prompts, *, layers="all", position="last",
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
         return _jlens_proxy(m.blocks(model), m.norm(model), m.head(model),
                             layers=layers, pos=pos, unembed=unembed,
-                            residual=residual, transport=transport)
+                            residual=residual, transport=transport,
+                            processor=model.logits_processor)
     return be.run(model, prompts, build)

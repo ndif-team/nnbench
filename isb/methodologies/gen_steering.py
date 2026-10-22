@@ -33,24 +33,25 @@ import torch.nn.functional as F
 
 from ..profiles import _resid
 from .observations import record_resolved
+from .readout import checkpoint_direction, checkpoint_of, head_direction
 from .registry import cell
 from .steering import _resolve_token, _strength_scale
 
 
-def _steer_step(blocks, head, *, layer, token_id, alpha, residual="plain", scale_by="mean_norm"):
+def _steer_step(blocks, *, layer, direction, alpha, residual="plain", scale_by="mean_norm"):
     """One decode step's steering write: replacement-add `alpha` (relative to the residual's own
-    per-token norm) of the target token's unembed direction into blocks[layer]'s output. Runs
-    INSIDE the trace, once per iteration step. Replacement-only (in-place writes raised on vLLM
-    before nnsight 0.8)."""
+    per-token norm) of `direction` (the target token's unit unembedding row, built before the
+    trace) into blocks[layer]'s output. Runs INSIDE the trace, once per iteration step.
+    Replacement-only (in-place writes raised on vLLM before nnsight 0.8)."""
     with torch.no_grad():                       # aux compute on inference tensors needs no_grad
-        direction = F.normalize(head.weight[token_id].float(), dim=0).to(head.weight.dtype)
         out = blocks[layer].output
         is_tuple = isinstance(out, tuple)
         hidden = out[0] if is_tuple else out
         # self-calibrating: alpha is relative to the stream's norm, which on fused-residual vLLM
         # layers is out[0] + out[1] (out[0] alone is the layer's sub-block output)
         scale = _strength_scale(_resid(out, residual), scale_by)
-        new_hidden = hidden + (alpha * scale) * direction
+        vec = direction.to(device=hidden.device, dtype=hidden.dtype)   # moved onto the stream
+        new_hidden = hidden + (alpha * scale) * vec
         blocks[layer].output = (new_hidden, *out[1:]) if is_tuple else new_hidden
 
 
@@ -64,12 +65,13 @@ def _check_bound(bound):
 def gen_steering_hf(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0,
                     bound="bounded", new_tokens=8, scale_by="mean_norm"):
     _check_bound(bound)
-    token_id = _resolve_token(model.tokenizer, target)
+    direction = (head_direction(model, m.head(model), _resolve_token(model.tokenizer, target))
+                 if alpha != 0 else None)               # alpha=0 writes nothing
 
     def step():
         if alpha != 0:
-            _steer_step(m.blocks(model), m.head(model),
-                        layer=layer, token_id=token_id, alpha=alpha, scale_by=scale_by)
+            _steer_step(m.blocks(model),
+                        layer=layer, direction=direction, alpha=alpha, scale_by=scale_by)
         return m.head(model).output[:, -1, :]            # this step's next-token logits [1, vocab]
 
     return be.generate(model, prompts, step, new_tokens=new_tokens,
@@ -82,14 +84,15 @@ def gen_steering_vllm(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6
     _check_bound(bound)
     residual = residual if residual is not None else m.default_residual(be.name)
     record_resolved(residual=residual)
-    token_id = _resolve_token(model.tokenizer, target)
+    direction = (checkpoint_direction(checkpoint_of(model), _resolve_token(model.tokenizer, target))
+                 if alpha != 0 else None)               # alpha=0 writes nothing
 
     def step():
         if alpha != 0:
-            _steer_step(m.blocks(model), m.head(model),
-                        layer=layer, token_id=token_id, alpha=alpha, residual=residual,
+            _steer_step(m.blocks(model),
+                        layer=layer, direction=direction, alpha=alpha, residual=residual,
                         scale_by=scale_by)
-        # engine site == portable unembed (Level-1 sites are portable on vLLM); [-1:, :] keeps the
+        # the engine site (docs/models/vllm.md), whole under tensor parallelism; [-1:, :] keeps the
         # step's LAST row so the prefill step (which may carry more than one logits row) matches
         # HF's [:, -1, :] read
         return model.logits[-1:, :]

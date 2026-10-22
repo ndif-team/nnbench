@@ -1,0 +1,29 @@
+services:
+  runner:
+    extends: {file: ../../../compose.base.yml, service: runner}
+    image: isb-nnsight-hf-0-8-1-tf5-19:local
+    build:
+      args:
+        NNSIGHT_REF: de7fec4d207fc8e0deacaa44fb68f8d0412506ef   # tag v0.8.1
+        # nnsight's tensor parallelism refuses transformers below 5.19 (docs/models/tensor-parallel.md)
+        TRANSFORMERS_VERSION: 5.19.0
+        CLICK_VERSION: 8.4.2   # the huggingface-hub that transformers 5.19 needs requires click >= 8.4.2
+        REMOVE_PACKAGES: spin  # the base image's numpy dev tool, which pins click < 8.4; unused here
+    environment:
+      ISB_BACKEND: ${ISB_BACKEND:-nnsight-hf/sdpa/0-8-1/tp2}
+      # sdpa in bf16, every layer sharded over two GPUs with transformers tensor parallelism
+      # (DistributedConfig(tp_size=2)); the ranks run each layer together, unlike gpu2's device_map
+      ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","attn_implementation":"sdpa","tp_size":2}'
+      # one torchrun rank per GPU; every rank runs the whole job, rank 0 publishes it (isb/jobs/entry.py)
+      ISB_RANKS: "2"
+      OMP_NUM_THREADS: "8"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${ISB_GPU}", "${ISB_GPU_1}"]   # two GPUs from --gpu (backends/README.md)
+              capabilities: [gpu]
+volumes:
+  model-cache:
+    name: ${ISB_MODEL_CACHE:-isb-model-cache}

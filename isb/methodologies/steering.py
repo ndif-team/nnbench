@@ -12,10 +12,12 @@ a crash-or-not check cannot tell apart:
   - vLLM raises on the write -> ERROR (in-place updates of inference tensors raised on nnsight
     versions before 0.8; on 260c555 both write forms score SUPPORTED)
 
-Observable = the **portable** unembed (weight matmul; `lm_head.forward` is guarded on vLLM, so
-unembed must use the weight matmul) of the FINAL block's residual, last token. We steer an *earlier* block (`layer` <
-last) so the perturbation propagates through the remaining layers into that readout, and the write
-and the read land on different modules — no write-then-read-same-module ordering hazard.
+Observable = the model's own next-token logits at the documented site (`readout.final_logits`:
+HF `lm_head.output[:, -1, :]`, vLLM `model.logits`), last token. We steer an *earlier* block
+(`layer` < last) so the perturbation propagates through the remaining layers into that readout.
+The direction is built before the trace (`readout.head_direction` on HF,
+`readout.checkpoint_direction` on vLLM, whose `lm_head.weight` is a rank slice under tensor
+parallelism) and moved onto the stream inside the block.
 
 Variances (params, §12):
   - `layer`  : which block to steer (abstract index into the model's own block list).
@@ -32,6 +34,7 @@ import torch.nn.functional as F
 
 from ..profiles import _resid        # the documented read pattern: plain vs fused (out[0]+out[1])
 from .observations import record_resolved
+from .readout import checkpoint_direction, checkpoint_of, final_logits, head_direction
 from .registry import cell
 
 
@@ -53,35 +56,33 @@ def _strength_scale(stream, scale_by):
     raise ValueError(f"unknown steering scale {scale_by!r} (expected 'mean_norm' or 'token_norm')")
 
 
-def _steer_and_read(blocks, norm, head, *, layer, token_id, alpha, mode, last_fn, residual="plain",
+def _steer_and_read(blocks, model, head, *, layer, direction, alpha, mode, site, residual="plain",
                     scale_by="mean_norm"):
-    """Steer blocks[layer], read the final block's portable-unembed logits. Runs INSIDE a trace.
+    """Steer blocks[layer] along `direction`, read the next-token logits at `site`
+    (`readout.final_logits`). Runs INSIDE a trace.
 
+    `direction` is a unit vector built before the trace; it is moved onto the steered stream's
+    device and dtype here (the documented form for a tensor referenced from outside the block).
     `alpha=0` performs no write at all (the honest unsteered baseline), so the same cell yields the
     control the effect-size check needs — run in the SAME `mode` as the cell under test.
 
-    `residual` selects the read-out denotation, the documented vLLM gap (interp-methods-catalog.md):
-    "plain" reads `out[0]`; "fused" reads `out[0] + out[1]` — REQUIRED on vLLM fused-residual RMSNorm
-    families (Llama/Qwen/NemotronH/...), where the final block's output is `(hidden, residual)` and the
-    true stream is their sum. Reading plain there drops the accumulated residual -> SILENTLY_WRONG (the
-    same denotation `_lens_proxy`/`_ablate_and_read` already thread through). Falls back to plain on a
-    bare tensor, so HF/GPT-2 are unaffected.
+    `residual` selects the stream the strength is relative to: "plain" is `out[0]`; "fused" is
+    `out[0] + out[1]`, the true stream on vLLM fused-residual RMSNorm families (Llama/Qwen/
+    NemotronH/...), where a block's output is `(hidden, residual)`. Falls back to plain on a bare
+    tensor, so HF/GPT-2 are unaffected.
 
-    Reuse contract: the final block's output is the PRE-final-norm residual stream (so `norm(...)` then
-    a weight matmul reproduces the model's logits), and `layer` is strictly before the read-out (final)
-    block, enforced below so the write and the read never collide on the same module.
+    `layer` must be strictly before the final block (enforced below): steering the last block
+    leaves no layer for the write to propagate through before the readout.
     """
     n = len(blocks)
     if alpha != 0 and layer % n == n - 1:
         raise ValueError(
             f"steer layer {layer} is the read-out (final) block; pick layer < {n - 1} so the write "
-            f"and the portable-unembed read land on different modules (no same-module write-then-read)"
+            f"propagates through at least one block before the readout"
         )
     with torch.no_grad():                                   # forward-only aux compute (vLLM activations
         # are inference tensors). The in-place write below raised under InferenceMode on nnsight
         # versions before 0.8; on 260c555 it scores SUPPORTED.
-        direction = F.normalize(head.weight[token_id].float(), dim=0).to(head.weight.dtype)
-
         if alpha != 0:
             out = blocks[layer].output
             is_tuple = isinstance(out, tuple)
@@ -89,7 +90,7 @@ def _steer_and_read(blocks, norm, head, *, layer, token_id, alpha, mode, last_fn
             # the stream's own scale -> alpha is relative. On fused-residual vLLM layers the stream
             # is out[0] + out[1]; out[0] alone is the layer's sub-block output.
             scale = _strength_scale(_resid(out, residual), scale_by)
-            vec = (alpha * scale) * direction
+            vec = (alpha * scale) * direction.to(device=hidden.device, dtype=hidden.dtype)
             if mode == "inplace":
                 hidden[:] = hidden + vec                    # in-place into the live buffer
             elif mode == "replace":
@@ -97,20 +98,18 @@ def _steer_and_read(blocks, norm, head, *, layer, token_id, alpha, mode, last_fn
                 blocks[layer].output = (new_hidden, *out[1:]) if is_tuple else new_hidden
             else:
                 raise ValueError(f"unknown steering mode {mode!r}")
-
-        normed = norm(_resid(blocks[-1].output, residual))  # residual stream (fused on vLLM RMSNorm) -> norm
-        logits = F.linear(normed, head.weight)              # portable unembed (lm_head.forward guarded)
-    return last_fn(logits)
+        return final_logits(model, head, site)
 
 
 @cell("steering", family="*", backend="hf", realizations=[{"mode": "inplace"}])
 def steering_hf(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="replace",
                 scale_by="mean_norm"):
-    token_id = _resolve_token(model.tokenizer, target)
+    direction = (head_direction(model, m.head(model), _resolve_token(model.tokenizer, target))
+                 if alpha != 0 else None)               # alpha=0 writes nothing
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
         return _steer_and_read(
-            m.blocks(model), m.norm(model), m.head(model),
-            layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
+            m.blocks(model), model, m.head(model),
+            layer=layer, direction=direction, alpha=alpha, mode=mode, site="head",
             scale_by=scale_by,
         )
     return be.run(model, prompts, build)
@@ -125,11 +124,12 @@ def steering_vllm(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, 
     # residual= param still overrides.
     residual = residual if residual is not None else m.default_residual(be.name)
     record_resolved(residual=residual)
-    token_id = _resolve_token(model.tokenizer, target)
+    direction = (checkpoint_direction(checkpoint_of(model), _resolve_token(model.tokenizer, target))
+                 if alpha != 0 else None)               # alpha=0 writes nothing
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
         return _steer_and_read(
-            m.blocks(model), m.norm(model), m.head(model),
-            layer=layer, token_id=token_id, alpha=alpha, mode=mode, last_fn=be.last,
+            m.blocks(model), model, m.head(model),
+            layer=layer, direction=direction, alpha=alpha, mode=mode, site="engine",
             residual=residual, scale_by=scale_by,
         )
     return be.run(model, prompts, build)

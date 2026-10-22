@@ -13,10 +13,10 @@
 #SBATCH --output=slurm/logs/%x-%j.out
 
 set -uo pipefail
-cd /work/nvme/bdnh/zwang83/nnbench
+cd "${SLURM_SUBMIT_DIR:-/work/nvme/bdnh/zwang83/nnbench}"
 PY=/work/nvme/bdnh/zwang83/envs/isb-host/bin/python
 export ISB_LAUNCHER=apptainer
-export ISB_APPTAINER_DIR=$PWD/.apptainer
+export ISB_APPTAINER_DIR=${ISB_APPTAINER_DIR:-$PWD/.apptainer}
 # Per-job layer cache: concurrent build jobs never write the same cache blobs.
 export APPTAINER_CACHEDIR=/work/nvme/bdnh/zwang83/.apptainer-cache/${SLURM_JOB_NAME}
 export APPTAINER_TMPDIR=/tmp/isb-build-$SLURM_JOB_ID

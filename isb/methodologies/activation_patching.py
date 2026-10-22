@@ -24,10 +24,10 @@ to vLLM-Llama too).
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
 from ..profiles import _resid
 from .observations import record_resolved
+from .readout import final_logits
 from .registry import cell
 
 
@@ -37,15 +37,15 @@ def _capture(blocks, layer, residual):
         return _resid(blocks[layer].output, residual).clone()  # clone -> an independent snapshot
 
 
-def _read_final(blocks, norm, head, residual, last_fn):
-    """The corrupted run's natural final logits — the un-patched baseline (no transplant)."""
+def _read_final(model, head, site):
+    """The corrupted run's natural next-token logits — the un-patched baseline (no transplant)."""
     with torch.no_grad():
-        normed = norm(_resid(blocks[-1].output, residual))
-        return last_fn(F.linear(normed, head.weight))
+        return final_logits(model, head, site)
 
 
-def _patch_and_read(blocks, norm, head, *, layer, clean_act, residual, last_fn, positions="all"):
-    """Trace-2 build: replace `layer`'s residual with the clean snapshot, read final logits.
+def _patch_and_read(blocks, model, head, *, layer, clean_act, residual, site, positions="all"):
+    """Trace-2 build: replace `layer`'s residual with the clean snapshot, read the next-token logits
+    at `site` (`readout.final_logits`).
     `positions="last"` keeps the corrupt run's stream and takes only the last row from the clean one."""
     with torch.no_grad():
         out = blocks[layer].output
@@ -71,17 +71,15 @@ def _patch_and_read(blocks, norm, head, *, layer, clean_act, residual, last_fn, 
         else:
             blocks[layer].output = (clean, *out[1:]) if is_tuple else clean  # whole-tuple replace (vLLM-safe)
 
-        normed = norm(_resid(blocks[-1].output, residual))      # final residual -> final norm
-        logits = F.linear(normed, head.weight)                  # portable unembed (lm_head guarded)
-    return last_fn(logits)
+        return final_logits(model, head, site)
 
 
-def _patch_cell(be, model, m, prompts, *, layer, residual, patch, positions="all"):
+def _patch_cell(be, model, m, prompts, *, layer, residual, patch, site, positions="all"):
     clean, corrupted = prompts
-    h, ln_f, head = m.blocks(model), m.norm(model), m.head(model)
+    h, head = m.blocks(model), m.head(model)
     if not patch:                                        # baseline: corrupted run, no transplant
         def build():  # named so nnsight can source-serialize it to the vLLM worker
-            return _read_final(h, ln_f, head, residual, be.last)
+            return _read_final(model, head, site)
         return be.run(model, [corrupted], build)
 
     def capture():  # named (not a lambda) so nnsight can source-serialize to the vLLM worker
@@ -89,7 +87,7 @@ def _patch_cell(be, model, m, prompts, *, layer, residual, patch, positions="all
 
     def patch_fn(clean_act):
         return _patch_and_read(
-            h, ln_f, head, layer=layer, clean_act=clean_act, residual=residual, last_fn=be.last,
+            h, model, head, layer=layer, clean_act=clean_act, residual=residual, site=site,
             positions=positions)
 
     return be.patch(model, clean, corrupted, capture=capture, patch=patch_fn)
@@ -98,7 +96,7 @@ def _patch_cell(be, model, m, prompts, *, layer, residual, patch, positions="all
 @cell("activation_patching", family="*", backend="hf")
 def patch_hf(be, model, m, prompts, *, layer=6, residual="plain", patch=True, positions="all"):
     return _patch_cell(be, model, m, prompts, layer=layer, residual=residual, patch=patch,
-                       positions=positions)
+                       site="head", positions=positions)
 
 
 @cell("activation_patching", family="*", backend="vllm_async", realizations=[{"residual": "plain"}])
@@ -108,4 +106,4 @@ def patch_vllm(be, model, m, prompts, *, layer=6, residual=None, patch=True, pos
     residual = residual if residual is not None else m.default_residual(be.name)
     record_resolved(residual=residual)
     return _patch_cell(be, model, m, prompts, layer=layer, residual=residual, patch=patch,
-                       positions=positions)
+                       site="engine", positions=positions)

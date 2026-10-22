@@ -3,6 +3,10 @@
 Resolves `ISB_BACKEND` (`<system>/<config>`) to the nearest `backend.py` and `cells.py` on the
 config's path (isb/jobs/layout.py), imports them as `backends.<system>...` modules, and runs the
 shared worker with that `create_backend`. A third-party backend may use any entrypoint instead.
+
+`ISB_RANKS=N` (N > 1) runs the job as N torchrun ranks, one per declared GPU, for a library whose
+multi-GPU mode needs one process per GPU (transformers tensor parallelism). Every rank runs the
+whole job; rank 0 alone publishes it (worker.py).
 """
 from __future__ import annotations
 
@@ -30,6 +34,10 @@ def load(name, root=layout.ROOT):
 
 
 def main():
+    ranks = int(os.environ.get("ISB_RANKS", "1"))
+    if ranks > 1 and "RANK" not in os.environ:
+        os.execvp("torchrun", ["torchrun", "--standalone", f"--nproc_per_node={ranks}",
+                               "-m", "isb.jobs.entry"])
     from .worker import main as worker
 
     create_backend, _ = load(os.environ.get("ISB_BACKEND", ""))

@@ -5,27 +5,26 @@ next-token distribution. Like steering this is a *write* methodology, but the wr
 (`output = 0`) rather than an additive steer. The vLLM-safe form is whole-tuple **replacement**
 (in-place writes raised on inference tensors before nnsight 0.8; replacement works).
 
-Observable = the portable unembed of the final block's residual, last token (same readout as
-steering/patching). `target="none"` skips the write -> the un-ablated baseline the effect-size guard
+Observable = the model's own next-token logits at the documented site, last token (same readout as
+steering/patching: `readout.final_logits`). `target="none"` skips the write -> the un-ablated baseline the effect-size guard
 needs (a knockout that doesn't move the output makes a SUPPORTED verdict vacuous, cf. the
 effect-size guard).
 
-Variances (params): `layer`; `target` ("mlp" | "attn" knock out that submodule, "none" = baseline);
-`residual` ("plain" | "fused" — the dual-stream reconstruction, where vLLM fused-residual blocks
-return (hidden, residual) whose sum is the true stream).
+Variances (params): `layer`; `target` ("mlp" | "attn" knock out that submodule, "none" = baseline).
+The write zeroes a submodule's own output and the read is the model's logits, so no residual-stream
+denotation enters the cell.
 """
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
-from ..profiles import _resid
-from .observations import record_resolved
+from .readout import final_logits
 from .registry import cell
 
 
-def _ablate_and_read(target_module, blocks, norm, head, *, target, residual, last_fn):
-    """Zero `target_module`'s output (unless target=="none"), then read final-block logits."""
+def _ablate_and_read(target_module, model, head, *, target, site):
+    """Zero `target_module`'s output (unless target=="none"), then read the next-token logits at
+    `site` (`readout.final_logits`)."""
     with torch.no_grad():
         if target != "none":
             out = target_module.output
@@ -33,9 +32,7 @@ def _ablate_and_read(target_module, blocks, norm, head, *, target, residual, las
                 target_module.output = (torch.zeros_like(out[0]), *out[1:])  # zero stream 0, keep tail
             else:
                 target_module.output = torch.zeros_like(out)                 # whole-tuple replace (vLLM-safe)
-        normed = norm(_resid(blocks[-1].output, residual))
-        logits = F.linear(normed, head.weight)
-    return last_fn(logits)
+        return final_logits(model, head, site)
 
 
 def _target_module(block, target):
@@ -47,28 +44,20 @@ def _target_module(block, target):
 
 
 @cell("ablation", family="*", backend="hf")
-def ablation_hf(be, model, m, prompts, *, layer=6, target="mlp", residual="plain"):
+def ablation_hf(be, model, m, prompts, *, layer=6, target="mlp"):
     blk = m.blocks(model)[layer]
     tgt = m.submodule(blk, "mlp" if target == "none" else target)  # "none" never reads it
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
-        return _ablate_and_read(
-            tgt, m.blocks(model), m.norm(model), m.head(model),
-            target=target, residual=residual, last_fn=be.last)
+        return _ablate_and_read(tgt, model, m.head(model), target=target, site="head")
     return be.run(model, prompts, build)
 
 
-@cell("ablation", family="*", backend="vllm_async", realizations=[{"residual": "plain"}])
-def ablation_vllm(be, model, m, prompts, *, layer=6, target="mlp", residual=None):
-    # Default to the family's vLLM denotation: fused-residual families (Llama/Qwen) read the
-    # hidden+residual sum. The declared alternative reads the plain stream (the naive port).
-    residual = residual if residual is not None else m.default_residual(be.name)
-    record_resolved(residual=residual)
+@cell("ablation", family="*", backend="vllm_async")
+def ablation_vllm(be, model, m, prompts, *, layer=6, target="mlp"):
     blk = m.blocks(model)[layer]
     tgt = m.submodule(blk, "mlp" if target == "none" else target)  # "none" never reads it
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
-        return _ablate_and_read(
-            tgt, m.blocks(model), m.norm(model), m.head(model),
-            target=target, residual=residual, last_fn=be.last)
+        return _ablate_and_read(tgt, model, m.head(model), target=target, site="engine")
     return be.run(model, prompts, build)
 
 
@@ -88,21 +77,19 @@ def _target_module_nemotron(block, target):
 
 
 @cell("ablation", family="nemotron", backend="hf")
-def ablation_nemotron_hf(be, model, prompts, *, layer=6, target="mixer", residual="plain"):
+def ablation_nemotron_hf(be, model, prompts, *, layer=6, target="mixer"):
     blk = model.model.layers[layer]
     def build():
-        return _ablate_and_read(
-            _target_module_nemotron(blk, target), model.model.layers, model.model.norm_f,
-            model.lm_head, target=target, residual=residual, last_fn=be.last)
+        return _ablate_and_read(_target_module_nemotron(blk, target), model, model.lm_head,
+                                target=target, site="head")
     return be.run(model, prompts, build)
 
 
 @cell("ablation", family="nemotron", backend="vllm_async")
-def ablation_nemotron_vllm(be, model, prompts, *, layer=6, target="mixer", residual="fused"):
-    # Same tree as HF (model.model.layers / .norm_f, block.mixer); vLLM uses fused-residual RMSNorm.
+def ablation_nemotron_vllm(be, model, prompts, *, layer=6, target="mixer"):
+    # Same tree as HF (model.model.layers, block.mixer); the read is the engine's logits.
     blk = model.model.layers[layer]
     def build():
-        return _ablate_and_read(
-            _target_module_nemotron(blk, target), model.model.layers, model.model.norm_f,
-            model.lm_head, target=target, residual=residual, last_fn=be.last)
+        return _ablate_and_read(_target_module_nemotron(blk, target), model, model.lm_head,
+                                target=target, site="engine")
     return be.run(model, prompts, build)

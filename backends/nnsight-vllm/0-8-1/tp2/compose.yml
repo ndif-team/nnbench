@@ -1,0 +1,22 @@
+services:
+  runner:
+    extends: {file: ../../compose.base.yml, service: runner}
+    image: isb-nnsight-vllm-0-8-1:local   # the same build as sync/0-8-1
+    build:
+      args:
+        VLLM_IMAGE: vllm/vllm-openai:v0.27.1
+        NNSIGHT_REF: de7fec4d207fc8e0deacaa44fb68f8d0412506ef   # tag v0.8.1
+    environment:
+      ISB_BACKEND: ${ISB_BACKEND:-nnsight-vllm/0-8-1/tp2}
+      # the async 0-8-1 config with tensor parallelism over two GPUs
+      ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","gpu_memory_utilization":0.85,"enable_prefix_caching":false,"tensor_parallel_size":2}'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${ISB_GPU}", "${ISB_GPU_1}"]   # two GPUs from --gpu (backends/README.md)
+              capabilities: [gpu]
+volumes:
+  model-cache:
+    name: ${ISB_MODEL_CACHE:-isb-model-cache}

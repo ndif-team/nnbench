@@ -68,7 +68,11 @@ UTC timestamp/UUID subdirectory and prints its location. `--timeout` limits each
 Neither the comparison axis nor reference is inferred from backend names.
 
 Jobs run sequentially on the selected host GPU index/UUID. Only that GPU is exposed by the bundled
-Compose configurations. Multiple timed jobs must not share an allocation; the runner is not a
+Compose configurations, except a config that declares several: its runner lists
+`device_ids: ["${ISB_GPU}", "${ISB_GPU_1}"]` (up to `ISB_GPU_7`), the GPUs from `--gpu` on, and sets
+the engine options that use them (`tensor_parallel_size`, `device_map`). `--gpu` must then be an
+index; the Apptainer launcher exposes the listed GPUs as `CUDA_VISIBLE_DEVICES`. The `*/tp2` and
+`*/gpu2` configs take two. Multiple timed jobs must not share an allocation; the runner is not a
 cluster scheduler or a cross-process GPU reservation service.
 
 The images pin nnsight and their library stacks. Repository code, including `backends/`, is

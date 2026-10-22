@@ -1,0 +1,21 @@
+services:
+  runner:
+    extends: {file: ../../compose.base.yml, service: runner}
+    image: isb-vllm-plain-0-28-0:local
+    build:
+      args:
+        VLLM_IMAGE: vllm/vllm-openai:v0.28.0
+    environment:
+      # plain vLLM 0.28.0 compiled, tensor parallel over two GPUs
+      ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","gpu_memory_utilization":0.85,"enable_prefix_caching":false,"enforce_eager":false,"tensor_parallel_size":2}'
+      ISB_BACKEND: ${ISB_BACKEND:-vllm-plain/0-28-0/tp2}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${ISB_GPU}", "${ISB_GPU_1}"]   # two GPUs from --gpu (backends/README.md)
+              capabilities: [gpu]
+volumes:
+  model-cache:
+    name: ${ISB_MODEL_CACHE:-isb-model-cache}

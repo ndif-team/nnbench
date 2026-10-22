@@ -14,9 +14,11 @@ from isb.runs import EngineConfig, RunConfig
 class NNsight04Backend(Backend):
     name = "hf_nnsight_0_4"
 
-    def __init__(self, dtype: str | None = None, attn_implementation: str = "eager"):
+    def __init__(self, dtype: str | None = None, attn_implementation: str = "eager",
+                 device_map: str | None = None):
         self.dtype = dtype
         self.attn_implementation = attn_implementation
+        self.device_map = device_map            # "auto": split across the visible GPUs
         self._arity = {}
 
     def load(self, repo: str, device: str = "cuda:0"):
@@ -28,7 +30,7 @@ class NNsight04Backend(Backend):
         if self.dtype is not None:   # transformers 5 renamed torch_dtype to dtype
             key = "dtype" if int(transformers.__version__.split(".")[0]) >= 5 else "torch_dtype"
             kw[key] = getattr(torch, self.dtype)
-        model = LanguageModel(repo, device_map=device, dispatch=True,
+        model = LanguageModel(repo, device_map=self.device_map or device, dispatch=True,
                               attn_implementation=self.attn_implementation, **kw)
         self._arity = {}
         return model
