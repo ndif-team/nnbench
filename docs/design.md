@@ -583,6 +583,13 @@ than numerical thresholds. Numerical differences alone, including persistent dif
 matched precision, cannot establish an incorrect intervention. This policy supersedes older
 oracle-as-correctness claims elsewhere in this document and historical findings.
 
+Output comparison is low priority until it is refactored as a whole (2026-10-21): the scorers
+(`isb/jobs/score.py`, `isb/sweep/score.py`, `scripts/score.py`), the oracle metrics
+(`isb/oracle/`) and `scripts/row_diff.py`. Inference forward passes are not deterministic, so the
+same code scores differently between runs, and deterministic forward passes are deferred. Until
+the refactor these tools are diagnostics: reviews raise no findings about them and other changes
+do not extend them.
+
 Validation is artifact-only where possible and can be rerun independently. Preserve numerical
 metrics as diagnostics. Future direct checks should establish intervention location, scope and
 consumption; token replay should preserve intervention and cache history. Those stronger checks
