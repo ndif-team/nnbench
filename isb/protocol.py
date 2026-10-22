@@ -202,7 +202,7 @@ PROTOCOLS: dict[str, InterventionSpec] = {
         data_roles=("base", "counterfactual"), components=("block_output", "lm_head"),
         operations=("read", "write", "grad"), mechanisms=("swap",), featurizers=("subspace",),
         capabilities=("grad", "paired_forward", "full_logits"),
-        semantic_params=("layer", "k", "train", "heldout", "lr", "seed"),
+        semantic_params=("layer", "k", "train", "batch", "heldout", "lr", "seed"),
         realization_params=("residual",),
     ),
     "jacobian_collect": _p(

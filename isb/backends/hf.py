@@ -52,6 +52,12 @@ class HFBackend(Backend):
             res = patch(clean_act).save()
         return res.detach().float().cpu()
 
+    def session(self, model, build):
+        out = [None]                     # index-assign: the session body is compiled, a rebinding
+        with model.session():            # inside it would be local to that body
+            out[0] = build()
+        return out[0]
+
     def train_patch(self, model, source_prompts, base_prompts, capture, step):
         """HF's form: each side is one left-padded batch, so every pair is in both traces."""
         sources, bases = self.paired(source_prompts, base_prompts, "train_patch")

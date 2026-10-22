@@ -90,6 +90,10 @@ class BackendSpy(Backend):
         value = capture()
         return torch.cat([build_step(value) for _ in range(new_tokens)])
 
+    def session(self, model, build):
+        self.calls.append("session")
+        return build()
+
     def train_patch(self, *args, **kwargs):
         self.calls.append("train_patch")
         raise GradientObserved

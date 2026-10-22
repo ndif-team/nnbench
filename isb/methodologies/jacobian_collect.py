@@ -56,29 +56,35 @@ def _collect_cell(be, model, m, prompts, *, dim_batch, skip_first, grad, residua
         return _resid(blocks[target].output, residual)
 
     J = torch.zeros(len(sources), d, d)
-    for prompt in prompts:
-        for start in range(0, d, dim_batch):
-            B = min(dim_batch, d - start)
 
-            def make_cotangent(t, rows):  # runs INSIDE the trace; t is the target residual —
-                # [B, seq, d] on HF's replicated batch, [seq, d] on vLLM's single-prompt trace;
-                # `rows` names which of the B copies this trace holds, so copy b probes output
-                # dim start + rows[b] in either form
-                flat = t.reshape(len(rows), -1, t.shape[-1])
-                cot = torch.zeros_like(flat)
-                pos = valid_slice(flat.shape[1], skip_first)
-                for b, row in enumerate(rows):
-                    cot[b, pos, start + row] = 1.0
-                return cot.reshape(t.shape)
+    def collect():                          # the whole sweep is one multi-trace job (be.session)
+        for prompt in prompts:
+            for start in range(0, d, dim_batch):
+                _collect_rows(prompt, start, min(dim_batch, d - start))
+        return J / len(prompts)
 
-            grads = be.vjp_batch(model, [prompt] * B, acts_of, target_of,
-                                 make_cotangent, len(sources))
-            for i, g in enumerate(grads):                # g: source-layer gradient, layout as above
-                nb = g.shape[0] if g.dim() == 3 else 1
-                gb = g.reshape(nb, -1, g.shape[-1])
-                pos = valid_slice(gb.shape[1], skip_first)
-                J[i, start:start + nb, :] += gb[:, pos, :].mean(dim=1)  # mean over source positions
-    return J / len(prompts)
+    def _collect_rows(prompt, start, B):
+
+        def make_cotangent(t, rows):  # runs INSIDE the trace; t is the target residual —
+            # [B, seq, d] on HF's replicated batch, [seq, d] on vLLM's single-prompt trace;
+            # `rows` names which of the B copies this trace holds, so copy b probes output
+            # dim start + rows[b] in either form
+            flat = t.reshape(len(rows), -1, t.shape[-1])
+            cot = torch.zeros_like(flat)
+            pos = valid_slice(flat.shape[1], skip_first)
+            for b, row in enumerate(rows):
+                cot[b, pos, start + row] = 1.0
+            return cot.reshape(t.shape)
+
+        grads = be.vjp_batch(model, [prompt] * B, acts_of, target_of,
+                             make_cotangent, len(sources))
+        for i, g in enumerate(grads):                # g: source-layer gradient, layout as above
+            nb = g.shape[0] if g.dim() == 3 else 1
+            gb = g.reshape(nb, -1, g.shape[-1])
+            pos = valid_slice(gb.shape[1], skip_first)
+            J[i, start:start + nb, :] += gb[:, pos, :].mean(dim=1)  # mean over source positions
+
+    return be.session(model, collect)
 
 
 @cell("jacobian_collect", family="*", backend="hf")

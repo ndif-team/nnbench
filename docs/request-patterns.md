@@ -278,17 +278,22 @@ notebook user's view and the per-call overhead. Each is one point of a load patt
 repeated input: `batched` is an offline call at B = 16, `interactive` and `generation` a closed loop
 at C = 1.
 
-Known gaps, recorded here rather than built:
+The DAS and Jacobian collection cells take the form nnsight documents for a multi-trace job: the
+whole fit, or the whole sweep, runs inside one `model.session()` (`be.session`, which on vLLM runs
+the job's traces as they are reached, since nnsight documents sessions for transformers and remote
+models only). A DAS step trains on a minibatch of 16 pairs, the train split (pyvene's IOI sweep
+steps on 20, causalab on 32): one left-padded batch, the rotated interchange at every row's last
+position, cross-entropy over the rows. Measured on gpt2 (HF, A100, nnsight dev line) against the
+1-pair step: the apply row's output is unchanged bit for bit (seeded rotation, 154 ms against
+182 ms per call), the train row goes from 1011 ms to 1385 ms per 24-step fit for 16 times the pairs
+per step, and its held-out guard still passes. Jacobian collection's output is unchanged bit for
+bit under the session (10.0 s against 11.0 s per 4-prompt sweep, one sample each on a shared
+card; cause of the difference not determined).
 
-- The DAS cell trains at 1 pair per step; pyvene uses 20 and causalab 32. The step is the unit of
-  work being timed, so the cell understates it. Raising it is a workload change with new numbers.
-- The DAS and Jacobian collection cells issue their traces from a Python loop. nnsight documents
-  `model.session()` for a multi-trace job (one serialized request, one queue wait on NDIF); the
-  cells should take that form once a GPU check confirms the numbers do not move.
-- A multi-tenant research server (NDIF) receives whole jobs at times its users choose: an open loop
-  whose unit is a job (a fit, a 256-prompt lens sweep), not a prompt. That is not implemented. The
-  engine behaviour it would expose, overlapping whole sessions, is nearest to what steering under
-  the concurrent pattern shows at request level.
+Known gap, recorded here rather than built: a multi-tenant research server (NDIF) receives whole
+jobs at times its users choose, an open loop whose unit is a job (a fit, a 256-prompt lens sweep),
+not a prompt. That is not implemented. The engine behaviour it would expose, overlapping whole
+sessions, is nearest to what steering under the concurrent pattern shows at request level.
 
 ## Choosing and comparing
 
