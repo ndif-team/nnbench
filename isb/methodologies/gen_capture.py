@@ -19,6 +19,7 @@ from __future__ import annotations
 from ..profiles import _resid
 from .gen_steering import _check_bound
 from .observations import record_resolved
+from .readout import engine_logits
 from .registry import cell
 
 
@@ -46,7 +47,7 @@ def gen_capture_vllm(be, model, m, prompts, *, layer, new_tokens, export=True, b
 
     def step():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
         if not export:
-            return model.logits[-1:, :].argmax(-1).cpu()
+            return engine_logits(model)[-1:, :].argmax(-1).cpu()
         return be.last(_resid(m.blocks(model)[layer].output, residual)).cpu()
 
     return be.generate(model, prompts, step, new_tokens=new_tokens,

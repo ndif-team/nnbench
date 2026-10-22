@@ -28,12 +28,22 @@ import torch.nn.functional as F
 SITES = ("head", "engine")
 
 
+def engine_logits(model):
+    """vLLM's logits for this step at the engine site. Runs INSIDE a trace. nnsight 0.7 and later
+    expose them as the `model.logits` property; 0.5 as the output of the `model.logits` wrapper
+    module (its README at v0.5.15: `model.logits.output`)."""
+    from nnsight.intervention.envoy import Envoy
+
+    logits = model.logits
+    return logits.output if isinstance(logits, Envoy) else logits
+
+
 def final_logits(model, head, site):
     """The last token's next-token logits at the documented read site. Runs INSIDE a trace.
-    "head": the model's own head output (HF), `[B, vocab]`. "engine": vLLM's `model.logits`,
-    `[1, vocab]`."""
+    "head": the model's own head output (HF), `[B, vocab]`. "engine": vLLM's engine logits
+    (`engine_logits`), `[1, vocab]`."""
     if site == "engine":
-        return model.logits[-1:, :]
+        return engine_logits(model)[-1:, :]
     if site == "head":
         return head.output[:, -1, :]
     raise ValueError(f"unknown read site {site!r} (expected one of {SITES})")

@@ -4,7 +4,7 @@ services:
     image: isb-nnsight-vllm-0-5-15:local
     build:
       args:
-        VLLM_IMAGE: vllm/vllm-openai:v0.12.0
+        VLLM_IMAGE: vllm/vllm-openai:v0.13.0
         NNSIGHT_REF: 79e18487ee86c96712df7561acf4a9ddb8469098   # tag v0.5.15 (2026-01-13)
     environment:
       ISB_BACKEND: ${ISB_BACKEND:-nnsight-vllm/sync/0-5-15/tp4}

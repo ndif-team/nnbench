@@ -4,12 +4,15 @@ services:
     image: isb-nnsight-vllm-0-5-15:local
     build:
       args:
-        VLLM_IMAGE: vllm/vllm-openai:v0.12.0
+        VLLM_IMAGE: vllm/vllm-openai:v0.13.0
         NNSIGHT_REF: 79e18487ee86c96712df7561acf4a9ddb8469098   # tag v0.5.15 (2026-01-13)
     environment:
       ISB_BACKEND: ${ISB_BACKEND:-nnsight-vllm/sync/0-5-15}
-      # nnsight 0.5.15 requires vllm>=0.12 (its package metadata); 0.5 has only the sync
-      # engine (backend.py)
+      # vLLM 0.13.0 (2025-12-19), the release current when nnsight 0.5.15 shipped. 0.5.15 installs
+      # its model runner by replacing vllm.v1.worker.gpu_model_runner.GPUModelRunner; 0.13.0's worker
+      # is the first to look that name up when it builds the runner (gpu_worker.py, init_device). On
+      # 0.12.0, which the package metadata allows, every trace fails with "'GPUModelRunner' object
+      # has no attribute 'finish_nnsight'". 0.5 has only the sync engine (backend.py).
 volumes:
   model-cache:
     name: ${ISB_MODEL_CACHE:-isb-model-cache}

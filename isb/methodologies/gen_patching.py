@@ -41,6 +41,7 @@ from __future__ import annotations
 import torch
 
 from ..profiles import _resid
+from .readout import engine_logits
 from .registry import cell
 
 
@@ -117,7 +118,7 @@ def gen_patching_vllm(be, model, m, prompts, *, layer=9, residual="plain",
 
     if not patch:
         def step():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
-            return model.logits[-1:, :]
+            return engine_logits(model)[-1:, :]
         return be.generate(model, [corrupted], step,
                            new_tokens=new_tokens, bounded=(bound == "bounded"))
 
@@ -130,7 +131,7 @@ def gen_patching_vllm(be, model, m, prompts, *, layer=9, residual="plain",
         if not injected[0]:                                    # the first generation forward IS prefill
             _inject_transplant(h, layer, clean_act)
             injected[0] = True
-        return model.logits[-1:, :]                            # engine site == portable unembed
+        return engine_logits(model)[-1:, :]                    # engine site == portable unembed
 
     return be.generate_patch(model, clean, corrupted, capture=capture,
                              build_step=step, new_tokens=new_tokens, bounded=(bound == "bounded"))

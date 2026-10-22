@@ -2,8 +2,10 @@
 
 0.5 has one vLLM engine, the synchronous `vllm.LLM`, and its `VLLM` takes no `mode`: every keyword
 it does not consume goes to vLLM's `EngineArgs` (nnsight modeling/vllm/vllm.py at v0.5.15, `_load`,
-which also forces `enforce_eager=True`). The load leaves `mode` out; the rest of the sync backend
-and the cells apply unchanged (design.md §12.14).
+which also forces `enforce_eager=True`). The load leaves `mode` out. 0.5 steps through generation
+with `tracer.iter[...]` as a context manager whose body runs once per step (its README:
+`with tracer.iter[:]:`), so `generate` takes that form; the rest of the sync backend and the cells
+apply unchanged (design.md §12.14).
 """
 from isb.backends.vllm_sync import VLLMSyncBackend
 from isb.jobs.worker import merge_requirements, options
@@ -20,6 +22,21 @@ class NNsight05SyncBackend(VLLMSyncBackend):
         if self.tensor_parallel_size > 1:
             kw["tensor_parallel_size"] = self.tensor_parallel_size
         return VLLM(repo, dispatch=True, gpu_memory_utilization=gpu_memory_utilization, **kw)
+
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
+        import torch
+
+        prompt = self.one(prompts, "generate")
+        it = slice(0, new_tokens) if bounded else slice(None)
+        with model.trace(prompt, temperature=0.0, top_p=1, max_tokens=new_tokens) as tracer:
+            rows = list().save()
+            with tracer.iter[it]:
+                rows.append(build_step())
+        if len(rows) != new_tokens:
+            raise RuntimeError(
+                f"vllm_sync generation collected {len(rows)} per-step rows, "
+                f"expected {new_tokens}")
+        return torch.cat([r.detach().float().cpu() for r in rows], dim=0)   # [steps, vocab]
 
 
 def create_backend(spec):

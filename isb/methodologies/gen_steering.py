@@ -33,7 +33,7 @@ import torch.nn.functional as F
 
 from ..profiles import _resid
 from .observations import record_resolved
-from .readout import checkpoint_direction, checkpoint_of, head_direction
+from .readout import checkpoint_direction, checkpoint_of, engine_logits, head_direction
 from .registry import cell
 from .steering import _resolve_token, _strength_scale
 
@@ -95,7 +95,7 @@ def gen_steering_vllm(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6
         # the engine site (docs/models/vllm.md), whole under tensor parallelism; [-1:, :] keeps the
         # step's LAST row so the prefill step (which may carry more than one logits row) matches
         # HF's [:, -1, :] read
-        return model.logits[-1:, :]
+        return engine_logits(model)[-1:, :]
 
     return be.generate(model, prompts, step, new_tokens=new_tokens,
                        bounded=(bound == "bounded"))

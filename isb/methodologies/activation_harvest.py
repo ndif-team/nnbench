@@ -28,6 +28,7 @@ import torch
 
 from ..profiles import _resid
 from .observations import record_resolved
+from .readout import engine_logits
 from .registry import cell
 
 
@@ -58,7 +59,7 @@ def activation_harvest_vllm(be, model, m, prompts, *, layer, export=True, residu
 
     def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
         if not export:
-            return model.logits[-1:, :].argmax(-1).cpu()
+            return engine_logits(model)[-1:, :].argmax(-1).cpu()
         return _resid(m.blocks(model)[layer].output, residual).cpu()    # [tokens, d]
 
     return be.run(model, prompts, build)
