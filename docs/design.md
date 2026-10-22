@@ -1300,6 +1300,20 @@ unexpected arguments become isolated call errors. Registered templates classify 
 baseline, and effect parameters at authoring time. Runtime classification remains checked because
 datasets, restored templates, and independently extended cells can differ from the built-in suite.
 
+**Unit form.** The cell never chooses the engine form (`isb/backends/base.py`). A cell hands a
+primitive the units of one call; the backend runs them as its engine documents: HF pads several
+prompts into one batch, the async vLLM engine runs one request per trace, the sync engine one
+invoke per prompt. One-unit primitives (`patch`, `generate`, `generate_patch`, `attribute`)
+check their arguments through `Backend.one()` and raise `FormError` on more, in every backend and
+in the test fakes, so a cell in the wrong form fails in the no-GPU suite rather than as an
+engine error on one backend. Several-unit primitives (`train_patch`, `vjp_batch`) pass the
+cell's closure the indices of the units the current trace holds (`rows`), so the closure selects
+targets per unit and the same cell runs batched on HF and one unit per trace on the async engine.
+`train_patch`'s step returns the loss summed over its rows, so the gradient is the same whichever
+way the backend splits the pairs into traces; unequal sides raise `FormError`. An engine error
+recorded for a cell is therefore the engine's answer to its documented form;
+`scripts/row_diff.py` compares two runs row by row (`docs/writing-workloads.md` §8).
+
 **What gets saved.** Successful effective-call records contain bound parameters, their semantic and
 realization split when available, and a case-level protocol description or explicit template-level
 coverage. Failed calls retain attempted parameters and the error stage. Baseline, effect, and
@@ -1356,6 +1370,7 @@ Acceptance checks:
 |---|---|
 | Effective calls | Real signature binding, generic-family binding, defaults with `**kwargs`, isolated invalid cases, baseline/effect/reference records |
 | Concrete requirements | Branch-behavior tests for no-write and no-gradient cases, plus a custom description hook |
+| Unit form | One-unit primitives raise `FormError` on several units in every backend and the test fake, and `train_patch` on unequal sides; the DAS and Jacobian closures take `rows` |
 | Ownership and timing | Nested mutation across warmups/trials/reference calls cannot alter snapshots; preparation occurs before the clock |
 | Comparison | Parameter, input, decode-length, aggregation, effect, and model-load changes reject comparison; timing-only changes compare; incomplete identity stays unverified |
 | File boundaries | Current jobs round-trip with saved coverage; historical and future versions fail clearly; malformed current artifacts fail validation |

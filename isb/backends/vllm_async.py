@@ -186,6 +186,9 @@ class VLLMAsyncBackend(VLLMBackend):
     def patch(self, model, clean_prompt, corrupted_prompt, capture, patch):
         import asyncio
 
+        clean_prompt = self.one(clean_prompt, "patch")
+        corrupted_prompt = self.one(corrupted_prompt, "patch")
+
         async def _go():
             # both traces in ONE event loop / coroutine: two sequential single-prompt requests on
             # the same async engine. Avoids the two-`asyncio.run` two-loop hazard, and uses two
@@ -207,56 +210,73 @@ class VLLMAsyncBackend(VLLMBackend):
 
         return self._run_coro(_go())
 
-    def train_patch(self, model, source_prompt, base_prompt, capture, step):
-        """The REAL train step, same flow as HF — on today's vLLM it dies at the engine's own
-        first refusal and that error is the recorded verdict: the dev line raises at the first
-        grad-tracking op on an inference tensor; the 0.8 line tolerates `requires_grad_` and
-        refuses at the backward session ("forward runs under torch.inference_mode"). Attempting
-        the real computation (not a probe) keeps the recorded error the engine's own words on
-        every client line, and a line that does support grad would simply work."""
-        async def _go():
-            with model.trace(source_prompt, temperature=0.0, top_p=1, max_tokens=1) as t1:
-                s = capture().save()  # noqa: F841 — var name IS the async .saves key
-            last1 = None
-            async for output in t1.backend:
-                last1 = output
-            src = self._extract(last1)
+    def train_patch(self, model, source_prompts, base_prompts, capture, step):
+        """The REAL train step in the async engine's form: one request per trace, so one pair per
+        pair of traces, the gradients of the pairs accumulating on `step`'s trainables (`step` sums
+        the losses of its rows, so the accumulated gradient is HF's padded-batch gradient). On
+        today's vLLM it dies at the engine's own first refusal and that error is the recorded
+        verdict: the dev line raises at the first grad-tracking op on an inference tensor; the 0.8
+        line tolerates `requires_grad_` and refuses at the backward session ("forward runs under
+        torch.inference_mode"). Attempting the real computation (not a probe) keeps the recorded
+        error the engine's own words on every client line, and a line that does support grad
+        would simply work."""
+        import torch
 
-            with model.trace(base_prompt, temperature=0.0, top_p=1, max_tokens=1) as t2:
-                loss = step(src)
-                lv = loss.save()  # noqa: F841 — var name IS the async .saves key
-                with loss.backward():
-                    pass                      # grads land on step's external trainables
-            last2 = None
-            async for output in t2.backend:
-                last2 = output
-            return self._extract(last2)
+        pairs = list(zip(*self.paired(source_prompts, base_prompts, "train_patch")))
+
+        async def _go():
+            total = torch.zeros(())
+            for i, (source_prompt, base_prompt) in enumerate(pairs):
+                with model.trace(source_prompt, temperature=0.0, top_p=1, max_tokens=1) as t1:
+                    s = capture().save()  # noqa: F841 — var name IS the async .saves key
+                last1 = None
+                async for output in t1.backend:
+                    last1 = output
+                src = self._extract(last1)
+
+                with model.trace(base_prompt, temperature=0.0, top_p=1, max_tokens=1) as t2:
+                    loss = step(src, [i])
+                    lv = loss.save()  # noqa: F841 — var name IS the async .saves key
+                    with loss.backward():
+                        pass                  # grads land on step's external trainables
+                last2 = None
+                async for output in t2.backend:
+                    last2 = output
+                total = total + self._extract(last2).reshape(())
+            return total
         return self._run_coro(_go())
 
     def vjp_batch(self, model, prompts, acts_of, target_of, make_cotangent, n=None):
         """The REAL VJP sweep, same flow as HF — dies at the engine's own first grad refusal
         (dev: `requires_grad_` on an inference tensor; 0.8: the backward session's
         inference_mode refusal), which is the recorded verdict. See `train_patch`."""
-        prompt = prompts[0] if isinstance(prompts, (list, tuple)) else prompts
+        import torch
+
+        prompts = self.many(prompts)
 
         async def _go():
-            with model.trace(prompt, temperature=0.0, top_p=1, max_tokens=1) as tracer:
-                grads = [None] * (n or 0)
-                grads = grads.save()  # noqa: F841 — parent-scope list; "grads" is the saves key
-                acts = acts_of(model)
-                for a in acts:
-                    a.requires_grad_(True)
-                target = target_of(model)
-                cot = make_cotangent(target)
-                metric = (target * cot).sum()
-                with metric.backward():
-                    for L in range(len(acts) - 1, -1, -1):
-                        grads[L] = acts[L].grad
-            last = None
-            async for output in tracer.backend:
-                last = output
-            (out,) = self._extract_keys(last, ["grads"])
-            return [g.detach().float().cpu() for g in out]
+            per_prompt = []
+            for i, prompt in enumerate(prompts):       # the async engine's form: one request per trace
+                with model.trace(prompt, temperature=0.0, top_p=1, max_tokens=1) as tracer:
+                    grads = [None] * (n or 0)
+                    grads = grads.save()  # noqa: F841 — parent-scope list; "grads" is the saves key
+                    acts = acts_of(model)
+                    for a in acts:
+                        a.requires_grad_(True)
+                    target = target_of(model)
+                    cot = make_cotangent(target, [i])
+                    metric = (target * cot).sum()
+                    with metric.backward():
+                        for L in range(len(acts) - 1, -1, -1):
+                            grads[L] = acts[L].grad
+                last = None
+                async for output in tracer.backend:
+                    last = output
+                (out,) = self._extract_keys(last, ["grads"])
+                per_prompt.append([g.detach().float().cpu() for g in out])
+            if len(per_prompt) == 1:
+                return per_prompt[0]                   # flat [seq, d] per layer, as `last` expects
+            return [torch.stack([p[L] for p in per_prompt]) for L in range(len(per_prompt[0]))]
         return self._run_coro(_go())
 
     def attribute(self, model, clean_prompt, corrupt_prompt, acts_of, metric_of, n=None):
@@ -269,6 +289,9 @@ class VLLMAsyncBackend(VLLMBackend):
         computation keeps every line's verdict the engine's own first error — and a line that
         supports grad would simply produce the attribution."""
         import torch
+
+        clean_prompt = self.one(clean_prompt, "attribute")
+        corrupt_prompt = self.one(corrupt_prompt, "attribute")
 
         async def _go():
             with model.trace(clean_prompt, temperature=0.0, top_p=1, max_tokens=1) as t1:
@@ -310,7 +333,7 @@ class VLLMAsyncBackend(VLLMBackend):
     def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
         import torch
 
-        prompt = prompts[0] if isinstance(prompts, (list, tuple)) else prompts
+        prompt = self.one(prompts, "generate")
 
         async def _go():
             with model.trace(prompt, temperature=0.0, top_p=1, max_tokens=new_tokens) as tracer:
@@ -366,6 +389,9 @@ class VLLMAsyncBackend(VLLMBackend):
 
     def generate_patch(self, model, source_prompt, base_prompt, capture, build_step,
                        *, new_tokens, bounded=True):
+        source_prompt = self.one(source_prompt, "generate_patch")
+        base_prompt = self.one(base_prompt, "generate_patch")
+
         async def _go():
             # trace 1: capture the source residual (single forward), like patch()'s clean trace
             with model.trace(source_prompt, temperature=0.0, top_p=1, max_tokens=1) as t1:
