@@ -30,12 +30,17 @@ class _Block:
 
 
 class _Head:
-    def __init__(self):
-        self.weight = torch.eye(HID, HID)
+    """The model's head: `.output` is its [B, S, vocab] logits (the HF read site)."""
+
+    def __init__(self, output=None):
+        self.output = torch.zeros(1, 2, HID) if output is None else output
 
 
-def _last(t):
-    return t[-1:, :]
+class _Model:
+    """`.logits` is the engine's [tokens, vocab] logits (the vLLM read site)."""
+
+    def __init__(self, logits=None):
+        self.logits = torch.zeros(2, HID) if logits is None else logits
 
 
 def test_cells_registered():
@@ -62,16 +67,16 @@ def test_ablate_zeros_tensor_output():
     mlp = _Mod(torch.ones(2, HID))
     final = _Mod(torch.ones(2, HID))
     blocks = [final]  # blocks[-1] is the readout block
-    _ablate_and_read(mlp, blocks, lambda x: x, _Head(),
-                     target="mlp", residual="plain", last_fn=_last)
+    _ablate_and_read(mlp, _Model(), _Head(),
+                     target="mlp", site="head")
     assert torch.count_nonzero(mlp.output) == 0  # knocked out
 
 
 def test_ablate_zeros_tuple_stream0_keeps_tail():
     attn = _Mod((torch.ones(2, HID), "weights"))
     blocks = [_Mod(torch.ones(2, HID))]
-    _ablate_and_read(attn, blocks, lambda x: x, _Head(),
-                     target="attn", residual="plain", last_fn=_last)
+    _ablate_and_read(attn, _Model(), _Head(),
+                     target="attn", site="head")
     assert torch.count_nonzero(attn.output[0]) == 0   # stream 0 zeroed
     assert attn.output[1] == "weights"                # tail preserved
 
@@ -80,17 +85,21 @@ def test_target_none_is_baseline_noop():
     mlp = _Mod(torch.full((2, HID), 5.0))
     before = mlp.output.clone()
     blocks = [_Mod(torch.ones(2, HID))]
-    _ablate_and_read(mlp, blocks, lambda x: x, _Head(),
-                     target="none", residual="plain", last_fn=_last)
+    _ablate_and_read(mlp, _Model(), _Head(),
+                     target="none", site="head")
     assert torch.equal(mlp.output, before)            # no write at all
 
 
-def test_readout_is_final_block_last_token():
-    final = _Mod(torch.tensor([[0.0, 0, 0, 0], [3.0, 0, 0, 0]]))
-    out = _ablate_and_read(_Mod(torch.ones(2, HID)), [final], lambda x: x, _Head(),
-                           target="none", residual="plain", last_fn=_last)
+def test_readout_is_the_documented_site_last_token():
+    logits = torch.tensor([[[0.0, 0, 0, 0], [3.0, 0, 0, 0]]])            # [B=1, S=2, vocab]
+    out = _ablate_and_read(_Mod(torch.ones(2, HID)), _Model(), _Head(logits),
+                           target="none", site="head")                  # HF: lm_head.output
     assert out.shape == (1, HID)
     assert out[0, 0].item() == 3.0
+    engine = _Model(torch.tensor([[0.0, 0, 0, 0], [0.0, 7.0, 0, 0]]))   # vLLM: model.logits
+    out = _ablate_and_read(_Mod(torch.ones(2, HID)), engine, _Head(), target="none", site="engine")
+    assert out.shape == (1, HID)
+    assert out[0, 1].item() == 7.0
 
 
 def _run_all():

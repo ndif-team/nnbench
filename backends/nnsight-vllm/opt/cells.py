@@ -11,12 +11,17 @@ Realization differs (docs/models/vllm-editing.md, vllm.md):
   layer handles they touch, never the root model;
 - writes are in place; reads that outlive their step are cloned (they alias engine memory).
 
+Tensor parallelism is transparent to the blocks (docs/models/vllm-parallelism.md) except for
+parameters, which are this rank's slice; so the lens projects through `model.logits_processor`
+(vllm-parallelism.md's form) and the steering direction is the checkpoint's unembedding row
+(`readout.checkpoint_direction`), built before the edit and moved onto the stream inside it.
+
 A `with` block must sit in the cell's own frame: nnsight compiles the block from that frame.
 Registered for family "llama" (vLLM Qwen2 paths `model.layers`, `model.norm`, `lm_head`).
 """
 import torch
-import torch.nn.functional as F
 
+from isb.methodologies.readout import checkpoint_direction, checkpoint_of
 from isb.methodologies.registry import cell
 from isb.methodologies.steering import _resolve_token
 
@@ -44,7 +49,7 @@ def logit_lens(be, model, prompts, *, layers="all"):
             for i in idx:
                 out = blocks[i].output
                 rows.append(out[0][-1:] + out[1][-1:])          # last-token fused stream
-            lens = F.linear(norm(torch.cat(rows)), head.weight).save()   # one batched readout
+            lens = model.logits_processor(head, norm(torch.cat(rows))).save()   # one batched readout
         be.remember_edit(key, edit)
     saves = be.run_edit(model, prompts[0])
     return saves["lens"].float().cpu().unsqueeze(1)               # [n_layers, 1, vocab]
@@ -54,12 +59,12 @@ def logit_lens(be, model, prompts, *, layers="all"):
 def steering(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, scale_by="mean_norm"):
     key = ("steering", layer, target, alpha, scale_by)
     if not _ensure(be, key):
-        token_id = _resolve_token(model.tokenizer, target)
-        block, head = model.model.layers[layer], model.lm_head
+        unit = checkpoint_direction(checkpoint_of(model), _resolve_token(model.tokenizer, target))
+        block = model.model.layers[layer]
         with model.edit(name=EDIT) as (tracer, edit):
             if alpha != 0:
                 out = block.output
-                direction = F.normalize(head.weight[token_id].float(), dim=0).to(out[0].dtype)
+                direction = unit.to(device=out[0].device, dtype=out[0].dtype)
                 stream = out[0] + out[1]
                 if scale_by == "mean_norm":
                     scale = stream.norm(dim=-1).mean()
@@ -79,14 +84,14 @@ def gen_steering(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, new_
     if not _ensure(be, key):
         import nnsight
 
-        token_id = _resolve_token(model.tokenizer, target)
-        block, head = model.model.layers[layer], model.lm_head
+        unit = checkpoint_direction(checkpoint_of(model), _resolve_token(model.tokenizer, target))
+        block = model.model.layers[layer]
         with model.edit(name=EDIT) as (tracer, edit):
             rows = nnsight.save([])
             for _ in tracer.all():                                # prefill and every decode step
                 if alpha != 0:
                     out = block.output
-                    direction = F.normalize(head.weight[token_id].float(), dim=0).to(out[0].dtype)
+                    direction = unit.to(device=out[0].device, dtype=out[0].dtype)
                     stream = out[0] + out[1]
                     if scale_by == "mean_norm":
                         scale = stream.norm(dim=-1).mean()
@@ -106,8 +111,7 @@ def gen_steering(be, model, prompts, *, layer=8, target=" Rome", alpha=6.0, new_
 def activation_patching(be, model, prompts, *, layer=6, patch=True, positions="all"):
     be.clear_edit()                    # traces only; no installed block may ride these requests
     clean_prompt, corrupt_prompt = prompts
-    block, final = model.model.layers[layer], model.model.layers[-1]
-    norm, head = model.model.norm, model.lm_head
+    block = model.model.layers[layer]
     sampling = {"temperature": 0.0, "top_p": 1, "max_tokens": 1, "edits": []}
     if patch:
         with model.trace(clean_prompt, **sampling):
@@ -122,9 +126,8 @@ def activation_patching(be, model, prompts, *, layer=6, patch=True, positions="a
                 out[0][-1:] = clean[-1:].to(out[0].dtype) - out[1][-1:]
             else:
                 out[0][:] = clean.to(out[0].dtype) - out[1]      # stream := clean, in place
-        fin = final.output
-        logits = F.linear(norm(fin[0][-1:] + fin[1][-1:]), head.weight).save()
-    return logits.float().cpu()                                   # [1, vocab]
+        logits = model.logits.save()                              # the engine site, as below
+    return logits[-1:].float().cpu()                              # [1, vocab]
 
 
 @cell("ablation", family="llama", backend="nnsight_opt")

@@ -108,6 +108,30 @@ SUITES = {s.name: s for s in (
                     "nnsight-hf/sdpa/0-7", "nnsight-vllm/sync/0-7",
                     "nnsight-hf/sdpa/0-4-6", "nnsight-hf/sdpa/0-4-6/era"),
           reference="nnsight-hf/sdpa/0-8-1", timeout=3600),
+    # The same three studies on Qwen2.5-72B-Instruct in bf16, which needs two GPUs: HF splits its
+    # layers across them (device_map="auto", the */gpu2 configs), vLLM shards each layer (tensor
+    # parallel, the */tp2 configs). The weights come from the group's shared cache
+    # (ISB_MODEL_CACHE). 0.7 is left out; the all-layer lens skips B=all, whose saves exceed memory.
+    Suite("nnsight-large-versions",
+          entries=(Entry(("logit_lens", "steering", "ablation"), ("qwen2.5-72b",), size=32),
+                   Entry(("gen_steering", "activation_patching"), ("qwen2.5-72b",), size=16)),
+          backends=("nnsight-hf/sdpa/0-8-1/gpu2", "nnsight-vllm/sync/0-8-1/tp2",
+                    "nnsight-vllm/sync/0-8-1/byref/tp2", "nnsight-hf/sdpa/0-4-6/gpu2"),
+          reference="nnsight-hf/sdpa/0-8-1/gpu2", timeout=7200),
+    Suite("nnsight-large-offline",
+          entries=(Entry(("steering", "ablation"), ("qwen2.5-72b",), regimes=("offline",),
+                         loads=(Offline(256, (1, 16, 64, None)),)),
+                   Entry(("logit_lens",), ("qwen2.5-72b",), regimes=("offline",),
+                         loads=(Offline(256, (1, 16, 64)),))),
+          backends=("nnsight-hf/sdpa/0-8-1/gpu2", "nnsight-vllm/sync/0-8-1/tp2",
+                    "nnsight-vllm/sync/0-8-1/byref/tp2", "nnsight-hf/sdpa/0-4-6/gpu2"),
+          reference="nnsight-hf/sdpa/0-8-1/gpu2", timeout=7200),
+    Suite("nnsight-large-concurrent",
+          entries=(Entry(("steering", "activation_patching", "gen_steering"), ("qwen2.5-72b",),
+                         regimes=("concurrent",), loads=(Concurrent(128, (1, 4, 16, 64)),)),),
+          backends=("nnsight-hf/sdpa/0-8-1/gpu2", "nnsight-vllm/0-8-1/tp2",
+                    "nnsight-vllm/0-8-1/byref/tp2", "nnsight-hf/sdpa/0-4-6/gpu2"),
+          reference="nnsight-hf/sdpa/0-8-1/gpu2", timeout=10800),
     # Qwen3.5-4B with the upstream fitted Jacobian lens (its `jlens` asset).
     Suite("fitted-jlens",
           entries=(Entry(("jacobian_lens",), ("qwen3.5-4b",)),),

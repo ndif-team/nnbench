@@ -4,7 +4,8 @@ own envoy at the same path, instead of shipping the whole envoy tree with every 
 Loaded at interpreter start in every process that has this directory on PYTHONPATH -- the client
 and vLLM's spawned EngineCore alike -- and active only when NNSIGHT_ENVOY_BYREF=1. Both halves are
 needed: the client writes the reference, the engine resolves it through its persistent-object map
-(built once at model load). Diagnostic only (slurm/diag_cost.py); not part of any backend image.
+(built once at model load). Not in any image: the `*/byref` configs and slurm/diag_cost.py put
+this directory on PYTHONPATH. A prototype of a fix for nnsight, measured, not shipped.
 """
 import os
 

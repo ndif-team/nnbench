@@ -28,7 +28,7 @@ class VLLMSyncBackend(VLLMBackend):
     def __init__(self, dtype: str | None = None, trust_remote_code: bool = False,
                  max_model_len: int | None = None, tokenizer: str | None = None,
                  enable_prefix_caching: bool | None = None,
-                 gpu_memory_utilization: float = 0.2):
+                 gpu_memory_utilization: float = 0.2, tensor_parallel_size: int = 1):
         super().__init__(dtype=dtype, trust_remote_code=trust_remote_code,
                          max_model_len=max_model_len, tokenizer=tokenizer,
                          enable_prefix_caching=enable_prefix_caching)
@@ -36,15 +36,19 @@ class VLLMSyncBackend(VLLMBackend):
         # its system under test sizes it through ISB_ENGINE_OPTIONS; the async run's batched twin
         # passes its own fraction to load().
         self.gpu_memory_utilization = gpu_memory_utilization
+        self.tensor_parallel_size = tensor_parallel_size
 
     def load(self, repo: str, gpu_memory_utilization: float | None = None):
         from nnsight.modeling.vllm import VLLM
 
         if gpu_memory_utilization is None:
             gpu_memory_utilization = self.gpu_memory_utilization
+        kw = self._engine_kwargs()
+        if self.tensor_parallel_size > 1:
+            kw["tensor_parallel_size"] = self.tensor_parallel_size
         return VLLM(
             repo, mode="sync", dispatch=True,
-            gpu_memory_utilization=gpu_memory_utilization, **self._engine_kwargs(),
+            gpu_memory_utilization=gpu_memory_utilization, **kw,
         )
 
     def vanilla(self, model, prompt, *, new_tokens):

@@ -380,6 +380,24 @@ def _cases(spec, interface: str):
                    {"row": task.label, "alternative": realization})
 
 
+def _cached_revision(repo):
+    """The commit of the cached snapshot `repo` loads from, or None. transformers 5.18 stopped
+    setting `config._commit_hash`, so a newer build reads the revision from the hub cache instead:
+    `snapshots/<commit>/config.json` is the same commit an older build reports."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        path = try_to_load_from_cache(repo, "config.json")
+    except Exception:
+        return None
+    if not isinstance(path, str):
+        return None
+    import os
+
+    commit = os.path.basename(os.path.dirname(path))
+    return commit if len(commit) == 40 else None
+
+
 def _layer_count(model):
     """The loaded model's decoder layer count from its config, or None when it does not say."""
     config = getattr(model, "config", None)
@@ -418,6 +436,8 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
             tokenizer = model.tokenizer
             vocab = tokenizer.get_vocab()
             revision = getattr(getattr(model, "config", None), "_commit_hash", None)
+            if not isinstance(revision, str):
+                revision = _cached_revision(spec.repo)
             prov["model_identity"] = {
                 "repo": spec.repo,
                 "revision": revision if isinstance(revision, str) else None,

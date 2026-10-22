@@ -1,0 +1,22 @@
+services:
+  runner:
+    extends: {file: ../../../compose.base.yml, service: runner}
+    image: isb-nnsight-hf-0-4-6:local
+    build:
+      args:
+        NNSIGHT_REF: a5bbbace8a4fe48eef5ce52a63723bbd16c23b89   # tag v0.4.6 (2025-04-24)
+    environment:
+      ISB_BACKEND: ${ISB_BACKEND:-nnsight-hf/sdpa/0-4-6/gpu2}
+      # sdpa in bf16 with accelerate's device_map="auto": the layers split across two GPUs
+      # and run one GPU after the other, transformers' own multi-GPU loading
+      ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","attn_implementation":"sdpa","device_map":"auto"}'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${ISB_GPU}", "${ISB_GPU_1}"]   # two GPUs from --gpu (backends/README.md)
+              capabilities: [gpu]
+volumes:
+  model-cache:
+    name: ${ISB_MODEL_CACHE:-isb-model-cache}

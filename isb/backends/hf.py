@@ -8,7 +8,8 @@ class HFBackend(Backend):
     name = "hf"
 
     def __init__(self, force_text_causal: bool = False, dtype: str | None = None,
-                 attn_implementation: str = "eager"):
+                 attn_implementation: str = "eager", device_map: str | None = None,
+                 tp_size: int = 1):
         # force_text_causal: load via AutoModelForCausalLM even when the architecture registers as
         # ImageTextToText. Needed for TEXT-ONLY checkpoints of multimodal-wrapper architectures
         # (Qwen/Qwen3.5-4B: no vision weights in the repo, transformers auto-routes its config to
@@ -21,6 +22,15 @@ class HFBackend(Backend):
         # eager by default (the oracle control); a config may choose transformers' own default,
         # sdpa, for timing comparisons
         self.attn_implementation = attn_implementation
+        # None places the model on `load`'s one device; "auto" lets accelerate split its layers
+        # across every visible GPU (a config that declares several GPUs, backends/README.md)
+        self.device_map = device_map
+        # >1 shards every layer over that many ranks with transformers tensor parallelism, one
+        # process per GPU under torchrun (nnsight docs/models/tensor-parallel.md); every rank runs
+        # the whole job and rank 0 alone publishes it (isb/jobs/worker.py)
+        self.tp_size = tp_size
+        if tp_size > 1 and device_map is not None:
+            raise ValueError("tp_size and device_map are mutually exclusive")
 
     def load(self, repo: str, device: str = "cuda:0"):
         import torch
@@ -34,8 +44,20 @@ class HFBackend(Backend):
                 pass
 
             kw["automodel"] = _TextCausal
+        if self.tp_size > 1:
+            import os
+
+            from transformers.distributed import DistributedConfig
+
+            # this rank's GPU, so the timer's CUDA sync and peak memory read the device it runs on
+            torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+            kw["distributed_config"] = DistributedConfig(tp_size=self.tp_size)
+        else:
+            kw["device_map"] = self.device_map or device
         return LanguageModel(
-            repo, device_map=device, dispatch=True, attn_implementation=self.attn_implementation, **kw
+            repo, dispatch=True,
+            attn_implementation=self.attn_implementation, **kw
         )
 
     def run(self, model, prompts, build):

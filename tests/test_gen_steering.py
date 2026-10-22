@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import isb.methodologies  # noqa: F401,E402  (registers cells)
 import isb.sweep.execute as execute_mod  # noqa: E402
 from isb.methodologies.gen_steering import _check_bound, _steer_step  # noqa: E402
+from isb.methodologies.readout import head_direction  # noqa: E402
 from isb.methodologies.registry import CELLS, get_cell  # noqa: E402
 from isb.runfile import load_run  # noqa: E402
 from isb.runs import EngineConfig, RunConfig  # noqa: E402
@@ -82,7 +83,7 @@ def test_steer_step_replacement_write_semantics():
     hidden = torch.ones(2, HID)
     before = hidden.clone()
     blocks = [_Block((hidden, "kv"))]
-    _steer_step(blocks, _Head(), layer=0, token_id=1, alpha=3.0)
+    _steer_step(blocks, layer=0, direction=head_direction(None, _Head(), 1), alpha=3.0)
     new_hidden, tail = blocks[0].output[0], blocks[0].output[1]
     assert tail == "kv"                                   # tuple tail preserved
     assert new_hidden.data_ptr() != hidden.data_ptr()     # replacement: NEW tensor,
@@ -95,7 +96,7 @@ def test_steer_step_replacement_write_semantics():
 def test_steer_step_handles_plain_tensor_output():
     hidden = torch.ones(2, HID)
     blocks = [_Block(hidden)]
-    _steer_step(blocks, _Head(), layer=0, token_id=2, alpha=1.0)
+    _steer_step(blocks, layer=0, direction=head_direction(None, _Head(), 2), alpha=1.0)
     assert not isinstance(blocks[0].output, tuple)
     assert torch.allclose(blocks[0].output, hidden + torch.tensor([0.0, 0.0, 2.0, 0.0]))
 

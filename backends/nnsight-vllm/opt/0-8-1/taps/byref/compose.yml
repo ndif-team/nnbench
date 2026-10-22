@@ -1,0 +1,18 @@
+services:
+  runner:
+    extends: {file: ../../../../compose.base.yml, service: runner}
+    image: isb-nnsight-vllm-0-8-1:local   # vLLM 0.27.1 has the breakable CUDA graphs taps need
+    build:
+      args:
+        VLLM_IMAGE: vllm/vllm-openai:v0.27.1
+        NNSIGHT_REF: de7fec4d207fc8e0deacaa44fb68f8d0412506ef   # tag v0.8.1
+    environment:
+      # envoy-by-reference prototype (backends/nnsight-vllm/envoy_byref), the vLLM baseline from 2026-10-21
+      PYTHONPATH: /workspace/backends/nnsight-vllm/envoy_byref:/workspace
+      NNSIGHT_ENVOY_BYREF: "1"
+      ISB_BACKEND: ${ISB_BACKEND:-nnsight-vllm/opt/0-8-1/taps/byref}
+      # opt/0-8-1 with CUDA graphs kept, serving only the spec's locations (docs/models/vllm.md)
+      ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","gpu_memory_utilization":0.85,"enable_prefix_caching":false,"taps":"auto"}'
+volumes:
+  model-cache:
+    name: ${ISB_MODEL_CACHE:-isb-model-cache}

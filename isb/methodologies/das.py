@@ -30,6 +30,7 @@ import torch
 import torch.nn.functional as F
 
 from ..profiles import _resid
+from .readout import final_logits
 from .registry import cell
 
 
@@ -52,7 +53,7 @@ def _capture_last(blocks, layer, residual):
         return h.reshape(-1, h.shape[-1])[-1, :].clone()
 
 
-def _interchange_read(blocks, norm, head, *, layer, src, R, k, residual, grad):
+def _interchange_read(blocks, model, head, *, layer, src, R, k, residual, grad, site):
     """Rotated interchange at (layer, last position), then the patched run's final logits.
     Runs INSIDE a trace. `grad=False` wraps everything in no_grad (the apply/eval path);
     `grad=True` leaves the graph alive so a loss on the returned logits reaches R."""
@@ -70,17 +71,15 @@ def _interchange_read(blocks, norm, head, *, layer, src, R, k, residual, grad):
         new = new_flat.reshape(h.shape)
         blocks[layer].output = (new, *out[1:]) if is_tuple else new  # whole-tuple replace
 
-        normed = norm(_resid(blocks[-1].output, residual))      # patched run's final readout
-        logits = F.linear(normed, head.weight)                  # portable unembed
-        return logits.reshape(-1, logits.shape[-1])[-1, :]
+        return final_logits(model, head, site)[0]              # patched run's next-token logits
 
 
-def _das_cell(be, model, m, prompts, *, layer, k, train, heldout, lr, seed, residual):
+def _das_cell(be, model, m, prompts, *, layer, k, train, heldout, lr, seed, residual, site):
     units = list(prompts)                    # labeled units: (clean, corrupted, (correct, incorrect))
     if len(units) <= heldout:
         raise ValueError(f"need more than heldout={heldout} units, got {len(units)}")
     train_units, eval_units = units[:-heldout], units[-heldout:]
-    blocks, ln_f, head = m.blocks(model), m.norm(model), m.head(model)
+    blocks, head = m.blocks(model), m.head(model)
     R = torch.nn.Parameter(_seeded_orthogonal(_d_model(model), seed))
 
     def capture():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
@@ -90,8 +89,8 @@ def _das_cell(be, model, m, prompts, *, layer, k, train, heldout, lr, seed, resi
         clean, corrupted, _answers = unit
 
         def apply_fn(src):  # rotated interchange with a FIXED rotation, no grad
-            return _interchange_read(blocks, ln_f, head, layer=layer, src=src,
-                                     R=rot, k=k, residual=residual, grad=False)
+            return _interchange_read(blocks, model, head, layer=layer, src=src,
+                                     R=rot, k=k, residual=residual, grad=False, site=site)
         return be.patch(model, corrupted, clean, capture=capture, patch=apply_fn)
 
     def iia(rot):
@@ -110,8 +109,8 @@ def _das_cell(be, model, m, prompts, *, layer, k, train, heldout, lr, seed, resi
             target_id = model.tokenizer.encode(answers[1])[0]
 
             def step(src):  # loss at the OUTPUT of the intervened forward -> backward reaches R
-                logits = _interchange_read(blocks, ln_f, head, layer=layer, src=src,
-                                           R=R, k=k, residual=residual, grad=True)
+                logits = _interchange_read(blocks, model, head, layer=layer, src=src,
+                                           R=R, k=k, residual=residual, grad=True, site=site)
                 return F.cross_entropy(logits[None, :], torch.tensor([target_id],
                                                                      device=logits.device))
             be.train_patch(model, corrupted, clean, capture=capture, step=step)
@@ -130,7 +129,7 @@ def _das_cell(be, model, m, prompts, *, layer, k, train, heldout, lr, seed, resi
 def das_hf(be, model, m, prompts, *, layer=6, k=64, train=0, heldout=8,
            lr=1e-3, seed=0, residual="plain"):
     return _das_cell(be, model, m, prompts, layer=layer, k=k, train=train,
-                     heldout=heldout, lr=lr, seed=seed, residual=residual)
+                     heldout=heldout, lr=lr, seed=seed, residual=residual, site="head")
 
 
 @cell("das", family="*", backend="vllm_async")
@@ -140,4 +139,4 @@ def das_vllm(be, model, m, prompts, *, layer=6, k=64, train=0, heldout=8,
     # needs the backward, which the backend's train_patch surfaces as the inference-tensor
     # requires_grad error — the `grad` frontier in its training-loop realization.
     return _das_cell(be, model, m, prompts, layer=layer, k=k, train=train,
-                     heldout=heldout, lr=lr, seed=seed, residual=residual)
+                     heldout=heldout, lr=lr, seed=seed, residual=residual, site="engine")

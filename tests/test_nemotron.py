@@ -47,6 +47,7 @@ class _Norm:
 class _Head:
     def __init__(self):
         self.weight = torch.eye(HID, HID)
+        self.output = torch.zeros(1, 2, HID)        # the model's own logits (the HF read site)
 
     def __call__(self, x):                         # idiomatic unembed path (unembed="module")
         return torch.nn.functional.linear(x, self.weight)
@@ -117,8 +118,7 @@ def test_ablate_makes_layer_identity():
     # zeroing the mixer output -> hidden = residual + 0; the mechanic just zeroes target.output
     mixer = _Mod(torch.ones(2, HID))
     final = _Mod(torch.full((2, HID), 2.0))
-    _ablate_and_read(mixer, [final], _Norm(), _Head(),
-                     target="mixer", residual="plain", last_fn=lambda t: t[-1:, :])
+    _ablate_and_read(mixer, None, _Head(), target="mixer", site="head")
     assert torch.count_nonzero(mixer.output) == 0
 
 

@@ -20,6 +20,15 @@ def merge_requirements(required, configured):
 
 def main(create_backend, job=Path("/job"), output=Path("/output")):
     """create_backend(spec) returns (backend instance, descriptive RunConfig)."""
+    if int(os.environ.get("RANK", "0")) > 0:
+        # A torchrun rank other than 0 (HF tensor parallelism): it runs the same job in lockstep so
+        # the collectives line up, but its results duplicate rank 0's and are discarded.
+        with tempfile.TemporaryDirectory(prefix=f"isb-rank{os.environ['RANK']}-") as scratch:
+            return _main(create_backend, job, scratch)
+    return _main(create_backend, job, output)
+
+
+def _main(create_backend, job, output):
     job, output = Path(job), Path(output)
     output.mkdir(parents=True, exist_ok=True)
     identity = {"version": VERSION}

@@ -35,8 +35,22 @@ def _scale(stream, scale_by):
     raise ValueError(f"unknown steering scale {scale_by!r} (expected 'mean_norm' or 'token_norm')")
 
 
-def _final_logits(blocks, norm, head, arity_last, last_fn):
-    return last_fn(F.linear(norm(_read(blocks[-1].output, arity_last)), head.weight))
+def _final_logits(head):
+    """The model's own next-token logits, last token (isb/methodologies/readout.py, "head")."""
+    return head.output[:, -1, :]
+
+
+def _device(envoy):
+    """Where a module's weights live: under `device_map` the layers sit on different GPUs. 0.4
+    cannot move a real tensor to a proxy's device (torch 2.6 rejects proxy arguments), so a vector
+    built outside the trace goes to its target module's device before the trace."""
+    return next(envoy._module.parameters()).device
+
+
+def _direction(head, token_id, envoy):
+    """Unit unembedding row of `token_id`, built before the trace, on `envoy`'s device."""
+    row = head._module.weight[token_id].detach().float()
+    return F.normalize(row, dim=0).to(device=_device(envoy), dtype=head._module.weight.dtype)
 
 
 @cell("logit_lens", family="*", backend=BACKEND, realizations=[{"unembed": "weight"}])
@@ -48,9 +62,8 @@ def logit_lens(be, model, m, prompts, *, layers="all", unembed="module"):
     def build():
         rows = []
         for i, a in zip(idx, arity):
-            normed = norm(_read(blocks[i].output, a))
-            logits = F.linear(normed, head.weight) if unembed == "weight" else head(normed)
-            rows.append(be.last(logits))
+            normed = norm(be.last(_read(blocks[i].output, a)))       # last token first
+            rows.append(F.linear(normed, head.weight) if unembed == "weight" else head(normed))
         return torch.stack(rows, dim=0)
 
     return be.run(model, prompts, build)
@@ -59,18 +72,17 @@ def logit_lens(be, model, m, prompts, *, layers="all", unembed="module"):
 @cell("steering", family="*", backend=BACKEND, realizations=[{"mode": "inplace"}])
 def steering(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, mode="replace",
              scale_by="mean_norm"):
-    blocks, norm, head = m.blocks(model), m.norm(model), m.head(model)
+    blocks, head = m.blocks(model), m.head(model)
     n = len(blocks)
     if alpha != 0 and layer % n == n - 1:
         raise ValueError(f"steer layer {layer} is the read-out block; pick layer < {n - 1}")
     if mode not in ("inplace", "replace"):
         raise ValueError(f"unknown steering mode {mode!r}")
-    token_id = _resolve_token(model.tokenizer, target)
-    a_layer, a_last = be.arity(model, [blocks[layer], blocks[-1]])
+    direction = _direction(head, _resolve_token(model.tokenizer, target), blocks[layer])
+    (a_layer,) = be.arity(model, [blocks[layer]])
 
     def build():
         if alpha != 0:
-            direction = F.normalize(head.weight[token_id].float(), dim=0).to(head.weight.dtype)
             out = blocks[layer].output
             hidden = _read(out, a_layer)
             vec = (alpha * _scale(hidden, scale_by)) * direction
@@ -78,22 +90,22 @@ def steering(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, mode=
                 hidden[:] = hidden + vec
             else:
                 _replace(blocks[layer], out, a_layer, hidden + vec)
-        return _final_logits(blocks, norm, head, a_last, be.last)
+        return _final_logits(head)
 
     return be.run(model, prompts, build)
 
 
 @cell("ablation", family="*", backend=BACKEND)
 def ablation(be, model, m, prompts, *, layer=6, target="mlp"):
-    blocks, norm, head = m.blocks(model), m.norm(model), m.head(model)
+    blocks, head = m.blocks(model), m.head(model)
     module = m.submodule(blocks[layer], "mlp" if target == "none" else target)
-    a_target, a_last = be.arity(model, [module, blocks[-1]])
+    (a_target,) = be.arity(model, [module])
 
     def build():
         if target != "none":
             out = module.output
             _replace(module, out, a_target, torch.zeros_like(_read(out, a_target)))
-        return _final_logits(blocks, norm, head, a_last, be.last)
+        return _final_logits(head)
 
     return be.run(model, prompts, build)
 
@@ -101,11 +113,11 @@ def ablation(be, model, m, prompts, *, layer=6, target="mlp"):
 @cell("activation_patching", family="*", backend=BACKEND)
 def activation_patching(be, model, m, prompts, *, layer=6, patch=True, positions="all"):
     clean_prompt, corrupted = prompts
-    blocks, norm, head = m.blocks(model), m.norm(model), m.head(model)
-    a_layer, a_last = be.arity(model, [blocks[layer], blocks[-1]])
+    blocks, head = m.blocks(model), m.head(model)
+    (a_layer,) = be.arity(model, [blocks[layer]])
     if not patch:
         def build():
-            return _final_logits(blocks, norm, head, a_last, be.last)
+            return _final_logits(head)
         return be.run(model, [corrupted], build)
     if positions not in ("all", "last"):
         raise ValueError(f"unknown patch positions {positions!r} (expected 'all' or 'last')")
@@ -115,6 +127,7 @@ def activation_patching(be, model, m, prompts, *, layer=6, patch=True, positions
 
     # the snapshot is a real tensor: move it with real values (torch 2.6 rejects proxy arguments)
     dtype = next(model._model.parameters()).dtype
+    device = _device(blocks[layer])                  # the patched layer's GPU under device_map
 
     def capture():
         return _read(blocks[layer].output, a_layer).clone()
@@ -122,11 +135,11 @@ def activation_patching(be, model, m, prompts, *, layer=6, patch=True, positions
     def patch_fn(clean_act):
         out = blocks[layer].output
         hidden = _read(out, a_layer)
-        clean = clean_act.to(device=model.device, dtype=dtype)
+        clean = clean_act.to(device=device, dtype=dtype)
         if positions == "last":
             clean = torch.cat([hidden[..., :-1, :], clean[..., -1:, :]], dim=-2)
         _replace(blocks[layer], out, a_layer, clean)
-        return _final_logits(blocks, norm, head, a_last, be.last)
+        return _final_logits(head)
 
     return be.patch(model, clean_prompt, corrupted, capture=capture, patch=patch_fn)
 
@@ -135,12 +148,11 @@ def activation_patching(be, model, m, prompts, *, layer=6, patch=True, positions
 def gen_steering(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0, new_tokens=8,
                  scale_by="mean_norm"):
     blocks, head = m.blocks(model), m.head(model)
-    token_id = _resolve_token(model.tokenizer, target)
+    direction = _direction(head, _resolve_token(model.tokenizer, target), blocks[layer])
     (a_layer,) = be.arity(model, [blocks[layer]])
 
     def step():
         if alpha != 0:
-            direction = F.normalize(head.weight[token_id].float(), dim=0).to(head.weight.dtype)
             out = blocks[layer].output
             hidden = _read(out, a_layer)
             _replace(blocks[layer], out, a_layer, hidden + (alpha * _scale(hidden, scale_by)) * direction)

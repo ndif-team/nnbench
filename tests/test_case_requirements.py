@@ -51,6 +51,7 @@ def model_fixture():
         transformer=SimpleNamespace(h=blocks, ln_f=lambda x: x),
         lm_head=SimpleNamespace(weight=torch.eye(3), output=torch.ones(1, 2, 3)),
         logits=torch.ones(2, 3), tokenizer=Tokenizer(), config=SimpleNamespace(n_embd=3),
+        repo_id="repo",
     )
 
 
@@ -120,7 +121,11 @@ def test_steering_requirements_follow_actual_replacement_write(alpha):
 
 @pytest.mark.parametrize("backend", ["hf", "vllm_async"])
 @pytest.mark.parametrize("alpha", [0, 1])
-def test_generation_steering_requirements_follow_public_cell_alpha_branch(backend, alpha):
+def test_generation_steering_requirements_follow_public_cell_alpha_branch(backend, alpha,
+                                                                         monkeypatch):
+    # the vLLM cell reads the direction from the checkpoint (readout.checkpoint_direction)
+    monkeypatch.setattr("isb.methodologies.gen_steering.checkpoint_direction",
+                        lambda repo, token_id: torch.eye(3)[token_id % 3])
     fn, params, protocol = bound_case("gen_steering", backend=backend, alpha=alpha,
                                       layer=0, new_tokens=2)
     model = model_fixture()

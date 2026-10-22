@@ -104,7 +104,7 @@ class Backend:
         raise NotImplementedError(f"{self.name} has no plain request")
 
     def last(self, t):
-        """Last-token row of a logits tensor (backend-shape-specific)."""
+        """Last-token row of a per-position tensor (residual stream or logits; backend-shape-specific)."""
         raise NotImplementedError
 
     def teardown(self, model) -> None:

@@ -980,6 +980,14 @@ to the correct *global* row), to be fixed in nnsight's translation layer — or,
 as an interface caveat. This is distinct from a cell using a *known-wrong* read pattern (e.g. the plain
 residual on a fused-residual family, §12.7), which IS a suite bug to fix in the cell.
 
+Update (2026-10-21): nnsight 0.8.1 documents the caveat as its interface. "Parameters are not [whole]:
+`layer.weight` is this rank's slice", and the logit lens goes through
+`model.logits_processor(model.lm_head, norm(h))` (`docs/models/vllm-parallelism.md` at the tag). So
+`head.weight` in a cell is off the documented form, the second case above. The cells read the
+model's own logits at the documented site (HF `lm_head.output`, vLLM `model.logits`), build the
+steering direction before the trace (`isb/methodologies/readout.py`), and keep the weight matmul as
+a declared alternative.
+
 ### 12.3 What is kept vs dropped from §11
 
 - **Dropped:** `isb/resolve/` (Resolver, FamilyProfile, Binding, read_value, predict), the heavy

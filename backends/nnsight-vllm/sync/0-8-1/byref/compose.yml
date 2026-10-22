@@ -1,0 +1,17 @@
+services:
+  runner:
+    extends: {file: ../../../compose.base.yml, service: runner}
+    image: isb-nnsight-vllm-0-8-1:local   # the same build as sync/0-8-1
+    build:
+      args:
+        VLLM_IMAGE: vllm/vllm-openai:v0.27.1
+        NNSIGHT_REF: de7fec4d207fc8e0deacaa44fb68f8d0412506ef   # tag v0.8.1
+    environment:
+      ISB_BACKEND: ${ISB_BACKEND:-nnsight-vllm/sync/0-8-1/byref}
+      # sync/0-8-1 with the envoy-by-reference prototype loaded in the client and the engine process
+      # (backends/nnsight-vllm/envoy_byref; findings.md 2026-10-20): headroom, not nnsight as shipped.
+      PYTHONPATH: /workspace/backends/nnsight-vllm/envoy_byref:/workspace
+      NNSIGHT_ENVOY_BYREF: "1"
+volumes:
+  model-cache:
+    name: ${ISB_MODEL_CACHE:-isb-model-cache}

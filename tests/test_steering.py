@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import isb.methodologies  # noqa: F401,E402  (registers cells)
 from isb.methodologies.registry import CELLS, get_cell  # noqa: E402
+from isb.methodologies.readout import head_direction  # noqa: E402
 from isb.methodologies.steering import _resolve_token, _steer_and_read  # noqa: E402
 
 VOCAB, HID = 11, 4
@@ -27,12 +28,21 @@ class _Block:
 
 
 class _Head:
-    def __init__(self):
+    def __init__(self, output=None):
         self.weight = torch.eye(VOCAB, HID)  # rows are unit-ish directions; row i picks dim i
+        self.output = torch.zeros(1, 2, VOCAB) if output is None else output   # HF read site
 
 
-def _last(t):
-    return t[-1:, :]
+class _Model:
+    def __init__(self, logits=None):
+        self.logits = torch.zeros(2, VOCAB) if logits is None else logits      # vLLM read site
+
+
+def _steer(blocks, head=None, *, token_id, site="head", **kw):
+    """`_steer_and_read` with the direction built before the trace, as the cells build it."""
+    head = head or _Head()
+    return _steer_and_read(blocks, _Model(), head, direction=head_direction(None, head, token_id),
+                           site=site, **kw)
 
 
 def _blocks(steer_out, final_hidden):
@@ -52,8 +62,8 @@ def test_inplace_mutates_live_buffer():
     before = hidden.clone()
     blocks = _blocks((hidden, "kv"), torch.ones(2, HID))
     ptr_before = hidden.data_ptr()
-    _steer_and_read(blocks, lambda x: x, _Head(),
-                    layer=0, token_id=1, alpha=3.0, mode="inplace", last_fn=_last)
+    _steer(blocks,
+                    layer=0, token_id=1, alpha=3.0, mode="inplace")
     # same storage, values now changed -> the write landed in the existing buffer (vLLM-fragile form)
     assert blocks[0].output[0].data_ptr() == ptr_before
     assert not torch.equal(blocks[0].output[0], before)
@@ -64,8 +74,8 @@ def test_replace_swaps_new_tensor_leaving_original():
     hidden = torch.ones(2, HID)
     before = hidden.clone()
     blocks = _blocks((hidden, "kv"), torch.ones(2, HID))
-    _steer_and_read(blocks, lambda x: x, _Head(),
-                    layer=0, token_id=1, alpha=3.0, mode="replace", last_fn=_last)
+    _steer(blocks,
+                    layer=0, token_id=1, alpha=3.0, mode="replace")
     assert blocks[0].output[0].data_ptr() != hidden.data_ptr()   # a NEW tensor was assigned
     assert torch.equal(hidden, before)                           # original buffer untouched
     assert not torch.equal(blocks[0].output[0], before)          # replacement carries the steer
@@ -76,8 +86,8 @@ def test_alpha_zero_is_true_noop():
     hidden = torch.full((2, HID), 5.0)
     blocks = _blocks((hidden.clone(), "kv"), torch.ones(2, HID))
     before = blocks[0].output[0].clone()
-    _steer_and_read(blocks, lambda x: x, _Head(),
-                    layer=0, token_id=1, alpha=0.0, mode="inplace", last_fn=_last)
+    _steer(blocks,
+                    layer=0, token_id=1, alpha=0.0, mode="inplace")
     assert torch.equal(blocks[0].output[0], before)  # no write at all
 
 
@@ -86,19 +96,19 @@ def test_bare_tensor_output_supported():
     hidden = torch.ones(3, HID)
     before = hidden.clone()
     blocks = [_Block(hidden), _Block(torch.ones(3, HID))]
-    out = _steer_and_read(blocks, lambda x: x, _Head(),
-                          layer=0, token_id=2, alpha=2.0, mode="replace", last_fn=_last)
+    out = _steer(blocks,
+                          layer=0, token_id=2, alpha=2.0, mode="replace")
     assert not isinstance(blocks[0].output, tuple)
     assert not torch.equal(blocks[0].output, before)
     assert out.shape == (1, VOCAB)
 
 
-def test_readout_reflects_final_block_last_token():
-    blocks = _blocks((torch.zeros(2, HID), "kv"), torch.tensor([[0.0, 0, 0, 0], [9.0, 0, 0, 0]]))
-    out = _steer_and_read(blocks, lambda x: x, _Head(),
-                          layer=0, token_id=1, alpha=1.0, mode="replace", last_fn=_last)
-    # identity norm + eye head -> logits == final hidden; last token's dim-0 is the 9.0 row
-    assert out.shape == (1, VOCAB)
+def test_readout_is_the_documented_site_last_token():
+    blocks = _blocks((torch.zeros(2, HID), "kv"), torch.ones(2, HID))
+    logits = torch.zeros(1, 2, VOCAB)
+    logits[0, -1, 0] = 9.0
+    out = _steer(blocks, _Head(logits), layer=0, token_id=1, alpha=1.0, mode="replace")
+    assert out.shape == (1, VOCAB)                   # HF: lm_head.output[:, -1, :]
     assert out[0, 0].item() == 9.0
 
 
@@ -110,8 +120,8 @@ def test_scale_is_relative_to_residual_norm():
         hidden = torch.full((2, HID), magnitude)
         before = hidden.clone()
         blocks = _blocks((hidden, "kv"), torch.ones(2, HID))
-        _steer_and_read(blocks, lambda x: x, head,
-                        layer=0, token_id=1, alpha=2.0, mode="inplace", last_fn=_last)
+        _steer(blocks, head,
+                        layer=0, token_id=1, alpha=2.0, mode="inplace")
         return blocks[0].output[0] - before
 
     d1 = delta(1.0)   # row-norm 2
@@ -128,8 +138,8 @@ def test_steer_layer_cannot_equal_readout_block():
     for bad in (1, -1):                                  # positive and negative spellings of "last"
         raised = False
         try:
-            _steer_and_read(blocks, lambda x: x, _Head(),
-                            layer=bad, token_id=1, alpha=2.0, mode="inplace", last_fn=_last)
+            _steer(blocks,
+                            layer=bad, token_id=1, alpha=2.0, mode="inplace")
         except ValueError:
             raised = True
         assert raised, f"steering the read-out block (layer={bad}) must raise"
@@ -166,10 +176,11 @@ def test_fused_scale_uses_the_whole_stream():
     for steer in ("single forward", "decode step"):
         blocks = _blocks((sub_block.clone(), residual), torch.ones(2, HID))
         if steer == "single forward":
-            _steer_and_read(blocks, lambda x: x, _Head(), layer=0, token_id=1, alpha=3.0,
-                            mode="replace", last_fn=_last, residual="fused")
+            _steer(blocks, layer=0, token_id=1, alpha=3.0,
+                            mode="replace", residual="fused")
         else:
-            _steer_step(blocks, _Head(), layer=0, token_id=1, alpha=3.0, residual="fused")
+            _steer_step(blocks, layer=0, direction=head_direction(None, _Head(), 1), alpha=3.0,
+                        residual="fused")
         added = blocks[0].output[0] - sub_block
         assert torch.allclose(added, (3.0 * stream_norm) * direction.expand(2, HID)), steer
         assert blocks[0].output[1] is residual, steer
@@ -179,8 +190,8 @@ def test_token_norm_scales_each_position_by_its_own_stream_norm():
     sub_block = torch.tensor([[0.5, 0.0, 0.0, 0.0], [3.0, 0.0, 0.0, 0.0]])
     residual = torch.tensor([[0.5, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
     blocks = _blocks((sub_block.clone(), residual), torch.ones(2, HID))
-    _steer_and_read(blocks, lambda x: x, _Head(), layer=0, token_id=1, alpha=2.0, mode="replace",
-                    last_fn=_last, residual="fused", scale_by="token_norm")
+    _steer(blocks, layer=0, token_id=1, alpha=2.0, mode="replace",
+                    residual="fused", scale_by="token_norm")
     added = blocks[0].output[0] - sub_block
     direction = torch.nn.functional.normalize(_Head().weight[1], dim=0)
     expected = 2.0 * (sub_block + residual).norm(dim=-1, keepdim=True) * direction

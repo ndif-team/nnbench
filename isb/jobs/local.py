@@ -45,8 +45,13 @@ def compose(name, project, root=ROOT):
 
 
 def environment(name, job, output, gpu):
+    """The job's Compose environment. `ISB_GPU` is the selected GPU; when it is an index,
+    `ISB_GPU_1` ... `ISB_GPU_7` are the indices after it, for a config whose `device_ids`
+    declares several GPUs (backends/README.md)."""
+    following = ({f"ISB_GPU_{k}": str(int(gpu) + k) for k in range(1, 8)}
+                 if str(gpu).isdigit() else {})
     return {**os.environ, "ISB_BACKEND": name, "ISB_JOB_DIR": str(job.resolve()),
-            "ISB_OUTPUT_DIR": str(output.resolve()), "ISB_GPU": str(gpu),
+            "ISB_OUTPUT_DIR": str(output.resolve()), "ISB_GPU": str(gpu), **following,
             "ISB_UID": str(os.getuid()), "ISB_GID": str(os.getgid())}
 
 

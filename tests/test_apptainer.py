@@ -158,3 +158,30 @@ def test_job_lifecycle_through_apptainer(tmp_path, monkeypatch):
 def test_timeout_kills_the_whole_process_group(tmp_path):
     with (tmp_path / "log").open("w") as log, pytest.raises(subprocess.TimeoutExpired):
         apptainer.run(["sh", "-c", "sleep 30 & sleep 30"], {}, log, timeout=0.5)
+
+
+def test_a_config_that_lists_several_gpus_sees_them_all(tmp_path, monkeypatch):
+    from isb.jobs.local import environment
+
+    monkeypatch.setenv("ISB_APPTAINER_DIR", str(tmp_path / "store"))
+    backend = tmp_path / "repo" / "backends" / "probe-system" / "tp2"
+    backend.mkdir(parents=True)
+    (backend / "compose.yml").write_text(COMPOSE.replace("volumes:\n  weights:", """\
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${ISB_GPU}", "${ISB_GPU_1}"]
+              capabilities: [gpu]
+volumes:
+  weights:"""))
+    image = apptainer.sif_path(tmp_path / "repo", "probe-system:local")
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"sif")
+    env = environment("probe-system/tp2", tmp_path / "j", tmp_path / "o", "2")
+    _, extra = apptainer.command(backend / "compose.yml", tmp_path / "repo", env)
+    assert extra["APPTAINERENV_CUDA_VISIBLE_DEVICES"] == "2,3"
+    env = environment("probe-system/tp2", tmp_path / "j", tmp_path / "o", "GPU-uuid")
+    with pytest.raises(ValueError, match="declares 2 GPUs"):
+        apptainer.command(backend / "compose.yml", tmp_path / "repo", env)
