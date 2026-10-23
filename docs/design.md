@@ -1600,7 +1600,13 @@ before its first await and two traces never interleave on the model's one interl
 property nnsight's own server relies on). Any other backend (HF, the sync engine) is driven
 through one lock, which is what a serial server does with concurrent clients: queueing counts toward
 request latency, and the result records `serial: true`. The executor never interleaves calls a
-backend has not declared safe.
+backend has not declared safe. A system whose interface takes overlapping requests must declare
+`concurrent_requests`, or its row measures the queue in front of it. Declared: nnsight's async
+engine and plain AsyncLLM (`isb/backends/async_loop.py`, one loop on a thread the clients submit
+to), nnsight-serve (one HTTP request per trace, gathered on the server) and interp-engine (its
+sync facade submits every call to one loop thread). Not declared, by their interfaces: nnsight on
+HF, nnsight's sync engine, the TransformerLens bridge, vLLM-Hook, and vLLM-Lens in-process (its
+`LLM`; under `vllm serve` it would take them, a transport not built).
 
 **Correctness.** The outputs of the first `score_units` (16) units of the last pass are kept and
 scored; the rest are timed only, since a sweep's full outputs can exceed host memory (an all-layer

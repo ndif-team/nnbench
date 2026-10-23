@@ -115,7 +115,7 @@ documented realization. Each system is a directory with one config per variant:
 | interp-engine | `interp-engine-vllm/default` (hooked), `interp-engine-vllm/static` (`vllm-static`) |
 | TransformerLens 4 | `transformer-lens-vllm/default`, `transformer-lens-vllm/opt` (headroom, see below) |
 | vLLM-Hook (IBM) | `vllm-hook/default` (rpc storage), `vllm-hook/disk` (`disk-st-async`) |
-| Plain vLLM | `vllm-plain/<version>` (compiled) and `vllm-plain/eager-<version>` |
+| Plain vLLM | `vllm-plain/<version>` (compiled) and `vllm-plain/eager-<version>` (the offline `LLM` class, one call at a time); `vllm-plain/async/<version>` and `vllm-plain/async/eager-<version>` (AsyncLLM, the `vllm serve` entrypoint: the floor under concurrent and open-loop load) |
 | Reference | `nnsight-hf/fp32` (HF transformers in fp32) |
 
 Plain vLLM at each system's release and execution mode is the overhead floor. Prefix caching is off
