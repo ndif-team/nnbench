@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import contextlib
 
+from .async_loop import AsyncLoopMixin
 from .vllm_base import VLLMBackend
 
 
-class VLLMAsyncBackend(VLLMBackend):
+class VLLMAsyncBackend(AsyncLoopMixin, VLLMBackend):
+    """The persistent event loop, `concurrent_requests` and the concurrent session come from
+    `AsyncLoopMixin` (shared with plain AsyncLLM serving)."""
     name = "vllm_async"
 
     def __init__(self, dtype: str | None = None,
@@ -44,64 +47,6 @@ class VLLMAsyncBackend(VLLMBackend):
         self.gpu_memory_utilization = gpu_memory_utilization
         self._loop = None
         self._loop_thread = None         # set while a concurrent session runs the loop
-
-    def __getstate__(self):
-        # The build closure captures `self.last` (a bound method), so this backend is serialized into
-        # the mediator sent to the worker. The persistent event loop is not picklable (it holds a
-        # `_contextvars.Context`) and the worker never needs it — drop it, and the thread a
-        # concurrent session runs it on, from the pickle.
-        state = self.__dict__.copy()
-        state["_loop"] = None
-        state["_loop_thread"] = None
-        return state
-
-    def _run_coro(self, coro):
-        """Drive an async trace on ONE persistent event loop, reused across calls. `asyncio.run`
-        creates AND closes a fresh loop each call, which kills the AsyncLLM engine's background loop
-        and makes the next call raise EngineDeadError — fatal once the engine is amortized across
-        warmup + timed trials (the perf path). So we keep one loop alive for the backend's lifetime.
-
-        We still run each call inside a FRESH copied contextvars Context — exactly what `asyncio.run`
-        does (`copy_context().run(...)`). Without this, `run_until_complete` executes in the live
-        current context and nnsight's mediator serialization captures a `_contextvars.Context`
-        (`TypeError: cannot pickle '_contextvars.Context'`). The copy isolates each call's context."""
-        import asyncio
-        import contextvars
-
-        if self._loop is None or self._loop.is_closed():
-            self._loop = asyncio.new_event_loop()
-        if self._loop_thread is not None:            # a concurrent session: the loop runs there
-            return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
-        return contextvars.copy_context().run(self._loop.run_until_complete, coro)
-
-    # Several client threads may submit at once (design.md §12.17): AsyncLLM is a serving engine.
-    concurrent_requests = True
-
-    @contextlib.contextmanager
-    def concurrent_session(self):
-        """Run the persistent loop on its own thread while clients submit from theirs. Each
-        call's coroutine is scheduled from the client thread, so it runs in a copy of that
-        thread's context (as `run_until_complete` above does). A trace's body runs inside its
-        coroutine up to the `with` exit, which submits it before the first await, so two
-        clients' traces never interleave on the model's one interleaver (nnsight's own server
-        relies on the same property, `nnsight/modeling/vllm/serve/server.py`)."""
-        import asyncio
-        import threading
-
-        if self._loop_thread is not None:
-            raise RuntimeError("a concurrent session is already open")
-        if self._loop is None or self._loop.is_closed():
-            self._loop = asyncio.new_event_loop()
-        loop = self._loop
-        thread = threading.Thread(target=loop.run_forever, name="isb-vllm-loop", daemon=True)
-        thread.start()
-        self._loop_thread = thread
-        try:
-            yield
-        finally:
-            loop.call_soon_threadsafe(loop.stop)
-            thread.join()
-            self._loop_thread = None
 
     def load(self, repo: str, gpu_memory_utilization: float | None = None):
         from nnsight.modeling.vllm import VLLM
@@ -514,28 +459,13 @@ class VLLMAsyncBackend(VLLMBackend):
         return list(v) if isinstance(v, (list, tuple)) else [v]
 
     def teardown(self, model) -> None:
-        import asyncio
         import gc
 
         import torch
 
         with contextlib.suppress(Exception):
             model.vllm_entrypoint.shutdown()
-        if self._loop is not None and not self._loop.is_closed():   # close the loop AFTER engine shutdown
-            # shutdown cancels engine handlers; let their finally blocks run before closing
-            # the loop (otherwise vLLM reports "Event loop is closed" during container exit).
-            async def drain():
-                pending = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-                await self._loop.shutdown_asyncgens()
-
-            with contextlib.suppress(Exception):
-                self._loop.run_until_complete(drain())
-            with contextlib.suppress(Exception):
-                self._loop.close()
-            self._loop = None
+        self._close_loop()                       # after engine shutdown: its handlers drain first
         with contextlib.suppress(Exception):
             del model
         gc.collect()

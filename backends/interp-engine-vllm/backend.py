@@ -4,6 +4,7 @@ The shared worker drives the cells in cells.py through this backend object. inte
 methods are async and bound to one event loop; `sync_model` is its documented synchronous facade,
 holding one loop for the model's life.
 """
+import contextlib
 from dataclasses import dataclass
 from importlib import metadata
 
@@ -23,6 +24,17 @@ class EngineModel:
 
 class InterpEngineBackend(Backend):
     name = "interp_engine"
+
+    # The sync facade submits every call to one event loop on its own thread
+    # (`interp_engine/_loop.py`, LoopRunner.run: run_coroutine_threadsafe per call, from any
+    # thread), and `capture` and the per-request lens ops are documented as safe to call
+    # concurrently with other requests (`vllm_backend.py`), so client threads calling the cells at
+    # once overlap on the engine's scheduler (design.md §12.17); nothing to open.
+    concurrent_requests = True
+
+    @contextlib.contextmanager
+    def concurrent_session(self):
+        yield
 
     def __init__(self, backend="vllm", concurrent_captures=False, **engine_options):
         # backend: interp-engine's engine choice (load.py). "vllm" hooks the eager forward and

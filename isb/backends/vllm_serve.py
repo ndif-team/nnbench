@@ -15,6 +15,7 @@ attributable purely to the wire boundary.
 """
 from __future__ import annotations
 
+import contextlib
 import time
 import urllib.request
 
@@ -52,6 +53,15 @@ def _force_cpu_platform_when_no_gpu() -> None:
 
 class VLLMServeBackend(VLLMBackend):
     name = "vllm_serve"
+
+    # Each trace is its own HTTP request from the calling thread (`LocalServeBackend._send` opens a
+    # client per request), and the server gathers overlapping requests on its engine, so client
+    # threads may submit at once (design.md §12.17); nothing to open on the client side.
+    concurrent_requests = True
+
+    @contextlib.contextmanager
+    def concurrent_session(self):
+        yield
 
     HEALTH_TIMEOUT = 120.0  # seconds to wait for the server's /health before giving up
 

@@ -1,0 +1,13 @@
+services:
+  runner:
+    extends: {file: ../../compose.base.yml, service: runner}
+    image: isb-vllm-plain-0-19-1:local
+    build:
+      args:
+        VLLM_IMAGE: vllm/vllm-openai:v0.19.1
+    environment:
+      ISB_BACKEND: ${ISB_BACKEND:-vllm-plain/async/0-19-1}
+      ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","gpu_memory_utilization":0.85,"enable_prefix_caching":false,"enforce_eager":false}'
+volumes:
+  model-cache:
+    name: ${ISB_MODEL_CACHE:-isb-model-cache}
