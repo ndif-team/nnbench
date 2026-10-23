@@ -3,18 +3,20 @@
 `run_offline` is MLPerf Offline / `vllm bench throughput`: the units go out as one sweep, one call
 per chunk, chunks back to back. `run_concurrent` is the closed-loop serving pattern (`vllm bench
 serve --max-concurrency`, AIPerf's concurrency sweep): `concurrency` clients each issue one unit
-per call and the next as soon as theirs returns, until the units run out. A backend that cannot
-take concurrent requests is driven through one lock, the way a serial server queues them; the time
-a request waits for the lock counts toward its latency, as a client would see it. `run_open` is the
-open-loop pattern (MLPerf Server, `vllm bench serve --request-rate`): each unit arrives at a fixed
-time of a seeded Poisson process and is issued then on its own thread, whatever the system is doing,
-so above capacity the requests queue and their latency grows.
+per call and the next as soon as theirs returns, until the units run out. A backend whose interface
+takes one request at a time (an HF forward, vLLM's offline `LLM` class) has its requests queued in
+front of it, one at a time, as a server built on that interface would; the time a request waits in
+that queue counts toward its latency, as a client would see it. `run_open` is the open-loop
+pattern (MLPerf Server, `vllm bench serve --request-rate`): each unit arrives at a fixed time of a
+seeded Poisson process and is issued then on its own thread, whatever the system is doing, so
+above capacity the requests queue and their latency grows.
 
-All run one untimed warm-up (a full pass offline; one request per client concurrently; one request
-open loop), then `passes` timed sweeps. A pass is timed between CUDA syncs; a request from issue to
-return, or open loop from its scheduled arrival, so a late issue counts against the system. Call
-preparation (the fresh parameter copy) happens outside both. The outputs of the first `keep` units
-of the last pass are returned for scoring.
+All run one untimed warm-up pass over every unit, under the same pattern as the timed passes (so
+the shapes the engine sees with requests overlapping are warm), then `passes` timed passes. A pass
+is timed between CUDA syncs; a request from issue to return, or open loop from its scheduled
+arrival, so a late issue counts against the system. Call preparation (the fresh parameter copy)
+happens outside both. The outputs of the first `keep` units of the last pass are returned for
+scoring.
 """
 from __future__ import annotations
 
@@ -34,7 +36,7 @@ class LoadResult:
     units: int                       # units per pass
     calls: int                       # calls per pass
     concurrency: int                 # clients (1 offline, 0 open loop)
-    serial: bool                     # requests were serialized through one lock
+    serial: bool                     # requests were queued one at a time in front of the interface
     pass_ms: list = field(default_factory=list)
     request_ms: list = field(default_factory=list)
     peak_mem_mb: float = 0.0
@@ -105,8 +107,9 @@ def run_concurrent(prepare: Callable[[Any], Callable[[], Any]], units: list, *, 
                    passes: int, keep: int, serial: bool):
     """Closed loop: `concurrency` client threads share the unit list, each issuing its next unit
     as soon as its previous one returns. Returns (LoadResult, outputs), `outputs` mapping unit
-    index -> output for the first `keep` units of the last pass. The first error a client meets
-    is raised once every client has stopped."""
+    index -> output for the first `keep` units of the last pass. One untimed warm-up pass over
+    every unit, then `passes` timed passes. The first error a client meets is raised once every
+    client has stopped."""
     if passes < 1 or concurrency < 1 or not units:
         raise ValueError("concurrent needs passes>=1, concurrency>=1 and at least one unit")
     result = LoadResult(units=len(units), calls=len(units), concurrency=concurrency, serial=serial)
@@ -156,7 +159,7 @@ def run_concurrent(prepare: Callable[[Any], Callable[[], Any]], units: list, *, 
             result.request_ms.extend(latencies)
         return produced
 
-    sweep(list(range(min(concurrency, len(units)))), timed=False)
+    sweep(list(range(len(units))), timed=False)                 # warm-up pass, untimed
     force_gc()
     reset_peak_mem()
     for _ in range(passes):
@@ -180,7 +183,8 @@ def run_open(prepare: Callable[[Any], Callable[[], Any]], units: list, *, rate: 
              keep: int, serial: bool):
     """Open loop: unit i is issued at `arrival_offsets(...)[i]` on a thread of its own, whether or
     not earlier requests have returned. Returns (LoadResult, outputs), `outputs` mapping unit index
-    -> output for the first `keep` units of the last pass. The first error a request meets stops
+    -> output for the first `keep` units of the last pass. One untimed warm-up pass over every unit
+    at the same arrivals, then `passes` timed passes. The first error a request meets stops
     further arrivals and is raised once the issued requests have returned."""
     if passes < 1 or rate <= 0 or not units:
         raise ValueError("open loop needs passes>=1, rate>0 and at least one unit")
@@ -237,7 +241,7 @@ def run_open(prepare: Callable[[Any], Callable[[], Any]], units: list, *, rate: 
             raise errors[0]
         return elapsed, latencies, produced, state["peak"]
 
-    prepare(units[0])()                                         # warm-up, untimed
+    sweep()                                                     # warm-up pass, untimed
     force_gc()
     reset_peak_mem()
     outputs = {}

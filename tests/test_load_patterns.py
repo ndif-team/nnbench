@@ -4,7 +4,7 @@ backends and cells.
 Pins: the regimes derive from a workload's own regimes (and are reported when a workload cannot
 take one); they round-trip through the job contract without changing other regimes' identity;
 offline issues chunks back to back and concurrent keeps `concurrency` requests in flight, or one
-at a time through a lock on a backend that cannot take concurrent requests; the executor records
+at a time in front of a backend whose interface takes one request at a time; the executor records
 the pattern's timing and the first `score_units` outputs, and scoring compares an offline cell
 with the reference's per-unit outputs."""
 import sys
@@ -40,7 +40,7 @@ def test_loads_derive_from_the_workloads_own_regimes():
     assert len(offline.prompts) == 24 and offline.batch_size == 8 and not offline.aggregate
     assert offline.data_name == "counterfact" and offline.passes == 3
     concurrent = spec.regimes[5]
-    assert len(concurrent.prompts) == 12 and concurrent.concurrency == 4 and concurrent.passes == 1
+    assert len(concurrent.prompts) == 12 and concurrent.concurrency == 4 and concurrent.passes == 3
     assert not skipped
 
 
@@ -198,7 +198,7 @@ def test_concurrent_keeps_c_requests_in_flight():
     result, outputs = run_concurrent(probe.call, list(range(12)), concurrency=4, passes=1,
                                      keep=5, serial=False)
     assert probe.peak == 4 and result.concurrency == 4 and not result.serial
-    assert len(result.request_ms) == 12 and len(probe.calls) == 4 + 12   # warm-up, then the pass
+    assert len(result.request_ms) == 12 and len(probe.calls) == 12 + 12  # warm-up pass, then the pass
     assert sorted(outputs) == [0, 1, 2, 3, 4]
 
 
@@ -207,7 +207,7 @@ def test_serial_backend_takes_one_request_at_a_time_and_queues_the_rest():
     result, _ = run_concurrent(probe.call, list(range(8)), concurrency=4, passes=1, keep=1,
                                serial=True)
     assert probe.peak == 1 and result.serial
-    # Queueing for the lock counts toward latency: the slowest request waited for the others.
+    # Queueing in front of the interface counts toward latency: the slowest request waited for the others.
     assert result.percentile(99) > 2 * result.percentile(0)
 
 
@@ -243,7 +243,7 @@ def test_open_loop_issues_on_arrival_without_waiting_for_returns():
     result, outputs = run_open(probe.call, list(range(12)), rate=2000.0, passes=1, keep=3,
                                serial=False)
     assert probe.peak > 1 and result.max_in_flight > 1 and result.concurrency == 0
-    assert len(result.request_ms) == 12 and len(probe.calls) == 1 + 12   # warm-up, then the pass
+    assert len(result.request_ms) == 12 and len(probe.calls) == 12 + 12  # warm-up pass, then the pass
     assert sorted(outputs) == [0, 1, 2]
     assert result.summary()["offered_rate"] == 2000.0
 

@@ -49,7 +49,7 @@ class ExecutionRegime:
     concurrency: int = 0
     rate: float = 0.0
     score_units: int = 16
-    passes: int = 1           # load patterns: timed sweeps over all units, after one warm-up
+    passes: int = 1           # load patterns: timed sweeps over all units, after one warm-up pass
 
     def __post_init__(self):
         from ..data import DataRef, load_data
@@ -318,7 +318,7 @@ class Concurrent:
     per entry of `concurrency`."""
     units: int
     concurrency: tuple = (1,)
-    passes: int = 1           # one sweep of `units` requests gives the latency distribution
+    passes: int = 3           # the latency distribution pools the requests of every timed pass
 
 
 @dataclass(frozen=True)
@@ -328,7 +328,7 @@ class Open:
     `rate` requests per second, whatever the system is doing. One regime per entry of `rates`."""
     units: int
     rates: tuple = (1.0,)
-    passes: int = 1
+    passes: int = 3           # the latency distribution pools the requests of every timed pass
 
 
 @dataclass(frozen=True)

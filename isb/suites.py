@@ -102,26 +102,28 @@ SUITES = {s.name: s for s in (
                          regimes=("offline",), loads=(Offline(8, (1,)),))),
           backends=("nnsight-hf/sdpa/0-8-1", "nnsight-vllm/sync/0-8-1"),
           reference="nnsight-hf/sdpa/0-8-1", timeout=7200),
-    # Closed-loop serving (`vllm bench serve --max-concurrency`, AIPerf's concurrency sweep): 128
-    # single-unit requests from C clients. HF and the sync engine take one request at a time (a
-    # serial server); the async engine takes them together.
+    # Closed-loop serving (`vllm bench serve --max-concurrency`, AIPerf's concurrency sweep): 256
+    # single-unit requests from C clients, a warm-up pass and three timed passes per C (768 latency
+    # samples). HF and the sync engine take one request at a time by their interface; the async
+    # engine takes them together.
     Suite("nnsight-load-concurrent",
           entries=(Entry(("steering", "logit_lens", "gen_steering", "gen_capture"),
                          ("qwen2.5-7b", "qwen3-32b"), regimes=("concurrent",),
-                         loads=(Concurrent(128, (1, 4, 16, 64)),)),),
+                         loads=(Concurrent(256, (1, 4, 16, 64)),)),),
           backends=("nnsight-hf/sdpa/0-8-1", "nnsight-vllm/sync/0-8-1", "nnsight-vllm/0-8-1"),
-          reference="nnsight-hf/sdpa/0-8-1", timeout=7200),
-    # Open-loop serving (MLPerf Server, `vllm bench serve --request-rate`): 128 single-unit
-    # requests arriving at 4, 16 and 64 per second. On Qwen2.5-7B the rates fall below, between and
-    # above HF's and the async engine's measured closed-loop capacity (steering 35 and 110 units/s,
-    # steered generation about 5 and 58). The sync engine is left out: it serves one request at a
-    # time like HF, so its open-loop latency follows from its single-request time.
+          reference="nnsight-hf/sdpa/0-8-1", timeout=14400),
+    # Open-loop serving (MLPerf Server, `vllm bench serve --request-rate`): 256 single-unit
+    # requests arriving at 4, 16 and 64 per second, a warm-up pass and three timed passes per
+    # rate. On Qwen2.5-7B the rates fall below, between and above HF's and the async engine's
+    # measured closed-loop capacity (steering 35 and 110 units/s, steered generation about 5 and
+    # 58). The sync engine is left out: it serves one request at a time like HF, so its open-loop
+    # latency follows from its single-request time.
     Suite("nnsight-load-open",
           entries=(Entry(("steering", "logit_lens", "gen_steering", "gen_capture"),
                          ("qwen2.5-7b", "qwen3-32b"), regimes=("open",),
-                         loads=(Open(128, (4, 16, 64)),)),),
+                         loads=(Open(256, (4, 16, 64)),)),),
           backends=("nnsight-hf/sdpa/0-8-1", "nnsight-vllm/0-8-1"),
-          reference="nnsight-hf/sdpa/0-8-1", timeout=7200),
+          reference="nnsight-hf/sdpa/0-8-1", timeout=14400),
     Suite("nnsight-versions",
           entries=(Entry(("logit_lens", "steering", "ablation"), ("qwen2.5-7b", "qwen3-32b"),
                          size=32),

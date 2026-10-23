@@ -1603,10 +1603,10 @@ same experiment record as before, and each load regime records only its own patt
 (`LOAD_FIELDS[kind]`), so adding a pattern changes no existing experiment identity; coordinates
 carry a `load` object only on load regimes.
 
-**Timing.** One untimed warm-up (a full pass offline; one request per client concurrently; one
-request open loop), then `passes` timed sweeps (offline 3, concurrent and open 1: a sweep of
-`units` requests is the latency sample, as the standard tools run one pass of N ≥ 5C requests). A
-pass is timed between CUDA syncs, a request from issue to return, or open loop from its scheduled
+**Timing.** One untimed warm-up pass over every unit under the same pattern (so the shapes the
+engine sees with requests overlapping are warm), then `passes` timed passes (3 for every pattern;
+concurrent and open loop pool the requests of all timed passes into one latency distribution, so
+the suites' 256 units give 768 samples per setting). A pass is timed between CUDA syncs, a request from issue to return, or open loop from its scheduled
 arrival, so an arrival the system is too busy to take counts against it rather than slowing the
 arrivals (the closed loop's coordinated omission). The open loop issues each request on a thread of
 its own; the arrival times are the same for every pass and backend. Parameter copies are made
@@ -1617,10 +1617,12 @@ concurrently) run under the same pattern, giving `overhead_vs_baseline` and `ove
 session in which every client submits at once: nnsight's async vLLM backend moves its persistent
 event loop to a thread and schedules each call's coroutine there, so a trace is built and submitted
 before its first await and two traces never interleave on the model's one interleaver (the same
-property nnsight's own server relies on). Any other backend (HF, the sync engine) is driven
-through one lock, which is what a serial server does with concurrent clients: queueing counts toward
-request latency, and the result records `serial: true`. The open loop uses the same session or lock. The executor never interleaves calls a
-backend has not declared safe.
+property nnsight's own server relies on). Any other backend (HF, the sync engine) has its
+requests queued one at a time in front of its interface, which is what a server built on a
+blocking single-model call does with concurrent clients: queueing counts toward request latency,
+and the result records `serial: true`. The open loop uses the same session or queue. The executor
+never interleaves calls a backend has not declared safe. A system whose interface takes
+overlapping requests must declare `concurrent_requests`, or its row measures that queue.
 
 **Correctness.** The outputs of the first `score_units` (16) units of the last pass are kept and
 scored; the rest are timed only, since a sweep's full outputs can exceed host memory (an all-layer

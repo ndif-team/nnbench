@@ -157,14 +157,16 @@ second, sync engine, which does not fit beside a large model).
 
 ### Concurrent, closed loop (`concurrent/c<C>`)
 
-**Issues** M single-unit calls (128) from C client threads (1, 4, 16, 64). Each client sends its
-next unit as soon as its last returns. A backend that declares it can take concurrent requests (the
-async vLLM engine) gets them together. Any other (HF, the sync engine) gets them one at a time
-through a lock, which is what a server without a scheduler does with concurrent clients. **Timed:**
-one warm-up request per client, then one pass of M requests. Each request is timed from issue to
-return, so time spent queueing counts. Calls are prepared before the pass. Reports units/s and
-request latency p50, p90, p99 and mean. **Scored:** the first 16 units, against the reference's same
-regime.
+**Issues** M single-unit calls (256) from C client threads (1, 4, 16, 64). Each client sends its
+next unit as soon as its last returns. A backend whose interface takes overlapping requests (the
+async vLLM engine, which has its own scheduler) gets them together. A backend whose interface is
+one blocking call on one model (an HF forward through nnsight; vLLM's offline `LLM` class behind
+the sync engine) gets them one at a time: requests queue in front of the call, as they would in
+front of a server built on that interface. **Timed:** one warm-up pass of M requests under the
+same pattern, then three timed passes; the latency distribution pools their 3M requests. Each
+request is timed from issue to return, so time spent queueing counts. Calls are prepared before
+the pass. Reports units/s and request latency p50, p90, p99 and mean. **Scored:** the first 16
+units of the last pass, against the reference's same regime.
 
 **Tests** a shared server: many independent users (or one user's parallel jobs) sending traces to one
 engine, which is the shape of nnsight-serve and NDIF. It shows whether the system overlaps requests
@@ -183,15 +185,16 @@ during it, so its tail latency understates what users would see (coordinated omi
 
 ### Open loop (`open/r<R>`)
 
-**Issues** M single-unit calls (128) at arrival times drawn from a Poisson process at R per second
+**Issues** M single-unit calls (256) at arrival times drawn from a Poisson process at R per second
 (4, 16, 64), each on a thread of its own as soon as it arrives, whether or not earlier requests have
 returned. The arrival times come from a fixed seed, so every pass and every backend sees the same
-schedule. A backend that can take concurrent requests gets them together; any other queues them
-behind one lock, as in the closed loop. **Timed:** one warm-up request, then one pass. Each request
-is timed from its scheduled arrival to its return, so waiting in a queue, or for the system to accept
-it, counts. Reports achieved units/s, request latency p50, p90, p99 and mean, the offered rate, and
-the most requests in flight at once. **Scored:** the first 16 units, against the reference's same
-regime.
+schedule. A backend whose interface takes overlapping requests gets them together; one whose
+interface takes one request at a time has them queued in front of it, as in the closed loop.
+**Timed:** one warm-up pass at the same arrivals, then three timed passes; the latency
+distribution pools their 3M requests. Each request is timed from its scheduled arrival to its
+return, so waiting in a queue, or for the system to accept it, counts. Reports achieved units/s,
+request latency p50, p90, p99 and mean, the offered rate, and the most requests in flight at once.
+**Scored:** the first 16 units of the last pass, against the reference's same regime.
 
 **Tests** a production server under real traffic, including overload. Below capacity, latency stays
 near the single-request time and achieved throughput tracks the offered rate (a little under
@@ -305,10 +308,12 @@ Known gaps, recorded here rather than built:
   whose unit is a job (a fit, a 256-prompt lens sweep), not a prompt. That is not implemented. The
   engine behaviour it would expose, overlapping whole sessions, is nearest to what steering under
   the concurrent pattern shows at request level.
-- Only the async vLLM engine declares `concurrent_requests`; every other backend is driven through
-  the serial lock. For the nnsight suites here that is the fact being measured (HF and the sync
-  engine serve one request at a time). A cross-system concurrent or open-loop row would need each
-  system's backend to declare whether it takes concurrent requests, or it would time the lock.
+- Only the async vLLM engine declares `concurrent_requests`; every other backend has its requests
+  queued one at a time. For the nnsight suites here that is the fact being measured (HF and the
+  sync engine take one request at a time by their interface). A system whose interface does take
+  overlapping requests (interp-engine's async methods, nnsight-serve, vLLM-Lens under `vllm
+  serve`, plain vLLM's AsyncLLM) must declare it and issue through that path, or the row would
+  measure the harness's queue in front of a system that has its own scheduler.
 
 ## Choosing and comparing
 
