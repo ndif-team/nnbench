@@ -74,6 +74,12 @@ class Backend:
         """
         raise NotImplementedError
 
+    def session(self, model, build):
+        """Run `build()`, a job of several traces with Python between them (a training loop, a
+        collection over prompts), in the form nnsight documents for a multi-trace job: one
+        `model.session()` around it. Returns what `build()` returns."""
+        raise NotImplementedError
+
     def train_patch(self, model, source_prompts, base_prompts, capture, step):
         """One gradient step over the (source, base) pairs `zip(source_prompts, base_prompts)` (a
         single prompt per side is one pair; unequal sides raise `FormError`, `paired()`). The

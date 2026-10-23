@@ -28,6 +28,8 @@ steering = Workload(
     regimes=(Regime("interactive", DataRef("counterfact", 100)),
              Regime("batched", DataRef("counterfact", 16))),
     baseline={**_ROME, "alpha": 0.0, "layer": _HALF},
+    # evaluated over datasets, and applied to live traffic
+    load_patterns=("offline", "concurrent", "open"),
     effect=Effect(baseline={**_ROME, "alpha": 0.0, "layer": _HALF},
                   perturbed=(Row("alpha 6", {**_ROME, "alpha": 6.0, "layer": _HALF}),)),
 )

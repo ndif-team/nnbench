@@ -21,4 +21,6 @@ gen_capture = Workload(
     # 32 CounterFact prompts, each greedily decoded for 8 steps (gen_steering's regime)
     regimes=(Regime("generation", DataRef("counterfact", 32), new_tokens=8),),
     baseline={"layer": _HALF, "export": False},
+    # trajectory tracing over datasets, and telemetry on live traffic
+    load_patterns=("offline", "concurrent", "open"),
 )

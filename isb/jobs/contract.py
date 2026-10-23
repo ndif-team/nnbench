@@ -7,7 +7,7 @@ import os
 from dataclasses import asdict
 from pathlib import Path
 
-from isb.sweep.spec import LOAD_FIELDS, LOAD_KINDS, regime_name
+from isb.sweep.spec import ALL_LOAD_FIELDS, LOAD_FIELDS, regime_name
 
 VERSION = 2            # experiment/result files this code writes
 VERSIONS = (VERSION,)  # experiment/result files this code reads
@@ -77,13 +77,12 @@ def prepare(spec, directory, *, seed=0):
     if not labels or not all(isinstance(label, str) and label for label in labels) or len(set(labels)) != len(labels):
         raise ValueError("task labels must be nonempty and unique")
     for index, regime in enumerate(record["regimes"]):
-        name = regime_name(regime["kind"], regime.get("batch_size"), regime.get("concurrency", 0))
+        name = regime_name(regime["kind"], regime)
         if name in kinds:
             raise ValueError("duplicate workload kinds would collide in output cell keys")
         kinds.add(name)
-        if regime["kind"] not in LOAD_KINDS:
-            for key in LOAD_FIELDS:
-                regime.pop(key, None)
+        for key in set(ALL_LOAD_FIELDS) - set(LOAD_FIELDS.get(regime["kind"], ())):
+            regime.pop(key, None)     # each regime records only its own pattern's settings
         units = regime.pop("prompts")
         if not units:
             raise ValueError("empty workload")
@@ -136,7 +135,7 @@ def wire_spec(experiment):
         raise ValueError("task labels must be nonempty and unique")
     if any(not isinstance(task.get("params"), dict) for task in record["tasks"]):
         raise ValueError("task parameters must be objects")
-    kinds = [regime_name(regime["kind"], regime.get("batch_size"), regime.get("concurrency", 0))
+    kinds = [regime_name(regime["kind"], regime)
              for regime in record["regimes"]]
     if not kinds or len(kinds) != len(set(kinds)):
         raise ValueError("experiment requires unique nonempty regimes")
@@ -172,7 +171,7 @@ def restore_spec(directory):
 
 def expected_cells(experiment):
     spec = wire_spec(experiment)
-    return {(regime_name(w["kind"], w.get("batch_size"), w.get("concurrency", 0)), task["label"])
+    return {(regime_name(w["kind"], w), task["label"])
             for w in spec["regimes"] for task in spec["tasks"]}
 
 

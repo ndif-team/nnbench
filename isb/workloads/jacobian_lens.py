@@ -27,4 +27,6 @@ jacobian_lens = Workload(
     ),
     regimes=(Regime("interactive", DataRef("jlens/multihop")),),
     baseline={"transport": None, "layers": [-1]},
+    # a dataset study: notebook calls, then evaluation-set sweeps
+    load_patterns=("offline",),
 )

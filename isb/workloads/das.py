@@ -15,10 +15,14 @@ _HALF = Depth(1 / 2)
 das = Workload(
     name="das", methodology="das",
     rows=(Row("apply a seeded orthogonal rotation at half depth", {"layer": _HALF, "train": 0}),
-          Row("train the rotation at half depth (24 steps + held-out accuracy guard)",
+          Row("train the rotation at half depth (24 steps of 16 pairs + held-out accuracy guard)",
               {"layer": _HALF, "train": 24})),
     regimes=(Regime("interactive", DataRef("mib/ioi_labeled", 24), aggregate=False),),
     baseline={"layer": _HALF, "train": 0},
+    # load_patterns: none (docs/request-patterns.md). A fit is one sequential job: each step needs
+    # the rotation the previous step updated, and the upstream sweeps (pyvene's IOI tutorial,
+    # causalab) train one fit after another, never several in one forward. The job runs single
+    # stream as the interactive regime's one call; no deployment runs a fit per live request.
     # the train row runs 24 steps x 2 traces per timing trial; keep trials small
     warmup=1, n_trials=3,
 )

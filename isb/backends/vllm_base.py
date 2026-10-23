@@ -14,6 +14,11 @@ from .base import Backend
 
 
 class VLLMBackend(Backend):
+    def session(self, model, build):
+        # nnsight documents `model.session()` for transformers and remote models only; on vLLM
+        # the job's traces are issued as they are reached, which is what a local session does
+        return build()
+
     def __init__(self, dtype: str | None = None, trust_remote_code: bool = False,
                  max_model_len: int | None = None, tokenizer: str | None = None,
                  enable_prefix_caching: bool | None = None):

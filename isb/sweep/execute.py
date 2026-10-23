@@ -203,19 +203,20 @@ def _stack(mats):
     return torch.cat(mats, dim=-2) if mats[0].dim() >= 2 else torch.stack(mats)
 
 
-def _first_units(tensor, keep):
-    """The first `keep` units of a stacked output (units run along dim -2, or dim 0 for 1-D rows)."""
+def _first_rows(tensor, rows):
+    """The first `rows` rows of a stacked output (units run along dim -2, or dim 0 for 1-D rows)."""
     if tensor is None:
         return None
-    return tensor.narrow(-2 if tensor.dim() >= 2 else 0, 0, keep)
+    return tensor.narrow(-2 if tensor.dim() >= 2 else 0, 0, rows)
 
 
 @contextlib.contextmanager
 def _concurrency(be, regime):
-    """Whether a concurrent regime's requests run together on this backend: a backend that
-    declares `concurrent_requests` opens its session for them (the async vLLM engine moves its
+    """Whether a concurrent or open-loop regime's requests run together on this backend: a backend
+    that declares `concurrent_requests` opens its session for them (the async vLLM engine moves its
     event loop to a thread every client submits to); any other backend is driven serially."""
-    together = regime.concurrency > 1 and getattr(be, "concurrent_requests", False)
+    overlapping = regime.kind == "open" or regime.concurrency > 1
+    together = overlapping and getattr(be, "concurrent_requests", False)
     if not together:
         yield False
         return
@@ -225,26 +226,36 @@ def _concurrency(be, regime):
 
 def _run_load(regime, prepare_units, be):
     """Drive one bound call under `regime`'s load pattern. `prepare_units(units)` returns a fresh
-    zero-argument call over that unit list. Returns (LoadResult, scored output): the stacked
-    output of the first `score_units` units of the last pass."""
-    from ..perf.load import run_concurrent, run_offline
+    zero-argument call over that unit list. A call over one unit gets that unit's prompt list
+    (`_unit`), as the per-unit reference does, so a single-unit cell sweeps offline at B=1.
+    Returns (LoadResult, scored output): the stacked outputs of the last pass's calls that cover
+    the first `score_units` units (offline: whole calls, so possibly more units; `_execute_load`
+    cuts them to the reference's rows)."""
+    from ..perf.load import run_concurrent, run_offline, run_open
 
     keep = min(regime.score_units, len(regime.prompts))
     if regime.kind == "offline":
         size = regime.batch_size or len(regime.prompts)
         chunks = [regime.prompts[i:i + size] for i in range(0, len(regime.prompts), size)]
-        result, outs = run_offline(prepare_units, chunks, passes=regime.passes, keep=keep)
-        return result, _first_units(_stack([outs[i] for i in sorted(outs)]), keep)
+        result, outs = run_offline(
+            lambda chunk: prepare_units(_unit(chunk[0]) if len(chunk) == 1 else chunk), chunks,
+            passes=regime.passes, keep=keep)
+        return result, _stack([outs[i] for i in sorted(outs)])
+    one = (lambda unit: prepare_units(_unit(unit)))
     with _concurrency(be, regime) as together:
-        result, outs = run_concurrent(lambda unit: prepare_units(_unit(unit)), regime.prompts,
-                                      concurrency=regime.concurrency, passes=regime.passes,
-                                      keep=keep, serial=not together)
+        if regime.kind == "open":
+            result, outs = run_open(one, regime.prompts, rate=regime.rate, passes=regime.passes,
+                                    keep=keep, serial=not together)
+        else:
+            result, outs = run_concurrent(one, regime.prompts, concurrency=regime.concurrency,
+                                          passes=regime.passes, keep=keep, serial=not together)
     return result, _stack([outs[i] for i in sorted(outs)])
 
 
 def _load_record(regime, result):
     """A load-pattern record's timing: `median_latency_ms` is the median time of a whole offline
-    pass, or the median request latency under concurrency; `throughput` is units/s either way."""
+    pass, or the median request latency under concurrency and open loop (from scheduled arrival);
+    `throughput` is units/s either way."""
     latency = result.median_pass_ms if regime.kind == "offline" else result.percentile(50)
     return {"median_latency_ms": latency, "std_latency_ms": None, "peak_mem_mb": result.peak_mem_mb,
             "throughput": result.throughput, "load": result.summary()}
@@ -283,12 +294,26 @@ def _execute_load(spec, regime, iface, r_iface, be, model, meta, outputs):
     """One load-pattern regime (design.md §12.17): the baseline, the plain system and every case
     under the same pattern, each recorded like a regime cell. An offline regime also records the
     per-unit outputs of its scored units once (`offline_perprompt`), the reference an offline
-    candidate is scored against; a concurrent regime's calls are single-unit already."""
+    candidate is scored against, and keeps the candidate's leading rows that those units fill: a
+    unit may fill several rows (decode steps, tokens, a pair), so the cut follows the per-unit
+    outputs rather than the unit count. Concurrent and open-loop calls are single-unit already."""
     name = regime.name
 
     def bound(params, record):
         call = _bind_case(spec, r_iface, _task_params(regime, params), record)
         return call, (lambda units: call.prepare(be, model, units))
+
+    if regime.kind == "offline" and not any(k[0] == "offline_perprompt" for k in meta):
+        keep = min(regime.score_units, len(regime.prompts))
+        for task in spec.tasks:
+            key = ("offline_perprompt", task.label)
+            record = meta[key] = {}
+            try:
+                call, _ = bound(task.params, record)
+                outputs[key] = _per_prompt_stack(call, be, model, regime.prompts[:keep])
+                _success(record)
+            except Exception as e:
+                _failure(record, e)
 
     base = None
     baseline = meta[("__baseline__", name)] = {}
@@ -307,6 +332,9 @@ def _execute_load(spec, regime, iface, r_iface, be, model, meta, outputs):
         try:
             _, prepare = bound(params, case)
             result, scored = _run_load(regime, prepare, be)
+            per_unit = outputs.get(("offline_perprompt", (alternative or {}).get("row", label)))
+            if regime.kind == "offline" and per_unit is not None:   # else scoring reports the gap
+                scored = _first_rows(scored, per_unit.shape[-2 if per_unit.dim() >= 2 else 0])
             outputs[key] = scored
             latency = _load_record(regime, result)
             case.update(latency)
@@ -319,18 +347,6 @@ def _execute_load(spec, regime, iface, r_iface, be, model, meta, outputs):
             _success(case)
         except Exception as e:              # isolated: engine survives, later cells run
             _failure(case, e)
-
-    if regime.kind == "offline" and not any(k[0] == "offline_perprompt" for k in meta):
-        keep = min(regime.score_units, len(regime.prompts))
-        for task in spec.tasks:
-            key = ("offline_perprompt", task.label)
-            record = meta[key] = {}
-            try:
-                call, _ = bound(task.params, record)
-                outputs[key] = _per_prompt_stack(call, be, model, regime.prompts[:keep])
-                _success(record)
-            except Exception as e:
-                _failure(record, e)
 
 
 def _load_sync_twin(be, repo):
@@ -425,12 +441,14 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
                 "vocab_size": len(vocab),
             }
         for regime in spec.regimes:
-            # The batched regime of an async run executes on a sync-mode twin engine:
-            # the async engine refuses several invokes per trace (see _load_sync_twin).
+            # A regime of several units per call (batched, offline at B>1) of an async run
+            # executes on a sync-mode twin engine: the async engine refuses several invokes
+            # per trace (see _load_sync_twin).
             # Everything else in the loop (interactive/generation cells, effect guard)
             # keeps the run's own backend.
             r_iface, r_be, r_model = iface, be, model
-            if regime.kind in ("batched", "offline") and iface == "vllm_async":
+            multi_unit = regime.kind == "batched" or regime.kind == "offline" and regime.batch_size != 1
+            if multi_unit and iface == "vllm_async":
                 if twin is None:
                     try:
                         twin = _load_sync_twin(be, spec.repo)

@@ -17,4 +17,7 @@ logit_lens = Workload(
     regimes=(Regime("interactive", DataRef("counterfact", 100)),
              Regime("batched", DataRef("counterfact", 16))),
     baseline={"layers": [-1]},
+    # research job (notebook calls, then corpus sweeps) and deployment: a last-position read on a
+    # served request is the runtime monitor or probe, so this is the read workload under load
+    load_patterns=("offline", "concurrent", "open"),
 )

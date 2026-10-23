@@ -5,9 +5,10 @@ Suites never carry intervention semantics: those are the workloads' rows.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
-from .sweep.spec import Concurrent, Offline
+from .sweep.spec import Concurrent, Offline, Open
 
 
 @dataclass(frozen=True)
@@ -15,7 +16,8 @@ class Entry:
     """Workloads × models, with optional data settings for this entry: `size` resizes each regime's
     default source (batched regimes stay at most 16), `data` ("source[:n]") rebinds every regime,
     `regimes` keeps a subset of regime kinds, `loads` adds load patterns (isb.sweep.spec Offline /
-    Concurrent, design.md §12.17) derived from each workload's own regimes."""
+    Concurrent / Open, design.md §12.17) derived from each workload's own regimes, for the workloads
+    that declare the pattern."""
     workloads: tuple
     models: tuple
     size: int | None = None
@@ -81,24 +83,47 @@ SUITES = {s.name: s for s in (
     # and 0.8.1 each on HF against vLLM, and 0.4.6 (2025-04-24) against 0.8.1 on HF. HF runs sdpa
     # attention in bf16; vLLM runs nnsight's documented default, the sync engine, eager. Timings
     # cover the request only: every engine loads once per job, before warm-up.
-    # Standard request patterns (design.md §12.17) on nnsight 0.8.1, HF against vLLM. Offline is
-    # `vllm bench throughput` / MLPerf Offline: 256 units as one sweep, B per call, B=all handing
-    # vLLM every unit at once (HF pads them into one batch, which may not fit: a finding). The
-    # async engine is left out: its offline calls would run on a second, sync engine (§12.14).
+    # Standard request patterns (design.md §12.17) on nnsight 0.8.1, HF against vLLM, each on the
+    # workloads that declare it. Offline is `vllm bench throughput` / MLPerf Offline: 256 units as
+    # one sweep, B per call, B=all handing vLLM every unit at once (HF pads them into one batch,
+    # which may not fit: a finding). Workloads whose cells take one unit per call sweep 64 units at
+    # B=1. The async engine is left out: its offline calls would run on a second, sync engine
+    # (§12.14).
     Suite("nnsight-load-offline",
-          entries=(Entry(("steering", "logit_lens", "ablation"), ("qwen2.5-7b", "qwen3-32b"),
-                         regimes=("offline",), loads=(Offline(256, (1, 16, 64, None)),)),),
+          entries=(Entry(("steering", "logit_lens", "ablation", "activation_harvest"),
+                         ("qwen2.5-7b", "qwen3-32b"), regimes=("offline",),
+                         loads=(Offline(256, (1, 16, 64, None)),)),
+                   Entry(("activation_patching", "gen_steering"), ("qwen2.5-7b", "qwen3-32b"),
+                         regimes=("offline",), loads=(Offline(64, (1,)),)),
+                   # one prompt per call is ceil(d_model/dim_batch) backward passes (43 at d=4096,
+                   # dim_batch 96):
+                   # few units, B=1 only (how jacobian-lens shards a corpus)
+                   Entry(("jacobian_collect",), ("qwen2.5-7b", "qwen3-32b"),
+                         regimes=("offline",), loads=(Offline(8, (1,)),))),
           backends=("nnsight-hf/sdpa/0-8-1", "nnsight-vllm/sync/0-8-1"),
           reference="nnsight-hf/sdpa/0-8-1", timeout=7200),
-    # Closed-loop serving (`vllm bench serve --max-concurrency`, AIPerf's concurrency sweep): 128
-    # single-unit requests from C clients. HF and the sync engine take one request at a time (a
-    # serial server); the async engine takes them together.
+    # Closed-loop serving (`vllm bench serve --max-concurrency`, AIPerf's concurrency sweep): 256
+    # single-unit requests from C clients, a warm-up pass and three timed passes per C (768 latency
+    # samples). HF and the sync engine take one request at a time by their interface; the async
+    # engine takes them together.
     Suite("nnsight-load-concurrent",
-          entries=(Entry(("steering", "activation_patching", "gen_steering"),
+          entries=(Entry(("steering", "logit_lens", "gen_steering", "gen_capture"),
                          ("qwen2.5-7b", "qwen3-32b"), regimes=("concurrent",),
-                         loads=(Concurrent(128, (1, 4, 16, 64)),)),),
+                         loads=(Concurrent(256, (1, 4, 16, 64)),)),),
           backends=("nnsight-hf/sdpa/0-8-1", "nnsight-vllm/sync/0-8-1", "nnsight-vllm/0-8-1"),
-          reference="nnsight-hf/sdpa/0-8-1", timeout=7200),
+          reference="nnsight-hf/sdpa/0-8-1", timeout=14400),
+    # Open-loop serving (MLPerf Server, `vllm bench serve --request-rate`): 256 single-unit
+    # requests arriving at 4, 16 and 64 per second, a warm-up pass and three timed passes per
+    # rate. On Qwen2.5-7B the rates fall below, between and above HF's and the async engine's
+    # measured closed-loop capacity (steering 35 and 110 units/s, steered generation about 5 and
+    # 58). The sync engine is left out: it serves one request at a time like HF, so its open-loop
+    # latency follows from its single-request time.
+    Suite("nnsight-load-open",
+          entries=(Entry(("steering", "logit_lens", "gen_steering", "gen_capture"),
+                         ("qwen2.5-7b", "qwen3-32b"), regimes=("open",),
+                         loads=(Open(256, (4, 16, 64)),)),),
+          backends=("nnsight-hf/sdpa/0-8-1", "nnsight-vllm/0-8-1"),
+          reference="nnsight-hf/sdpa/0-8-1", timeout=14400),
     Suite("nnsight-versions",
           entries=(Entry(("logit_lens", "steering", "ablation"), ("qwen2.5-7b", "qwen3-32b"),
                          size=32),
@@ -116,9 +141,8 @@ SUITES = {s.name: s for s in (
 
 
 def parse_load(kind: str, text: str):
-    """`UNITS:S[,S...]` -> an Offline (S = units per call, or `all`) or Concurrent (S = clients)."""
-    from .sweep.spec import Concurrent, Offline
-
+    """`UNITS:S[,S...]` -> an Offline (S = units per call, or `all`), Concurrent (S = clients) or
+    Open (S = arrivals per second, a positive decimal)."""
     units, separator, settings = text.partition(":")
     if not units.isdigit() or int(units) < 1 or not separator or not settings:
         raise ValueError(f"--{kind} takes UNITS:S[,S...] with UNITS positive")
@@ -126,14 +150,15 @@ def parse_load(kind: str, text: str):
     for item in settings.split(","):
         if kind == "offline" and item == "all":
             values.append(None)
-        elif item.isdigit() and int(item) >= 1:
+        elif kind == "open" and re.fullmatch(r"[0-9]+(\.[0-9]+)?", item) and float(item) > 0:
+            values.append(float(item))
+        elif kind != "open" and item.isdigit() and int(item) >= 1:
             values.append(int(item))
         else:
-            raise ValueError(f"--{kind} setting {item!r} must be a positive integer"
-                             + (" or 'all'" if kind == "offline" else ""))
-    if kind == "offline":
-        return Offline(int(units), tuple(values))
-    return Concurrent(int(units), tuple(values))
+            raise ValueError(f"--{kind} setting {item!r} must be a positive "
+                             + {"offline": "integer or 'all'", "concurrent": "integer",
+                                "open": "decimal"}[kind])
+    return {"offline": Offline, "concurrent": Concurrent, "open": Open}[kind](int(units), tuple(values))
 
 
 def parse_data(text):
