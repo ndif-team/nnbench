@@ -202,6 +202,21 @@ SUITES = {s.name: s for s in (
                     "nnsight-hf/sdpa/0-5-15/gpu4", "nnsight-vllm/0-8-1/tp4",
                     "nnsight-vllm/0-7/tp4", "nnsight-vllm/sync/0-5-15/tp4"),
           reference="nnsight-hf/sdpa/0-8-1/gpu4", timeout=7200),
+    # The fastest form each engine offers on nnsight 0.8.1, one prompt per call
+    # (docs/large-model-handoff.md on four GPUs): HF splitting the layers (gpu4) or sharding them with
+    # transformers tensor parallelism (tp4); on vLLM the default cell, installed edits, and edits with
+    # CUDA-graph taps, the edits also with envoys by reference (the unreleased prototype); plain vLLM
+    # 0.27.1 compiled for the engine alone.
+    Suite("llama70b-fastest",
+          entries=(Entry(("logit_lens", "steering", "ablation", "gen_steering"), ("llama3.3-70b",),
+                         size=16, regimes=("interactive", "generation")),
+                   Entry(("activation_patching",), ("llama3.3-70b",), size=16,
+                         regimes=("interactive",))),
+          backends=("nnsight-hf/sdpa/0-8-1/gpu4", "nnsight-hf/sdpa/0-8-1/tp4",
+                    "nnsight-vllm/sync/0-8-1/tp4", "nnsight-vllm/opt/0-8-1/tp4",
+                    "nnsight-vllm/opt/0-8-1/taps/tp4", "nnsight-vllm/opt/0-8-1/byref/tp4",
+                    "nnsight-vllm/opt/0-8-1/taps/byref/tp4", "vllm-plain/0-27-1/tp4"),
+          reference="nnsight-hf/sdpa/0-8-1/gpu4", timeout=3600),
     # Qwen3.5-4B with the upstream fitted Jacobian lens (its `jlens` asset).
     Suite("fitted-jlens",
           entries=(Entry(("jacobian_lens",), ("qwen3.5-4b",)),),
