@@ -13,9 +13,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from build import E, SERIES, chip, figure, fnum, mounts, page_head, provenance, table  # noqa: E402
 
-HF, HF_TP = "nnsight-hf/sdpa/0-8-1/gpu2", "nnsight-hf/sdpa/0-8-1/tp2"
-GEN, OPT, TAPS = ("nnsight-vllm/sync/0-8-1/byref/tp2", "nnsight-vllm/opt/0-8-1/byref/tp2",
-                  "nnsight-vllm/opt/0-8-1/taps/byref/tp2")
+HF, HF_TP = "nnsight-hf/0-8-1/gpu2", "nnsight-hf/0-8-1/tp2"
+GEN, OPT, TAPS = ("nnsight-vllm/0-8-1/tp2", "nnsight-vllm/0-8-1/opt/tp2",
+                  "nnsight-vllm/0-8-1/opt/taps/tp2")
 PLAIN = "vllm-plain/0-28-0/tp2"
 COLS = [  # (backend, head, sub)
     (HF, "nnsight on HF", "general cell · device_map over two GPUs, sdpa"),

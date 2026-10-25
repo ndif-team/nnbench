@@ -12,9 +12,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from build import E, SERIES, chip, figure, fnum, mounts, page_head, provenance, table  # noqa: E402
 
-HF, HF_REF = "nnsight-hf/sdpa/0-8-1", "nnsight-hf/fp32"
-GEN, OPT, TAPS = "nnsight-vllm/sync/0-8-1/byref", "nnsight-vllm/opt/0-8-1/byref", "nnsight-vllm/opt/0-8-1/taps/byref"
-PLAIN, PLAIN_E = "vllm-plain/0-28-0", "vllm-plain/eager-0-28-0"
+HF, HF_REF = "nnsight-hf/0-8-1", "nnsight-hf/fp32"
+GEN, OPT, TAPS = "nnsight-vllm/0-8-1", "nnsight-vllm/0-8-1/opt", "nnsight-vllm/0-8-1/opt/taps"
+PLAIN, PLAIN_E = "vllm-plain/0-28-0", "vllm-plain/0-28-0/eager"
 COLS = [  # (backend, head, sub)
     (HF, "nnsight on HF", "general cell · transformers 5.12.1, sdpa"),
     (GEN, "nnsight on vLLM", "general cell · vLLM 0.27.1, eager"),
