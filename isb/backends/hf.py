@@ -1,7 +1,7 @@
-"""HF Transformers backend infra — also the per-family oracle control (design.md §12.2)."""
+"""HF Transformers backend: the per-family control. Several units run as one left-padded batch."""
 from __future__ import annotations
 
-from .base import Backend
+from .base import Backend, prompts_of
 
 
 class HFBackend(Backend):
@@ -10,24 +10,15 @@ class HFBackend(Backend):
     def __init__(self, force_text_causal: bool = False, dtype: str | None = None,
                  attn_implementation: str = "eager", device_map: str | None = None,
                  tp_size: int = 1):
-        # force_text_causal: load via AutoModelForCausalLM even when the architecture registers as
-        # ImageTextToText. Needed for TEXT-ONLY checkpoints of multimodal-wrapper architectures
-        # (Qwen/Qwen3.5-4B: no vision weights in the repo, transformers auto-routes its config to
-        # the text-only Qwen3_5ForCausalLM, yet nnsight's LanguageModel guard refuses the repo by
-        # model_type and points at VisionLanguageModel). The guard exempts any non-default
-        # `automodel`, so a trivial AutoModelForCausalLM subclass (identical behavior, different
-        # class object) opts out of the second-guessing. Arrives via spec.hf_kwargs.
+        # force_text_causal: load through AutoModelForCausalLM for a text-only checkpoint of a
+        # multimodal-wrapper architecture (Qwen/Qwen3.5-4B), which nnsight's guard otherwise refuses.
         self.force_text_causal = force_text_causal
         self.dtype = dtype          # None loads the checkpoint's own dtype
-        # eager by default (the oracle control); a config may choose transformers' own default,
-        # sdpa, for timing comparisons
         self.attn_implementation = attn_implementation
         # None places the model on `load`'s one device; "auto" lets accelerate split its layers
-        # across every visible GPU (a config that declares several GPUs, backends/README.md)
+        # across every visible GPU
         self.device_map = device_map
-        # >1 shards every layer over that many ranks with transformers tensor parallelism, one
-        # process per GPU under torchrun (nnsight docs/models/tensor-parallel.md); every rank runs
-        # the whole job and rank 0 alone publishes it (isb/jobs/worker.py)
+        # >1 shards every layer over that many torchrun ranks with transformers tensor parallelism
         self.tp_size = tp_size
         if tp_size > 1 and device_map is not None:
             raise ValueError("tp_size and device_map are mutually exclusive")
@@ -40,7 +31,7 @@ class HFBackend(Backend):
         if self.force_text_causal:
             from transformers import AutoModelForCausalLM
 
-            class _TextCausal(AutoModelForCausalLM):    # non-default automodel -> guard opts out
+            class _TextCausal(AutoModelForCausalLM):    # a non-default automodel: the guard opts out
                 pass
 
             kw["automodel"] = _TextCausal
@@ -51,40 +42,36 @@ class HFBackend(Backend):
 
             # this rank's GPU, so the timer's CUDA sync and peak memory read the device it runs on
             torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-
             kw["distributed_config"] = DistributedConfig(tp_size=self.tp_size)
         else:
             kw["device_map"] = self.device_map or device
-        return LanguageModel(
-            repo, dispatch=True,
-            attn_implementation=self.attn_implementation, **kw
-        )
+        return LanguageModel(repo, dispatch=True, attn_implementation=self.attn_implementation, **kw)
 
     def run(self, model, prompts, build):
-        with model.trace(prompts):          # a list of prompts -> a batch
-            saved = build().save()
+        prompts = self.many(prompts, "run")
+        with model.trace(prompts):                       # the prompts as one left-padded batch
+            saved = build(list(range(len(prompts)))).save()
         return saved.detach().float().cpu()
 
-    def patch(self, model, clean_prompt, corrupted_prompt, capture, patch):
-        clean_prompt, corrupted_prompt = self.one(clean_prompt, "patch"), self.one(corrupted_prompt, "patch")
-        with model.trace(clean_prompt):     # trace 1: snapshot the clean activation
+    def patch(self, model, clean_prompts, corrupted_prompts, capture, patch):
+        clean_prompts, corrupted_prompts = self.paired(clean_prompts, corrupted_prompts, "patch")
+        with model.trace(clean_prompts):                 # trace 1: snapshot the clean activations
             ca = capture().save()
         clean_act = ca.detach().float().cpu()
-        with model.trace(corrupted_prompt):  # trace 2: inject it, observe the corrupted run
+        with model.trace(corrupted_prompts):             # trace 2: inject them, observe the batch
             res = patch(clean_act).save()
         return res.detach().float().cpu()
 
     def session(self, model, build):
-        out = [None]                     # index-assign: the session body is compiled; whether a
-        with model.session():            # rebinding inside it is pushed back to this frame (0.8.1)
-            out[0] = build()             # or dropped (the dev line), the list is shared
+        out = [None]                     # index-assign: the compiled session body shares the list
+        with model.session():
+            out[0] = build()
         return out[0]
 
     def train_patch(self, model, source_prompts, base_prompts, capture, step):
-        """HF's form: each side is one left-padded batch, so every pair is in both traces."""
         sources, bases = self.paired(source_prompts, base_prompts, "train_patch")
         rows = list(range(len(sources)))
-        with model.trace(sources):           # trace 1: source (counterfactual) activations, no grad
+        with model.trace(sources):           # trace 1: source activations, no grad
             s = capture().save()
         src = s.detach().float().cpu()
         with model.trace(bases):             # trace 2: intervened forward + backward on the loss
@@ -95,8 +82,7 @@ class HFBackend(Backend):
         return lv.detach().float().cpu()
 
     def vjp_batch(self, model, prompts, acts_of, target_of, make_cotangent, n):
-        """HF's form: the prompts as one padded batch, every row in one trace."""
-        prompts = self.many(prompts)
+        prompts = self.many(prompts, "vjp_batch")
         grads = [None] * n
         with model.trace(prompts):
             a = acts_of(model)
@@ -104,105 +90,86 @@ class HFBackend(Backend):
                 a[L].requires_grad_(True)            # retain grad on the intermediate residuals
             target = target_of(model)
             cot = make_cotangent(target, list(range(len(prompts))))
-            metric = (target * cot).sum()            # (target * one-hot cotangents) -> VJP
+            metric = (target * cot).sum()
             with metric.backward():
-                for L in range(n - 1, -1, -1):       # grads in REVERSE module order
+                for L in range(n - 1, -1, -1):       # grads in reverse module order
                     grads[L] = a[L].grad.save()
-        import torch  # noqa: F401 — keep symmetry with attribute; grads are proxies until here
         return [g.detach().float().cpu() for g in grads]
 
-    def attribute(self, model, clean_prompt, corrupt_prompt, acts_of, metric_of, n):
+    def attribute(self, model, clean_prompts, corrupt_prompts, acts_of, metric_of, n):
+        """One pair per trace pair: the metric is a per-pair scalar, so pairs do not batch."""
         import torch
 
-        clean_prompt = self.one(clean_prompt, "attribute")
-        corrupt_prompt = self.one(corrupt_prompt, "attribute")
-
-        # Pre-create the result lists OUTSIDE the trace and index-assign inside: the trace body is
-        # compiled into a separate function, so rebinding a name inside it (`clean = [...]`) is local
-        # to that body and lost, but index-assigning into a list made out here mutates the shared
-        # object — the pattern nnsight's attribution-patching doc uses.
-        clean = [None] * n
-        with model.trace(clean_prompt):                  # pass 1: clean activations
-            a = acts_of(model)
-            for L in range(n):
-                clean[L] = a[L].save()
-
-        corrupt = [None] * n
-        grads = [None] * n
-        with model.trace(corrupt_prompt):                # pass 2: corrupt forward + backward
-            a = acts_of(model)
-            for L in range(n):
-                a[L].requires_grad_(True)                # retain grad on the intermediate residuals
-            for L in range(n):
-                corrupt[L] = a[L].save()
-            metric = metric_of(model)                    # read .output BEFORE the backward session
-            with metric.sum().backward():
-                for L in range(n - 1, -1, -1):           # grads in REVERSE module order
-                    grads[L] = a[L].grad.save()
-
-        # attribution[L] = (clean - corrupt) · grad, summed over the activation's dims
-        return torch.stack([
-            ((clean[L].float() - corrupt[L].float()) * grads[L].float()).sum().detach().cpu()
-            for L in range(n)
-        ])
+        pairs = list(zip(*self.paired(clean_prompts, corrupt_prompts, "attribute")))
+        scores = []
+        for i, (clean_prompt, corrupt_prompt) in enumerate(pairs):
+            clean = [None] * n          # index-assign into lists made outside the compiled body
+            with model.trace(clean_prompt):                  # pass 1: clean activations
+                a = acts_of(model)
+                for L in range(n):
+                    clean[L] = a[L].save()
+            corrupt, grads = [None] * n, [None] * n
+            with model.trace(corrupt_prompt):                # pass 2: corrupt forward + backward
+                a = acts_of(model)
+                for L in range(n):
+                    a[L].requires_grad_(True)
+                for L in range(n):
+                    corrupt[L] = a[L].save()
+                metric = metric_of(model, i)
+                with metric.sum().backward():
+                    for L in range(n - 1, -1, -1):
+                        grads[L] = a[L].grad.save()
+            scores.append(torch.stack([
+                ((clean[L].float() - corrupt[L].float()) * grads[L].float()).sum().detach().cpu()
+                for L in range(n)]))
+        return torch.stack(scores)                                   # [B, n]
 
     def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
-        import torch
-
-        prompt = self.one(prompts, "generate")
-        it = slice(0, new_tokens) if bounded else slice(None)   # unbounded: stop bound comes from
-        with model.generate(prompt, max_new_tokens=new_tokens,  # max_new_tokens via default_all
+        prompts = self.many(prompts, "generate")
+        it = slice(0, new_tokens) if bounded else slice(None)
+        with model.generate(prompts, max_new_tokens=new_tokens, min_new_tokens=new_tokens,
                             do_sample=False) as tracer:
             rows = list().save()
-            for _step in tracer.iter[it]:
-                rows.append(build_step())
-        if len(rows) != new_tokens:
-            raise RuntimeError(
-                f"hf generation collected {len(rows)} per-step rows, expected {new_tokens}")
-        return torch.cat([r.detach().float().cpu() for r in rows], dim=0)   # [steps, vocab]
+            for step in tracer.iter[it]:
+                rows.append(build_step(step))
+        return self._steps(rows, new_tokens, "generation")
 
-    def generate_patch(self, model, source_prompt, base_prompt, capture, build_step,
+    def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
                        *, new_tokens, bounded=True):
-        import torch
-
-        source_prompt = self.one(source_prompt, "generate_patch")
-        base_prompt = self.one(base_prompt, "generate_patch")
-        with model.trace(source_prompt):            # trace 1: snapshot the source activation
+        sources, bases = self.paired(source_prompts, base_prompts, "generate_patch")
+        with model.trace(sources):                  # trace 1: snapshot the source activations
             ca = capture().save()
-        clean_act = ca.detach().float().cpu()       # materialized; closed over by trace 2's steps
-
+        clean_act = ca.detach().float().cpu()
         it = slice(0, new_tokens) if bounded else slice(None)
-        with model.generate(base_prompt, max_new_tokens=new_tokens, do_sample=False) as tracer:
+        with model.generate(bases, max_new_tokens=new_tokens, min_new_tokens=new_tokens,
+                            do_sample=False) as tracer:
             rows = list().save()
-            for _step in tracer.iter[it]:
-                rows.append(build_step(clean_act))  # inject@prefill + read this step's logits
+            for step in tracer.iter[it]:
+                rows.append(build_step(clean_act, step))
+        return self._steps(rows, new_tokens, "generate_patch")
+
+    def _steps(self, rows, new_tokens, what):
+        """Per-step `[B, ...]` rows -> `[new_tokens, B, ...]`."""
+        import torch
+
         if len(rows) != new_tokens:
-            raise RuntimeError(
-                f"hf generate_patch collected {len(rows)} per-step rows, expected {new_tokens}")
-        return torch.cat([r.detach().float().cpu() for r in rows], dim=0)   # [steps, vocab]
+            raise RuntimeError(f"hf {what} collected {len(rows)} per-step rows, expected {new_tokens}")
+        return torch.stack([r.detach().float().cpu() for r in rows], dim=0)
 
-    def vanilla(self, model, prompt, *, new_tokens):
-        """The wrapped transformers module (`model._module`) called directly, with no trace."""
+    def plain(self, model, units, *, new_tokens=1):
+        """The wrapped transformers module called directly on one left-padded batch, no trace. Ends
+        where the cells end: the result copied to the host, so a timer sees the same boundary."""
         import torch
 
-        inputs = model.tokenizer(prompt, return_tensors="pt").to(model._module.device)
+        inputs = model.tokenizer(prompts_of(units), return_tensors="pt", padding=True)
+        inputs = inputs.to(model._module.device)
         with torch.no_grad():
             if new_tokens == 1:
-                model._module(**inputs)
+                out = model._module(**inputs).logits[:, -1, :]
             else:
-                model._module.generate(**inputs, max_new_tokens=new_tokens, do_sample=False)
-
-    def vanilla_many(self, model, prompts, *, new_tokens):
-        """`vanilla` over several prompts as one left-padded batch: the plain system's own
-        multi-prompt request, the offline load pattern's denominator (design.md §12.17)."""
-        import torch
-
-        inputs = model.tokenizer(list(prompts), return_tensors="pt", padding=True).to(model._module.device)
-        with torch.no_grad():
-            if new_tokens == 1:
-                model._module(**inputs)
-            else:
-                model._module.generate(**inputs, max_new_tokens=new_tokens, do_sample=False)
+                out = model._module.generate(**inputs, max_new_tokens=new_tokens,
+                                             min_new_tokens=new_tokens, do_sample=False)
+        return out.cpu()
 
     def last(self, t):
         return t[:, -1, :]                  # [B, S, vocab] -> [B, vocab]

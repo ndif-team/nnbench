@@ -25,11 +25,11 @@ precision, on the same card, in the same job, with the plain engine (no trace) b
 
   | Column | Backend config | What it is |
   |---|---|---|
-  | HF, device_map (reference) | `nnsight-hf/sdpa/0-8-1/gpu2` | nnsight 0.8.1 `LanguageModel`, transformers sdpa, accelerate `device_map="auto"`: layers split across the GPUs and run one after the other |
-  | HF, tensor parallel | `nnsight-hf/sdpa/0-8-1/tp2` | the same under nnsight's transformers TP (`DistributedConfig(tp_size=2)`, transformers 5.19, `torchrun` with one rank per GPU) |
-  | vLLM, general cell | `nnsight-vllm/sync/0-8-1/byref/tp2` | nnsight 0.8.1 on vLLM 0.27.1, one trace per call, envoys by reference, `tensor_parallel_size=2` |
-  | vLLM, installed edits | `nnsight-vllm/opt/0-8-1/byref/tp2` | the block installed once with `model.edit(name=...)`, each timed call a plain request with `edits=[name]` |
-  | vLLM, edits + taps | `nnsight-vllm/opt/0-8-1/taps/byref/tp2` | the same edits on an engine started with `taps` naming the touched sites, so CUDA graphs stay on |
+  | HF, device_map (reference) | `nnsight-hf/0-8-1/gpu2` | nnsight 0.8.1 `LanguageModel`, transformers sdpa, accelerate `device_map="auto"`: layers split across the GPUs and run one after the other |
+  | HF, tensor parallel | `nnsight-hf/0-8-1/tp2` | the same under nnsight's transformers TP (`DistributedConfig(tp_size=2)`, transformers 5.19, `torchrun` with one rank per GPU) |
+  | vLLM, general cell | `nnsight-vllm/0-8-1/tp2` | nnsight 0.8.1 on vLLM 0.27.1, one trace per call, `tensor_parallel_size=2` |
+  | vLLM, installed edits | `nnsight-vllm/0-8-1/opt/tp2` | the block installed once with `model.edit(name=...)`, each timed call a plain request with `edits=[name]` |
+  | vLLM, edits + taps | `nnsight-vllm/0-8-1/opt/taps/tp2` | the same edits on an engine started with `taps` naming the touched sites, so CUDA graphs stay on |
   | plain vLLM | `vllm-plain/0-28-0/tp2` | vLLM 0.28.0 compiled, no nnsight; gives the engine's own forward |
 
   The plain HF number is the HF backend's own no-trace call (every nnsight backend times one; it is
@@ -39,10 +39,12 @@ precision, on the same card, in the same job, with the plain engine (no trace) b
   (`CLAUDE.md`, design §8.1) a numerical difference is `NUMERICAL_MISMATCH` with correctness
   unresolved and the row stays in the timing table; only failures leave it.
 
-The envoy-by-reference prototype is the vLLM baseline on purpose: stock nnsight 0.8.1 pickles the
-whole envoy tree with every request, which is the bulk of its per-request cost on vLLM. The fix is
-on its way into nnsight (branch `zikai/envoy-by-reference`); until it is released, the `*/byref`
-configs load the prototype from `backends/nnsight-vllm/envoy_byref` through `PYTHONPATH`.
+The runs this document reports used an envoy-by-reference prototype as the vLLM baseline (stock
+nnsight 0.8.1 pickles the whole envoy tree with every request, the bulk of its per-request cost on
+vLLM). The prototype and its `*/byref` configs were removed from the tree on 2026-10-24;
+`nnsight-vllm/0-8-1` pins upstream v0.8.1 (`de7fec4d`) as released, so a rerun with the configs
+above measures stock nnsight. The numbers below were measured with the prototype
+(`docs/findings.md`, 2026-10-21).
 
 ## 2. Deliverables
 
@@ -64,7 +66,11 @@ configs load the prototype from `backends/nnsight-vllm/envoy_byref` through `PYT
 Everything the comparison ran on is on branch `feat/large-model-realizations` of
 `ndif-team/nnbench` (one commit on top of `main`, 58 files; the no-GPU suite passes, 618 tests).
 Check it out, then copy `scripts/report/` from this branch (`docs/large-model-handoff`) next to it,
-or merge the two. What the branch adds over `main`:
+or merge the two. The list below names the files as that branch laid them out; the 2026-10-24
+refactor moved configs into `backends/<system>/configs.yml` (`nnsight-hf/0-8-1/gpu2`,
+`nnsight-hf/0-8-1/tp2`, `nnsight-vllm/0-8-1/opt/tp2`, `nnsight-vllm/0-8-1/opt/taps/tp2`,
+`vllm-plain/0-28-0/tp2`), the opt cells to `backends/nnsight-vllm/{backend_opt,cells_opt}.py`,
+and removed the byref prototype. What the branch added over `main`:
 
 - `backends/nnsight-hf/sdpa/0-8-1/{gpu2,tp2}` and `backends/nnsight-hf/sdpa/0-4-6/gpu2`: the
   two-GPU HF configs. `tp2` needs the HF image built with `TRANSFORMERS_VERSION=5.19.0`,
@@ -96,18 +102,18 @@ in bf16 (145 GB of weights; vLLM at `gpu_memory_utilization` 0.85 needs about 13
 the two cards plus KV cache, so two 80 GB cards are the floor and two 141 GB cards comfortable).
 Four cards and `tp4` configs are the alternative; see section 7.
 
-1. **Build the images.** Each config's `compose.yml` names its image and build args; `bench.py
-   build` builds what the listed configs need:
+1. **Build the images.** Each system's `configs.yml` names its configs' images and build args;
+   `bench.py build` builds what the listed configs need, each distinct image once:
 
    ```bash
-   python scripts/bench.py build nnsight-hf/sdpa/0-8-1/gpu2 nnsight-hf/sdpa/0-8-1/tp2 \
-       nnsight-vllm/sync/0-8-1/byref/tp2 vllm-plain/0-28-0/tp2
+   python scripts/bench.py build nnsight-hf/0-8-1/gpu2 nnsight-hf/0-8-1/tp2 \
+       nnsight-vllm/0-8-1/tp2 vllm-plain/0-28-0/tp2
    ```
 
-   That is three images: `isb-nnsight-hf-0-8-1` (nnsight 0.8.1, transformers 5.12), the same with
+   That is four images: `isb-nnsight-hf-0-8-1` (nnsight 0.8.1, transformers 5.12), the same with
    transformers 5.19 as `isb-nnsight-hf-0-8-1-tf5-19`, `isb-nnsight-vllm-0-8-1` (vLLM 0.27.1,
    shared by the general, edits and taps configs), and `isb-vllm-plain-0-28-0` (vLLM 0.28.0). The
-   nnsight ref is pinned in every compose file (`de7fec4d…`, tag v0.8.1).
+   nnsight ref is pinned in each system's `configs.yml` (`de7fec4d…`, tag v0.8.1).
 2. **Stock the model cache.** The containers read `/models` from the named volume `isb-model-cache`
    (override the name with `ISB_MODEL_CACHE`). Either let the first run download (set `HF_TOKEN` if
    the repo is gated) or populate the volume from an existing HF cache (`hub/models--Qwen--...`
@@ -117,7 +123,7 @@ Four cards and `tp4` configs are the alternative; see section 7.
 
    ```bash
    python scripts/bench.py run --workload steering --model qwen2.5-7b --data counterfact:4 \
-       --backends nnsight-hf/sdpa/0-8-1 nnsight-vllm/sync/0-8-1/byref --reference nnsight-hf/sdpa/0-8-1 --gpu 0
+       --backends nnsight-hf/0-8-1 nnsight-vllm/0-8-1 --reference nnsight-hf/0-8-1 --gpu 0
    ```
 
    Then the two-GPU HF TP smoke on the 7B (`slurm/delta-compare.slurm hftp-smoke` has the exact
@@ -128,17 +134,18 @@ Four cards and `tp4` configs are the alternative; see section 7.
 ## 5. Running the comparison
 
 The `large-opt` stage, as two `bench run` calls (one per data set). `--gpu 0` means GPUs 0 and 1
-for a `tp2`/`gpu2` config (the launcher exposes `ISB_GPU` and `ISB_GPU_1`; `--gpu` must be an
-index, not a UUID). Jobs run one after another, each in its own container; the timeout is per job.
+for a `tp2`/`gpu2` config (the launcher reserves the config's `gpus` from `--gpu` on as `ISB_GPUS`;
+`--gpu` must be an index, not a UUID). Jobs run one after another, each in its own container; the
+timeout is per job.
 
 ```bash
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1   # once the cache is stocked
 for spec in "logit_lens steering ablation gen_steering|counterfact:16" "activation_patching|mib/ioi:16"; do
     python scripts/bench.py run --workload ${spec%%|*} --model qwen2.5-72b \
         --data "${spec##*|}" --regimes interactive generation --realizations default \
-        --backends nnsight-hf/sdpa/0-8-1/gpu2 nnsight-hf/sdpa/0-8-1/tp2 nnsight-vllm/sync/0-8-1/byref/tp2 \
-                   nnsight-vllm/opt/0-8-1/byref/tp2 nnsight-vllm/opt/0-8-1/taps/byref/tp2 vllm-plain/0-28-0/tp2 \
-        --reference nnsight-hf/sdpa/0-8-1/gpu2 --gpu 0 --timeout 3600 --out runs/large-opt
+        --backends nnsight-hf/0-8-1/gpu2 nnsight-hf/0-8-1/tp2 nnsight-vllm/0-8-1/tp2 \
+                   nnsight-vllm/0-8-1/opt/tp2 nnsight-vllm/0-8-1/opt/taps/tp2 vllm-plain/0-28-0/tp2 \
+        --reference nnsight-hf/0-8-1/gpu2 --gpu 0 --timeout 3600 --out runs/large-opt
 done
 ```
 

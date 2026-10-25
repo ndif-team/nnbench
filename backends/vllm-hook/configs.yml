@@ -1,0 +1,9 @@
+# IBM vLLM-Hook on vLLM 0.19.1 (the Dockerfile's ARG values). `storage` selects the plugin's
+# activation transport: rpc (its default) or the asynchronous safetensors spill to disk.
+images:
+  default: {}
+configs:
+  default:
+    image: default
+    options: &base {dtype: bfloat16, gpu_memory_utilization: 0.85, enable_prefix_caching: false}
+  disk: {image: default, options: {<<: *base, storage: disk-st-async}}

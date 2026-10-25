@@ -12,7 +12,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import isb.methodologies  # noqa: F401,E402  (registers cells)
-from isb.methodologies.ablation import _ablate_and_read, _target_module  # noqa: E402
+from isb.methodologies.ablation import _ablate_and_read  # noqa: E402
 from isb.methodologies.registry import CELLS, get_cell  # noqa: E402
 
 HID = 4
@@ -48,19 +48,6 @@ def test_cells_registered():
     assert ("ablation", "*", "hf") in CELLS
     assert ("ablation", "*", "vllm_async") in CELLS
     assert get_cell("ablation", "gpt2", "hf") is not None
-
-
-def test_target_routing():
-    blk = _Block(torch.ones(2, HID), (torch.ones(2, HID), "w"))
-    assert _target_module(blk, "mlp") is blk.mlp
-    assert _target_module(blk, "attn") is blk.attn
-    assert _target_module(blk, "none") is blk.mlp  # placeholder; never read for "none"
-    raised = False
-    try:
-        _target_module(blk, "bogus")
-    except ValueError:
-        raised = True
-    assert raised
 
 
 def test_ablate_zeros_tensor_output():

@@ -4,7 +4,7 @@ backends and cells.
 Pins: the regimes derive from a workload's own regimes (and are reported when a workload cannot
 take one); they round-trip through the job contract without changing other regimes' identity;
 offline issues chunks back to back and concurrent keeps `concurrency` requests in flight, or one
-at a time through a lock on a backend that cannot take concurrent requests; the executor records
+at a time, first come first served, on a backend that cannot take concurrent requests; the executor records
 the pattern's timing and the first `score_units` outputs, and scoring compares an offline cell
 with the reference's per-unit outputs."""
 import sys
@@ -37,10 +37,10 @@ def test_loads_derive_from_the_workloads_own_regimes():
     assert names == ["interactive", "batched", "offline/b8", "offline/all",
                      "concurrent/c1", "concurrent/c4"]
     offline = spec.regimes[2]
-    assert len(offline.prompts) == 24 and offline.batch_size == 8 and not offline.aggregate
+    assert len(offline.units) == 24 and offline.batch_size == 8 and not offline.aggregate
     assert offline.data_name == "counterfact" and offline.passes == 3
     concurrent = spec.regimes[5]
-    assert len(concurrent.prompts) == 12 and concurrent.concurrency == 4 and concurrent.passes == 1
+    assert len(concurrent.units) == 12 and concurrent.concurrency == 4 and concurrent.passes == 3
     assert not skipped
 
 
@@ -54,26 +54,26 @@ def test_a_load_the_workload_does_not_declare_derives_nothing():
                for row in skipped if row["label"].endswith(" load]"))
 
 
-def test_single_unit_cells_sweep_offline_at_b1_and_serve_from_their_single_unit_regime():
+def test_generation_cells_sweep_offline_at_every_batch_size_and_serve_from_their_regime():
     spec, skipped = instantiate(WORKLOADS["gen_steering"], "gpt2", size=4,
                                 loads=(Offline(16, (1, 8)), Concurrent(8, (2,)), Open(8, (2.5,))))
-    assert [r.name for r in spec.regimes] == ["generation", "offline/b1", "concurrent/c2", "open/r2.5"]
+    assert [r.name for r in spec.regimes] == ["generation", "offline/b1", "offline/b8",
+                                              "concurrent/c2", "open/r2.5"]
     assert all(r.new_tokens == spec.regimes[0].new_tokens > 0 for r in spec.regimes)
-    assert len(spec.regimes[1].prompts) == 16 and len(spec.regimes[3].prompts) == 8
-    assert skipped == [{"label": "[offline load]",
-                        "reason": "this workload's cells take one unit per call, so offline runs "
-                                  "at B=1 only"}]
+    assert len(spec.regimes[1].units) == len(spec.regimes[2].units) == 16
+    assert spec.regimes[2].batch_size == 8 and len(spec.regimes[4].units) == 8
+    assert skipped == []
 
 
 def test_a_whole_list_cell_that_declares_offline_sweeps_one_unit_per_call():
-    # Jacobian collection's one regime hands every prompt to one call; declaring offline says the
-    # per-prompt work is independent, so the sweep issues one prompt per call and nothing larger
+    # Jacobian collection's one regime reduces every prompt it is handed to one mean, so a chunk of
+    # B prompts has no per-unit outputs: offline runs one prompt per call and reports the B it drops
     spec, skipped = instantiate(WORKLOADS["jacobian_collect"], "gpt2", size=4,
-                                loads=(Offline(8, (1, 4)),))
+                                loads=(Offline(8, (1, 4, None)),))
     assert [r.name for r in spec.regimes] == ["interactive", "offline/b1"]
-    assert len(spec.regimes[1].prompts) == 8 and not spec.regimes[0].aggregate
-    assert [row["reason"] for row in skipped] == \
-        ["this workload's cells take one unit per call, so offline runs at B=1 only"]
+    assert len(spec.regimes[1].units) == 8 and not spec.regimes[0].aggregate
+    assert [row["label"] for row in skipped] == ["[offline load]"]
+    assert "offline runs at B=1 only" in skipped[0]["reason"]
     # DAS has the same whole-list regime but declares nothing: a fit's steps depend on each other
     spec, skipped = instantiate(WORKLOADS["das"], "gpt2", loads=(Offline(8, (1,)),))
     assert [r.name for r in spec.regimes] == ["interactive"]
@@ -87,11 +87,11 @@ def test_regimes_filter_keeps_only_the_load_patterns():
 
 
 def test_a_workload_left_with_no_regime_is_skipped_with_the_load_reason():
-    specs, skipped = cases([Entry(("steering", "gen_steering"), ("gpt2",), size=4,
+    specs, skipped = cases([Entry(("steering", "das"), ("gpt2",), size=4,
                                          regimes=("offline",), loads=(Offline(16, (4,)),))])
     assert [s.name for s in specs] == ["steering/gpt2"]
     [whole] = [row for row in skipped if row["label"] == "*"]
-    assert whole["case"] == "gen_steering/gpt2" and "offline runs at B=1 only" in whole["reason"]
+    assert whole["case"] == "das/gpt2" and "its load patterns: none" in whole["reason"]
 
 
 def test_regime_names_and_validation():
@@ -207,8 +207,26 @@ def test_serial_backend_takes_one_request_at_a_time_and_queues_the_rest():
     result, _ = run_concurrent(probe.call, list(range(8)), concurrency=4, passes=1, keep=1,
                                serial=True)
     assert probe.peak == 1 and result.serial
-    # Queueing for the lock counts toward latency: the slowest request waited for the others.
+    # Queueing for the gate counts toward latency: the slowest request waited for the others.
     assert result.percentile(99) > 2 * result.percentile(0)
+
+
+def test_serial_backend_queues_clients_first_come_first_served():
+    """A serial server serves its queue in arrival order, so two closed-loop clients alternate and
+    every request after the first waits one service time. A plain lock lets the client that just
+    finished barge ahead of the one waiting, so one client runs most of the pass and the other's
+    single request carries the whole wait."""
+    order = []
+
+    def prepare(unit):
+        def invoke():
+            order.append(threading.current_thread().name)
+            time.sleep(0.005)
+            return torch.zeros(1, 1)
+        return invoke
+    run_concurrent(prepare, list(range(8)), concurrency=2, passes=1, keep=0, serial=True)
+    timed = order[2:]                                   # after the two-request warm-up
+    assert len(timed) == 8 and all(a != b for a, b in zip(timed, timed[1:]))
 
 
 def test_concurrent_pass_time_excludes_call_preparation():
@@ -287,7 +305,7 @@ class _Backend:
     name = "hf"
 
     def __init__(self, concurrent=False):
-        self.many, self.plain, self.sessions, self.calls = [], [], 0, []
+        self.plain_units, self.sessions, self.calls = [], 0, []
         self.in_flight = _InFlight()
         if concurrent:
             self.concurrent_requests = True
@@ -301,11 +319,8 @@ class _Backend:
     def last(self, t):
         return t
 
-    def vanilla(self, model, prompt, *, new_tokens):
-        self.plain.append(prompt)
-
-    def vanilla_many(self, model, prompts, *, new_tokens):
-        self.many.append(list(prompts))
+    def plain(self, model, units, *, new_tokens=1):
+        self.plain_units.append(list(units))
 
     def concurrent_session(self):
         import contextlib
@@ -321,10 +336,11 @@ class _Backend:
 
 def _cells(wrong_on=None, rows=1):
     def fake(methodology, family, backend):
-        def fn(impl, model, prompts, **params):
-            impl.calls.append(list(prompts))
+        def fn(impl, model, units, **params):
+            impl.calls.append(list(units))
             impl.in_flight.call(0)()
-            outs = [_onehot(7) if p == wrong_on else _onehot(int(p[1])) for p in prompts]
+            names = [u[0] if isinstance(u, tuple) else u for u in units]   # a pair's clean prompt
+            outs = [_onehot(7) if n == wrong_on else _onehot(int(n[1])) for n in names]
             return torch.cat([o for o in outs for _ in range(rows)], dim=0)
         return fn
     return fake
@@ -372,7 +388,7 @@ def test_executor_records_load_patterns(tmp_path):
     assert out[("offline_perprompt", "t")].shape == (3, 8)
     # The plain system runs under the same pattern.
     assert meta[("__vanilla__", "offline/b4")]["error"] is None
-    assert backend.many[:2] == [["p0", "p1", "p2", "p3"], ["p4", "p5"]]
+    assert backend.plain_units[:2] == [["p0", "p1", "p2", "p3"], ["p4", "p5"]]
     assert meta[("__baseline__", "concurrent/c3")]["load"]["units"] == 6
     assert offline["overhead_vs_vanilla"] is not None
     loads = [r["load"] for r in prov["coordinates"]["regimes"]]
@@ -403,10 +419,10 @@ def test_executor_runs_single_unit_offline_and_the_open_loop(tmp_path):
     _execute(tmp_path, "cand", "vllm", backend, spec=_serving_spec())
     out, _ = load_run(str(tmp_path), "cand")
     meta = out[("__meta__",)]
-    # Offline at B=1 hands a single-unit cell each unit's prompt list, a pair as [clean, corrupted].
-    assert ["p0", "q0"] in backend.calls and [("p0", "q0")] not in backend.calls
+    # Offline at B=1 hands the cell a one-pair unit list, never the pair spread as two prompts.
+    assert [("p0", "q0")] in backend.calls and ["p0", "q0"] not in backend.calls
     assert meta[("offline/b1", "t")]["load"]["calls_per_pass"] == 4
-    assert out[("offline/b1", "t")].shape == (4, 8)     # two units, two rows each
+    assert out[("offline/b1", "t")].shape == (2, 8)     # two scored units, one row each
     opened = meta[("open/r1000", "t")]
     assert opened["error"] is None and opened["load"]["offered_rate"] == 1000.0
     assert out[("open/r1000", "t")].shape == (3, 8)

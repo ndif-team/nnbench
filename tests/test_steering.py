@@ -179,8 +179,8 @@ def test_fused_scale_uses_the_whole_stream():
             _steer(blocks, layer=0, token_id=1, alpha=3.0,
                             mode="replace", residual="fused")
         else:
-            _steer_step(blocks, layer=0, direction=head_direction(None, _Head(), 1), alpha=3.0,
-                        residual="fused")
+            _steer_step(blocks, None, layer=0, direction=head_direction(None, _Head(), 1),
+                        alpha=3.0, residual="fused")
         added = blocks[0].output[0] - sub_block
         assert torch.allclose(added, (3.0 * stream_norm) * direction.expand(2, HID)), steer
         assert blocks[0].output[1] is residual, steer

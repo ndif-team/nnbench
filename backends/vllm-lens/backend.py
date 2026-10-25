@@ -1,12 +1,13 @@
-"""The vLLM-Lens backend: UK AISI's vLLM plugin as a system under comparison (design.md §12.14).
+"""The vLLM-Lens backend: UK AISI's vLLM plugin as a system under comparison.
 
-The shared worker drives the cells in cells.py through this backend object. vLLM-Lens registers
+The shared worker drives the cells in cells.py through this backend object; `mode: opt` in the
+engine options selects the fastest documented realization (cells_opt.py). vLLM-Lens registers
 through vLLM's general_plugins entry point and forces enforce_eager on every engine.
 """
 from dataclasses import dataclass, field
 from importlib import metadata
 
-from isb.backends.base import Backend
+from isb.backends.base import Backend, prompts_of
 from isb.jobs.worker import merge_requirements, options
 from isb.runs import EngineConfig, RunConfig
 
@@ -35,19 +36,31 @@ class VLLMLensBackend(Backend):
         config = AutoConfig.from_pretrained(repo)
         return LensModel(llm, llm.get_tokenizer(), config, config.num_hidden_layers)
 
-    def vanilla(self, model, prompt, *, new_tokens):
+    def plain(self, model, units, *, new_tokens=1):
         """A plain generate on the plugin's engine: no extra_args, so no capture, steering or hook."""
         from vllm import SamplingParams
 
-        model.llm.generate([prompt], SamplingParams(max_tokens=new_tokens, temperature=0.0, top_p=1.0),
+        model.llm.generate(prompts_of(units),
+                           SamplingParams(max_tokens=new_tokens, min_tokens=new_tokens,
+                                          temperature=0.0, top_p=1.0),
                            use_tqdm=False)
 
     def teardown(self, model) -> None:
         model.llm.llm_engine.engine_core.shutdown()
 
 
-def create_backend(spec, cls=None, mode="vllm-lens"):
+class VLLMLensOptBackend(VLLMLensBackend):
+    name = "vllm_lens_opt"
+
+
+def create_backend(spec):
     params = merge_requirements(spec.vllm_kwargs, options())
-    run = RunConfig(EngineConfig("vllm", mode=mode, params={
+    mode = params.pop("mode", "default")
+    if mode not in ("default", "opt"):
+        raise ValueError(f"mode must be default or opt, not {mode!r}")
+    if mode == "opt":
+        from . import cells_opt  # noqa: F401  (registers the vllm_lens_opt cells)
+    cls = VLLMLensOptBackend if mode == "opt" else VLLMLensBackend
+    run = RunConfig(EngineConfig("vllm", mode="vllm-lens-opt" if mode == "opt" else "vllm-lens", params={
         **params, "enforce_eager": True, "vllm_lens": metadata.version("vllm-lens")}))
-    return (cls or VLLMLensBackend)(**params), run
+    return cls(**params), run

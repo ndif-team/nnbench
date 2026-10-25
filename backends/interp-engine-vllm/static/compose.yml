@@ -1,9 +1,0 @@
-services:
-  runner:
-    extends: {file: ../compose.base.yml, service: runner}
-    environment:
-      ISB_BACKEND: ${ISB_BACKEND:-interp-engine-vllm/static}
-      ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","gpu_memory_utilization":0.85,"extra_vllm_kwargs":{"enable_prefix_caching":false},"backend":"vllm-static","concurrent_captures":true}'
-volumes:
-  model-cache:
-    name: ${ISB_MODEL_CACHE:-isb-model-cache}

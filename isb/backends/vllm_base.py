@@ -1,4 +1,4 @@
-"""Shared engine-config base for the vLLM backends (design.md §12.3).
+"""Shared engine-config base for the vLLM backends.
 
 The three vLLM backends — in-process async, in-process sync, and over-HTTP serve — differ only in
 HOW they run a trace (event loop / in-frame / wire). They share the same vLLM *engine config*: the

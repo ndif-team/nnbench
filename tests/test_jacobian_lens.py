@@ -59,7 +59,7 @@ class _FakeBE:
     name = "hf"
 
     def run(self, model, prompts, build):
-        return build()
+        return build(list(range(len(prompts))))
 
     def last(self, t):
         return t[:, -1, :]
@@ -111,7 +111,7 @@ def test_hub_transport_spec_parses_and_rejects_malformed():
 def test_spec_workload_is_the_upstream_multihop_dataset():
     spec = case("jacobian_lens/gpt2")
     assert spec.name in {s.name for s in suite_cases("smoke")}   # gpt2-scale -> in the smoke suite
-    prompts = spec.regimes[0].prompts
+    prompts = spec.regimes[0].units
     assert len(prompts) == 93                                    # the shipped multihop item count
     assert any("Carnival" in p for p in prompts)                 # really the upstream data
     labels = [task.label for task in spec.tasks]

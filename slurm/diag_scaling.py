@@ -13,8 +13,6 @@ CounterFact prompts, one output token. For each N in (1, 4, 16, 64):
 vLLM has one invoke per prompt (its sync tracer takes one prompt per invoke). HF is run both ways:
 `batch` (one invoke over N prompts, the padded batch the benchmark's HF cells use) and `invokes`
 (N invokes of one prompt, which nnsight concatenates into one batch). Median of 10 after 3 warm-up.
-With NNSIGHT_ENVOY_BYREF=1 and backends/nnsight-vllm/envoy_byref on PYTHONPATH the vLLM side runs
-the envoy-by-reference prototype.
 """
 import json
 import os
@@ -141,8 +139,7 @@ def hf_cases(result):
 
 def main(engine, out_path):
     result = []
-    meta = {"engine": engine, "repo": REPO,
-            "byref": os.environ.get("NNSIGHT_ENVOY_BYREF") == "1"}
+    meta = {"engine": engine, "repo": REPO}
     (vllm_cases if engine == "vllm" else hf_cases)(result)
     with open(out_path, "w") as f:
         json.dump({"meta": meta, "rows": result}, f, indent=1)

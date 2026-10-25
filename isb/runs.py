@@ -1,21 +1,18 @@
-"""Run configuration + provenance (design.md §12.10): a run is a fully described execution.
+"""Run configuration + provenance: a run is a fully described execution.
 
-A benchmark result's identity is not a backend name. It is the composition of four layers,
-each DECLARED in the config and/or RECORDED (resolved empirically at run start):
+A result's identity is the composition of four layers, each declared in the config and/or
+recorded at run start:
 
-  engine      WHAT executes the model: transformers | vllm, its drive mode, its params
-              (dtype, tp/pp, max_model_len, prefix caching, ... — the design §6 config axes)
-  deployment  WHERE that engine runs: local | serve | ndif — a hosting layer with its OWN code
-              identity (host, the deployment's commit, its env). NDIF is a deployment, not an
-              engine: transformers or vllm runs INSIDE it.
+  engine      what executes the model: transformers | vllm, its drive mode, its params
+              (dtype, tp/pp, max_model_len, prefix caching, ...)
+  deployment  where that engine runs: local | serve | ndif, a hosting layer with its own code
+              identity (host, the deployment's commit, its env); NDIF is a deployment, not an
+              engine: transformers or vllm runs inside it
   client      the interpreter driving the run (conda env -> library versions -> nnsight checkout)
   host        the hardware and system it ran on (GPU model/count/VRAM, driver, CUDA, CPU, RAM)
 
-Nothing here provisions, mutates envs, or refuses to run: declared values are recorded verbatim
-next to what actually resolved, so drift is visible in the record. Everything resolved lands in
-the run's provenance file, written next to its outputs, so a comparison can NAME what was
-compared (the missing piece that turned a branch skew into a two-day hunt: two
-"identical" HF runs on different nnsight commits were indistinguishable in every report).
+Declared values are recorded verbatim next to what resolved, so drift is visible in the record;
+everything resolved lands in the run's provenance file next to its outputs.
 """
 from __future__ import annotations
 
@@ -88,7 +85,7 @@ def make_backend(run: RunConfig, spec):
 
     if d.kind == "ndif":
         raise NotImplementedError(
-            "ndif deployment: config slot reserved (design §3.8); executor lands with the "
+            "ndif deployment: config slot reserved; executor lands with the "
             "NDIF-plane scope decision")
     if e.kind == "transformers":
         if d.kind != "local":
@@ -326,7 +323,7 @@ def run_coordinates(*, spec: str, methodology: str, family: str, repo: str, inte
     regimes = [{"kind": r["kind"], "units": r["units"], "data": r.get("data"),
                 "new_tokens": r.get("new_tokens", 0), "aggregate": r.get("aggregate", True),
                 "data_knobs": dict(r.get("data_knobs") or {}),
-                # a load pattern's settings (design.md §12.17); other regimes carry none
+                # a load pattern's settings; other regimes carry none
                 **({"load": _load_settings(r)} if r["kind"] in LOAD_KINDS else {})}
                for r in regimes]
     coordinates = deepcopy({
@@ -352,12 +349,12 @@ def spec_coordinates(spec, interface: str, *, inputs_sha256=None, config=None) -
 
     if inputs_sha256 is None:
         inputs = b"".join(canonical({"workload": index, "unit": pack(unit)}) + b"\n"
-                          for index, regime in enumerate(spec.regimes) for unit in regime.prompts)
+                          for index, regime in enumerate(spec.regimes) for unit in regime.units)
         inputs_sha256 = digest(inputs)
     return run_coordinates(
         spec=spec.name, methodology=spec.methodology, family=spec.family, repo=spec.repo,
         interface=interface,
-        regimes=[{"kind": r.kind, "units": len(r.prompts), "data": r.data_name,
+        regimes=[{"kind": r.kind, "units": len(r.units), "data": r.data_name,
                   "new_tokens": r.new_tokens, "aggregate": r.aggregate, "data_knobs": r.data_knobs,
                   **({"load": {k: getattr(r, k) for k in LOAD_FIELDS[r.kind]}} if r.kind in LOAD_KINDS
                      else {})}

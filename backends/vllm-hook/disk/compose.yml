@@ -1,9 +1,0 @@
-services:
-  runner:
-    extends: {file: ../compose.base.yml, service: runner}
-    environment:
-      ISB_BACKEND: ${ISB_BACKEND:-vllm-hook/disk}
-      ISB_ENGINE_OPTIONS: '{"dtype":"bfloat16","gpu_memory_utilization":0.85,"enable_prefix_caching":false,"storage":"disk-st-async"}'
-volumes:
-  model-cache:
-    name: ${ISB_MODEL_CACHE:-isb-model-cache}

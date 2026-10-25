@@ -4,8 +4,9 @@
 per chunk, chunks back to back. `run_concurrent` is the closed-loop serving pattern (`vllm bench
 serve --max-concurrency`, AIPerf's concurrency sweep): `concurrency` clients each issue one unit
 per call and the next as soon as theirs returns, until the units run out. A backend that cannot
-take concurrent requests is driven through one lock, the way a serial server queues them; the time
-a request waits for the lock counts toward its latency, as a client would see it. `run_open` is the
+take concurrent requests is driven through one first-come, first-served gate, the way a serial
+server queues them; the time a request waits for its turn counts toward its latency, as a client
+would see it. `run_open` is the
 open-loop pattern (MLPerf Server, `vllm bench serve --request-rate`): each unit arrives at a fixed
 time of a seeded Poisson process and is issued then on its own thread, whatever the system is doing,
 so above capacity the requests queue and their latency grows.
@@ -29,12 +30,41 @@ from typing import Any, Callable
 from .timing import force_gc, peak_mem_mb, reset_peak_mem, sync_cuda
 
 
+class _FifoGate:
+    """A serial server's queue: callers are served first come, first served, so a request's wait is
+    the service of those ahead of it. `threading.Lock` lets the thread that just released take the
+    lock again ahead of a thread already waiting, which hands one client most of a pass. A release
+    wakes only the caller holding the next ticket."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._next = 0
+        self._serving = 0
+        self._waiters: dict[int, threading.Event] = {}
+
+    def __enter__(self):
+        with self._lock:
+            ticket = self._next
+            self._next += 1
+            if ticket == self._serving:
+                return
+            turn = self._waiters[ticket] = threading.Event()
+        turn.wait()
+
+    def __exit__(self, *exc):
+        with self._lock:
+            self._serving += 1
+            turn = self._waiters.pop(self._serving, None)
+            if turn is not None:
+                turn.set()
+
+
 @dataclass
 class LoadResult:
     units: int                       # units per pass
     calls: int                       # calls per pass
     concurrency: int                 # clients (1 offline, 0 open loop)
-    serial: bool                     # requests were serialized through one lock
+    serial: bool                     # requests were queued through one first-come, first-served gate
     pass_ms: list = field(default_factory=list)
     request_ms: list = field(default_factory=list)
     peak_mem_mb: float = 0.0
@@ -110,7 +140,7 @@ def run_concurrent(prepare: Callable[[Any], Callable[[], Any]], units: list, *, 
     if passes < 1 or concurrency < 1 or not units:
         raise ValueError("concurrent needs passes>=1, concurrency>=1 and at least one unit")
     result = LoadResult(units=len(units), calls=len(units), concurrency=concurrency, serial=serial)
-    gate = threading.Lock() if serial else None
+    gate = _FifoGate() if serial else None
     outputs = {}
 
     def sweep(indices, timed):
@@ -186,7 +216,7 @@ def run_open(prepare: Callable[[Any], Callable[[], Any]], units: list, *, rate: 
         raise ValueError("open loop needs passes>=1, rate>0 and at least one unit")
     result = LoadResult(units=len(units), calls=len(units), concurrency=0, serial=serial,
                         offered_rate=rate, max_in_flight=0)
-    gate = threading.Lock() if serial else None
+    gate = _FifoGate() if serial else None
     offsets = arrival_offsets(len(units), rate)
 
     def sweep():

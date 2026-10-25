@@ -1,26 +1,10 @@
-"""Activation patching (causal tracing) — fixed per-cell methodology (design.md §12; registry
-entry "activation patching / causal tracing").
-
-Cross-prompt write methodology: capture a layer's residual from a CLEAN run, inject it into a
-CORRUPTED run at the same layer, observe the corrupted run's next-token distribution. We use the
-**two-trace** formulation (capture in trace 1, inject in trace 2 via `be.patch`). This is the
-DOCUMENTED vLLM recipe, not an invention: the canonical single-trace form uses `tracer.barrier(2)`
-to hand the clean value from invoke 1 to invoke 2, but on vLLM the barrier is not shared across
-invokes (cross-invoke dependencies are unsupported — see nnsight VLLM_GUIDE "Activation Patching"
-and docs/developing/barrier-vllm-not-shared.md). Multi-invoke itself IS supported for *independent*
-prompts; it's the cross-invoke value hand-off that isn't. Two separate single-prompt traces
-guarantee ordering and need no barrier, so the methodology is the same shape on both backends.
-
-`clean` and `corrupted` are a length-matched minimal pair (differ at one token), so (a) the residual
-shapes align for replacement and (b) the patch actually changes the corrupted output — without that
-effect the SUPPORTED verdict would be vacuous (cf. the steering effect-size guard).
-
-The patch uses whole-tuple **replacement** (in-place writes raised on vLLM before nnsight 0.8;
-replacement works). Variances (params): `layer` (which block's residual to transplant),
-`residual` ("plain" | "fused" — same fused-residual reconstruction as logit-lens, where vLLM
-fused-residual blocks return (hidden, residual) whose sum is the true stream, so this ports
-to vLLM-Llama too).
-"""
+"""Activation patching (causal tracing): capture a layer's residual stream from the clean prompts,
+replace the corrupted prompts' stream at that layer with it, read the corrupted run's next-token
+logits. Two traces (`be.patch`): the documented vLLM form, where invokes share no values. A unit is
+a length-matched (clean, corrupted) pair, so the streams align position by position; `positions`
+patches every position or the last one. `residual` selects the stream on vLLM's fused-residual
+families, where the layer returns (hidden, residual) and the clean stream is written back as
+(clean - residual, residual)."""
 from __future__ import annotations
 
 import torch
@@ -32,78 +16,72 @@ from .registry import cell
 
 
 def _capture(blocks, layer, residual):
-    """Trace-1 build: snapshot the clean residual stream at `layer`. Returns a proxy (be saves it)."""
+    """The clean residual stream at `layer`, an independent snapshot. Runs inside trace 1."""
     with torch.no_grad():
-        return _resid(blocks[layer].output, residual).clone()  # clone -> an independent snapshot
+        return _resid(blocks[layer].output, residual).clone()
 
 
 def _read_final(model, head, site):
-    """The corrupted run's natural next-token logits — the un-patched baseline (no transplant)."""
+    """The corrupted run's own next-token logits (the unpatched baseline)."""
     with torch.no_grad():
         return final_logits(model, head, site)
 
 
 def _patch_and_read(blocks, model, head, *, layer, clean_act, residual, site, positions="all"):
-    """Trace-2 build: replace `layer`'s residual with the clean snapshot, read the next-token logits
-    at `site` (`readout.final_logits`).
-    `positions="last"` keeps the corrupt run's stream and takes only the last row from the clean one."""
+    """Replace `layer`'s stream with the clean snapshot and read the next-token logits. Runs inside
+    trace 2."""
     with torch.no_grad():
         out = blocks[layer].output
         is_tuple = isinstance(out, tuple)
         hidden = out[0] if is_tuple else out
-        clean = clean_act.to(device=hidden.device, dtype=hidden.dtype)  # runtime device/dtype
+        clean = clean_act.to(device=hidden.device, dtype=hidden.dtype)
         if tuple(clean.shape) != tuple(hidden.shape):
             raise ValueError(
-                f"patch shape {tuple(clean.shape)} != target {tuple(hidden.shape)} — clean/corrupted "
-                f"token lengths must match for position-aligned patching"
-            )
+                f"patch shape {tuple(clean.shape)} != target {tuple(hidden.shape)}; clean/corrupted "
+                f"token lengths must match for position-aligned patching")
         if positions == "last":
-            stream = _resid(out, residual)                      # the corrupt run's own stream here
+            stream = _resid(out, residual)
             clean = torch.cat([stream[..., :-1, :], clean[..., -1:, :]], dim=-2)
         elif positions != "all":
             raise ValueError(f"unknown patch positions {positions!r} (expected 'all' or 'last')")
         if residual == "fused":
-            # vLLM fused-residual layers return (hidden, residual) and the stream is their sum;
-            # the clean snapshot is a whole stream, so write it as (clean - residual, residual).
             if not (is_tuple and len(out) >= 2):
                 raise ValueError("fused patch needs a (hidden, residual) layer output")
             blocks[layer].output = (clean - out[1], *out[1:])
         else:
-            blocks[layer].output = (clean, *out[1:]) if is_tuple else clean  # whole-tuple replace (vLLM-safe)
-
+            blocks[layer].output = (clean, *out[1:]) if is_tuple else clean
         return final_logits(model, head, site)
 
 
-def _patch_cell(be, model, m, prompts, *, layer, residual, patch, site, positions="all"):
-    clean, corrupted = prompts
+def _patch_cell(be, model, m, units, *, layer, residual, patch, site, positions="all"):
+    clean = [unit[0] for unit in units]
+    corrupted = [unit[1] for unit in units]
     h, head = m.blocks(model), m.head(model)
-    if not patch:                                        # baseline: corrupted run, no transplant
-        def build():  # named so nnsight can source-serialize it to the vLLM worker
+    if not patch:                                        # baseline: the corrupted runs, no transplant
+        def build(rows):
             return _read_final(model, head, site)
-        return be.run(model, [corrupted], build)
 
-    def capture():  # named (not a lambda) so nnsight can source-serialize to the vLLM worker
+        return be.run(model, corrupted, build)
+
+    def capture():
         return _capture(h, layer, residual)
 
     def patch_fn(clean_act):
-        return _patch_and_read(
-            h, model, head, layer=layer, clean_act=clean_act, residual=residual, site=site,
-            positions=positions)
+        return _patch_and_read(h, model, head, layer=layer, clean_act=clean_act, residual=residual,
+                               site=site, positions=positions)
 
     return be.patch(model, clean, corrupted, capture=capture, patch=patch_fn)
 
 
 @cell("activation_patching", family="*", backend="hf")
-def patch_hf(be, model, m, prompts, *, layer=6, residual="plain", patch=True, positions="all"):
-    return _patch_cell(be, model, m, prompts, layer=layer, residual=residual, patch=patch,
+def patch_hf(be, model, m, units, *, layer=6, residual="plain", patch=True, positions="all"):
+    return _patch_cell(be, model, m, units, layer=layer, residual=residual, patch=patch,
                        site="head", positions=positions)
 
 
 @cell("activation_patching", family="*", backend="vllm_async", realizations=[{"residual": "plain"}])
-def patch_vllm(be, model, m, prompts, *, layer=6, residual=None, patch=True, positions="all"):
-    # Default to the family's vLLM denotation: fused-residual families (Llama/Qwen) read and write
-    # the hidden+residual sum. The declared alternative reads the plain stream (the naive port).
+def patch_vllm(be, model, m, units, *, layer=6, residual=None, patch=True, positions="all"):
     residual = residual if residual is not None else m.default_residual(be.name)
     record_resolved(residual=residual)
-    return _patch_cell(be, model, m, prompts, layer=layer, residual=residual, patch=patch,
+    return _patch_cell(be, model, m, units, layer=layer, residual=residual, patch=patch,
                        site="engine", positions=positions)

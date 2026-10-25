@@ -1,10 +1,9 @@
-"""Local Docker Compose job lifecycle. Backend names are config paths under backends/
-(`<system>/<config>`, isb/jobs/layout.py), never engine keys."""
+"""Local Docker Compose job lifecycle. Backend names are catalog entries, `<system>/<config>`
+(isb/jobs/layout.py), never engine keys."""
 from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import time
 import uuid
@@ -12,7 +11,7 @@ from pathlib import Path
 
 from . import apptainer
 from .contract import digest, file_digest, validate_result, write_json
-from .layout import ROOT, canonical, config_dir, discover  # noqa: F401  (re-exported for the CLI)
+from .layout import ROOT, canonical, config, discover, system_dir  # noqa: F401  (re-exported for the CLI)
 
 LAUNCHERS = ("docker", "apptainer")
 
@@ -25,33 +24,33 @@ def default_launcher():
     return launcher
 
 
-def backend_file(name, root=ROOT):
-    """compose.yml of one config; `name` must be the full `<system>/<config>` name."""
-    if name not in discover(root):
-        raise ValueError(f"unknown backend {name!r}; available: {', '.join(discover(root))}")
-    path = config_dir(name, root) / "compose.yml"
-    if path.resolve().parent != config_dir(name, root).resolve():
-        raise ValueError("backend configuration must be inside its directory")
-    return path
-
-
-def project_name(prefix, name):
-    """A Compose project name for one config (lowercase letters, digits, '-' and '_' only)."""
-    return prefix + re.sub(r"[^a-z0-9_-]", "-", name)
+def compose_file(name, root=ROOT):
+    """compose.yml of the backend's system."""
+    return system_dir(canonical(name, root), root) / "compose.yml"
 
 
 def compose(name, project, root=ROOT):
-    return ["docker", "compose", "--project-name", project, "--file", str(backend_file(name, root))]
+    return ["docker", "compose", "--project-name", project, "--file", str(compose_file(name, root))]
 
 
-def environment(name, job, output, gpu):
-    """The job's Compose environment. `ISB_GPU` is the selected GPU; when it is an index,
-    `ISB_GPU_1` ... `ISB_GPU_7` are the indices after it, for a config whose `device_ids`
-    declares several GPUs (backends/README.md)."""
-    following = ({f"ISB_GPU_{k}": str(int(gpu) + k) for k in range(1, 8)}
-                 if str(gpu).isdigit() else {})
-    return {**os.environ, "ISB_BACKEND": name, "ISB_JOB_DIR": str(job.resolve()),
-            "ISB_OUTPUT_DIR": str(output.resolve()), "ISB_GPU": str(gpu), **following,
+def gpu_list(gpu, count):
+    """The host GPUs a config reserves: `--gpu` and, for a config reserving several, the indices
+    after it."""
+    if count == 1:
+        return [str(gpu)]
+    if not str(gpu).isdigit():
+        raise ValueError(f"a config reserving {count} GPUs needs --gpu to be an index")
+    return [str(int(gpu) + k) for k in range(count)]
+
+
+def environment(name, job, output, gpu, root=ROOT):
+    """The job's Compose environment: the config's image, options, GPUs and ranks
+    (backends/README.md)."""
+    chosen = config(name, root)
+    return {**os.environ, "ISB_BACKEND": chosen.name, "ISB_IMAGE": chosen.tag,
+            "ISB_ENGINE_OPTIONS": json.dumps(chosen.options, separators=(",", ":")),
+            "ISB_GPUS": ",".join(gpu_list(gpu, chosen.gpus)), "ISB_RANKS": str(chosen.ranks),
+            "ISB_JOB_DIR": str(job.resolve()), "ISB_OUTPUT_DIR": str(output.resolve()),
             "ISB_UID": str(os.getuid()), "ISB_GID": str(os.getgid())}
 
 
@@ -112,15 +111,15 @@ def wait_for_release(gpu, baseline, *, tolerance_mib=1024, timeout=120, poll=1.0
 def run_job(name, job, experiment, output, *, gpu="0", timeout=1800, root=ROOT, launcher="docker"):
     """Always collect an execution record and clean only this job's Compose project (Docker) or
     process group (Apptainer)."""
-    # A nested config's job directory sits inside its parent config's (opt/taps in opt): the
-    # directory may exist, a previous job's record in it may not.
+    # A config's job directory may sit inside another's (0-8-1/opt in 0-8-1): the directory may
+    # exist, a previous job's record in it may not.
     output.mkdir(parents=True, exist_ok=True)
     if (output / "execution.json").exists():
         raise FileExistsError(f"{output} already holds a job")
     project = "isb-" + uuid.uuid4().hex[:20]
     container = project + "-runner"
     command = compose(name, project, root)
-    env = environment(name, job, output, gpu)
+    env = environment(name, job, output, gpu, root)
     record = {"backend": name, "experiment_id": experiment["id"], "project": project,
               "launcher": launcher, "status": "running", "source": source_identity(root)}
     write_json(output / "execution.json", record)
@@ -128,7 +127,7 @@ def run_job(name, job, experiment, output, *, gpu="0", timeout=1800, root=ROOT, 
     print(f"[run] {name} / {experiment['spec']['name']} → {output}", flush=True)
     try:
         if launcher == "apptainer":
-            argv, extra_env = apptainer.command(backend_file(name, root), root, env)
+            argv, extra_env = apptainer.command(compose_file(name, root), root, env)
             with (output / "execution.log").open("w") as log:
                 exit_code = apptainer.run(argv, extra_env, log, timeout)
         else:
@@ -155,7 +154,7 @@ def run_job(name, job, experiment, output, *, gpu="0", timeout=1800, root=ROOT, 
         try:
             if launcher == "apptainer":
                 # The process group is gone (run() waited or killed it); the image is the .sif.
-                service, _ = apptainer.load_service(backend_file(name, root), env)
+                service, _ = apptainer.load_service(compose_file(name, root), env)
                 record["image_id"] = apptainer.image_identity(apptainer.sif_path(root, service["image"]))
             else:
                 # Inspect the container's actual image, not a tag that may have moved mid-run.

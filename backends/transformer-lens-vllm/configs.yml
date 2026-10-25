@@ -1,0 +1,10 @@
+# TransformerLens 4.0 bridging vLLM 0.20.2 (the Dockerfile's ARG values). `mode: opt` selects the
+# GPU-readout realization (cells_opt.py).
+images:
+  default: {}
+configs:
+  default:
+    image: default
+    options: &base {dtype: bfloat16, gpu_memory_utilization: 0.85, enable_position_interventions: true}
+  fp32: {image: default, options: {<<: *base, dtype: float32}}
+  opt: {image: default, options: {<<: *base, mode: opt}}

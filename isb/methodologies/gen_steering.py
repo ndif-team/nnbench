@@ -1,56 +1,30 @@
-"""Generation-time steering — the WRITE × iteration composition (catalog roadmap item 1).
-
-Steering (activation addition) applied at EVERY decode step of a greedy multi-token generation,
-reading the per-step next-token logits. This is the serving-shaped workload: the intervention has
-to survive the engine's decode loop, not just one forward. It is also the first cell measuring a
-COMPOSITION of two separately-measured rows — replacement WRITE (in-place writes raised on vLLM
-before nnsight 0.8) inside the iteration construct (unbounded tracer.iter[:] drops all per-step
-saves on vLLM, bounded iter[0:N] works) — i.e. the "statuses compose upward" claim (design.md
-§3.6) at method tier.
-Its decode-step writes are an nnbench extension to CausaLab's current prefill-only protocol
-write contract; see `docs/causalab-portability-audit.md` §4.
-
-The realization axis here is the iteration BOUND (Level 1.5), not the write form (in-place vs
-replace is already measured by the steering methodology — this cell writes replacement-only):
-
-  - `bound="bounded"`   -> `tracer.iter[0:N]` — carries its own stop; the working idiom on vLLM.
-  - `bound="unbounded"` -> `tracer.iter[:]`   — the documented idiom; works on HF (stop bound
-    from max_new_tokens), drops ALL per-step saves on vLLM -> the frontier marker /
-    flip-detector for the upstream fix.
-
-Observable = per-step last-token logits, stacked `[new_tokens, vocab]`: HF reads
-`lm_head.output[:, -1, :]` per step; vLLM reads the engine site `model.logits` (measured equal to
-the portable unembed; Level-1 sites are portable on vLLM). Greedy on both backends, so per-step rows are comparable — a
-near-tie token flip mid-generation diverges every later step, which is exactly the regime
-sensitivity this workload exists to expose (the fp32 control separates precision from mechanism).
-
-`alpha=0` performs no write at all — the unsteered baseline, same trace shape.
-"""
+"""Generation-time steering: the steering write applied at every decode step of a greedy
+generation, reading each step's next-token logits (`[new_tokens, B, vocab]`). The write is a
+whole-tuple replacement; `bound` selects the iteration form, `tracer.iter[0:N]` (bounded) or
+`tracer.iter[:]` (unbounded). `alpha=0` writes nothing."""
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
 from ..profiles import _resid
 from .observations import record_resolved
 from .readout import checkpoint_direction, checkpoint_of, engine_logits, head_direction
 from .registry import cell
-from .steering import _resolve_token, _strength_scale
+from .steering import _attention_mask, _resolve_token, _strength_scale
 
 
-def _steer_step(blocks, *, layer, direction, alpha, residual="plain", scale_by="mean_norm"):
-    """One decode step's steering write: replacement-add `alpha` (relative to the residual's own
-    per-token norm) of `direction` (the target token's unit unembedding row, built before the
-    trace) into blocks[layer]'s output. Runs INSIDE the trace, once per iteration step.
-    Replacement-only (in-place writes raised on vLLM before nnsight 0.8)."""
-    with torch.no_grad():                       # aux compute on inference tensors needs no_grad
+def _steer_step(blocks, model, *, layer, direction, alpha, residual="plain", scale_by="mean_norm",
+                masked=False):
+    """One decode step's steering write into blocks[layer]'s output. Runs inside the trace, once
+    per step. `masked` reads the padded batch's attention mask for the per-unit mean norm (HF)."""
+    with torch.no_grad():
+        mask = _attention_mask(model) if masked else None         # before the model runs past it
         out = blocks[layer].output
         is_tuple = isinstance(out, tuple)
         hidden = out[0] if is_tuple else out
-        # self-calibrating: alpha is relative to the stream's norm, which on fused-residual vLLM
-        # layers is out[0] + out[1] (out[0] alone is the layer's sub-block output)
-        scale = _strength_scale(_resid(out, residual), scale_by)
-        vec = direction.to(device=hidden.device, dtype=hidden.dtype)   # moved onto the stream
+        stream = _resid(out, residual)
+        scale = _strength_scale(stream, scale_by, mask)
+        vec = direction.to(device=hidden.device, dtype=hidden.dtype)
         new_hidden = hidden + (alpha * scale) * vec
         blocks[layer].output = (new_hidden, *out[1:]) if is_tuple else new_hidden
 
@@ -60,42 +34,35 @@ def _check_bound(bound):
         raise ValueError(f"unknown iteration bound {bound!r} (expected 'bounded' or 'unbounded')")
 
 
-# alternative: the documented unbounded iter[:] (drops every per-step save on vLLM)
 @cell("gen_steering", family="*", backend="hf", realizations=[{"bound": "unbounded"}])
-def gen_steering_hf(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0,
+def gen_steering_hf(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0,
                     bound="bounded", new_tokens=8, scale_by="mean_norm"):
     _check_bound(bound)
     direction = (head_direction(model, m.head(model), _resolve_token(model.tokenizer, target))
-                 if alpha != 0 else None)               # alpha=0 writes nothing
+                 if alpha != 0 else None)
 
-    def step():
+    def step(index):
         if alpha != 0:
-            _steer_step(m.blocks(model),
-                        layer=layer, direction=direction, alpha=alpha, scale_by=scale_by)
-        return m.head(model).output[:, -1, :]            # this step's next-token logits [1, vocab]
+            _steer_step(m.blocks(model), model, layer=layer, direction=direction, alpha=alpha,
+                        scale_by=scale_by, masked=True)
+        return m.head(model).output[:, -1, :]            # this step's next-token logits [B, vocab]
 
-    return be.generate(model, prompts, step, new_tokens=new_tokens,
-                       bounded=(bound == "bounded"))
+    return be.generate(model, units, step, new_tokens=new_tokens, bounded=(bound == "bounded"))
 
 
 @cell("gen_steering", family="*", backend="vllm_async", realizations=[{"bound": "unbounded"}])
-def gen_steering_vllm(be, model, m, prompts, *, layer=8, target=" Rome", alpha=6.0,
+def gen_steering_vllm(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0,
                       bound="bounded", new_tokens=8, residual=None, scale_by="mean_norm"):
     _check_bound(bound)
     residual = residual if residual is not None else m.default_residual(be.name)
     record_resolved(residual=residual)
     direction = (checkpoint_direction(checkpoint_of(model), _resolve_token(model.tokenizer, target))
-                 if alpha != 0 else None)               # alpha=0 writes nothing
+                 if alpha != 0 else None)
 
-    def step():
+    def step(index):
         if alpha != 0:
-            _steer_step(m.blocks(model),
-                        layer=layer, direction=direction, alpha=alpha, residual=residual,
-                        scale_by=scale_by)
-        # the engine site (docs/models/vllm.md), whole under tensor parallelism; [-1:, :] keeps the
-        # step's LAST row so the prefill step (which may carry more than one logits row) matches
-        # HF's [:, -1, :] read
-        return engine_logits(model)[-1:, :]
+            _steer_step(m.blocks(model), model, layer=layer, direction=direction, alpha=alpha,
+                        residual=residual, scale_by=scale_by)
+        return engine_logits(model)[-1:, :]              # the step's last row, [1, vocab]
 
-    return be.generate(model, prompts, step, new_tokens=new_tokens,
-                       bounded=(bound == "bounded"))
+    return be.generate(model, units, step, new_tokens=new_tokens, bounded=(bound == "bounded"))

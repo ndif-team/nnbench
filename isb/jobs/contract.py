@@ -11,8 +11,8 @@ from isb.sweep.spec import ALL_LOAD_FIELDS, LOAD_FIELDS, regime_name
 
 VERSION = 2            # experiment/result files this code writes
 VERSIONS = (VERSION,)  # experiment/result files this code reads
-# A result cell carrying `row` and `alternative` is an alternative realization of that row (design.md
-# §12.16), an additive field: a result without such cells holds the default realizations only.
+# A result cell carrying `row` and `alternative` is an alternative realization of that row, an
+# additive field: a result without such cells holds the default realizations only.
 PLAN_VERSION = 1       # the launcher's plan.json / report.json
 
 
@@ -83,7 +83,7 @@ def prepare(spec, directory, *, seed=0):
         kinds.add(name)
         for key in set(ALL_LOAD_FIELDS) - set(LOAD_FIELDS.get(regime["kind"], ())):
             regime.pop(key, None)     # each regime records only its own pattern's settings
-        units = regime.pop("prompts")
+        units = regime.pop("units")
         if not units:
             raise ValueError("empty workload")
         regime["units"] = len(units)
@@ -159,7 +159,7 @@ def restore_spec(directory):
     for index, regime in enumerate(regimes):
         if regime.pop("units") != len(units[index]):
             raise ValueError("workload input count mismatch")
-    record["regimes"] = [ExecutionRegime(prompts=u, **w) for w, u in zip(regimes, units)]
+    record["regimes"] = [ExecutionRegime(units=u, **w) for w, u in zip(regimes, units)]
     record["tasks"] = [TaskSpec(**task) for task in record["tasks"]]
     if record["protocol"] is not None:
         record["protocol"] = InterventionSpec(**record["protocol"])

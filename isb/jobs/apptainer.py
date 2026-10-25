@@ -1,8 +1,8 @@
 """Apptainer launch path, for hosts without Docker (for example NCSA Delta).
 
-The backend config contract is unchanged: `compose.yml` and the `Dockerfile` it builds stay the
-single source. This module reads them. A build translates the Dockerfile's ARG/FROM/RUN lines into
-an Apptainer definition; a run maps the `runner` service's image, entrypoint, working directory,
+The system's `compose.yml` and `Dockerfile` stay the single source. A build translates the
+Dockerfile's ARG/FROM/RUN lines, with the image's build arguments from configs.yml, into an
+Apptainer definition; a run maps the `runner` service's image, entrypoint, working directory,
 environment and volumes onto `apptainer exec --nv`. The launch method is a runner setting, never a
 per-backend switch.
 
@@ -42,62 +42,27 @@ def base_dir(root):
     return Path(os.environ.get("ISB_APPTAINER_DIR") or Path(root) / ".apptainer")
 
 
-def _absolute_paths(service, directory):
-    """The service with its build context and relative bind sources resolved against `directory`."""
-    service = dict(service)
-    build = service.get("build")
-    if build is not None:
-        build = {"context": build} if isinstance(build, str) else dict(build)
-        if "context" in build:          # an extending service that sets only args keeps the base's
-            build["context"] = str((directory / build["context"]).resolve())
-        service["build"] = build
-    if service.get("volumes"):
-        service["volumes"] = [str((directory / v.split(":")[0]).resolve()) + v[len(v.split(":")[0]):]
-                              if v.startswith(".") else v for v in service["volumes"]]
-    return service
+def _absolute(volume, directory):
+    """A bind entry with a relative host source resolved against the compose file's directory."""
+    source, _, rest = volume.partition(":")
+    if source.startswith("."):
+        source = str((directory / source).resolve())
+    return f"{source}:{rest}"
 
 
-def _merge(base, override):
-    """Compose's `extends` merge: mappings merge key by key, volumes by container path, and any
-    other value of the extending service replaces the base's."""
-    merged = dict(base)
-    for key, value in override.items():
-        if key == "volumes":
-            by_target = {v.split(":")[1]: v for v in [*base.get("volumes", []), *value]}
-            merged[key] = list(by_target.values())
-        elif isinstance(value, dict) and isinstance(base.get(key), dict):
-            merged[key] = _merge(base[key], value)
-        else:
-            merged[key] = value
-    return merged
-
-
-def _services(compose_file, env):
-    """The interpolated services of one compose file with `extends` resolved. Paths become absolute
-    against the file that wrote them, as Compose resolves them."""
+def load_service(compose_file, env):
+    """The interpolated `runner` service and the named volumes of one compose.yml."""
     import yaml
 
     compose_file = Path(compose_file)
     config = interpolate(yaml.safe_load(compose_file.read_text()), env)
-    services = {}
-    for name, service in (config.get("services") or {}).items():
-        service = _absolute_paths(service, compose_file.parent)
-        extends = service.pop("extends", None)
-        if extends is not None:
-            source = compose_file.parent / extends.get("file", compose_file.name)
-            service = _merge(_services(source, env)[0][extends["service"]], service)
-        services[name] = service
-    return services, config
-
-
-def load_service(compose_file, env):
-    """The interpolated `runner` service and the top-level named volumes of one compose.yml. An
-    `extends` base contributes its service only; named volumes are the compose.yml's own."""
-    services, config = _services(compose_file, env)
+    services = config.get("services") or {}
     if set(services) != {"runner"}:
         raise ValueError(f"{compose_file}: the apptainer launcher runs a single 'runner' service; "
                          f"supporting services ({sorted(set(services) - {'runner'})}) need Docker")
-    service = services["runner"]
+    service = dict(services["runner"])
+    if service.get("volumes"):
+        service["volumes"] = [_absolute(v, compose_file.parent) for v in service["volumes"]]
     if service.get("ports") or service.get("container_name") or service.get("network_mode"):
         raise ValueError(f"{compose_file}: ports, container_name and network_mode are not job-isolated")
     if "image" not in service or "entrypoint" not in service:
@@ -105,18 +70,14 @@ def load_service(compose_file, env):
     return service, config.get("volumes") or {}
 
 
-def gpus(service, env, compose_file=""):
-    """The GPUs the runner service reserves (`deploy.resources.reservations.devices[].device_ids`,
-    interpolated), else the selected one. A config declares several GPUs by listing
-    `${ISB_GPU}`, `${ISB_GPU_1}`, ...; those exist only when `--gpu` is an index."""
+def gpus(service, env):
+    """The GPUs the runner reserves: its interpolated `device_ids` (the launcher's ISB_GPUS list),
+    else the launcher's list itself."""
     devices = (((service.get("deploy") or {}).get("resources") or {}).get("reservations")
                or {}).get("devices") or []
-    ids = [str(i) for d in devices for i in (d.get("device_ids") or [])]
-    if not ids:
-        return [env["ISB_GPU"]]
-    if not all(ids) or len(set(ids)) != len(ids):
-        raise ValueError(f"{compose_file}: declares {len(ids)} GPUs, which needs --gpu to be an "
-                         f"index with that many GPUs from it (got {ids})")
+    ids = [str(i) for d in devices for i in (d.get("device_ids") or [])] or [env.get("ISB_GPUS", "")]
+    if not all(ids):
+        raise ValueError("the runner service reserves GPUs but ISB_GPUS names none")
     return ids
 
 
@@ -170,21 +131,13 @@ def definition(dockerfile, build_args):
     return f"Bootstrap: docker\nFrom: {base}\n\n%post\n    set -e\n{body}\n"
 
 
-def build(compose_file, root, env):
-    """Build the runner service's image as a .sif from the Dockerfile its compose.yml names."""
-    compose_file = Path(compose_file)
-    service, _ = load_service(compose_file, env)
-    spec = service.get("build")
-    if spec is None:
-        raise ValueError(f"{compose_file}: no build section; pull the image with apptainer instead")
-    if isinstance(spec, str):
-        spec = {"context": spec}
-    context = (compose_file.parent / spec.get("context", ".")).resolve()
-    args = {k: str(v) for k, v in (spec.get("args") or {}).items()}
-    target = sif_path(root, service["image"])
+def build(config, root):
+    """Build one catalog image as a .sif from its system's Dockerfile and the image's build
+    arguments (isb/jobs/layout.py Config)."""
+    target = sif_path(root, config.tag)
     target.parent.mkdir(parents=True, exist_ok=True)
     recipe = target.with_suffix(".def")
-    recipe.write_text(definition(context / spec.get("dockerfile", "Dockerfile"), args))
+    recipe.write_text(definition(config.directory / "Dockerfile", config.build_args))
     flags = shlex.split(os.environ.get("ISB_APPTAINER_BUILD_FLAGS", "--fakeroot"))
     partial = target.with_suffix(".sif.partial")
     subprocess.run(["apptainer", "build", "--force", *flags, str(partial), str(recipe)], check=True)
@@ -208,11 +161,11 @@ def command(compose_file, root, env):
             host = base_dir(root) / "volumes" / named
             host.mkdir(parents=True, exist_ok=True)
         else:
-            host = (compose_file.parent / source).resolve()
+            host = Path(source)
         binds += ["--bind", ":".join([str(host), destination, *mode])]
     environment = {key: str(value) for key, value in
                    (service.get("environment") or {}).items()}
-    environment["CUDA_VISIBLE_DEVICES"] = ",".join(gpus(service, env, compose_file))
+    environment["CUDA_VISIBLE_DEVICES"] = ",".join(gpus(service, env))
     argv = ["apptainer", "exec", "--nv", "--cleanenv", "--no-home",
             "--pwd", service.get("working_dir", "/"), *binds, str(image), *service["entrypoint"]]
     return argv, {f"APPTAINERENV_{key}": value for key, value in environment.items()}

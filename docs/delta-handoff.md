@@ -17,7 +17,7 @@ Branch `feat/cross-system-comparison`; the Apptainer launcher needs the commit t
 | backend | system | vLLM | engine mode |
 |---|---|---|---|
 | `nnsight-hf/default` | nnsight on transformers 5.12.1 (the reference) | — | eager PyTorch |
-| `nnsight-vllm/default` | nnsight 0.8.0rc1 (260c555) | 0.19.1 | eager |
+| `nnsight-vllm/default` | nnsight 0.8.0rc1 (260c555), the sync engine | 0.19.1 | eager |
 | `vllm-lens/default` | vLLM-Lens 1.2.1 | 0.19.1 | eager (forced by the plugin) |
 | `interp-engine-vllm/default` | interp-engine 1.12.0 | 0.28.0 | eager |
 | `transformer-lens-vllm/default` | TransformerLens 4.0.0 `RemoteBridge.boot_vllm` | 0.20.2 | torch.compile + CUDA graphs |
@@ -71,9 +71,8 @@ Notes:
 - The GPUs are A100-SXM4-40GB. Every vLLM backend runs at `gpu_memory_utilization` 0.85 (34 GB
   here; at 0.9 TransformerLens's full-vocabulary sampler warmup ran out of memory), the same in every `compose.yml`. The earlier 0.2 was for the shared development host; on
   an exclusive Delta allocation one job owns the GPU. Any change to the fraction must be made for
-  every backend alike and committed before the run. The `cross-system` suite runs no batched regime, so
-  nnsight-vllm never loads its co-resident sync twin (`isb/sweep/execute.py`, `_load_sync_twin`),
-  which would not fit beside a 0.9 engine.
+  every backend alike and committed before the run. Every nnsight-vllm config runs one engine per job;
+  a multi-unit call goes to that engine as several invokes (sync) or gathered requests (async).
 - The vLLM 0.28.0 image ships CUDA 13.0 torch; driver 595 supports it natively.
 - Inside an allocation the GPU is index 0: pass `--gpu 0`.
 - Run on a GPU no one else uses for the duration. Every job records the GPU's used memory before

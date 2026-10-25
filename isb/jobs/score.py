@@ -39,7 +39,7 @@ def _eager(provenance):
 
 
 def attach_plain_vllm(rows, results):
-    """Whole-system overhead (design.md §12.14): each timed row on a vLLM engine is divided by the
+    """Whole-system overhead: each timed row on a vLLM engine is divided by the
     no-intervention request of a plain-vLLM job at the same vLLM version, execution mode (eager or
     compiled) and workload. A plain job is one whose provenance declares engine mode "plain"; its
     `__vanilla__` record is the latency. Matching the mode keeps an eager-only system's ratio from

@@ -1,35 +1,19 @@
-"""vLLM serve-client backend — the VM-style, over-the-wire counterpart to `vllm_async`.
-
-Where `vllm_async` runs the vLLM engine IN-PROCESS, this backend builds only a META `VLLM` model (no
-engine, no GPU — the CPU platform when NVML sees zero devices, e.g. a GPU-less container) and submits
-the compiled trace to a SEPARATE nnsight-vllm-serve instance over HTTP via `model.trace(serve=url)`.
-The server runs the intervention on its real vLLM engine, collects the `.save()`d values, and returns
-them; nnsight's `tracer.push` (blocking mode) injects them back into this frame as CPU tensors.
-
-This is structurally SIMPLER than the async backend: the blocking serve path has no event loop, no
-output stream, and no `.saves` envelope walk. Worker-side intervention errors surface here as raised
-`RuntimeError`s (`local_serve.surface_server_errors`), and saved values arrive already materialized on
-CPU (`torch.load(map_location="cpu")`). The cell code is identical to the in-process vLLM cell — see
-`registry.get_cell`, which lets `vllm_serve` reuse the `vllm_async` cell — so any map/perf difference is
-attributable purely to the wire boundary.
-"""
+"""vLLM serve-client backend: a meta `VLLM` model whose traces run on a separate nnsight-vllm-serve
+instance over HTTP (`model.trace(serve=url)`). Saved values arrive materialized on the CPU and bind
+back into the trace frame; worker errors surface as raised `RuntimeError`s. Several units are one
+trace with one invoke per unit, as on the sync engine."""
 from __future__ import annotations
 
 import time
 import urllib.request
 
 from .vllm_base import VLLMBackend
+from .vllm_sync import SAMPLING as _SAMPLING
 
 
 def _force_cpu_platform_when_no_gpu() -> None:
-    """Make a GPU-less client build a CUDA-free meta VLLM model.
-
-    vLLM only auto-selects its CPU platform for a `+cpu` build (or macOS); the stock GPU wheel on a
-    GPU-less Linux host resolves to `UnspecifiedPlatform` and then fails to infer a device. So we
-    register a CPU choice in vLLM's builtin platform registry that activates ONLY when NVML reports no
-    GPU — leaving the GPU server (NVML count > 0) on the CUDA platform untouched. Must run before vLLM
-    resolves `current_platform`; the serve backend calls it right before importing the vLLM model.
-    """
+    """Make a GPU-less client build a CUDA-free meta VLLM model: register a CPU platform choice in
+    vLLM's builtin registry that activates only when NVML reports no GPU."""
     import vllm.platforms as platforms
 
     def cpu_when_no_gpu():
@@ -40,11 +24,11 @@ def _force_cpu_platform_when_no_gpu() -> None:
             pynvml.nvmlInit()
             try:
                 if pynvml.nvmlDeviceGetCount() > 0:
-                    return None  # a GPU is present -> let the CUDA platform win (e.g. the server)
+                    return None
             finally:
                 pynvml.nvmlShutdown()
         except Exception:
-            pass  # NVML absent/failed -> no usable GPU -> select the CPU platform
+            pass
         return "vllm.platforms.cpu.CpuPlatform"
 
     platforms.builtin_platform_plugins["cpu"] = cpu_when_no_gpu
@@ -53,38 +37,25 @@ def _force_cpu_platform_when_no_gpu() -> None:
 class VLLMServeBackend(VLLMBackend):
     name = "vllm_serve"
 
-    HEALTH_TIMEOUT = 120.0  # seconds to wait for the server's /health before giving up
+    HEALTH_TIMEOUT = 120.0  # seconds to wait for the server's /health
 
     def __init__(self, host: str, dtype: str | None = None, trust_remote_code: bool = False,
                  max_model_len: int | None = None, tokenizer: str | None = None,
                  enable_prefix_caching: bool | None = None):
-        # `host` is the serve URL (e.g. "http://server:6677"). dtype/trust_remote_code/max_model_len
-        # share the VLLMBackend engine-config signature so the driver can splat spec.vllm_kwargs here
-        # too. dtype and max_model_len are informational client-side (they are the SERVER's engine
-        # config — the client is meta-only, and carries them for provenance); trust_remote_code IS
-        # applied, because even the meta build reads the repo config.
+        # dtype, max_model_len and enable_prefix_caching are the server's engine config, carried
+        # for provenance; trust_remote_code applies to the meta build, which reads the repo config.
         super().__init__(dtype=dtype, trust_remote_code=trust_remote_code,
                          max_model_len=max_model_len, tokenizer=tokenizer,
-                         enable_prefix_caching=enable_prefix_caching)   # server-side; provenance only
+                         enable_prefix_caching=enable_prefix_caching)
         self.host = host.rstrip("/")
 
-    # No __getstate__ needed: unlike vllm_async (which carries a non-picklable event loop), this
-    # backend holds only host/dtype/trust_remote_code. The cell's `build` closure captures `be.last`
-    # (a bound method), so the backend IS serialized into the request sent to the server — and it must
-    # be, and is, fully picklable.
-
     def load(self, repo: str):
-        # Force vLLM's CPU platform when no GPU is visible BEFORE importing the vLLM model — otherwise
-        # the meta build resolves the CUDA platform and crashes probing device capability (see project
-        # memory). No-op on a GPU host. Must precede the vLLM import below.
-        _force_cpu_platform_when_no_gpu()
+        _force_cpu_platform_when_no_gpu()        # before vLLM resolves its platform
         from nnsight.modeling.vllm import VLLM
 
         self._wait_for_health()
-        # Meta model: architecture / envoy tree only — no engine, no weights, no GPU. trust_remote_code
-        # is still needed to READ an auto_map repo's config (dtype is server-side, so it is omitted).
         kw = {"trust_remote_code": True} if self.trust_remote_code else {}
-        return VLLM(repo, **kw)
+        return VLLM(repo, **kw)                   # meta model: the envoy tree, no engine
 
     def _wait_for_health(self) -> None:
         url = f"{self.host}/health"
@@ -95,72 +66,75 @@ class VLLMServeBackend(VLLMBackend):
                 with urllib.request.urlopen(url, timeout=5) as r:  # noqa: S310 (trusted compose host)
                     if r.status == 200:
                         return
-            except Exception as e:  # 503 (engine warming) or connection-refused (not up yet) -> retry
+            except Exception as e:
                 last_err = e
                 time.sleep(1.0)
         raise RuntimeError(
-            f"nnsight-serve at {self.host} not healthy within {self.HEALTH_TIMEOUT}s: {last_err}"
-        )
+            f"nnsight-serve at {self.host} not healthy within {self.HEALTH_TIMEOUT}s: {last_err}")
+
+    def _collect(self, rows, n, what):
+        import torch
+
+        mats = [r.detach().float().cpu() for r in rows if r is not None]
+        if len(mats) != n:
+            raise RuntimeError(f"vllm_serve {what} collected {len(mats)}/{n} per-unit outputs")
+        return torch.cat(mats, dim=-2) if mats[0].dim() >= 2 else torch.stack(mats)
 
     def run(self, model, prompts, build):
-        if isinstance(prompts, (list, tuple)) and len(prompts) > 1:
-            # The server `asyncio.gather`s multiple invokes, but wiring N-invoke batched traces through
-            # the serve cell is a follow-up — surface it honestly rather than silently dropping prompts.
-            raise NotImplementedError(
-                "batched (multi-prompt) serve is a follow-up; the serve cell submits one prompt/trace"
-            )
-        prompt = prompts[0] if isinstance(prompts, (list, tuple)) else prompts
-        with model.trace(prompt, serve=self.host, temperature=0.0, top_p=1, max_tokens=1):
-            saved = build().save()  # var name "saved" IS the saves key; blocking push rebinds it here
-        return saved.detach().float().cpu()
+        prompts = self.many(prompts, "run")
+        with model.trace(serve=self.host, **_SAMPLING) as tracer:
+            rows = [None] * len(prompts)
+            rows = rows.save()
+            for i, p in enumerate(prompts):
+                with tracer.invoke(p):
+                    rows[i] = build([i])
+        return self._collect(rows, len(prompts), "run")
 
-    def patch(self, model, clean_prompt, corrupted_prompt, capture, patch):
-        # Two SEPARATE serve traces (two HTTP requests), mirroring the documented vLLM patching recipe
-        # (no barrier shared across invokes). The clean activation comes back as a materialized CPU
-        # tensor and is closed over by the corrupt trace's `patch(...)`, which serializes it into the
-        # second request's intervention.
-        clean_prompt, corrupted_prompt = self.one(clean_prompt, "patch"), self.one(corrupted_prompt, "patch")
-        with model.trace(clean_prompt, serve=self.host, temperature=0.0, top_p=1, max_tokens=1):
-            ca = capture().save()
-        clean_act = ca.detach().float().cpu()
-        with model.trace(corrupted_prompt, serve=self.host, temperature=0.0, top_p=1, max_tokens=1):
-            res = patch(clean_act).save()
-        return res.detach().float().cpu()
+    def patch(self, model, clean_prompts, corrupted_prompts, capture, patch):
+        clean_prompts, corrupted_prompts = self.paired(clean_prompts, corrupted_prompts, "patch")
+        n = len(clean_prompts)
+        with model.trace(serve=self.host, **_SAMPLING) as tracer:
+            clean = [None] * n
+            clean = clean.save()
+            for i, p in enumerate(clean_prompts):
+                with tracer.invoke(p):
+                    clean[i] = capture()
+        clean_acts = [c.detach().float().cpu() for c in clean]
+        with model.trace(serve=self.host, **_SAMPLING) as tracer:
+            rows = [None] * n
+            rows = rows.save()
+            for i, p in enumerate(corrupted_prompts):
+                with tracer.invoke(p):
+                    rows[i] = patch(clean_acts[i])
+        return self._collect(rows, n, "patch")
 
-    def attribute(self, model, clean_prompt, corrupt_prompt, acts_of, metric_of, n=None):
-        # The server runs vLLM in inference mode (activations are inference tensors with no autograd),
-        # so attribution patching cannot run. Attempt `requires_grad_(True)` on the corrupt run's
-        # activations: it raises on the worker and surfaces here as a clean per-cell ERROR. Forward-only
-        # (no `.backward()` over the wire) so it fails fast with no hang risk — recording that the
-        # `grad` primitive is unavailable over serve, same as in-process vLLM.
-        self.one(clean_prompt, "attribute")          # never traced here, but held to the same form
-        corrupt_prompt = self.one(corrupt_prompt, "attribute")
-        with model.trace(corrupt_prompt, serve=self.host, temperature=0.0, top_p=1, max_tokens=1):
-            acts = acts_of(model)
-            for a in acts:
-                a.requires_grad_(True)  # raises on the server: inference tensor, no autograd
-            probe = acts[0].save()  # noqa: F841 — never meaningfully reached; the above raises
-        return probe.detach().float().cpu()
+    def attribute(self, model, clean_prompts, corrupt_prompts, acts_of, metric_of, n):
+        """The server runs vLLM in inference mode; `requires_grad_` on an activation raises there
+        and surfaces here, forward-only, as the recorded verdict."""
+        clean_prompts, corrupt_prompts = self.paired(clean_prompts, corrupt_prompts, "attribute")
+        probes = [None] * len(corrupt_prompts)
+        with model.trace(serve=self.host, **_SAMPLING) as tracer:
+            probes = probes.save()
+            for i, p in enumerate(corrupt_prompts):
+                with tracer.invoke(p):
+                    acts = acts_of(model)
+                    for a in acts:
+                        a.requires_grad_(True)
+                    probes[i] = acts[0]       # not reached: the line above raises
+        return self._collect(probes, len(corrupt_prompts), "attribute")
 
     def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
-        # Whether a tracer.iter loop survives the serve transport (compiled client-side, iterated
-        # server-side) is its own venue question — surface it honestly rather than guessing.
-        raise NotImplementedError(
-            "generation over serve is a follow-up; the per-step iteration loop is not yet wired "
-            "through the serve transport"
-        )
+        raise NotImplementedError("the per-step iteration loop is not wired through the serve transport")
 
-    def generate_patch(self, model, source_prompt, base_prompt, capture, build_step,
+    def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
                        *, new_tokens, bounded=True):
-        # Inherits the same gap as generate() over serve (the iteration loop is not wired through
-        # the transport), plus the two-trace transplant — a follow-up for the serve venue.
-        raise NotImplementedError(
-            "generate_patch over serve is a follow-up; the per-step iteration loop is not yet "
-            "wired through the serve transport"
-        )
+        raise NotImplementedError("the per-step iteration loop is not wired through the serve transport")
+
+    def plain(self, model, units, *, new_tokens=1):
+        raise NotImplementedError("the serve client holds no engine for a plain request")
 
     def last(self, t):
-        return t[-1:, :]  # server returns flat [tokens, vocab] (vLLM shape), like vllm_async
+        return t[-1:, :]  # the server returns vLLM's flat [tokens, vocab]
 
     def teardown(self, model) -> None:
         import gc
@@ -169,4 +143,3 @@ class VLLMServeBackend(VLLMBackend):
             del model
         finally:
             gc.collect()
-        # No GPU cleanup: the client holds no engine. The server lifecycle is owned by docker-compose.

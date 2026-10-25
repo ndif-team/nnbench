@@ -39,7 +39,7 @@ class Tokenizer:
     def __call__(self, text, **kwargs):
         return {"input_ids": [1]}
 
-    def encode(self, text):
+    def encode(self, text, add_special_tokens=True):
         return [1]
 
 
@@ -52,7 +52,7 @@ def model_fixture():
         transformer=SimpleNamespace(h=blocks, ln_f=lambda x: x),
         lm_head=SimpleNamespace(weight=torch.eye(3), output=torch.ones(1, 2, 3)),
         logits=torch.ones(2, 3), tokenizer=Tokenizer(), config=SimpleNamespace(n_embd=3),
-        repo_id="repo",
+        repo_id="repo", inputs=((), {"attention_mask": torch.ones(1, 2, dtype=torch.long)}),
     )
 
 
@@ -61,35 +61,37 @@ class GradientObserved(Exception):
 
 
 class BackendSpy(Backend):
-    """Records which primitive a cell called. Inherits the form check (`one()`), so a cell that
-    hands a one-unit primitive several units fails here, with no GPU, as it would on vLLM."""
+    """Records which primitive a cell called and the unit lists it passed. Inherits the form
+    checks (`many()`, `paired()`), so a cell that hands a primitive something other than the unit
+    lists it takes fails here, with no GPU, as it would on an engine."""
     name = "hf"
 
     def __init__(self):
-        self.calls = []
+        self.calls, self.units = [], []
 
     def last(self, value):
         return value[-1:, :]
 
     def run(self, model, prompts, build):
         self.calls.append("run")
-        return build()
+        self.units.append(self.many(prompts, "run"))
+        return build(list(range(len(prompts))))
 
     def patch(self, model, clean, corrupted, *, capture, patch):
         self.calls.append("patch")
-        self.one(clean, "patch"), self.one(corrupted, "patch")
+        self.units.append(self.paired(clean, corrupted, "patch"))
         return patch(capture())
 
     def generate(self, model, prompts, step, *, new_tokens, bounded):
         self.calls.append("generate")
-        self.one(prompts, "generate")
-        return torch.cat([step() for _ in range(new_tokens)])
+        self.units.append(self.many(prompts, "generate"))
+        return torch.stack([step(index) for index in range(new_tokens)])
 
     def generate_patch(self, model, clean, corrupted, *, capture, build_step, new_tokens, bounded):
         self.calls.append("generate_patch")
-        self.one(clean, "generate_patch"), self.one(corrupted, "generate_patch")
+        self.units.append(self.paired(clean, corrupted, "generate_patch"))
         value = capture()
-        return torch.cat([build_step(value) for _ in range(new_tokens)])
+        return torch.stack([build_step(value, index) for index in range(new_tokens)])
 
     def session(self, model, build):
         self.calls.append("session")
@@ -111,12 +113,12 @@ class BackendSpy(Backend):
 @pytest.mark.parametrize("backend_module, cls", [
     ("isb.backends.hf", "HFBackend"), ("isb.backends.vllm_async", "VLLMAsyncBackend"),
     ("isb.backends.vllm_sync", "VLLMSyncBackend")])
-@pytest.mark.parametrize("primitive", ["patch", "generate", "generate_patch", "attribute"])
-def test_one_unit_primitives_refuse_several_units_before_touching_the_engine(backend_module, cls,
-                                                                          primitive):
-    """Every backend checks the form first: two units to a one-unit primitive raise the harness
-    FormError, with no model and no engine, instead of the engine's own refusal (or a silent
-    first-prompt pick) on one backend only."""
+@pytest.mark.parametrize("primitive", ["run", "patch", "generate", "generate_patch", "attribute"])
+def test_primitives_refuse_a_bare_unit_and_unequal_sides_before_touching_the_engine(
+        backend_module, cls, primitive):
+    """Every backend checks the form first: a bare prompt where a unit list is due, or two sources
+    against one base, raise the harness FormError with no model and no engine, instead of the
+    engine's own refusal (or a silently batched string) on one backend only."""
     import importlib
 
     backend_cls = getattr(importlib.import_module(backend_module), cls)
@@ -125,14 +127,20 @@ def test_one_unit_primitives_refuse_several_units_before_touching_the_engine(bac
     fn = getattr(be, primitive)
     if fn.__func__ is getattr(Backend, primitive):
         pytest.skip(f"{cls} has no {primitive}")
-    two = ["one prompt", "another prompt"]
-    args = {"patch": (None, two, "base", None, None), "generate": (None, two, None),
-            "generate_patch": (None, two, "base", None, None),
-            "attribute": (None, two, "base", None, None, 1)}
+    bare, two, one = "one prompt", ["one prompt", "another prompt"], ["base"]
     kwargs = {"generate": {"new_tokens": 2}, "generate_patch": {"new_tokens": 2}}.get(primitive, {})
-    with pytest.raises(FormError, match=f"{cls}.{primitive} takes one unit per side; the cell passed 2"):
+    args = {"run": (None, bare, None), "patch": (None, bare, one, None, None),
+            "generate": (None, bare, None), "generate_patch": (None, bare, one, None, None),
+            "attribute": (None, bare, one, None, None, 1)}
+    with pytest.raises(FormError, match=f"{cls}.{primitive} takes a nonempty list of units, got str"):
         fn(*args[primitive], **kwargs)
-    assert be.one(["only"], primitive) == "only" and be.one("only", primitive) == "only"
+    with pytest.raises(FormError, match="takes a nonempty list of units, got list"):
+        fn(*tuple([] if a is bare else a for a in args[primitive]), **kwargs)
+    if primitive != "run" and primitive != "generate":
+        unequal = tuple(two if a is bare else a for a in args[primitive])
+        with pytest.raises(FormError, match=f"{cls}.{primitive} takes one base per source; the cell "
+                                            f"passed 2 source and 1 base prompts"):
+            fn(*unequal, **kwargs)
 
 
 @pytest.mark.parametrize("backend_module, cls", [
@@ -150,13 +158,14 @@ def test_train_patch_refuses_unequal_sides_before_touching_the_engine(backend_mo
         be.train_patch(None, ["source one", "source two"], ["base"], None, None)
 
 
-def test_a_cell_that_hands_a_one_unit_primitive_several_units_fails_without_a_gpu():
-    """The no-GPU fake inherits the form check, so a cell passing a batch to `generate` fails in
-    the test suite, where before only the vLLM run would have shown it."""
-    fn = get_cell("gen_steering", "gpt2", "hf")
-    with pytest.raises(FormError, match="generate takes one unit per side; the cell passed 2"):
-        fn(BackendSpy(), model_fixture(), ["p one", "p two"], layer=0, target="x", alpha=1.0,
-           new_tokens=2)
+def test_a_cell_hands_the_primitive_every_unit_of_the_call():
+    """A cell passes its whole unit list through: the primitive sees both units, never the first
+    alone, and the per-step rows come back with the unit axis in place."""
+    be = BackendSpy()
+    out = get_cell("gen_steering", "gpt2", "hf")(be, model_fixture(), ["p one", "p two"], layer=0,
+                                                 target="x", alpha=1.0, new_tokens=2)
+    assert be.units == [["p one", "p two"]]
+    assert out.shape[0] == 2                              # one row per decode step
 
 
 def bound_case(methodology, *, backend="hf", family="gpt2", **overrides):
@@ -207,7 +216,7 @@ def test_patch_requirements_follow_single_and_paired_execution(methodology, patc
         overrides["new_tokens"] = 2
     fn, params, protocol = bound_case(methodology, **overrides)
     model, backend = model_fixture(), BackendSpy()
-    fn(backend, model, ["clean", "corrupted"], **params)
+    fn(backend, model, [("clean", "corrupted")], **params)
     wrote = model.transformer.h[0].writes > 0
     assert wrote == patch == ("write" in protocol["operations"])
     assert ("paired_forward" in protocol["capabilities"]) == patch
@@ -259,7 +268,7 @@ def test_das_requirements_follow_training_backend_call(train):
 def test_gradient_requirements_follow_backend_gradient_entrypoints(methodology, grad):
     fn, params, protocol = bound_case(methodology, grad=grad)
     backend = BackendSpy()
-    prompts = (("clean", "corrupted", ("a", "b")) if methodology == "attribution_patching"
+    prompts = ([("clean", "corrupted", ("a", "b"))] if methodology == "attribution_patching"
                else ["prompt"])
     if grad:
         with pytest.raises(GradientObserved):
@@ -269,6 +278,20 @@ def test_gradient_requirements_follow_backend_gradient_entrypoints(methodology, 
     observed_grad = any(call in {"attribute", "vjp_batch"} for call in backend.calls)
     assert observed_grad == grad == ("grad" in protocol["operations"])
     assert ("grad" in protocol["capabilities"]) == grad
+
+
+def test_answer_ids_skip_the_tokenizers_special_prefix():
+    """A Llama-3 tokenizer prepends BOS when special tokens are on; the answer id is the content
+    token either way."""
+    from isb.methodologies.attribution_patching import _answer_ids
+
+    class BosTokenizer:
+        def encode(self, text, add_special_tokens=True):
+            ids = {" Phil": [1234], " Mary": [5678]}[text]
+            return [128000] + ids if add_special_tokens else ids
+
+    model = SimpleNamespace(tokenizer=BosTokenizer())
+    assert _answer_ids(model, [("clean", "corrupt", (" Phil", " Mary"))]) == [(1234, 5678)]
 
 
 @pytest.mark.parametrize("methodology", ["activation_harvest", "gen_capture"])

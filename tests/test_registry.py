@@ -51,9 +51,9 @@ def test_explicit_family_registration_overrides_generic():
 def test_cell_accepts_variances():
     fn = get_cell("logit_lens", "gpt2", "hf")
     # the profile-bound wrapper carries the generic cell via functools.wraps, so signature
-    # inspection sees the real params (m + prompts + the variance knobs)
+    # inspection sees the real params (m + units + the variance knobs)
     params = inspect.signature(fn).parameters
-    assert "prompts" in params
+    assert "units" in params
     assert "layers" in params and params["layers"].default == "all"
     assert "unembed" in params
 

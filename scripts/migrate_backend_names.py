@@ -10,6 +10,13 @@ directory moves to `experiments/<id>/<system>/<config>/`, and the name is replac
 result.pt (`provenance.job.backend`, with result.json's `outputs_sha256` updated to match), and
 report.json (`reference` and each row's `backend`, `plain_vllm`, `plain_vllm_default`). Logs are
 left as recorded. A run whose names are already current is skipped, so the script is idempotent.
+
+The map covers the flat names and the directory-era names whose meaning did not change. Names that
+changed meaning on 2026-10-24 are left alone, because a run's date, not its name, says what they
+denoted: `nnsight-vllm/default`, `nnsight-vllm/fp32`, `nnsight-vllm/<version>` and their `/tp*`
+variants ran the async engine before that date and the sync engine after it (rename such a run by
+hand to `.../async`), and `nnsight-hf/0-7` ran eager attention before and sdpa after. The removed
+`*/byref` configs have no current name.
 """
 from __future__ import annotations
 
@@ -24,8 +31,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 MAP = {
     "nnsight-hf": "nnsight-hf/default", "nnsight-hf-fp32": "nnsight-hf/fp32",
     "nnsight-hf-0-7": "nnsight-hf/0-7",
-    "nnsight-vllm": "nnsight-vllm/default", "nnsight-vllm-fp32": "nnsight-vllm/fp32",
-    "nnsight-vllm-0-7": "nnsight-vllm/0-7", "nnsight-vllm-sync": "nnsight-vllm/sync",
+    "nnsight-vllm": "nnsight-vllm/async", "nnsight-vllm-fp32": "nnsight-vllm/async/fp32",
+    "nnsight-vllm-0-7": "nnsight-vllm/0-7/async", "nnsight-vllm-sync": "nnsight-vllm/default",
     "nnsight-vllm-opt": "nnsight-vllm/opt", "nnsight-vllm-taps": "nnsight-vllm/opt/taps",
     "transformer-lens": "transformer-lens-vllm/default",
     "transformer-lens-fp32": "transformer-lens-vllm/fp32",
@@ -34,9 +41,19 @@ MAP = {
     "vllm-hook": "vllm-hook/default", "vllm-hook-disk": "vllm-hook/disk",
     "interp-engine": "interp-engine-vllm/default", "interp-engine-static": "interp-engine-vllm/static",
     **{f"vllm-plain-{v}": f"vllm-plain/{v}" for v in ("0-15-1", "0-19-1", "0-20-2", "0-28-0")},
-    **{f"vllm-plain-eager-{v}": f"vllm-plain/eager-{v}" for v in ("0-15-1", "0-19-1", "0-20-2", "0-28-0")},
+    **{f"vllm-plain-eager-{v}": f"vllm-plain/{v}/eager" for v in ("0-15-1", "0-19-1", "0-20-2", "0-28-0")},
     # removed configs (prefix caching off, d0fd79b), still named in saved diagnostic runs
     "nnsight-vllm-nopc": "nnsight-vllm/nopc", "nnsight-vllm-0-7-nopc": "nnsight-vllm/0-7-nopc",
+    # directory-era names (configs as compose.yml directories) whose meaning is unchanged
+    "nnsight-vllm/sync": "nnsight-vllm/default",
+    **{f"nnsight-vllm/sync/{c}": f"nnsight-vllm/{c}"
+       for c in ("0-5-15", "0-5-15/tp4", "0-7", "0-7/tp4", "0-8-1", "0-8-1/tp2", "0-8-1/tp4")},
+    **{f"nnsight-vllm/opt/0-8-1{c}": f"nnsight-vllm/0-8-1/opt{c}"
+       for c in ("", "/tp4", "/taps", "/taps/tp4")},
+    **{f"nnsight-hf/sdpa/{c}": f"nnsight-hf/{c}"
+       for c in ("0-4-6", "0-4-6/era", "0-4-6/gpu2", "0-5-15", "0-5-15/gpu4", "0-7", "0-7/gpu4",
+                 "0-8-1", "0-8-1/gpu2", "0-8-1/gpu4", "0-8-1/tp2", "0-8-1/tp4")},
+    **{f"vllm-plain/eager-{v}": f"vllm-plain/{v}/eager" for v in ("0-15-1", "0-19-1", "0-20-2", "0-28-0")},
 }
 
 

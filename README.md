@@ -109,13 +109,13 @@ documented realization. Each system is a directory with one config per variant:
 
 | System | Backends |
 |---|---|
-| nnsight 0.8 | `nnsight-vllm/default` (async), `nnsight-vllm/sync`, `nnsight-vllm/opt` (installed edits), `nnsight-vllm/opt/taps` (CUDA-graph taps, vLLM 0.28.0) |
+| nnsight 0.8 | `nnsight-vllm/default` (the sync engine, nnsight's documented LLM path), `nnsight-vllm/async`, `nnsight-vllm/opt` (installed edits), `nnsight-vllm/opt/taps` (CUDA-graph taps, vLLM 0.28.0) |
 | nnsight 0.7 | `nnsight-vllm/0-7`, `nnsight-hf/0-7` |
 | vLLM-Lens | `vllm-lens/default`, `vllm-lens/opt` |
 | interp-engine | `interp-engine-vllm/default` (hooked), `interp-engine-vllm/static` (`vllm-static`) |
 | TransformerLens 4 | `transformer-lens-vllm/default`, `transformer-lens-vllm/opt` (headroom, see below) |
 | vLLM-Hook (IBM) | `vllm-hook/default` (rpc storage), `vllm-hook/disk` (`disk-st-async`) |
-| Plain vLLM | `vllm-plain/<version>` (compiled) and `vllm-plain/eager-<version>` |
+| Plain vLLM | `vllm-plain/<version>` (compiled) and `vllm-plain/<version>/eager` |
 | Reference | `nnsight-hf/fp32` (HF transformers in fp32) |
 
 Plain vLLM at each system's release and execution mode is the overhead floor. Prefix caching is off
@@ -222,7 +222,7 @@ isb/
   oracle/                  numerical comparison
   perf/                    timing and microbenchmarks
   manager/                 saved-report browser and HTML export
-backends/                  <system>/{Dockerfile,compose.base.yml,backend.py,cells.py} + <system>/<config>/compose.yml
+backends/                  <system>/{Dockerfile,compose.yml,configs.yml,backend.py,cells.py}; configs.yml lists the images and configs
 slurm/                     batch scripts for the Apptainer path on Slurm clusters
 scripts/                   benchmark CLI, alignment checker, manager and standalone tools
 docs/                      design, alignment audit, guides and measured findings

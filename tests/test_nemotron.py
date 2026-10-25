@@ -72,7 +72,7 @@ class _NemoModel:
 class _FakeBE:
     """Runs the cell's build() closure with no trace/GPU — the no-GPU cell harness."""
     def run(self, model, prompts, build):
-        return build()
+        return build(list(range(len(prompts))))
 
     def last(self, t):
         return t[-1:, :]                           # [seq, vocab] -> [1, vocab]

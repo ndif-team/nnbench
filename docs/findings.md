@@ -1324,7 +1324,8 @@ Open loop, steering: request latency p50 / p99 in ms. The seeded schedule offers
 - **HF latency above one client is not compared across versions.** HF requests pass through the
   driver's lock (`isb/perf/load.py`, a `threading.Lock`), which admits waiting clients in no fixed
   order, so at the same throughput HF's p50 differs between runs (steering at 64 clients: 1.5 s on
-  0.8.1, 6.9 s on 0.7.0).
+  0.8.1, 6.9 s on 0.7.0). Since 2026-10-24 the gate is first come, first served, so runs from that
+  date on are comparable at the same client count; the numbers above stand as measured.
 - **vLLM 0.7.0 stalls in the logit lens sweep.** In the offline run and again in the rerun, the sync
   engine stopped on the 573rd 80-layer lens request at one prompt per call, after the 16 reference
   requests and the 1,024 requests of the one-layer baseline row: vLLM logged "No available shared

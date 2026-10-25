@@ -332,7 +332,7 @@ def barrier_hf(be, model):
         model.transformer.h[5].output = _with_hidden(out, hs)
         return model.lm_head.output[..., -1, :]
 
-    ref = be.patch(model, CLEAN, CORRUPT, capture, patch_fn)
+    ref = be.patch(model, [CLEAN], [CORRUPT], capture, patch_fn)
 
     with model.trace() as tracer:
         barrier = tracer.barrier(2)
@@ -356,7 +356,7 @@ def barrier_hf(be, model):
 def _vllm_trace_saves(be, model, body, **trace_kw):
     """One single-prompt async trace. The saves collector reads the TRACE-FRAME
     locals (var name = saves key), so a `.save()` inside a nested closure frame is
-    silently lost. The shared-container idiom from `VLLMAsyncBackend.run_batched`:
+    silently lost. The shared-container idiom from `VLLMSyncBackend.run`:
     create+save ONE dict in the with-frame, let `body(tracer, out)` fill it by
     mutation, and return the collected dict."""
     kw = {"temperature": 0.0, "top_p": 1, "max_tokens": 1, **trace_kw}
@@ -617,7 +617,7 @@ def barrier_vllm(be, model):
     whichever fires first is the measured failure mode. LAST: highest hang risk."""
     async def _go():
         with model.trace(temperature=0.0, top_p=1, max_tokens=1) as tracer:
-            res = dict().save()  # noqa: F841 — parent-scope container (run_batched idiom)
+            res = dict().save()  # noqa: F841 — parent-scope container (the sync backend's run form)
             barrier = tracer.barrier(2)
             with tracer.invoke(CLEAN):
                 clean_hs = _untuple(model.transformer.h[5].output)[-1:, :]
@@ -885,7 +885,7 @@ def barrier_vllm_sync(be, model):
             model.transformer.h[5].output = hs
         return model.logits
 
-    ref = be.patch(model, CLEAN, CORRUPT, capture, patch_fn)
+    ref = be.patch(model, [CLEAN], [CORRUPT], capture, patch_fn)
 
     with model.trace(temperature=0.0, top_p=1, max_tokens=1) as tracer:
         res = dict().save()

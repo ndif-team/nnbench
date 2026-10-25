@@ -1,4 +1,4 @@
-"""Cell registry (design.md §12.1, §12.4, §12.8).
+"""Cell registry.
 
 A cell is a fixed, explicit function for one (methodology, family, backend). It is keyed
 by exactly those three; *variances* (prompts, which layers/sites to observe, idiomatic vs
@@ -7,7 +7,7 @@ portable formulation) are runtime PARAMS the cell accepts, not separate registra
     @cell("logit_lens", family="gpt2", backend="hf")
     def _(be, model, prompts, *, layers="all", unembed="module"): ...
 
-§12.8 adds the family-generic form: a cell registered `family="*"` serves ANY family that
+The family-generic form: a cell registered `family="*"` serves ANY family that
 has a ModelProfile, receiving the profile as its third argument:
 
     @cell("logit_lens", family="*", backend="hf")
@@ -30,19 +30,19 @@ CELLS = {}  # (methodology, family, backend) -> fn(be, model, prompts, **params)
 REALIZATIONS = {}  # same key -> alternative realization params, in declaration order
 
 # nnsight's own vLLM interfaces, which share the vllm_async cells. A foreign system on vLLM
-# (e.g. vllm_lens) never inherits nnsight intervention code (design.md §12.14).
+# (e.g. vllm_lens) never inherits nnsight intervention code.
 NNSIGHT_VLLM_VARIANTS = frozenset({"vllm_serve", "vllm_sync", "vllm_pp"})
 
 
 class Unsupported(Exception):
     """Raised by a cell whose system cannot express the workload; the message names the missing
-    capability. Recorded as UNSUPPORTED, distinct from ERROR (design.md §12.14)."""
+    capability. Recorded as UNSUPPORTED, distinct from ERROR."""
 
 
 def cell(methodology: str, family: str, backend: str, realizations=()):
     """Register a cell. `realizations` lists this system's alternative spellings of every row, as
     realization params (`{"mode": "inplace"}`); the cell's own defaults are the documented
-    realization, and the alternatives run when a run asks for them (design.md §12.16)."""
+    realization, and the alternatives run when a run asks for them."""
     from ..protocol import protocol_for
 
     protocol = protocol_for(methodology)
@@ -99,8 +99,8 @@ def get_cell(methodology: str, family: str, backend: str):
             view = profile.for_backend(backend)         # engine view (e.g. a vLLM wrapper prefix)
 
             @functools.wraps(generic)                   # callers can reach the shared underlying fn
-            def bound(be, model, prompts, *args, **params):    # bind the family's profile as `m`
-                return generic(be, model, view, prompts, *args, **params)
+            def bound(be, model, units, *args, **params):      # bind the family's profile as `m`
+                return generic(be, model, view, units, *args, **params)
             signature = inspect.signature(generic)
             bound.__signature__ = signature.replace(
                 parameters=[p for i, p in enumerate(signature.parameters.values()) if i != 2])

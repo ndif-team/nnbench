@@ -67,7 +67,7 @@ def _main(create_backend, job, output):
             metadata = outputs.get(("__meta__",), {})
             cells = []
             requested = expected_cells(experiment)
-            # Alternative realizations the system declared are cells of their own (§12.16).
+            # Alternative realizations the system declared are cells of their own.
             alternatives = {key for key, info in metadata.items()
                             if isinstance(info, dict) and (key[0], info.get("row")) in requested}
             for key in sorted(requested) + sorted(alternatives):
@@ -103,7 +103,7 @@ def _main(create_backend, job, output):
 
 
 def options():
-    value = json.loads(os.environ.get("ISB_ENGINE_OPTIONS", "{}"))
+    value = json.loads(os.environ.get("ISB_ENGINE_OPTIONS") or "{}")   # unset or empty: none
     if not isinstance(value, dict):
         raise ValueError("ISB_ENGINE_OPTIONS must be a JSON object")
     return value

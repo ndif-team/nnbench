@@ -7,7 +7,7 @@
 #   nnsight-versions  nnsight 0.7.0 vs 0.8.0rc1 on HF and vLLM (smoke gate, then five workloads)
 #   overhead IMG:hf|vllm ...   per-trace overhead decomposition (slurm/diag_overhead.py)
 #   fair WORKLOAD ... the fairness-controlled comparison: every system incl. nnsight 0.7 and the
-#                     sync engine, plain vLLM eager and compiled per version, scored vs HF fp32
+#                     async engine, plain vLLM eager and compiled per version, scored vs HF fp32
 #   micro             construct probes (nnsight 0.7 / 0.8 x HF / vLLM async / sync) and the
 #                     perf microbenchmark sweeps (plans/delta_perf_vllm0191.json, ..._vllm0151.json)
 #   perf-read         the perf read cells again (plans/delta_perf_read_*.json)
@@ -17,14 +17,12 @@
 #   versions-fill MODEL WORKLOAD BACKEND...  one workload again, beside the HF 0.8.1 reference
 #   load SUITE MODEL  a load-pattern suite (nnsight-load-offline | nnsight-load-concurrent)
 #   load-fill SUITE MODEL WORKLOAD BACKEND...  one workload again, beside the HF 0.8.1 reference
-#   byref SUITE MODEL BACKEND...  a suite on stock and envoy-by-reference vLLM configs, beside HF 0.8.1
-#   diag-byref-profile N...  profile the byref trace at N invokes (slurm/diag_cost.py inproc)
 #   versions-small [MODEL]  the nnsight-versions workloads on a small model (gpt2), all versions
 #   large SUITE [ARGS]  an nnsight-large-* suite (qwen2.5-72b, shared cache, two GPUs)
 #   large-min         four prompts per cell over two GPUs, HF 0.8.1/0.4.6 vs vLLM tp2
 #   large-smoke       every 72B backend loads and runs one steering case
 #                     submit both with --partition=gpuH200x8 --gpus=2 --mem=480G
-#   diag-scaling      trace time against prompts x sites per prompt, vLLM stock/byref and HF
+#   diag-scaling      trace time against prompts x sites per prompt, vLLM and HF
 #   versions-awq      whether each nnsight-versions backend loads Qwen2.5-72B-Instruct-AWQ
 #   optimal WORKLOAD ... each system's general cells beside its fastest documented realization
 #                     (the */opt configs, nnsight-vllm/opt/taps, interp-engine-vllm/static), plain vLLM
@@ -57,7 +55,7 @@ bench() { echo; echo "### $(date -Is) bench.py $*"; $PY scripts/bench.py "$@"; l
 # waits for the GPU to drain afterwards: perf.py starts the next cell's engine at once.
 make_wrappers() {
     mkdir -p $bin runs/micro-delta/constructs runs/micro-delta/perf
-    for img in vllm-plain-0-19-1 vllm-plain-0-15-1 nnsight-vllm nnsight-vllm-0-7 vllm-lens vllm-hook nnsight-hf nnsight-hf-0-7; do
+    for img in vllm-plain-0-19-1 vllm-plain-0-15-1 nnsight-vllm-default nnsight-vllm-0-7 vllm-lens-default vllm-hook-default nnsight-hf-default nnsight-hf-0-7; do
         cat > $bin/py-$img <<WRAP
 #!/bin/bash
 apptainer exec --nv --cleanenv --no-home --bind $PWD --bind /tmp \\
@@ -214,32 +212,6 @@ diag-cost)
     run_in nnsight-hf-0-8-1 hf slurm/diag_hf_invokes.py /out/inputs.jsonl /out/hf.json
     exit $rc
     ;;
-diag-byref)
-    # The envoy-by-reference prototype (backends/nnsight-vllm/envoy_byref) in vLLM's own process layout:
-    # slurm/diag_cost.py mp without, then with, the patch loaded in client and EngineCore alike.
-    shift
-    out=runs/nnsight-versions-diag/byref
-    mkdir -p $out
-    cp runs/nnsight-versions-diag/batch/inputs.jsonl $out/inputs.jsonl
-    rc=0
-    for variant in stock byref; do
-        pp=/workspace; flag=0
-        [ $variant = byref ] && { pp=/workspace/backends/nnsight-vllm/envoy_byref:/workspace; flag=1; }
-        echo "### $(date -Is) diag-byref $variant"
-        timeout 1800 apptainer exec --nv --cleanenv --no-home --pwd /workspace \
-            --bind $PWD:/workspace:ro --bind $PWD/$out:/out \
-            --bind $ISB_APPTAINER_DIR/volumes/isb-model-cache:/models \
-            --env PYTHONPATH=$pp,NNSIGHT_ENVOY_BYREF=$flag,PYTHONDONTWRITEBYTECODE=1,USER=isb \
-            --env HF_HOME=/models,HF_HUB_CACHE=/models/hub,HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1 \
-            --env XDG_CACHE_HOME=/tmp/cache,VLLM_CACHE_ROOT=/tmp/vllm,TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor \
-            --env TRITON_CACHE_DIR=/tmp/triton,FLASHINFER_WORKSPACE_BASE=/tmp,CUDA_VISIBLE_DEVICES=0 \
-            .apptainer/images/isb-nnsight-vllm-0-8-1_local.sif \
-            python3 slurm/diag_cost.py mp /out/inputs.jsonl /out/$variant.json > $out/$variant.log 2>&1 \
-            || { echo "diag-byref $variant failed rc=$?"; rc=1; }
-        sleep 20
-    done
-    exit $rc
-    ;;
 fair)
     # Fairness-controlled rerun: prefix caching off on every vLLM engine, an eager and a compiled
     # plain vLLM per version (overhead matched to each system's execution mode), nnsight through
@@ -247,9 +219,9 @@ fair)
     shift
     bench run --suite cross-system --workload "$@" \
         --backends nnsight-hf/fp32 nnsight-hf/default nnsight-hf/0-7 \
-                   nnsight-vllm/default nnsight-vllm/sync nnsight-vllm/0-7 vllm-lens/default interp-engine-vllm/default transformer-lens-vllm/default \
+                   nnsight-vllm/default nnsight-vllm/async nnsight-vllm/0-7 vllm-lens/default interp-engine-vllm/default transformer-lens-vllm/default \
                    vllm-plain/0-15-1 vllm-plain/0-19-1 vllm-plain/0-20-2 vllm-plain/0-28-0 \
-                   vllm-plain/eager-0-15-1 vllm-plain/eager-0-19-1 vllm-plain/eager-0-20-2 vllm-plain/eager-0-28-0 \
+                   vllm-plain/0-15-1/eager vllm-plain/0-19-1/eager vllm-plain/0-20-2/eager vllm-plain/0-28-0/eager \
         --reference nnsight-hf/fp32 --gpu 0 --timeout 3600 --out runs/fair-delta
     exit $?
     ;;
@@ -257,7 +229,7 @@ micro)
     make_wrappers
     rc=0
     # Construct probes on GPT-2: nnsight's primitive map per version and engine interface.
-    for pair in nnsight-hf:hf nnsight-hf-0-7:hf nnsight-vllm:vllm_async nnsight-vllm:vllm_sync \
+    for pair in nnsight-hf-default:hf nnsight-hf-0-7:hf nnsight-vllm-default:vllm_async nnsight-vllm-default:vllm_sync \
                 nnsight-vllm-0-7:vllm_async nnsight-vllm-0-7:vllm_sync; do
         img=${pair%%:*}; be=${pair##*:}
         echo "### $(date -Is) constructs $img $be"
@@ -267,8 +239,8 @@ micro)
     done
     # Perf microbenchmark: one sweep per vLLM version, each with its own pure-vLLM baseline.
     echo "### $(date -Is) perf vLLM 0.19.1"
-    ISB_PY_pure_vllm=$bin/py-vllm-plain-0-19-1 ISB_PY_nnsight_vllm=$bin/py-nnsight-vllm \
-    ISB_PY_vllm_lens=$bin/py-vllm-lens \
+    ISB_PY_pure_vllm=$bin/py-vllm-plain-0-19-1 ISB_PY_nnsight_vllm=$bin/py-nnsight-vllm-default \
+    ISB_PY_vllm_lens=$bin/py-vllm-lens-default \
         $PY scripts/perf.py sweep --plan plans/delta_perf_vllm0191.json --name delta_perf_vllm0191 \
         --run-dir runs/micro-delta/perf --out runs/micro-delta/perf/delta_perf_vllm0191.json || rc=1
     echo "### $(date -Is) perf vLLM 0.15.1"
@@ -283,8 +255,8 @@ perf-read)
     # saved name, so they ship to the client like vllm-lens's; rows record transfer_bytes.
     make_wrappers
     rc=0
-    ISB_PY_pure_vllm=$bin/py-vllm-plain-0-19-1 ISB_PY_nnsight_vllm=$bin/py-nnsight-vllm \
-    ISB_PY_vllm_lens=$bin/py-vllm-lens \
+    ISB_PY_pure_vllm=$bin/py-vllm-plain-0-19-1 ISB_PY_nnsight_vllm=$bin/py-nnsight-vllm-default \
+    ISB_PY_vllm_lens=$bin/py-vllm-lens-default \
         $PY scripts/perf.py sweep --plan plans/delta_perf_read_vllm0191.json --name delta_perf_read_vllm0191 \
         --run-dir runs/micro-delta/perf --out runs/micro-delta/perf/delta_perf_read_vllm0191.json || rc=1
     ISB_PY_pure_vllm=$bin/py-vllm-plain-0-15-1 ISB_PY_nnsight_vllm=$bin/py-nnsight-vllm-0-7 \
@@ -296,10 +268,10 @@ vllm-hook)
     rc=0
     bench run --suite cross-system \
         --backends nnsight-hf/fp32 nnsight-vllm/default vllm-lens/default vllm-hook/default vllm-hook/disk \
-                   vllm-plain/0-19-1 vllm-plain/eager-0-19-1 \
+                   vllm-plain/0-19-1 vllm-plain/0-19-1/eager \
         --reference nnsight-hf/fp32 --gpu 0 --timeout 3600 --out runs/vllm-hook-delta || rc=1
     make_wrappers
-    ISB_PY_pure_vllm=$bin/py-vllm-plain-0-19-1 ISB_PY_vllm_hook=$bin/py-vllm-hook \
+    ISB_PY_pure_vllm=$bin/py-vllm-plain-0-19-1 ISB_PY_vllm_hook=$bin/py-vllm-hook-default \
         $PY scripts/perf.py sweep --plan plans/delta_perf_vllmhook_0191.json --name delta_perf_vllmhook_0191 \
         --run-dir runs/micro-delta/perf --out runs/micro-delta/perf/delta_perf_vllmhook_0191.json || rc=1
     exit $rc
@@ -322,11 +294,11 @@ optimal)
     shift
     bench run --suite cross-system --workload "$@" \
         --backends nnsight-hf/fp32 \
-                   nnsight-vllm/default nnsight-vllm/sync nnsight-vllm/opt nnsight-vllm/opt/taps \
+                   nnsight-vllm/default nnsight-vllm/async nnsight-vllm/opt nnsight-vllm/opt/taps \
                    vllm-lens/default vllm-lens/opt interp-engine-vllm/default interp-engine-vllm/static \
                    transformer-lens-vllm/default transformer-lens-vllm/opt \
                    vllm-plain/0-15-1 vllm-plain/0-19-1 vllm-plain/0-20-2 vllm-plain/0-28-0 \
-                   vllm-plain/eager-0-15-1 vllm-plain/eager-0-19-1 vllm-plain/eager-0-20-2 vllm-plain/eager-0-28-0 \
+                   vllm-plain/0-15-1/eager vllm-plain/0-19-1/eager vllm-plain/0-20-2/eager vllm-plain/0-28-0/eager \
         --reference nnsight-hf/fp32 --gpu 0 --timeout 3600 --out runs/optimal-delta
     exit $?
     ;;
@@ -343,8 +315,8 @@ versions-046)
     # The nnsight 0.4.6 side of the suite alone, beside its HF 0.8.1 reference on the same card.
     shift
     bench run --suite nnsight-versions --model "$1" \
-        --backends nnsight-hf/sdpa/0-8-1 nnsight-hf/sdpa/0-4-6 nnsight-hf/sdpa/0-4-6/era \
-        --reference nnsight-hf/sdpa/0-8-1 --gpu 0 --out runs/nnsight-versions-perf
+        --backends nnsight-hf/0-8-1 nnsight-hf/0-4-6 nnsight-hf/0-4-6/era \
+        --reference nnsight-hf/0-8-1 --gpu 0 --out runs/nnsight-versions-perf
     exit $?
     ;;
 versions-fill)
@@ -353,7 +325,7 @@ versions-fill)
     shift
     model=$1 workload=$2; shift 2
     bench run --suite nnsight-versions --model "$model" --workload "$workload" \
-        --backends nnsight-hf/sdpa/0-8-1 "$@" --reference nnsight-hf/sdpa/0-8-1 --gpu 0 \
+        --backends nnsight-hf/0-8-1 "$@" --reference nnsight-hf/0-8-1 --gpu 0 \
         --out runs/nnsight-versions-perf
     exit $?
     ;;
@@ -370,49 +342,24 @@ load-fill)
     shift
     suite=$1 model=$2 workload=$3; shift 3
     bench run --suite "$suite" --model "$model" --workload "$workload" \
-        --backends nnsight-hf/sdpa/0-8-1 "$@" --reference nnsight-hf/sdpa/0-8-1 --gpu 0 \
+        --backends nnsight-hf/0-8-1 "$@" --reference nnsight-hf/0-8-1 --gpu 0 \
         --out runs/nnsight-load
     exit $?
     ;;
-diag-byref-profile)
-    # Where the remaining per-invoke time goes with envoys by reference: slurm/diag_cost.py inproc,
-    # byref on throughout, at N invokes per trace: diag-byref-profile N...
-    shift
-    out=runs/nnsight-versions-diag/byref-profile
-    mkdir -p $out
-    cp runs/nnsight-versions-diag/batch/inputs.jsonl $out/inputs.jsonl
-    rc=0
-    for n in "$@"; do
-        echo "### $(date -Is) diag-byref-profile N=$n"
-        timeout 1800 apptainer exec --nv --cleanenv --no-home --pwd /workspace \
-            --bind $PWD:/workspace:ro --bind $PWD/$out:/out \
-            --bind $ISB_APPTAINER_DIR/volumes/isb-model-cache:/models \
-            --env PYTHONPATH=/workspace,DIAG_N=$n,DIAG_BYREF=1,PYTHONDONTWRITEBYTECODE=1,USER=isb \
-            --env HF_HOME=/models,HF_HUB_CACHE=/models/hub,HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1 \
-            --env XDG_CACHE_HOME=/tmp/cache,VLLM_CACHE_ROOT=/tmp/vllm,TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor \
-            --env TRITON_CACHE_DIR=/tmp/triton,FLASHINFER_WORKSPACE_BASE=/tmp,CUDA_VISIBLE_DEVICES=0 \
-            .apptainer/images/isb-nnsight-vllm-0-8-1_local.sif \
-            python3 slurm/diag_cost.py inproc /out/inputs.jsonl /out/n$n.json > $out/n$n.log 2>&1 \
-            || { echo "diag-byref-profile N=$n failed rc=$?"; rc=1; }
-        sleep 20
-    done
-    exit $rc
-    ;;
 diag-scaling)
     # nnsight trace time against prompts and intervention sites per prompt (slurm/diag_scaling.py),
-    # Qwen2.5-7B: vLLM stock, vLLM envoy-by-reference, HF 0.8.1.
+    # Qwen2.5-7B: vLLM and HF, nnsight 0.8.1.
     out=runs/nnsight-versions-diag/scaling
     mkdir -p $out
     rc=0
-    for run in "vllm-stock|nnsight-vllm-0-8-1|vllm|/workspace|0" \
-               "vllm-byref|nnsight-vllm-0-8-1|vllm|/workspace/backends/nnsight-vllm/envoy_byref:/workspace|1" \
-               "hf|nnsight-hf-0-8-1|hf|/workspace|0"; do
-        IFS='|' read -r name img engine pp flag <<< "$run"
+    for run in "vllm|nnsight-vllm-0-8-1|vllm" \
+               "hf|nnsight-hf-0-8-1|hf"; do
+        IFS='|' read -r name img engine <<< "$run"
         echo "### $(date -Is) diag-scaling $name"
         timeout 3600 apptainer exec --nv --cleanenv --no-home --pwd /workspace \
             --bind $PWD:/workspace:ro --bind $PWD/$out:/out \
             --bind $ISB_APPTAINER_DIR/volumes/isb-model-cache:/models \
-            --env PYTHONPATH=$pp,NNSIGHT_ENVOY_BYREF=$flag,PYTHONDONTWRITEBYTECODE=1,USER=isb \
+            --env PYTHONPATH=/workspace,PYTHONDONTWRITEBYTECODE=1,USER=isb \
             --env HF_HOME=/models,HF_HUB_CACHE=/models/hub,HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1 \
             --env XDG_CACHE_HOME=/tmp/cache,VLLM_CACHE_ROOT=/tmp/vllm,TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor \
             --env TRITON_CACHE_DIR=/tmp/triton,FLASHINFER_WORKSPACE_BASE=/tmp,CUDA_VISIBLE_DEVICES=0 \
@@ -423,25 +370,16 @@ diag-scaling)
     done
     exit $rc
     ;;
-byref)
-    # Stock nnsight 0.8.1 on vLLM beside the envoy-by-reference prototype (the */byref configs),
-    # one suite on one model, scored against HF 0.8.1 on the same card: byref SUITE MODEL BACKEND...
-    shift
-    suite=$1 model=$2; shift 2
-    bench run --suite "$suite" --model "$model" --backends nnsight-hf/sdpa/0-8-1 "$@" \
-        --reference nnsight-hf/sdpa/0-8-1 --gpu 0 --out runs/nnsight-byref
-    exit $?
-    ;;
 versions-small)
     # The nnsight-versions workloads on a small model (default gpt2), where per-call overhead and
-    # not the forward dominates: every version's backend, plus the byref prototype.
+    # not the forward dominates: every version's backend.
     # Ad hoc rather than --suite: the suite's cases name only its two models.
     shift
     bench run --workload logit_lens steering ablation gen_steering activation_patching \
         --model "${1:-gpt2}" \
-        --backends nnsight-hf/sdpa/0-8-1 nnsight-vllm/sync/0-8-1 nnsight-vllm/sync/0-8-1/byref \
-                   nnsight-hf/sdpa/0-7 nnsight-vllm/sync/0-7 nnsight-hf/sdpa/0-4-6 \
-        --reference nnsight-hf/sdpa/0-8-1 --gpu 0 --timeout 3600 --out runs/nnsight-versions-small
+        --backends nnsight-hf/0-8-1 nnsight-vllm/0-8-1 \
+                   nnsight-hf/0-7 nnsight-vllm/0-7 nnsight-hf/0-4-6 \
+        --reference nnsight-hf/0-8-1 --gpu 0 --timeout 3600 --out runs/nnsight-versions-small
     exit $?
     ;;
 large)
@@ -460,47 +398,47 @@ large-min)
     for spec in "logit_lens steering ablation gen_steering|counterfact:4" "activation_patching|mib/ioi:4"; do
         ISB_MODEL_CACHE=isb-shared-cache bench run --workload ${spec%%|*} --model qwen2.5-72b \
             --data "${spec##*|}" --realizations default \
-            --backends nnsight-hf/sdpa/0-8-1/gpu2 nnsight-vllm/sync/0-8-1/tp2 nnsight-hf/sdpa/0-4-6/gpu2 \
-            --reference nnsight-hf/sdpa/0-8-1/gpu2 --gpu 0 --timeout 3600 --out runs/nnsight-large/min \
+            --backends nnsight-hf/0-8-1/gpu2 nnsight-vllm/0-8-1/tp2 nnsight-hf/0-4-6/gpu2 \
+            --reference nnsight-hf/0-8-1/gpu2 --gpu 0 --timeout 3600 --out runs/nnsight-large/min \
             || rc=1
     done
     exit $rc
     ;;
 large-opt)
     # Each nnsight realization at 72B over two H200s, bf16 throughout: HF device_map (reference) and
-    # HF tensor parallel; vLLM byref TP general cells, installed edits, edits + taps; plain vLLM
+    # HF tensor parallel; vLLM TP general cells, installed edits, edits + taps; plain vLLM
     # 0.28.0 compiled TP. One prompt per call (the realizations' regime), 16 units scored.
     rc=0
     for spec in "logit_lens steering ablation gen_steering|counterfact:16" "activation_patching|mib/ioi:16"; do
         ISB_MODEL_CACHE=isb-shared-cache bench run --workload ${spec%%|*} --model qwen2.5-72b \
             --data "${spec##*|}" --regimes interactive generation --realizations default \
-            --backends nnsight-hf/sdpa/0-8-1/gpu2 nnsight-hf/sdpa/0-8-1/tp2 nnsight-vllm/sync/0-8-1/byref/tp2 \
-                       nnsight-vllm/opt/0-8-1/byref/tp2 nnsight-vllm/opt/0-8-1/taps/byref/tp2 vllm-plain/0-28-0/tp2 \
-            --reference nnsight-hf/sdpa/0-8-1/gpu2 --gpu 0 --timeout 3600 --out runs/large-opt \
+            --backends nnsight-hf/0-8-1/gpu2 nnsight-hf/0-8-1/tp2 nnsight-vllm/0-8-1/tp2 \
+                       nnsight-vllm/0-8-1/opt/tp2 nnsight-vllm/0-8-1/opt/taps/tp2 vllm-plain/0-28-0/tp2 \
+            --reference nnsight-hf/0-8-1/gpu2 --gpu 0 --timeout 3600 --out runs/large-opt \
             || rc=1
     done
     exit $rc
     ;;
 hftp-smoke)
-    # HF tensor parallelism (nnsight-hf/sdpa/0-8-1/tp2, torchrun ranks) on Qwen2.5-7B over two GPUs,
+    # HF tensor parallelism (nnsight-hf/0-8-1/tp2, torchrun ranks) on Qwen2.5-7B over two GPUs,
     # four prompts, every default cell, scored against the same HF build on one GPU.
     rc=0
     for spec in "logit_lens steering ablation gen_steering|counterfact:4" "activation_patching|mib/ioi:4"; do
         bench run --workload ${spec%%|*} --model qwen2.5-7b --data "${spec##*|}" --realizations default \
-            --backends nnsight-hf/sdpa/0-8-1 nnsight-hf/sdpa/0-8-1/tp2 \
-            --reference nnsight-hf/sdpa/0-8-1 --gpu 0 --timeout 3600 --out runs/hftp/smoke || rc=1
+            --backends nnsight-hf/0-8-1 nnsight-hf/0-8-1/tp2 \
+            --reference nnsight-hf/0-8-1 --gpu 0 --timeout 3600 --out runs/hftp/smoke || rc=1
     done
     exit $rc
     ;;
 hftp-min)
-    # large-min's 72B comparison with HF tensor parallel beside HF device_map and vLLM byref TP,
+    # large-min's 72B comparison with HF tensor parallel beside HF device_map and vLLM TP,
     # scored against HF device_map.
     rc=0
     for spec in "logit_lens steering ablation gen_steering|counterfact:4" "activation_patching|mib/ioi:4"; do
         ISB_MODEL_CACHE=isb-shared-cache bench run --workload ${spec%%|*} --model qwen2.5-72b \
             --data "${spec##*|}" --realizations default \
-            --backends nnsight-hf/sdpa/0-8-1/gpu2 nnsight-hf/sdpa/0-8-1/tp2 nnsight-vllm/sync/0-8-1/byref/tp2 \
-            --reference nnsight-hf/sdpa/0-8-1/gpu2 --gpu 0 --timeout 3600 --out runs/hftp/min \
+            --backends nnsight-hf/0-8-1/gpu2 nnsight-hf/0-8-1/tp2 nnsight-vllm/0-8-1/tp2 \
+            --reference nnsight-hf/0-8-1/gpu2 --gpu 0 --timeout 3600 --out runs/hftp/min \
             || rc=1
     done
     exit $rc
@@ -509,9 +447,9 @@ large-smoke)
     # Every 72B backend loads and runs one steering case on four prompts over two GPUs.
     ISB_MODEL_CACHE=isb-shared-cache bench run --workload steering --model qwen2.5-72b \
         --data counterfact:4 --regimes interactive --realizations default \
-        --backends nnsight-hf/sdpa/0-8-1/gpu2 nnsight-vllm/sync/0-8-1/tp2 nnsight-vllm/sync/0-8-1/byref/tp2 \
-                   nnsight-vllm/0-8-1/tp2 nnsight-vllm/0-8-1/byref/tp2 nnsight-hf/sdpa/0-4-6/gpu2 \
-        --reference nnsight-hf/sdpa/0-8-1/gpu2 --gpu 0 --timeout 3600 --out runs/nnsight-large/smoke
+        --backends nnsight-hf/0-8-1/gpu2 nnsight-vllm/0-8-1/tp2 \
+                   nnsight-vllm/0-8-1/async/tp2 nnsight-hf/0-4-6/gpu2 \
+        --reference nnsight-hf/0-8-1/gpu2 --gpu 0 --timeout 3600 --out runs/nnsight-large/smoke
     exit $?
     ;;
 versions-awq)
@@ -520,8 +458,8 @@ versions-awq)
     # Ad hoc rather than --suite: the suite's cases name only its two models.
     bench run --workload steering --model qwen2.5-72b-awq --data counterfact:4 --regimes interactive \
         --realizations default \
-        --backends nnsight-hf/sdpa/0-8-1 nnsight-vllm/sync/0-8-1 nnsight-hf/sdpa/0-7 nnsight-vllm/sync/0-7 \
-                   nnsight-hf/sdpa/0-4-6 nnsight-hf/sdpa/0-4-6/era \
+        --backends nnsight-hf/0-8-1 nnsight-vllm/0-8-1 nnsight-hf/0-7 nnsight-vllm/0-7 \
+                   nnsight-hf/0-4-6 nnsight-hf/0-4-6/era \
         --gpu 0 --timeout 3600 --out runs/nnsight-versions-perf/awq-probe
     exit $?
     ;;

@@ -1,14 +1,15 @@
-"""Plain vLLM with no interpretability layer: the whole-system denominator (design.md §12.14).
+"""Plain vLLM with no interpretability layer: the whole-system denominator.
 
-Shared by every vllm-plain config, one per engine version and execution mode. It times only the
-no-intervention request; every intervention cell is declared unsupported. `vllm-plain/X` keeps
-vLLM's default configuration (torch.compile and CUDA graphs), which is what a user gets from plain
-vLLM; `vllm-plain/eager-X` sets enforce_eager, the mode the eager-only systems run in, so their
-overhead is not confounded with the CUDA-graph gap (`isb/jobs/score.py`, `attach_plain_vllm`).
+Shared by every vllm-plain config (configs.yml), one per engine version and execution mode. It
+times only the no-intervention request; every intervention cell is declared unsupported.
+`vllm-plain/<version>` keeps vLLM's default configuration (torch.compile and CUDA graphs), which is
+what a user gets from plain vLLM; `vllm-plain/<version>/eager` sets enforce_eager, the mode the
+eager-only systems run in, so their overhead is not confounded with the CUDA-graph gap
+(`isb/jobs/score.py`, `attach_plain_vllm`).
 """
 from dataclasses import dataclass
 
-from isb.backends.base import Backend
+from isb.backends.base import Backend, prompts_of
 from isb.jobs.worker import merge_requirements, options
 from isb.runs import EngineConfig, RunConfig
 
@@ -24,7 +25,7 @@ class PlainVLLMBackend(Backend):
     name = "vllm_plain"
 
     def __init__(self, *, enforce_eager, **engine_options):
-        # Every config states the mode (compose.base.yml): attach_plain_vllm pairs baselines on it.
+        # Every config states the mode: attach_plain_vllm pairs baselines on it.
         self.engine_options = {**engine_options, "enforce_eager": enforce_eager}
 
     def load(self, repo: str):
@@ -34,10 +35,12 @@ class PlainVLLMBackend(Backend):
         llm = LLM(model=repo, **self.engine_options)
         return PlainModel(llm, llm.get_tokenizer(), AutoConfig.from_pretrained(repo))
 
-    def vanilla(self, model, prompt, *, new_tokens):
+    def plain(self, model, units, *, new_tokens=1):
         from vllm import SamplingParams
 
-        model.llm.generate([prompt], SamplingParams(max_tokens=new_tokens, temperature=0.0, top_p=1.0),
+        model.llm.generate(prompts_of(units),
+                           SamplingParams(max_tokens=new_tokens, min_tokens=new_tokens,
+                                          temperature=0.0, top_p=1.0),
                            use_tqdm=False)
 
     def teardown(self, model) -> None:

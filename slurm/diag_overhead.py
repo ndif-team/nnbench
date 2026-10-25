@@ -2,7 +2,7 @@
 
 Usage (inside the container, /workspace on PYTHONPATH): python3 diag_overhead.py hf|vllm OUT.json
 Times, on Qwen2.5-7B bf16 with one CounterFact-length prompt:
-  vanilla   the backend's no-intervention call (HF: model._module; vLLM: AsyncLLM request)
+  plain     the backend's no-intervention call (HF: model._module; vLLM: AsyncLLM request)
   read1     a trace reading layer 14's last-token residual          (1 module event)
   read28    a trace reading every layer's last-token residual        (28 module events)
   readwrite a trace reading layer 14, writing it back, reading layer 27 (3 events, 1 swap)
@@ -52,13 +52,13 @@ def main(kind, out_path):
     resid = m.resid
     last = be.last
 
-    def read1():
+    def read1(rows):
         return last(resid(h[14].output, residual))
 
-    def read28():
+    def read28(rows):
         return torch.stack([last(resid(h[i].output, residual)) for i in range(len(h))])
 
-    def readwrite():
+    def readwrite(rows):
         out = h[14].output
         h[14].output = out                      # whole-tuple replacement with itself
         return last(resid(h[27].output, residual))
@@ -71,7 +71,7 @@ def main(kind, out_path):
         result["vllm"] = vllm.__version__
     except ImportError:
         pass
-    result["vanilla"] = timed(lambda: be.vanilla(model, PROMPT, new_tokens=1))
+    result["plain"] = timed(lambda: be.plain(model, [PROMPT], new_tokens=1))
     for name, build in [("read1", read1), ("read28", read28), ("readwrite", readwrite)]:
         result[name] = timed(lambda build=build: be.run(model, [PROMPT], build))
     if kind == "hf":

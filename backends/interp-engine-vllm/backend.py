@@ -1,4 +1,4 @@
-"""The interp-engine backend: Neuronpedia / Decode Research's engine on vLLM (design.md §12.14).
+"""The interp-engine backend: Neuronpedia / Decode Research's engine on vLLM.
 
 The shared worker drives the cells in cells.py through this backend object. interp-engine's
 methods are async and bound to one event loop; `sync_model` is its documented synchronous facade,
@@ -7,7 +7,7 @@ holding one loop for the model's life.
 from dataclasses import dataclass
 from importlib import metadata
 
-from isb.backends.base import Backend
+from isb.backends.base import Backend, prompts_of
 from isb.jobs.worker import merge_requirements, options
 from isb.runs import EngineConfig, RunConfig
 
@@ -18,18 +18,16 @@ class EngineModel:
     tokenizer: object          # the checkpoint's HF tokenizer, used exactly as the nnsight cells do
     config: object             # the checkpoint's HF config; model identity reads its revision
     n_layers: int
-    concurrent: bool = False   # issue independent captures concurrently (cells.py, patching)
 
 
 class InterpEngineBackend(Backend):
     name = "interp_engine"
 
-    def __init__(self, backend="vllm", concurrent_captures=False, **engine_options):
+    def __init__(self, backend="vllm", **engine_options):
         # backend: interp-engine's engine choice (load.py). "vllm" hooks the eager forward and
         # serves every point; "vllm-static" replays CUDA graphs over the taps it bakes in
         # (resid_post at every layer by default), its documented fast mode.
         self.backend = backend
-        self.concurrent_captures = concurrent_captures
         self.engine_options = engine_options
 
     def load(self, repo: str):
@@ -40,12 +38,21 @@ class InterpEngineBackend(Backend):
         engine.warmup()
         config = AutoConfig.from_pretrained(repo)
         return EngineModel(engine, AutoTokenizer.from_pretrained(repo), config,
-                           config.num_hidden_layers, self.concurrent_captures)
+                           config.num_hidden_layers)
 
-    def vanilla(self, model, prompt, *, new_tokens):
-        """generate_text with no capture points and no steering spec."""
-        model.engine.generate_text(model.tokenizer(prompt)["input_ids"], max_tokens=new_tokens,
-                                   temperature=0.0)
+    def plain(self, model, units, *, new_tokens=1):
+        """`generate_text` with no capture points and no steering spec, one request per prompt,
+        issued concurrently on the facade's loop for the scheduler to batch."""
+        import asyncio
+
+        ids = [model.tokenizer(prompt)["input_ids"] for prompt in prompts_of(units)]
+
+        async def all_of():
+            return await asyncio.gather(*(
+                model.engine.model.generate_text(row, max_tokens=new_tokens, temperature=0.0)
+                for row in ids))
+
+        model.engine.runner.run(all_of())
 
     def teardown(self, model) -> None:
         model.engine.shutdown()

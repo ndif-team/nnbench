@@ -1,0 +1,9 @@
+# vLLM-Lens on vLLM 0.19.1 (the Dockerfile's ARG values). `mode: opt` selects the fastest
+# documented realization (cells_opt.py).
+images:
+  default: {}
+configs:
+  default:
+    image: default
+    options: &base {dtype: bfloat16, gpu_memory_utilization: 0.85, enable_prefix_caching: false}
+  opt: {image: default, options: {<<: *base, mode: opt}}

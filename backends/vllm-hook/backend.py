@@ -1,4 +1,4 @@
-"""The vLLM-Hook backend: IBM's vLLM plugin as a system under comparison (design.md §12.14).
+"""The vLLM-Hook backend: IBM's vLLM plugin as a system under comparison.
 
 Driven through its documented offline entry point, `HookLLM` (README, docs/configs.md), with the
 built-in `probe_hidden_states` worker and `hidden_states` analyzer. The plugin registers through
@@ -16,7 +16,7 @@ import tempfile
 from dataclasses import dataclass, field
 from importlib import metadata
 
-from isb.backends.base import Backend
+from isb.backends.base import Backend, prompts_of
 from isb.jobs.worker import merge_requirements, options
 from isb.runs import EngineConfig, RunConfig
 
@@ -63,11 +63,13 @@ class VLLMHookBackend(Backend):
         return HookModel(llm, llm.tokenizer, config, config.num_hidden_layers, repo,
                          save_to_disk=self.storage != "rpc")
 
-    def vanilla(self, model, prompt, *, new_tokens):
+    def plain(self, model, units, *, new_tokens=1):
         """A plain generate on the plugin's engine: use_hook=False clears extra_args."""
         from vllm import SamplingParams
 
-        model.llm.generate([prompt], SamplingParams(max_tokens=new_tokens, temperature=0.0, top_p=1.0),
+        model.llm.generate(prompts_of(units),
+                           SamplingParams(max_tokens=new_tokens, min_tokens=new_tokens,
+                                          temperature=0.0, top_p=1.0),
                            use_hook=False, use_tqdm=False)
 
     def teardown(self, model) -> None:

@@ -76,7 +76,7 @@ An interpretability call is not just a forward:
 
 Each pattern also times two denominators under the same pattern: the workload's own no-intervention
 *baseline* call (for example steering with alpha 0), giving `overhead_vs_baseline`, and the
-*plain system* with no trace at all (`vanilla`, `vanilla_many`), giving `overhead_vs_vanilla`. The
+*plain system* with no trace at all (`be.plain`), giving `overhead_vs_vanilla`. The
 first isolates the intervention; the second the whole interpretability layer. Engine load is never
 timed: each job loads once, warms up, then measures.
 
@@ -160,8 +160,9 @@ second, sync engine, which does not fit beside a large model).
 **Issues** M single-unit calls (128) from C client threads (1, 4, 16, 64). Each client sends its
 next unit as soon as its last returns. A backend that declares it can take concurrent requests (the
 async vLLM engine) gets them together. Any other (HF, the sync engine) gets them one at a time
-through a lock, which is what a server without a scheduler does with concurrent clients. **Timed:**
-one warm-up request per client, then one pass of M requests. Each request is timed from issue to
+through a first-come, first-served gate, which is what a server without a scheduler does with
+concurrent clients: every request after the first waits for those ahead of it. **Timed:**
+one warm-up request per client, then three passes of M requests. Each request is timed from issue to
 return, so time spent queueing counts. Calls are prepared before the pass. Reports units/s and
 request latency p50, p90, p99 and mean. **Scored:** the first 16 units, against the reference's same
 regime.
@@ -187,7 +188,7 @@ during it, so its tail latency understates what users would see (coordinated omi
 (4, 16, 64), each on a thread of its own as soon as it arrives, whether or not earlier requests have
 returned. The arrival times come from a fixed seed, so every pass and every backend sees the same
 schedule. A backend that can take concurrent requests gets them together; any other queues them
-behind one lock, as in the closed loop. **Timed:** one warm-up request, then one pass. Each request
+behind the closed loop's first-come, first-served gate. **Timed:** one warm-up request, then three passes. Each request
 is timed from its scheduled arrival to its return, so waiting in a queue, or for the system to accept
 it, counts. Reports achieved units/s, request latency p50, p90, p99 and mean, the offered rate, and
 the most requests in flight at once. **Scored:** the first 16 units, against the reference's same
@@ -245,9 +246,8 @@ The declaration follows from who controls the arrival process:
 Two axes are involved. The request shape is the workload's own regime: one unit per call
 (`interactive`), several units per call (`batched`), or one unit decoded for several steps
 (`generation`). The load pattern says how those requests are issued. Offline sweeps a workload with
-several-unit calls at any B, and a workload whose cells take one unit per call at B=1, which is how
-a researcher loops over a dataset with a one-unit API. Concurrent and open issue the single-unit
-request shape, decode included.
+calls of B units each (every cell takes a unit list, so B=1 is a one-element list and B=all one
+call); concurrent and open issue single-unit requests, decode included.
 
 | Workload | Setting | Request shape (own regimes) | Load patterns |
 |---|---|---|---|
@@ -306,9 +306,9 @@ Known gaps, recorded here rather than built:
   engine behaviour it would expose, overlapping whole sessions, is nearest to what steering under
   the concurrent pattern shows at request level.
 - Only the async vLLM engine declares `concurrent_requests`; every other backend is driven through
-  the serial lock. For the nnsight suites here that is the fact being measured (HF and the sync
+  the serial gate. For the nnsight suites here that is the fact being measured (HF and the sync
   engine serve one request at a time). A cross-system concurrent or open-loop row would need each
-  system's backend to declare whether it takes concurrent requests, or it would time the lock.
+  system's backend to declare whether it takes concurrent requests, or it would time the gate.
 
 ## Choosing and comparing
 
