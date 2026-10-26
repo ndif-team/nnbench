@@ -2,7 +2,7 @@
 
 The upstream jacobian lens is fitted on Salesforce/wikitext (the published checkpoint's
 "Salesforce-wikitext" tag), so the jacobian-collection workload uses the same distribution.
-Snapshot recipe, deterministic: the first 100 body paragraphs of the wikitext-103-raw-v1
+Snapshot recipe, deterministic: the first 256 body paragraphs of the wikitext-103-raw-v1
 `test` split (skip headings and short lines), each cropped to 300 characters at a word
 boundary. The collection estimator skips the first 16 positions (attention sinks), so every
 prompt must tokenize well past that; the 200-character floor guarantees it.
@@ -16,7 +16,7 @@ from pathlib import Path
 DATASET = "Salesforce/wikitext"
 CONFIG = "wikitext-103-raw-v1"
 SPLIT = "test"
-N = 100
+N = 256
 OUT = Path(__file__).resolve().parents[1] / "data" / "wikitext" / "wikitext.json"
 
 

@@ -79,11 +79,15 @@ def test_for_backend_prefixes_every_path_on_vllm_only():
     # a wrapper architecture mounts the same text tree behind a prefix on vLLM (qwen3_5's
     # language_model); the engine view must prefix ALL paths there and be identity on hf
     prof = ModelProfile("wrapped", "core.blocks", "core.final_rms",
-                        head_path="proj_out", vllm_prefix="text_side")
+                        head_path="proj_out", logits_processor_path="score_fn",
+                        vllm_prefix="text_side")
     assert prof.for_backend("hf") is prof                        # identity, not a copy
     v = prof.for_backend("vllm_async")
-    assert (v.blocks_path, v.norm_path, v.head_path) == (
-        "text_side.core.blocks", "text_side.core.final_rms", "text_side.proj_out")
+    assert (v.blocks_path, v.norm_path, v.head_path, v.logits_processor_path) == (
+        "text_side.core.blocks", "text_side.core.final_rms", "text_side.proj_out",
+        "text_side.score_fn")
+    wrapper = SimpleNamespace(text_side=SimpleNamespace(score_fn="the-processor"))
+    assert v.logits_processor(wrapper) == "the-processor"
     assert v.for_backend("vllm_serve") is v                      # idempotent (prefix consumed)
     # no prefix declared -> identity on every backend
     assert WEIRD.for_backend("vllm_async") is WEIRD

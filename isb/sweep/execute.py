@@ -33,7 +33,7 @@ from ..sweep.spec import LOAD_KINDS
 def _cell(name, methodology, family):
     fn = get_cell(methodology, family, name)
     if fn is None:
-        raise LookupError(f"no cell for {methodology}/{family}/{name}")
+        raise Unsupported(f"no cell for {methodology}/{family}/{name}")
     return fn
 
 

@@ -1394,3 +1394,28 @@ the backend refused the pattern.
   `reference_key`), and HF 0.8.1's own left-padded batch of 16 moves that row by the same amount,
   unscored because it is the reference. The other seven steering rows move by TV ≤ 0.013 in HF's
   batch, and vLLM's batch of 16, which has no padding, moves this row by 0.007.
+
+## nnsight on vLLM in fp32: the min-tokens mask writes -inf into the saved step logits (2026-10-26)
+
+Run `/disk/u/zikai/isb-runs/eval-v1/stage1c-fp32-waveA/20261026T000931Z-5ce97389` (commit d0ed4b9, hakone,
+one A100-SXM4-80GB per job): steered generation on Qwen2.5-7B-Instruct, 16 CounterFact prompts, 8 greedy
+tokens, on `nnsight-vllm/fp32` (nnsight 0.8.0rc1 at `260c555b` on vLLM 0.19.1, eager) scored against
+`nnsight-hf/fp32`. All four rows on vLLM are `INVALID_OUTPUT` ("missing, empty or nonfinite tensor
+output"). The saved per-step logits hold -inf at Qwen2.5's two EOS ids, 151643 and 151645, at every step
+of every unit: 256 of the 19.46M saved values (16 units × 8 steps × 152,064 vocabulary entries). The
+finite values match HF fp32.
+
+The vLLM backends request exactly the generated length (`max_tokens` = `min_tokens` = 8,
+`isb/backends/vllm_sync.py`, `isb/backends/vllm_async.py`), so vLLM masks the stop tokens at every step.
+In vLLM 0.19.1 the sampler first converts the logits with `logits = logits.to(torch.float32)`
+(`vllm/v1/sample/sampler.py:90`), which returns the same tensor when the logits are already fp32 and a
+copy when they are bf16. `MinTokensLogitsProcessor.apply` then writes the mask in place with
+`logits.index_put_(self.logits_slice, self.neg_inf_tensor)` (`vllm/v1/sample/logits_processor/builtin.py:237`).
+In fp32 that is the tensor nnsight saved at `model.logits`, so the saved value changes after the trace
+read it. In bf16 the write lands on the fp32 copy: the same rows on `nnsight-vllm/default` (same image,
+bf16) hold finite logits.
+
+Classification: a translation gap for nnsight to close. `.save()` on vLLM keeps a reference to the
+engine's logits tensor, and the engine mutates that tensor after the read whenever no dtype conversion
+has copied it. Until then a user who saves `model.logits` in fp32 while a request sets `min_tokens` has
+to `.clone()` it. Not run: nnsight 0.8.1 on vLLM 0.27.1 in fp32.

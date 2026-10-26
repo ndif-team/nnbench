@@ -128,6 +128,6 @@ def jacobian_lens_vllm(be, model, m, units, *, layers="all", position="last",
         return _jlens_proxy(m.blocks(model), m.norm(model), m.head(model), layers=layers,
                             positions=[positions[r] for r in rows], unembed=unembed,
                             residual=residual, transport=transport,
-                            processor=model.logits_processor)
+                            processor=m.logits_processor(model))
 
     return be.run(model, units, build)

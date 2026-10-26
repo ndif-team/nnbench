@@ -59,6 +59,11 @@ def test_unknown_source_and_missing_size_are_loud():
         raise AssertionError("generated source without n must raise")
     except ValueError:
         pass
+    try:
+        load_data(DataRef("jlens/order-ops", 56))         # the file holds 55
+        raise AssertionError("asking a file source for more units than it holds must raise")
+    except ValueError as e:
+        assert "lens-eval-order-ops.json holds 55" in str(e)
 
 
 def test_workload_binds_a_dataref_and_carries_its_knobs():
@@ -132,7 +137,7 @@ if __name__ == "__main__":
 
 def test_wikitext_source_and_jacobian_valid_slice():
     prompts, knobs = load_data(DataRef("wikitext"))
-    assert len(prompts) == 100 and knobs == {}
+    assert len(prompts) == 256 and knobs == {}            # the offline sweep's 256 units
     assert all(len(p) >= 150 for p in prompts)            # long enough to clear the sink skip
     from isb.methodologies.jacobian_collect import valid_slice
     assert valid_slice(50, 16) == slice(16, 49)           # sink prefix out, final position out

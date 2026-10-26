@@ -86,6 +86,7 @@ class ModelProfile(Family):
         p = self.vllm_prefix
         return replace(self, blocks_path=f"{p}.{self.blocks_path}",
                        norm_path=f"{p}.{self.norm_path}", head_path=f"{p}.{self.head_path}",
+                       logits_processor_path=f"{p}.{self.logits_processor_path}",
                        vllm_prefix="")
 
     def default_residual(self, backend_name: str) -> str:
@@ -100,6 +101,9 @@ class ModelProfile(Family):
 
     def head(self, model):
         return _attr(model, self.head_path)
+
+    def logits_processor(self, model):
+        return _attr(model, self.logits_processor_path)
 
     def submodule(self, block, which: str):
         """The within-block ablation target ("attn" | "mlp") by this family's own name."""

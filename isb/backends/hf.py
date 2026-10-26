@@ -4,6 +4,16 @@ from __future__ import annotations
 from .base import Backend, prompts_of
 
 
+def _takes_automodel(language_model) -> bool:
+    """Whether this nnsight's LanguageModel picks its auto class from `automodel` (0.7, whose
+    multimodal-wrapper guard a non-default class opts out of). 0.8 loads through the text-generation
+    pipeline, which already resolves AutoModelForCausalLM, and forwards an unknown `automodel` into
+    the model constructor."""
+    import inspect
+
+    return "automodel" in inspect.signature(language_model.__init__).parameters
+
+
 class HFBackend(Backend):
     name = "hf"
 
@@ -28,7 +38,7 @@ class HFBackend(Backend):
         from nnsight import LanguageModel
 
         kw = {} if self.dtype is None else {"dtype": getattr(torch, self.dtype)}
-        if self.force_text_causal:
+        if self.force_text_causal and _takes_automodel(LanguageModel):
             from transformers import AutoModelForCausalLM
 
             class _TextCausal(AutoModelForCausalLM):    # a non-default automodel: the guard opts out

@@ -39,6 +39,8 @@ class Family:
     blocks_path: str            # the decoder block list
     norm_path: str              # the final norm before the unembed
     head_path: str = "lm_head"
+    # vLLM's logits processor, the module the lens cells project through on vLLM (no HF counterpart)
+    logits_processor_path: str = "logits_processor"
     # A block-output's DENOTATION is per (family x engine), not per family alone (design §3.2: the
     # same site name means different things per context): HF blocks carry the full residual stream
     # in [0] ("plain") for every family, while vLLM's implementation of RMSNorm families returns

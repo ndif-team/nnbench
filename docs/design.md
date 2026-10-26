@@ -1431,8 +1431,9 @@ object loads the engine, and the cell returns the same tensor shapes as the nnsi
 **Declared unsupported.** A system that cannot express a workload registers a cell that raises
 `Unsupported(reason)`, naming the missing capability, for example "hooks fire only at decoder-layer
 boundaries; the attention output is not addressable". The worker records `UNSUPPORTED` with that
-reason. A missing registration stays an `ERROR`, because it means the suite lacks the cell, not
-that the system lacks the capability. `UNSUPPORTED` cells are excluded from performance comparison.
+reason. A missing registration is also recorded as `UNSUPPORTED`, with the reason "no cell for
+`<methodology>/<family>/<interface>`", which tells a suite that lacks the cell apart from a system
+that lacks the capability. `UNSUPPORTED` cells are excluded from performance comparison.
 
 **Denominators.** Two ratios, both computed from the same experiment's jobs:
 
@@ -1440,9 +1441,12 @@ that the system lacks the capability. `UNSUPPORTED` cells are excluded from perf
   intervention attached over the regime's units in the regime's call form. The executor times it
   in the same job, regime and timing loop as the cells (the `__vanilla__` auxiliary record, a wire
   name kept for saved runs), and each cell records `overhead_vs_vanilla`.
-- Whole-system overhead: `vllm-plain/*` configs run plain vLLM at each engine version in use, with
-  vLLM's default configuration (torch.compile and CUDA graphs), and declare every intervention
-  unsupported. The scorer divides each vLLM-engine row by the plain job's `__vanilla__` latency at
+- Whole-system overhead: `vllm-plain/*` configs run plain vLLM's serving engine (`AsyncLLM`) at each
+  engine version in use, compiled with CUDA graphs or eager, and declare every intervention
+  unsupported. Concurrent and open-loop clients share the engine as they would share a vLLM server.
+  Chunked prefill follows the systems a floor serves: the 0.27.1 floors turn it off, matching
+  nnsight 0.8, which starts vLLM with it off, and the other versions keep vLLM's default. The scorer
+  divides each vLLM-engine row by the plain job's `__vanilla__` latency at
   the same vLLM version and workload (`overhead_vs_plain_vllm`). Plain jobs are identified by the
   engine mode they declare, never by name.
 
@@ -1644,7 +1648,8 @@ over each call's units) run under the same pattern, giving `overhead_vs_baseline
 session in which every client submits at once: nnsight's async vLLM backend moves its persistent
 event loop to a thread and schedules each call's coroutine there, so a trace is built and submitted
 before its first await and two traces never interleave on the model's one interleaver (the same
-property nnsight's own server relies on). Any other backend (HF, the sync engine) is driven
+property nnsight's own server relies on). Plain vLLM runs its `AsyncLLM` the same way. Any other
+backend (HF, the sync engine) is driven
 through one first-come, first-served gate, which is what a serial server does with concurrent
 clients: every request after the first waits for those ahead of it, the wait counts toward request
 latency, and the result records `serial: true` (a plain `threading.Lock` lets the client that just
