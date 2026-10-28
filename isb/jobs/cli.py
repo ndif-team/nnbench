@@ -100,6 +100,9 @@ def parser():
     run.add_argument("--realizations", choices=["default", "all"],
                      help="each system's documented realization only, or also every alternative its "
                           "cells declare (ad-hoc default: all)")
+    run.add_argument("--labels", nargs="+",
+                     help="keep only the rows with these labels (exact, as a report's label column "
+                          "prints them); baselines, effect checks and plain-request calls still run")
     run.add_argument("--backends", nargs="+",
                      help="config names, <system>/<config>; a bare system name means <system>/default")
     run.add_argument("--reference", help="one of --backends; omit (or '' with --suite) to collect "
@@ -139,7 +142,7 @@ def _run(args):
     if not args.gpu or "," in args.gpu:
         raise ValueError("select one GPU index/UUID; a config reserving several GPUs takes the "
                          "indices from it on (backends/README.md)")
-    specs, skipped = cases(entries, settings["realizations"])
+    specs, skipped = cases(entries, settings["realizations"], labels=args.labels)
     launcher = args.launcher or default_launcher()
     for name in args.backends:
         env = environment(name, args.out, args.out, args.gpu)
@@ -154,7 +157,8 @@ def _run(args):
     directory.mkdir(parents=True, exist_ok=False)
     plan = {"version": PLAN_VERSION, "suite": suite, "backends": args.backends,
             "reference": args.reference, "comparison": args.comparison,
-            "realizations": settings["realizations"], "gpu": args.gpu, "launcher": launcher,
+            "realizations": settings["realizations"], "labels": args.labels,
+            "gpu": args.gpu, "launcher": launcher,
             "experiments": [], "cases": [spec.name for spec in specs], "not_applicable": skipped,
             "status": "preparing"}
     for row in skipped:

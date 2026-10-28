@@ -347,6 +347,28 @@ def test_cli_suite_settings_and_overrides():
         _recipe(parser().parse_args(["run", "--workload", "steering", "--model", "gpt2"]))
 
 
+def test_cli_labels_keep_only_the_listed_rows():
+    run = ["run", "--suite", "nnsight-load-open", "--model", "qwen2.5-7b"]
+    keep = ["add toward ' Rome' at half depth", "every layer, last token",
+            "half depth residual stream, every decode step",
+            "add toward ' Rome' at half depth, every step, scaled by each token's norm"]
+    _, entries, settings = _recipe(parser().parse_args(run))
+    full = {s.name: s for s in cases(entries, settings["realizations"])[0]}
+    args = parser().parse_args([*run, "--labels", *keep])
+    specs, _ = cases(entries, settings["realizations"], labels=args.labels)
+    assert {s.name for s in specs} == set(full)
+    for spec in specs:
+        assert len(spec.tasks) == 1 and spec.tasks[0].label in keep
+        assert spec.tasks[0] in full[spec.name].tasks
+        # the baseline, effect check and regimes are not rows and stay
+        assert (spec.baseline, spec.effect, spec.regimes) == (
+            full[spec.name].baseline, full[spec.name].effect, full[spec.name].regimes)
+    with pytest.raises(ValueError, match="keeps no row of logit_lens"):
+        cases(entries, settings["realizations"], labels=keep[:1] + keep[2:])
+    with pytest.raises(ValueError, match="no case has"):
+        cases(entries, settings["realizations"], labels=[*keep, "add toward ' Paris' at half depth"])
+
+
 def test_cli_records_rows_a_model_cannot_express():
     args = parser().parse_args(["run", "--workload", "ablation", "--model", "nemotron3-nano-4b",
                                 "--backends", "nnsight-hf/default"])

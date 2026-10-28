@@ -293,14 +293,16 @@ def parse_data(text):
     return DataRef(name, int(count) if separator else None)
 
 
-def cases(entries, realizations="default"):
+def cases(entries, realizations="default", labels=None):
     """Instantiate every (workload, model) of the entries. Returns the resolved specs and the rows
-    the models cannot express, as [{"case", "label", "reason"}] ("*" for a whole case)."""
+    the models cannot express, as [{"case", "label", "reason"}] ("*" for a whole case). `labels`
+    keeps only the rows with those labels; each case's baseline, effect check and plain-request
+    calls are not rows and stay. A case that keeps no row, or a label no case has, is an error."""
     from .models import MODELS
     from .sweep.spec import NotApplicable, instantiate
     from .workloads import WORKLOADS
 
-    specs, skipped, seen = [], [], set()
+    specs, skipped, seen, used = [], [], set(), set()
     for entry in entries:
         for workload in entry.workloads:
             if workload not in WORKLOADS:
@@ -316,14 +318,23 @@ def cases(entries, realizations="default"):
                     skipped.append({"case": f"{workload}/{model}", "label": "*", "reason": str(reason)})
                     continue
                 skipped += [{"case": spec.name, **row} for row in rows]
+                if labels is not None:
+                    kept = [task for task in spec.tasks if task.label in labels]
+                    if not kept:
+                        raise ValueError(f"--labels keeps no row of {spec.name}; its rows: "
+                                         + "; ".join(task.label for task in spec.tasks))
+                    used.update(task.label for task in kept)
+                    spec = dataclasses.replace(spec, tasks=kept)
                 for one in ([dataclasses.replace(spec, tasks=[task]) for task in spec.tasks]
                             if entry.split_rows else [spec]):
                     key = (one.name, tuple(task.label for task in one.tasks))
-                    if any(seen_name == one.name and set(labels) & set(key[1])
-                           for seen_name, labels in seen):
+                    if any(seen_name == one.name and set(seen_labels) & set(key[1])
+                           for seen_name, seen_labels in seen):
                         raise ValueError(f"case {one.name} is selected twice")
                     seen.add(key)
                     specs.append(one)
+    if labels is not None and set(labels) - used:
+        raise ValueError(f"--labels names rows no case has: {sorted(set(labels) - used)}")
     if not specs:
         raise ValueError("the selection contains no case any model can express")
     return specs, skipped
