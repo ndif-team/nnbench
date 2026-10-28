@@ -7,12 +7,13 @@ and ablation is expressed through hooks (a pre-hook's input on vLLM's Qwen2 laye
 layer's MLP output, so zeroing it removes that MLP; the attention output is removed by recomputing
 the layer's MLP from the stream without it). A call's units go out as one `generate` over all their
 prompts, each request hooked on its own token slice with its own `ctx.saved`, and come back in
-prompt order; outputs carry the unit axis at dim -2. Per-request row lists are kept on
-tensor-parallel rank 0 only (`_append`), as in cells.py.
+prompt order; outputs carry the unit axis at dim -2. Readouts are computed and kept on
+tensor-parallel rank 0 only (`_rank0`), as in cells.py.
 
 Registered for family "llama" (vLLM module paths `model.norm`, `lm_head`; vLLM-Lens itself finds
 decoder layers only under `model.layers`-style trees).
 """
+import functools
 import sys
 
 import cloudpickle
@@ -21,7 +22,7 @@ import torch.nn.functional as F
 
 from isb.methodologies.jacobian_lens import _load_fitted, _orthogonal
 from isb.methodologies.registry import Unsupported, cell
-from isb.methodologies.steering import _resolve_token
+from isb.methodologies.steering import CALIBRATED, _resolve_token, calibrated_strengths
 from isb.tasks.lens_eval import locate
 
 # The hook closures travel to the engine-core process by value; this module is not on its path.
@@ -30,15 +31,22 @@ cloudpickle.register_pickle_by_value(sys.modules[__name__])
 _GREEDY = {"temperature": 0.0, "top_p": 1.0}
 
 
-def _append(ctx, key, value):
-    """Append to a per-request list in `ctx.saved`, on tensor-parallel rank 0 only. Every TP rank
-    runs the hook on the same replicated stream, and the plugin concatenates list values across
-    ranks (`_activations_plugin.py`, `_merge_hook_results`), so a list kept on every rank would
-    hold each row once per rank."""
+def _rank0():
+    """Whether this worker is tensor-parallel rank 0, the one rank that computes and keeps a
+    request's readouts. Every TP rank runs each hook on the same replicated stream, and the plugin
+    merges the ranks' `ctx.saved` dicts (`_activations_plugin.py`, `_merge_hook_results`: list
+    values concatenated, any other value overwritten by a later rank's, a key a rank lacks left
+    as the others set it), so a value kept on rank 0 alone arrives once and is computed once.
+    Under TP the backend prefetches `lm_head.weight`, so `ctx.get_parameter` on rank 0 alone runs
+    no collective (`_helpers/types.py`, `HookContext.get_parameter`)."""
     from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
-    if get_tensor_model_parallel_rank() == 0:
-        ctx.saved.setdefault(key, []).append(value)
+    return get_tensor_model_parallel_rank() == 0
+
+
+def _append(ctx, key, value):
+    """Append to a per-request list in `ctx.saved` (callers keep readouts on `_rank0` only)."""
+    ctx.saved.setdefault(key, []).append(value)
 
 
 def _unembed(ctx, x):
@@ -95,7 +103,7 @@ def _steer_fn(layers, token_id, alpha, last):
                 weight = ctx.get_parameter("lm_head.weight")
                 built.append(F.normalize(weight[token_id].float(), dim=0).to(weight.dtype))
             return h + (alpha * h.norm(dim=-1).mean()) * built[0]
-        if ctx.layer_idx == last:
+        if ctx.layer_idx == last and _rank0():
             _append(ctx, "rows", _readout(ctx, h))
         return None
     return steer
@@ -105,7 +113,8 @@ def _direction(model, token_id):
     """The target token's unit unembedding row, fetched once from the worker through a hook."""
     if token_id not in model.directions:
         def fetch(ctx, h):
-            ctx.saved["row"] = ctx.get_parameter("lm_head.weight")[token_id].float().cpu()
+            if _rank0():
+                ctx.saved["row"] = ctx.get_parameter("lm_head.weight")[token_id].float().cpu()
         (saved,) = _hooked(model, [" "], [fetch], [0])
         model.directions[token_id] = F.normalize(saved["row"], dim=0)
     return model.directions[token_id]
@@ -123,9 +132,33 @@ def _norm_matched(model, token_id, layers, alpha):
     return {"apply_steering_vectors": [vector]}
 
 
+def _mean_norms(model, prompts, layers):
+    """The unsteered summed stream's mean per-token norm at each of `layers`, averaged over
+    `prompts`: one hooked `generate` whose hook only reads (`calibrated_strengths`)."""
+    def read(ctx, h):
+        if _rank0():
+            ctx.saved[f"norm{ctx.layer_idx}"] = h.float().norm(dim=-1).mean().item()
+
+    saved = _hooked(model, prompts, [read] * len(prompts), layers)
+    return [sum(s[f"norm{i}"] for s in saved) / len(saved) for i in layers]
+
+
+def _fixed_vectors(model, token_id, layers, strengths):
+    """vLLM-Lens's documented steering form with fixed vectors (README "Steering vectors"):
+    SteeringVector adds `scale * activations[i]` to the summed stream at `layer_indices[i]` on every
+    forward (`_worker_ext._apply_steering`, norm_match off); row i is `strengths[i]` times the
+    target's unit unembedding row."""
+    from vllm_lens import SteeringVector
+
+    direction = _direction(model, token_id)
+    vector = SteeringVector(activations=torch.stack([s * direction for s in strengths]),
+                            layer_indices=list(layers), scale=1.0)
+    return {"apply_steering_vectors": [vector]}
+
+
 def _read_last(last):
     def read(ctx, h):
-        if ctx.layer_idx == last:
+        if ctx.layer_idx == last and _rank0():
             _append(ctx, "rows", _readout(ctx, h))
     return read
 
@@ -141,7 +174,7 @@ def _transplant(clean, layer, positions, last):
             if positions == "last":                        # keep the corrupt rows, swap the last
                 patched = torch.cat([h[:-1], patched[-1:]])
             return patched
-        if ctx.layer_idx == last:
+        if ctx.layer_idx == last and _rank0():
             _append(ctx, "rows", _readout(ctx, h))
         return None
     return transplant
@@ -154,6 +187,8 @@ def logit_lens(be, model, units, *, layers="all"):
     last = max(idx)
 
     def lens(ctx, h):
+        if not _rank0():
+            return
         ctx.saved.setdefault("_rows", []).append(h[-1:])      # a fresh clone per layer, on GPU
         if ctx.layer_idx == last:
             stacked = torch.cat(ctx.saved.pop("_rows"))
@@ -167,16 +202,28 @@ def logit_lens(be, model, units, *, layers="all"):
 @cell("steering", family="llama", backend="vllm_lens_opt")
 def steering(be, model, units, *, layer=8, layers=None, target=" Rome", alpha=6.0,
              scale_by="mean_norm"):
-    """`layers` steers every listed layer in the one forward (and `layer` is ignored)."""
+    """`layers` steers every listed layer in the one forward (and `layer` is ignored), each with
+    `alpha / len(layers)`. `scale_by="calibrated_mean_norm"` adds fixed vectors through
+    `apply_steering_vectors`, their norms measured once by a read-only hooked request
+    (isb/methodologies/steering.py, `calibrated_strengths`)."""
     last = model.n_layers - 1
     steered = [i % model.n_layers for i in (layers if layers is not None else [layer])]
     if alpha != 0 and last in steered:
         raise ValueError(f"steer layers {steered} include the read-out layer; pick layers < {last}")
     token_id = _resolve_token(model.tokenizer, target)
+    if scale_by == CALIBRATED:
+        extra = None
+        if alpha != 0:
+            strengths = calibrated_strengths(be, steered, alpha, units,
+                                             functools.partial(_mean_norms, model))
+            extra = _fixed_vectors(model, token_id, steered, strengths)
+        return _logits(_hooked(model, units, [_read_last(last)] * len(units), [last],
+                               extra=extra))                                     # [B, vocab]
+    share = alpha / len(steered)
     if scale_by == "token_norm":
         return _logits(_hooked(model, units, [_read_last(last)] * len(units), [last],
-                               extra=_norm_matched(model, token_id, steered, alpha)))
-    fn = _steer_fn(steered, token_id, alpha, last)
+                               extra=_norm_matched(model, token_id, steered, share)))
+    fn = _steer_fn(steered, token_id, share, last)
     return _logits(_hooked(model, units, [fn] * len(units), [*steered, last]))     # [B, vocab]
 
 
@@ -227,7 +274,7 @@ def _prefill_transplant(clean, layer, last):
             ctx.saved["patched"] = tuple(h.shape)
             if tuple(clean.shape) == tuple(h.shape):
                 out = clean.to(device=h.device, dtype=h.dtype)
-        if ctx.layer_idx == last:
+        if ctx.layer_idx == last and _rank0():
             _append(ctx, "rows", _unembed(ctx, (h if out is None else out)[-1:]).cpu())
         return out
     return transplant
@@ -301,6 +348,8 @@ def jacobian_lens(be, model, units, *, layers="all", position="last", transport=
 
     def lens_at(position):
         def lens(ctx, h):
+            if not _rank0():
+                return
             ctx.saved.setdefault("_rows", []).append(h[position].unsqueeze(0))   # on GPU
             if ctx.layer_idx == last:
                 x = torch.cat(ctx.saved.pop("_rows"))                           # [n_layers, d]

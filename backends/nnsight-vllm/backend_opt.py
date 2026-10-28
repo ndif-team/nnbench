@@ -73,15 +73,35 @@ class NnsightOptBackend(VLLMSyncBackend):
         super().teardown(model)
 
 
+def _layer_outputs(indices, n_layers):
+    """Tap locations of the decoder layer outputs `indices` (negative indices count from the end)."""
+    return sorted({f"model.layers.{i % n_layers}.output" for i in indices},
+                  key=lambda tap: int(tap.split(".")[2]))
+
+
+def _listed(p):
+    """The layers one call's params name: `layers` when given, else `layer`."""
+    if p.get("layers") is not None:
+        return list(p["layers"])
+    return [p["layer"]] if p.get("layer") is not None else []
+
+
 def spec_taps(spec):
-    """The locations a spec's cells read or write: the smallest tap set for its graphs."""
+    """The locations a spec's cells read or write: the smallest tap set for its graphs. A call
+    that reads and writes nothing at a layer (steering at alpha 0, a harvest with export off) adds
+    no tap, so a case's taps are exactly the layers its rows, baseline and effect check touch."""
     params = [t.params for t in spec.tasks] + [spec.baseline.params]
     if spec.effect is not None:
         params += [spec.effect.baseline_params, spec.effect.perturbed_params]
+    n = spec.n_layers
     if spec.methodology == "logit_lens":
-        return ["model.layers.*.output"]
+        if any(p.get("layers", "all") == "all" for p in params):
+            return ["model.layers.*.output"]
+        return _layer_outputs([i for p in params for i in p["layers"]], n)
     if spec.methodology in ("steering", "gen_steering"):
-        return sorted({f"model.layers.{p['layer']}.output" for p in params if "layer" in p})
+        return _layer_outputs([i for p in params if p.get("alpha", 1) != 0 for i in _listed(p)], n)
+    if spec.methodology in ("residual_readout", "activation_harvest", "gen_capture"):
+        return _layer_outputs([i for p in params if p.get("export", True) for i in _listed(p)], n)
     if spec.methodology == "activation_patching":     # the readout is the engine's `model.logits`
         return sorted({f"model.layers.{p['layer']}.output" for p in params if "layer" in p})
     if spec.methodology == "ablation":

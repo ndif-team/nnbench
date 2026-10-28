@@ -18,6 +18,7 @@ The bridge exposes no unembedding accessor, so the per-layer logit lens and the 
 read weights through the driver's `get_param` (the RPC the driver uses for its own logit
 reconstruction), reached through the bridge's `_driver` attribute.
 """
+import functools
 from collections.abc import Mapping
 
 import torch
@@ -25,7 +26,7 @@ import torch.nn.functional as F
 
 from isb.methodologies.jacobian_lens import _load_fitted, _orthogonal
 from isb.methodologies.registry import Unsupported, cell
-from isb.methodologies.steering import _resolve_token
+from isb.methodologies.steering import CALIBRATED, _resolve_token, calibrated_strengths
 from isb.tasks.lens_eval import locate
 
 
@@ -153,6 +154,26 @@ def _steer_edits(be, model, prompts, sites, direction, alpha):
     return edits
 
 
+def _mean_norms(be, model, prompts, layers):
+    """The unsteered stream's mean per-token norm at each of `layers` (`blocks.{i}.hook_out`),
+    averaged over `prompts`: one capture forward with no intervention."""
+    names = [f"blocks.{i}.hook_out" for i in layers]
+    caches = [cache for _, cache in _forward(be, model, prompts, names, logits=False)]
+    return [sum(c[name].float().norm(dim=-1).mean().item() for c in caches) / len(caches)
+            for name in names]
+
+
+def _fixed_edit(be, model, units, sites, direction, alpha):
+    """The one `add` edit every prompt carries under `scale_by="calibrated_mean_norm"`: at each site
+    the fixed value `alpha / len(sites) * n * d`, `n` the first site's unsteered mean norm measured
+    once per loaded engine (isb/methodologies/steering.py, `calibrated_strengths`). `add` takes exactly such a value, so
+    the steered forward needs no capture first and the batched path runs a call as one forward."""
+    strengths = calibrated_strengths(be, sites, alpha, units,
+                                     functools.partial(_mean_norms, be, model))
+    return {f"blocks.{site}.hook_out": {"op": "add", "value": k * direction}
+            for site, k in zip(sites, strengths)}
+
+
 @cell("logit_lens", family="llama", backend="transformer_lens")
 def logit_lens(be, model, units, *, layers="all"):
     """Capture every block's output stream, then apply the final RMSNorm and the unembedding on
@@ -189,7 +210,9 @@ def steering(be, model, units, *, layer=8, layers=None, target=" Rome", alpha=6.
              scale_by="mean_norm"):
     """`add` takes a fixed value, so a strength relative to the stream's own norm needs a capture
     forward per steered layer before the steered forward (`_steer_edits`). `layers` steers every
-    listed layer in one forward and replaces `layer`."""
+    listed layer in one forward and replaces `layer`. Each listed layer gets
+    `alpha / len(layers)`. `scale_by="calibrated_mean_norm"` instead adds fixed values measured
+    once per loaded engine (`_fixed_edit`): no capture before the steered forward."""
     sites = _steer_layers(model, layer, layers, alpha)
     if alpha == 0:
         return _final_logits(be, model, units)
@@ -199,7 +222,10 @@ def steering(be, model, units, *, layer=8, layers=None, target=" Rome", alpha=6.
                           "(intervention_specs.validate_spec)")
     token_id = _resolve_token(model.tokenizer, target)
     direction = F.normalize(_weight(model, "unembedding")[token_id], dim=0)
-    edits = _steer_edits(be, model, units, sites, direction, alpha)
+    if scale_by == CALIBRATED:
+        return _final_logits(be, model, units,
+                             _fixed_edit(be, model, units, sites, direction, alpha))  # [B, vocab]
+    edits = _steer_edits(be, model, units, sites, direction, alpha / len(sites))
     return torch.cat([_final_logits(be, model, [prompt], edit)
                       for prompt, edit in zip(units, edits)])                # [B, vocab]
 

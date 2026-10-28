@@ -7,6 +7,10 @@ configs:
     image: default
     options: &base {dtype: bfloat16, gpu_memory_utilization: 0.85, enable_prefix_caching: false}
   opt: {image: default, options: {<<: *base, mode: opt}}
+  # vLLM's serving engine (AsyncLLM) in-process, one request per prompt, the same cells: the
+  # engine for concurrent and open-loop clients
+  async: {image: default, options: {<<: *base, async_llm: true}}
+  opt/async: {image: default, options: {<<: *base, mode: opt, async_llm: true}}
   # tensor parallelism: hooks run on every rank; output_residual_stream captures on TP rank 0 only
   # (`_worker_ext.py`, install_hooks: `_should_capture`), the stream being replicated there
   tp2: {image: default, options: {<<: *base, tensor_parallel_size: 2}, gpus: 2}

@@ -9,6 +9,10 @@ configs:
     image: default
     options: &base {dtype: bfloat16, gpu_memory_utilization: 0.85, enable_prefix_caching: false}
   disk: {image: default, options: {<<: *base, storage: disk-st-async}}
+  # vLLM's serving engine (AsyncLLM) in-process, one request per prompt with its own extra_args:
+  # the engine for concurrent and open-loop clients (hidden-state cells only)
+  async: {image: default, options: {<<: *base, async_llm: true}}
+  disk/async: {image: default, options: {<<: *base, storage: disk-st-async, async_llm: true}}
   qk: {image: default, options: {<<: *base, worker: probe_hook_qk}}
   qk/disk: {image: default, options: {<<: *base, worker: probe_hook_qk, storage: disk-st-async}}
   # tensor parallelism: only TP rank 0 captures (probe_hidden_states_worker / probe_hookqk_worker,

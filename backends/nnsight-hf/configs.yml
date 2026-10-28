@@ -19,6 +19,9 @@ configs:
   default: {image: default, options: {}}
   fp32: {image: default, options: {dtype: float32}}
   sdpa: {image: default, options: &sdpa {dtype: bfloat16, attn_implementation: sdpa}}
+  # the sdpa config with eager attention, the only HF kernel that returns attention weights: the
+  # attention_pattern reference
+  eager: {image: default, options: {<<: *sdpa, attn_implementation: eager}}
   0-4-6: {image: 0-4-6, options: *sdpa}
   0-4-6/era: {image: 0-4-6-era, options: *sdpa}
   0-4-6/gpu2: {image: 0-4-6, options: {<<: *sdpa, device_map: auto}, gpus: 2}

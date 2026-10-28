@@ -35,16 +35,20 @@ steering = Workload(
 )
 
 
-# How the cost of one forward grows with the number of edited layers: the "half depth" row's edit
-# (alpha 6, mean norm) applied at every layer of the first k, k from one layer to every layer below
-# the final (readout) layer. Baseline and effect check sit at the first layer, which every row
-# edits, so a system that sizes its engine to the locations a case touches (nnsight's taps) sees
-# exactly each row's layers.
+# How the cost of one forward grows with the number of steered layers: a total strength of alpha 6
+# toward ' Rome' split evenly over each of the first k layers, k from one layer to every layer below
+# the final (readout) layer. Each layer adds the same fixed vector, `alpha / k` times the unsteered
+# stream's mean per-token norm at the first layer (measured once per engine, outside the timed
+# calls), so every system that adds a fixed value at a hook steers any k in one forward, and the
+# vectors sum to alpha 6 times that norm at every k (isb/methodologies/steering.py).
+# Baseline and effect check sit at the first layer, which every row steers, so a system that sizes
+# its engine to the locations a case touches (nnsight's taps) sees exactly each row's layers.
 _FIRST = FirstLayers(count=1)
+_FIXED = {**_ROME, "scale_by": "calibrated_mean_norm"}
 steering_layers = Workload(
     name="steering_layers", methodology="steering",
     rows=tuple(
-        Row(f"add toward ' Rome' at {where}", {**_ROME, "alpha": 6.0, "layers": layers})
+        Row(f"add toward ' Rome' at {where}", {**_FIXED, "alpha": 6.0, "layers": layers})
         for where, layers in (
             ("the first layer", FirstLayers(count=1, below_final=True)),
             ("each of the first seventh of the layers", FirstLayers(1 / 7, below_final=True)),
@@ -53,7 +57,8 @@ steering_layers = Workload(
             ("each of the first three quarters of the layers", FirstLayers(3 / 4, below_final=True)),
             ("every layer below the final layer", FirstLayers(1.0, below_final=True)))),
     regimes=(Regime("interactive", DataRef("counterfact", 100)),),
-    baseline={**_ROME, "alpha": 0.0, "layers": _FIRST},
-    effect=Effect(baseline={**_ROME, "alpha": 0.0, "layers": _FIRST},
-                  perturbed=(Row("alpha 6 at the first layer", {**_ROME, "alpha": 6.0, "layers": _FIRST}),)),
+    baseline={**_FIXED, "alpha": 0.0, "layers": _FIRST},
+    effect=Effect(baseline={**_FIXED, "alpha": 0.0, "layers": _FIRST},
+                  perturbed=(Row("alpha 6 at the first layer",
+                                 {**_FIXED, "alpha": 6.0, "layers": _FIRST}),)),
 )

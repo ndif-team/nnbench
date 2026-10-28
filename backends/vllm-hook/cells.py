@@ -36,6 +36,8 @@ from isb.methodologies.jacobian_lens import _load_fitted, _orthogonal
 from isb.methodologies.registry import Unsupported, cell
 from isb.tasks.lens_eval import locate
 
+from .backend import AsyncHook
+
 ONE_ENGINE = ("an engine carries one worker extension (HookLLM worker_name), so reading the stream "
               "(probe_hidden_states) and writing it (steer_hook_act) cannot share an engine")
 LAST_ROW_STEER = ("steer_hook_act writes only the last row of each forward "
@@ -95,6 +97,8 @@ def _capture(model, prompts, layers, mode):
 
     if model.worker != "probe_hidden_states":
         raise _other_worker(model, "probe_hidden_states", "hidden-state capture")
+    if isinstance(model.llm, AsyncHook):           # AsyncLLM: the fields go on each request
+        return model.llm.capture(prompts, [i + 1 for i in layers], mode)
     llm = model.llm
     llm._output_layers = [i + 1 for i in layers]          # the worker numbers layers from 1
     previous, llm._hs_mode = llm._hs_mode, mode           # what load_config sets from a config file
@@ -282,3 +286,10 @@ def attention_pattern(be, model, units, *, layers="all"):
         raise RuntimeError(f"reconstructed {len(weights)} requests' attention, expected {len(units)}")
     return torch.stack([torch.stack([torch.log(w[f"model.layers.{i}.self_attn.attn"]["attention"])
                                      for w in weights]) for i in idx])
+
+
+# On the AsyncLLM backend (backend.py, VLLMHookAsyncBackend) the same cells read through
+# `AsyncHook.capture`.
+for _workload, _fn in (("logit_lens", logit_lens), ("steering", steering),
+                       ("gen_steering", gen_steering)):
+    cell(_workload, family="llama", backend="vllm_hook_async")(_fn)

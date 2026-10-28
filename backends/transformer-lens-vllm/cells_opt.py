@@ -14,10 +14,11 @@ import torch
 import torch.nn.functional as F
 
 from isb.methodologies.registry import Unsupported, cell
-from isb.methodologies.steering import _resolve_token
+from isb.methodologies.steering import CALIBRATED, _resolve_token
 from isb.tasks.lens_eval import locate
 
-from .cells import (_forward, _ids, _jlens_maps, _last_rows, _steer_edits, _steer_layers,
+from .cells import (_fixed_edit, _forward, _ids, _jlens_maps, _last_rows, _steer_edits,
+                    _steer_layers,
                     _transported, _weight, activation_harvest, gen_capture, residual_readout)
 
 
@@ -77,7 +78,9 @@ def steering(be, model, units, *, layer=8, layers=None, target=" Rome", alpha=6.
              scale_by="mean_norm"):
     """`add` takes a fixed value, so a strength relative to the stream's own norm needs a capture
     forward per steered layer before the steered forward (cells.py, `_steer_edits`). `layers`
-    steers every listed layer in one forward and replaces `layer`."""
+    steers every listed layer in one forward and replaces `layer`. Each listed layer gets
+    `alpha / len(layers)`. `scale_by="calibrated_mean_norm"` instead adds fixed values measured
+    once per loaded engine (`_fixed_edit`): no capture before the steered forward."""
     sites = _steer_layers(model, layer, layers, alpha)
     if alpha == 0:
         return _final_logits(be, model, units)
@@ -87,7 +90,10 @@ def steering(be, model, units, *, layer=8, layers=None, target=" Rome", alpha=6.
                           "(intervention_specs.validate_spec)")
     token_id = _resolve_token(model.tokenizer, target)
     direction = F.normalize(_weight(model, "unembedding")[token_id], dim=0)
-    edits = _steer_edits(be, model, units, sites, direction, alpha)
+    if scale_by == CALIBRATED:
+        return _final_logits(be, model, units,
+                             _fixed_edit(be, model, units, sites, direction, alpha))  # [B, vocab]
+    edits = _steer_edits(be, model, units, sites, direction, alpha / len(sites))
     return torch.cat([_final_logits(be, model, [prompt], edit)
                       for prompt, edit in zip(units, edits)])                # [B, vocab]
 

@@ -17,8 +17,11 @@ from .observations import record_resolved
 from .registry import cell
 
 
+@functools.lru_cache(maxsize=4)
 def _orthogonal(d: int, seed: int) -> torch.Tensor:
-    """A seeded random orthogonal [d, d] map (QR of a seeded gaussian), the same on every backend."""
+    """A seeded random orthogonal [d, d] map (QR of a seeded gaussian), the same on every backend.
+    Built once per process and (d, seed): the vLLM worker resolves this function by reference, so
+    its cache also lives across requests. Callers must not modify the returned tensor."""
     g = torch.Generator().manual_seed(int(seed))
     q, _ = torch.linalg.qr(torch.randn(d, d, generator=g))
     return q

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 
 from .contract import PLAN_VERSION, read_experiment, unpack, validate_result, write_json
@@ -33,45 +34,90 @@ def _compatible(candidate, reference, cexec, rexec):
         raise ValueError("benchmark source differs between compared jobs")
 
 
-def _eager(provenance):
-    """Whether the job's engine ran eager (no torch.compile / CUDA graphs), as its backend recorded."""
-    return bool(provenance.get("engine", {}).get("params", {}).get("enforce_eager", False))
+_ENGINE_START = re.compile(r"Initializing a V1 LLM engine \(v([^)]+)\) with config: (.*)")
+_COMPILE = re.compile(r"'mode': <CompilationMode\.(\w+): \d+>")
+_GRAPHS = re.compile(r"'cudagraph_mode': <CUDAGraphMode\.(\w+)")
+_TP = re.compile(r"tensor_parallel_size=(\d+)")
+
+
+def engine_run(log):
+    """What a job's vLLM engine ran, from the engine's own startup line in the job's log
+    ("Initializing a V1 LLM engine (v<version>) with config: ..."): {"vllm": version,
+    "torch_compile": compilation mode other than CompilationMode.NONE, "cuda_graphs":
+    cudagraph_mode other than CUDAGraphMode.NONE, "tensor_parallel_size"}. What ran can differ from
+    the declared options: nnsight's taps and interp-engine's static points set
+    VLLM_USE_BREAKABLE_CUDAGRAPH, which turns torch.compile off and keeps CUDA graphs on under
+    enforce_eager=False. None when the log has no such line (an HF job, or an engine that never
+    started); raises when a startup line lacks one of the fields or two lines disagree."""
+    log = Path(log)
+    if not log.exists():
+        return None
+    runs = set()
+    with log.open(errors="replace") as lines:
+        for line in lines:
+            start = _ENGINE_START.search(line)
+            if start is None:
+                continue
+            config = start.group(2)
+            fields = _COMPILE.search(config), _GRAPHS.search(config), _TP.search(config)
+            if not all(fields):
+                raise ValueError(f"{log}: engine startup line without compilation mode, "
+                                 f"cudagraph_mode or tensor_parallel_size")
+            compile_mode, graph_mode, tp = (field.group(1) for field in fields)
+            runs.add((start.group(1), compile_mode != "NONE", graph_mode != "NONE", int(tp)))
+    if len(runs) > 1:
+        raise ValueError(f"{log}: engines started with different configurations: {sorted(runs)}")
+    if not runs:
+        return None
+    version, torch_compile, cuda_graphs, tp = runs.pop()
+    return {"vllm": version, "torch_compile": torch_compile, "cuda_graphs": cuda_graphs,
+            "tensor_parallel_size": tp}
+
+
+def _floor_key(run, workload):
+    return (run["vllm"], run["torch_compile"], run["cuda_graphs"], run["tensor_parallel_size"],
+            workload)
 
 
 def attach_plain_vllm(rows, results):
-    """Whole-system overhead: each timed row on a vLLM engine is divided by the
-    no-intervention request of a plain-vLLM job at the same vLLM version, execution mode (eager or
-    compiled) and workload. A plain job is one whose provenance declares engine mode "plain"; its
-    `__vanilla__` record is the latency. Matching the mode keeps an eager-only system's ratio from
-    absorbing the eager-vs-CUDA-graph gap; `overhead_vs_plain_vllm_default` additionally divides
-    an eager row by vLLM's default compiled engine when that job is present, the cost a user pays
-    relative to plain vLLM as shipped. `results` maps backend -> {"provenance", "auxiliary_calls"};
-    a provenance without an engine record (older artifacts) matches nothing."""
+    """Whole-system overhead: each timed row on a vLLM engine is divided by the no-intervention
+    request of a plain-vLLM job whose engine ran the same vLLM version, torch.compile on or off,
+    CUDA graphs on or off and tensor-parallel size, on the same workload. A plain job is one whose
+    provenance declares engine mode "plain"; its `__vanilla__` record is the latency. The mode is
+    what each engine ran (`engine_run`, from the job's own log), so an eager system's ratio does not
+    absorb the CUDA-graph gap, and a system running CUDA graphs without torch.compile, which no
+    plain vLLM config runs, gets no `overhead_vs_plain_vllm`. Every row whose mode is not vLLM's
+    default (torch.compile and CUDA graphs) also gets `overhead_vs_plain_vllm_default`, against the
+    default engine at the same version and tensor-parallel size: the cost a user pays relative to
+    plain vLLM as shipped. `results` maps backend -> {"provenance", "auxiliary_calls",
+    "engine_run"}; a job without an engine run (an HF job, an older log) matches nothing."""
     plain = {}
     for backend, result in results.items():
-        provenance = result["provenance"]
-        if provenance.get("engine", {}).get("mode") != "plain":
+        run = result["engine_run"]
+        if result["provenance"].get("engine", {}).get("mode") != "plain" or run is None:
             continue
         for call in result.get("auxiliary_calls", []):
             role, workload = call["key"]
             latency = call["record"].get("median_latency_ms")
             if role == "__vanilla__" and latency:
-                key = (provenance["client"].get("vllm"), _eager(provenance), workload)
+                key = _floor_key(run, workload)
+                if key in plain:
+                    raise ValueError(f"plain-vLLM jobs {plain[key][0]} and {backend} ran the same "
+                                     f"engine mode {key}; keep one floor per mode")
                 plain[key] = (backend, latency)
     for row in rows:
         result = results.get(row["backend"])
-        if result is None or row.get("median_latency_ms") is None:
+        if result is None or result["engine_run"] is None or row.get("median_latency_ms") is None:
             continue
-        provenance = result["provenance"]
-        if provenance.get("engine", {}).get("kind") != "vllm":
-            continue
-        version, eager = provenance["client"].get("vllm"), _eager(provenance)
-        match = plain.get((version, eager, row.get("workload")))
+        run = result["engine_run"]
+        row["engine_run"] = run
+        match = plain.get(_floor_key(run, row.get("workload")))
         if match:
             row.update(plain_vllm=match[0], plain_vllm_ms=match[1],
                        overhead_vs_plain_vllm=row["median_latency_ms"] / match[1])
-        default = plain.get((version, False, row.get("workload")))
-        if eager and default:
+        shipped = {**run, "torch_compile": True, "cuda_graphs": True}
+        default = plain.get(_floor_key(shipped, row.get("workload")))
+        if run != shipped and default:
             row.update(plain_vllm_default=default[0], plain_vllm_default_ms=default[1],
                        overhead_vs_plain_vllm_default=row["median_latency_ms"] / default[1])
 
@@ -175,7 +221,8 @@ def score_experiment(directory, backends, reference=None, comparison="correctnes
                         row.update(state=good if is_equivalent(metrics) else bad, metrics=metrics)
             rows.append(row)
     calls = {backend: {"provenance": artifact["provenance"],
-                       "auxiliary_calls": result.get("auxiliary_calls", [])}
+                       "auxiliary_calls": result.get("auxiliary_calls", []),
+                       "engine_run": engine_run(directory / backend / "execution.log")}
              for backend, (result, artifact, _) in loaded.items()}
     attach_plain_vllm(rows, calls)
     attach_worker_memory(rows, calls)

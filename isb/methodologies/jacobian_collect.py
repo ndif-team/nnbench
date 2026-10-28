@@ -1,10 +1,17 @@
 """Jacobian collection: fitting the Jacobian lens's transport maps (anthropics/jacobian-lens,
-jlens/fitting.py). J_l is the average input-output Jacobian dh_target/dh_l: per prompt, one forward
-plus ceil(d_model / dim_batch) backward passes, each over dim_batch copies of the prompt carrying a
+jlens/fitting.py). J_l is the average input-output Jacobian dh_target/dh_l. Upstream runs, per
+prompt, one forward over dim_batch copies and ceil(d_model / dim_batch) backward passes on the
+retained graph; here each block of dim_batch output rows is one `vjp_batch` call (a forward and a
+backward over dim_batch copies), since the primitive takes one cotangent. Copy b of a block carries a
 one-hot cotangent on one output dimension at every valid target position (positions skip_first ..
 len-2). The cell consumes the whole prompt list as one job and returns `[n_sources, d, d]`; HF runs
 the sweep, vLLM's inference-mode activations refuse the backward. `grad=False` is the baseline: the
-same forward over the units, reading the target residual's last row, `[B, d]`."""
+same forward over the units, reading the target residual's last row, `[B, d]`.
+
+`dim_batch` changes how many rows one backward computes, never the rows: the default sizes it by
+model. The replicated batch's activations grow with copies x layers x width, so the default holds
+that product at GPT-2's 96 copies x 12 layers x 768: 96 rows per backward on GPT-2, 8 on
+Qwen2.5-7B (28 x 3584, upstream's own default), 10 on Qwen3.5-4B."""
 from __future__ import annotations
 
 import functools
@@ -15,6 +22,14 @@ from ..profiles import _resid
 from .das import _d_model
 from .observations import record_resolved
 from .registry import cell
+
+
+_ROW_BUDGET = 96 * 12 * 768         # GPT-2's copies x layers x width per backward
+
+
+def rows_per_backward(n_layers: int, d_model: int) -> int:
+    """The default dim_batch: the most copies whose copies x layers x width stays within GPT-2's."""
+    return max(1, _ROW_BUDGET // (n_layers * d_model))
 
 
 def valid_slice(seq_len: int, skip_first: int) -> slice:
@@ -54,6 +69,9 @@ def _collect_cell(be, model, m, units, *, dim_batch, skip_first, grad, residual)
     def target_of(mdl):
         return _resid(blocks[target].output, residual)
 
+    if dim_batch is None:
+        dim_batch = rows_per_backward(len(blocks), d)
+    record_resolved(dim_batch=dim_batch)
     J = torch.zeros(len(sources), d, d)
 
     def collect_rows(prompt, start, B):
@@ -72,15 +90,15 @@ def _collect_cell(be, model, m, units, *, dim_batch, skip_first, grad, residual)
     return be.session(model, collect)
 
 
-@cell("jacobian_collect", family="*", backend="hf")
-def jacobian_collect_hf(be, model, m, units, *, dim_batch=96, skip_first=16, grad=True,
+@cell("jacobian_collect", family="*", backend="hf", realizations=[{"dim_batch": 96}])
+def jacobian_collect_hf(be, model, m, units, *, dim_batch=None, skip_first=16, grad=True,
                         residual="plain"):
     return _collect_cell(be, model, m, units, dim_batch=dim_batch, skip_first=skip_first, grad=grad,
                          residual=residual)
 
 
 @cell("jacobian_collect", family="*", backend="vllm_async", realizations=[{"residual": "plain"}])
-def jacobian_collect_vllm(be, model, m, units, *, dim_batch=96, skip_first=16, grad=True,
+def jacobian_collect_vllm(be, model, m, units, *, dim_batch=None, skip_first=16, grad=True,
                           residual=None):
     residual = residual if residual is not None else m.default_residual(be.name)
     record_resolved(residual=residual)
