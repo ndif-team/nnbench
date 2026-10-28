@@ -8,9 +8,11 @@ the process boundary only with `VLLM_ALLOW_INSECURE_SERIALIZATION=1` (vllm/v1/se
 which `allow_callable_rpc` sets before the engine starts; the engine processes inherit it.
 
 The measurement is opt-in (`ISB_WORKER_MEMORY=1` in the launcher's environment, forwarded by each
-vLLM backend's compose.yml): with the flag set, vLLM type-tags and converts every RPC result, which
-slowed vLLM-Lens's 28-layer logit lens by 9-13% on Qwen2.5-7B against the same cell without it
-(interference-check/summary.md). Timed runs leave it unset; memory runs set it.
+vLLM backend's compose.yml). With the flag set, vLLM type-tags and converts every RPC result. An A/B
+on one GPU with no other container (interference-check/serialization-flag, beace01) gave
+vLLM-Lens's 28-layer logit lens on Qwen2.5-7B 70.2 and 79.2 ms without the flag and 74.0 and 79.0 ms
+with it, and its steering rows within 3% across all four runs. Timed runs leave it unset; memory
+runs set it.
 """
 from __future__ import annotations
 
