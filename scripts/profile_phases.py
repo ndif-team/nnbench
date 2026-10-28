@@ -31,17 +31,19 @@ from isb.perf.phase_profiler import ATTRIBUTIONS, split_with_floors  # noqa: E40
 from isb.suites import Entry, cases  # noqa: E402
 
 
-def run(name, job, output, gpu, timeout, rows):
+def run(name, job, output, gpu, timeout, rows, marks=True):
     output.mkdir(parents=True, exist_ok=True)
     project = "isb-phase-" + uuid.uuid4().hex[:16]
     command = compose(name, project)
-    env = {**environment(name, job, output, gpu), "ISB_PHASE_ROWS": json.dumps(rows)}
+    env = {**environment(name, job, output, gpu), "ISB_PHASE_ROWS": json.dumps(rows),
+           "ISB_PHASE_MARKS": "1" if marks else "0"}
     configuration(name, env=env)
     baseline = gpu_used_mib(gpu)
     with (output / "execution.log").open("w") as log:
         try:
             code = subprocess.run(command + ["run", "--rm", "--no-TTY", "-e", "ISB_PHASE_PROFILE=1",
-                                             "-e", "ISB_PHASE_ROWS", "--entrypoint", "python3",
+                                             "-e", "ISB_PHASE_ROWS", "-e", "ISB_PHASE_MARKS",
+                                             "--entrypoint", "python3",
                                              "runner", "-m", "isb.perf.phase_profiler"],
                                   env=env, stdout=log, stderr=subprocess.STDOUT,
                                   timeout=timeout).returncode
@@ -68,6 +70,9 @@ def main():
     ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--rows", nargs="+", help="row labels to profile (default: every row)")
     ap.add_argument("--out", type=Path)
+    ap.add_argument("--trace-only", action="store_true",
+                    help="open the trace session but record no region boundaries: the tracing's "
+                         "own cost")
     args = ap.parse_args()
     if args.combine:
         return combine(args.combine, args.attribution)
@@ -84,7 +89,8 @@ def main():
         prepare(spec, job)
         for name in [canonical(b) for b in args.backends]:
             output = job.parent / name.replace("/", "-")
-            code = run(name, job, output, args.gpu, args.timeout, args.rows)
+            code = run(name, job, output, args.gpu, args.timeout, args.rows,
+                       marks=not args.trace_only)
             profile = output / "phase_profile.json"
             if code != 0 or not profile.exists():
                 failed = True

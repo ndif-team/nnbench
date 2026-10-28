@@ -6,9 +6,11 @@ directory at /job and the output at /output (scripts/profile_phases.py launches 
 backend's own compose.yml). It builds the backend exactly as `isb.jobs.entry` does, binds every
 row of the job's spec the way the harness does (`isb.sweep.execute._bind_case`), and times each
 row (or the labels listed in `ISB_PHASE_ROWS`, a JSON list) and the backend's plain request with
-the harness's warm-up and trial counts. Each row runs twice in the same engine: first with every
-wrapper below passing straight through (`OFF` present; the harness's timing loop), then
-instrumented, so the record carries the instrumentation's own cost.
+the harness's warm-up and trial counts. Each row runs three times in the same engine: with every
+wrapper below passing straight through (no trace session open; the harness's timing loop), then
+instrumented, then passing through again, so the record carries the instrumentation's own cost
+against the mean of the two uninstrumented medians, and their gap shows how far the engine's own
+timing moves over the row.
 
 Host timestamps are `time.perf_counter_ns()` (CLOCK_MONOTONIC, one clock for every process in the
 container), taken at six boundaries of each timed call:
@@ -28,37 +30,39 @@ per-request bookkeeping in `Requests`); `readout` while that code runs a lens pr
 norm, the logits processor or `F.linear`), a device-to-host copy (`Tensor.cpu`) or nnsight's
 packing of saves for the return (`Requests.harvest`, `Requests.record_saves`); `base` for the rest
 of a step; `between` outside steps. At every change of kind, and at every step's start and end,
-the engine records the host time c_i and a CUDA event on the step's stream (the current stream at
-the step's start; the traced call counts marks that find another current stream, which would
-break the ordering below). The event completes at g_i, when the GPU has finished everything
-launched before it, and never before c_i; the two clocks are aligned at the request's first
-step, where the GPU is idle (offset = max_i of c_i - event time_i). From g_i to g_(i+1) the GPU either runs the kernels launched in region i or
-waits for that region's host code to launch them, so each such stretch is charged to region i's
-kind: host work that overlaps earlier GPU work is charged to nothing, and nothing is counted
-twice. The stretches telescope from t2 to t3 (clipped to that window, kept in order).
+the engine thread records one host time and the kind that starts there (a boundary; nothing else).
+
+The GPU side comes from one torch.profiler session with CUDA activity only (CUPTI: every kernel,
+copy and set with its GPU start and end, and the runtime or driver call that launched it, joined by
+correlation id), open across a row's instrumented calls. Its clock is mapped onto perf_counter by
+one constant offset: at the session's start and end the engine brackets ANCHORS stream queries with
+perf_counter, each bracket bounds the offset, and the offset is the middle of all the bounds'
+intersection (`_clock_fit`; its width is recorded per row). Each device activity takes the kind of the host region open when its
+launching call started; an activity launched from another host thread, or without a launch record,
+counts as base. Engine time t2..t3 is then charged instant by instant: while the GPU runs an
+activity, to that activity's kind (the earlier-started one where two overlap); while the GPU is
+idle, to the host region open at that instant, whose code the GPU is waiting for. Host work that
+overlaps GPU work is charged to nothing, every instant is charged once, and the charges sum to
+t3 - t2.
 
 Subphases (they telescope to e2e = t7 - t0):
   client_prep  = t1 - t0     request_transfer = t2 - t1     engine = t3 - t2
   output_transfer = t4 - t3  client_post = t7 - t4
-  engine_hook, engine_readout = the stretches charged to hook / readout regions
+  engine_hook, engine_readout = the engine time charged to hook / readout
   engine_outside_spans = engine - engine_hook - engine_readout
 
-Raw per-run segments, event attribution (`segments_raw_ms`):
+Raw per-run segments, kernel-trace attribution (`segments_raw_ms`):
   engine_outside_spans   = the base model and the engine's own host work, together
   hook_dispatch_and_edit = client_prep + request_transfer + engine_hook
   readout_and_host_ipc   = engine_readout + output_transfer + client_post
 
-One extra call per row runs with torch.profiler on in the engine process (one session from the
-request's first step to the step that finishes it), outside the timed trials and followed by a
-fresh warm-up. It labels every device activity with the kind of region its launching runtime call
-ran in (`traced`: kernel time per kind, the timeline) for diagnostics, and feeds the span
-attribution (`segments_raw_spans_ms`), kept for comparison; it counts host span time on top of
-the GPU time it overlaps:
+The span attribution (`segments_raw_spans_ms`), kept for comparison, counts host span time on top
+of the GPU time it overlaps:
   base_gpu_kernels       = base kernel time
   engine_host            = engine - base - interp - hook_kernels - readout_kernels
   hook_dispatch_and_edit = client_prep + request_transfer + (interp - readout) + hook_kernels
   readout_and_host_ipc   = readout + readout_kernels + output_transfer + client_post
-(interp and readout here are the host time inside those spans.)
+(interp and readout here are the host time inside those regions; kernel times are summed per kind.)
 
 `split_with_floors` turns raw segments into the figure's four with the compiled stock floor of
 the same workload, vLLM version and GPU count (a `vllm-plain` config without enforce_eager,
@@ -71,9 +75,10 @@ time outside interpretability code (engine_outside_spans; the same attribution o
 
 Patches go in when this module is imported with ISB_PHASE_PROFILE set: in the client before the
 engine starts, and in the engine process because vLLM starts it with fork (inherited) or spawn
-(which re-imports this main module). Every wrapper returns straight to the wrapped function under
-torch.compile tracing, so compiled graphs are unchanged, and while instrumentation is off; no
-event is recorded while a stream is capturing a CUDA graph.
+(which re-imports this main module). Without an open session every wrapper passes straight
+through after one flag check; under torch.compile tracing they pass through too, so compiled
+graphs are unchanged; no boundary is recorded while a stream is capturing a CUDA graph.
+`ISB_PHASE_MARKS=0` keeps the session but records no boundaries: the tracing's own cost.
 """
 from __future__ import annotations
 
@@ -81,7 +86,6 @@ import bisect
 import functools
 import json
 import os
-import queue
 import random
 import statistics
 import threading
@@ -92,220 +96,224 @@ from pathlib import Path
 import torch
 
 FLAG = "ISB_PHASE_PROFILE"
-LOG = Path("/dev/shm/isb_phase_profile.jsonl")      # engine process -> client, one line per event
-TRACE = Path("/dev/shm/isb_phase_trace")            # present: the engine traces its steps
-OFF = Path("/dev/shm/isb_phase_off")                # present: every wrapper passes through
-_COUNTERS = ("interp_ns", "readout_ns")
-_state = {"on": True, "interp": 0, "readout": 0, "in_step": False, "tracing": False,
-          "prof": None, **dict.fromkeys(_COUNTERS, 0)}
-_RANGES = {"isb_interp": "hook", "isb_readout": "readout"}       # host ranges of a traced call
+LOG = Path("/dev/shm/isb_phase_profile.jsonl")      # engine process -> client: arrivals, steps
+TRACE = Path("/dev/shm/isb_phase_trace")            # present: the engine opens a trace session
+STOP = Path("/dev/shm/isb_phase_stop")              # present: the engine closes it and exports
+EXPORT = Path("/dev/shm/isb_phase_export.json")     # the closed session's boundaries and activities
+MARKS = os.environ.get("ISB_PHASE_MARKS", "1") != "0"
 _KINDS = ("base", "hook", "readout")
 _SEGMENT = {"between": "engine", "base": "engine", "hook": "hook", "readout": "readout"}
-# boundaries of the request in flight: host times with the kind that starts there, their events,
-# the stream they are recorded on (fetched once per step) and, on a traced call, how many marks
-# found a different current stream
-_bounds = {"active": False, "marks": [], "events": [], "free": [], "queue": None, "stream": None,
-           "off_stream": 0}
+_perf = time.perf_counter_ns
+_compiling = torch.compiler.is_compiling
+
+# engine process: the open session, and the boundaries of the request in flight
+_session = None
+_live = False            # boundaries are recorded: a session is open and no graph is capturing
+_in_step = False
+_depth = 0               # an interpretability span is open (only the outermost one marks)
+_reading = 0             # a readout span is open
+_owner = None            # the thread running engine steps; spans on other threads pass through
+_marks = []
+_append = _marks.append
+_finished = []           # requests finished while the session is open: {"end", "marks"}
+_anchors = []            # per session end: {anchor call: [(before, after)] perf_counter}
+# client process
+_on = True               # the client wrappers record (off for the uninstrumented pass)
 _client = {"sent": [], "received": []}
-
-
-def _compiling():
-    return torch.compiler.is_compiling()
 
 
 def _capturing():
     return torch.cuda.is_current_stream_capturing()
 
 
-def _new_event():
-    return torch.cuda.Event(enable_timing=True)
-
-
-_record = torch._C._CudaEventBase.record     # the event record without torch.cuda.Event's wrapper
-
-
-def _mark(kind):
-    """A boundary of the request in flight: the host region that starts now is `kind`. The step
-    checks for graph capture and fetches the stream once; a mark only records."""
-    if not _bounds["active"]:
-        return
-    if _state["tracing"] and torch.cuda.current_stream() != _bounds["stream"]:
-        _bounds["off_stream"] += 1
-    free = _bounds["free"]
-    event = free.pop() if free else _new_event()
-    _bounds["marks"].append((time.perf_counter_ns(), kind))
-    _record(event, _bounds["stream"])
-    _bounds["events"].append(event)
-
-
-def _read_bounds(work):
-    """Engine-process thread: once a request's last event completes, log every boundary's host
-    time and event time (ms after the first event), keyed by the finishing step's end."""
-    while True:
-        end, marks, events = work.get()
-        for event in events:               # they may sit on different streams
-            event.synchronize()
-        _log({"event": "bounds", "end": end, "marks": marks,
-              "gpu_ms": [events[0].elapsed_time(e) for e in events]})
-        _bounds["free"].extend(events)
-
-
-def _submit_bounds(end):
-    """Hand the finished request's boundaries to the reader thread, off the engine's path."""
-    if _bounds["queue"] is None:
-        _bounds["queue"] = queue.Queue()
-        threading.Thread(target=_read_bounds, args=(_bounds["queue"],), daemon=True).start()
-    _bounds["queue"].put((end, _bounds["marks"], _bounds["events"]))
-    _bounds.update(active=False, marks=[], events=[])
-
-
 def _interp_span(fn):
-    """Run `fn` as interpretability-system code; nested spans count once."""
+    """Run `fn` as interpretability-system code: a boundary at its start (hook) and at its end
+    (back to base, or between outside a step). Nested spans mark once."""
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        if _compiling() or not _state["on"]:
+        global _depth
+        if not _live or _depth or threading.get_ident() != _owner or _compiling():
             return fn(*args, **kwargs)
-        outer = _state["interp"] == 0
-        _state["interp"] += 1
-        record = None
-        if outer:
-            _mark("hook")
-            if _state["tracing"]:
-                record = torch.profiler.record_function("isb_interp")
-                record.__enter__()
-        start = time.perf_counter_ns()
+        _depth = 1
+        _append((_perf(), "hook"))
         try:
             return fn(*args, **kwargs)
         finally:
-            if outer:
-                _state["interp_ns"] += time.perf_counter_ns() - start
-                if record is not None:
-                    record.__exit__(None, None, None)
-                _mark("base" if _state["in_step"] else "between")
-            _state["interp"] -= 1
+            _append((_perf(), "base" if _in_step else "between"))
+            _depth = 0
     return wrapper
 
 
 def _readout_span(fn):
-    """Run `fn` as readout when it runs inside an interp span."""
+    """Run `fn` as readout when it runs inside an interp span; otherwise (the base model's own
+    calls, and everything while no session is open) pass straight through after one check."""
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        if _compiling() or _state["interp"] == 0 or _state["readout"]:
+        global _reading
+        if not _depth or _reading or threading.get_ident() != _owner or _compiling():
             return fn(*args, **kwargs)
-        _state["readout"] += 1
-        _mark("readout")
-        record = torch.profiler.record_function("isb_readout") if _state["tracing"] else None
-        if record is not None:
-            record.__enter__()
-        start = time.perf_counter_ns()
+        _reading = 1
+        _append((_perf(), "readout"))
         try:
             return fn(*args, **kwargs)
         finally:
-            _state["readout_ns"] += time.perf_counter_ns() - start
-            if record is not None:
-                record.__exit__(None, None, None)
-            _mark("hook")
-            _state["readout"] -= 1
+            _append((_perf(), "hook"))
+            _reading = 0
     return wrapper
 
 
 def _log(event):
-    with LOG.open("a") as f:
-        f.write(json.dumps(event) + "\n")
+    """Append one line with a single write() on an O_APPEND descriptor, so a line from another
+    thread or process never lands inside it."""
+    line = (json.dumps(event) + "\n").encode()
+    fd = os.open(LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        written = os.write(fd, line)
+    finally:
+        os.close(fd)
+    if written != len(line):
+        raise RuntimeError(f"short write to {LOG}: {written} of {len(line)} bytes")
 
 
-def _step_trace(prof):
-    """A traced request's timeline in the profiler's clock (us), for diagnostics: the window from
-    its first step's start to its finishing step's end, the steps, the interp and readout ranges
-    on the host, and every device activity (kernel, copy, set) with the kind of range its
-    launching runtime call ran in. A device activity shares its correlation id with that call;
-    one without a matching call counts as base and is reported. A `record_function` range also
-    appears on the device as a user annotation spanning its kernels; those are spans, not GPU
-    work, and are left out."""
+ANCHORS = 20                   # bracketed calls at each end of a session (clock alignment)
+_ANCHOR_CALLS = ("cudaStreamQuery", "cudaDeviceSynchronize")
+
+
+def _anchor_round():
+    """ANCHORS non-blocking stream queries, then ANCHORS synchronizes, each bracketed by
+    perf_counter: the trace records every call, and each bracket bounds the clock offset. The
+    synchronizes are the fallback should the trace leave the queries out."""
+    query = torch.cuda.current_stream().query
+    rounds = {}
+    for name, call in zip(_ANCHOR_CALLS, (query, torch.cuda.synchronize)):
+        brackets = []
+        for _ in range(ANCHORS):
+            before = _perf()
+            call()
+            brackets.append((before, _perf()))
+        rounds[name] = brackets
+    return rounds
+
+
+def _open_session():
+    global _session
+    _session = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
+    _session.start()
+    _anchors[:] = [_anchor_round()]
+    _finished.clear()
+
+
+def _close_session():
+    """Close the session and export, for the client, every finished request's boundaries and
+    every device activity on the perf_counter clock."""
+    global _session, _live, _marks, _append
+    _anchors.append(_anchor_round())
+    prof, _session = _session, None
+    _live = False
+    _marks = []
+    _append = _marks.append
+    prof.stop()
+    export = json.dumps(_export(prof.events(), _anchors, _finished))
+    _finished.clear()
+    partial = EXPORT.with_suffix(".partial")
+    partial.write_text(export)
+    partial.rename(EXPORT)
+
+
+def _clock_fit(host, anchors):
+    """The constant offset perf_counter minus trace clock (ns). A bracketed call's record lies
+    inside its bracket, so each pair bounds the offset to [before - record start, after - record
+    end]; the session's first ANCHORS records of the call pair with the opening round and its last
+    ANCHORS with the closing one, and the offset is the middle of all the bounds' intersection.
+    Its width is the fit's accuracy (negative: the bounds disagree by that much)."""
+    for name in _ANCHOR_CALLS:
+        records = [e for e in host if e.name == name]
+        if len(records) >= 2 * ANCHORS:
+            break
+    else:
+        raise RuntimeError("the trace holds fewer than "
+                           f"{2 * ANCHORS} records of every anchor call {_ANCHOR_CALLS}")
+
+    def bounds(brackets, matched):
+        return (max(b - r.time_range.start * 1e3 for (b, _), r in zip(brackets, matched)),
+                min(a - r.time_range.end * 1e3 for (_, a), r in zip(brackets, matched)))
+
+    (lo1, hi1) = bounds(anchors[0][name], records[:ANCHORS])
+    (lo2, hi2) = bounds(anchors[-1][name], records[-ANCHORS:])
+    lo, hi = max(lo1, lo2), min(hi1, hi2)
+    fit = {"call": name, "bracket_width_ns": hi - lo, "start_width_ns": hi1 - lo1,
+           "end_width_ns": hi2 - lo2, "end_minus_start_ns": (lo2 + hi2 - lo1 - hi1) / 2,
+           "narrowest_bracket_ns": min(a - b for r in (anchors[0], anchors[-1])
+                                       for b, a in r[name]),
+           "span_s": (records[-1].time_range.start - records[0].time_range.start) * 1e-6}
+    return (lo + hi) / 2, {records[0].thread, records[-1].thread}, fit
+
+
+def _export(events, anchors, finished):
+    """The session's device activities as [gpu start, gpu end, launch or None, launched by the
+    engine thread] in perf_counter ns, with the clock fit and trace diagnostics."""
     from torch.autograd import DeviceType
 
-    events = prof.events()
-    host = [e for e in events if e.device_type == DeviceType.CPU]
-    steps = [e.time_range for e in host if e.name == "isb_step"]
-    ranges = sorted([e.time_range.start, e.time_range.end, _RANGES[e.name]]
-                    for e in host if e.name in _RANGES)
-    launches = {e.id: e.time_range.start for e in host if e.name.startswith("cu")}
-    index = {kind: [r for r in ranges if r[2] == kind] for kind in ("readout", "hook")}
-    kernels, unmatched = [], 0.0
+    host = sorted((e for e in events if e.device_type == DeviceType.CPU),
+                  key=lambda e: e.time_range.start)
+    offset, engine_threads, fit = _clock_fit(host, anchors)
+
+    def perf(us):                    # whole ns: perf_counter values are beyond float precision
+        return round(us * 1e3 + offset)
+
+    launches = {e.id: e for e in host if e.name.startswith("cu")}
+    activities = []
     for e in events:
         if e.device_type != DeviceType.CUDA or e.is_user_annotation:
             continue
-        launched = launches.get(e.id)
-        if launched is None:
-            unmatched += e.time_range.elapsed_us()
-        kernels.append([e.time_range.start, e.time_range.end,
-                        "base" if launched is None else _kind_at(index, launched)])
-    return {"window": [min(r.start for r in steps), max(r.end for r in steps)],
-            "steps": [[r.start, r.end] for r in steps], "ranges": ranges, "kernels": kernels,
-            "unmatched_kernel_us": unmatched}
-
-
-def _kind_at(index, t):
-    """The kind of host range open at `t` (`index`: each kind's ranges sorted by start): readout,
-    then hook, else base. Ranges of one kind do not overlap (only the outermost interp span and
-    the outermost readout span open one)."""
-    for kind in ("readout", "hook"):
-        own = index[kind]
-        i = bisect.bisect_right(own, [t, float("inf")]) - 1
-        if i >= 0 and t <= own[i][1]:
-            return kind
-    return "base"
+        launch = launches.get(e.id)
+        activities.append([perf(e.time_range.start), perf(e.time_range.end),
+                           None if launch is None else perf(launch.time_range.start),
+                           launch is not None and launch.thread in engine_threads])
+    return {"requests": finished, "activities": activities, "alignment": fit,
+            "trace": {"launch_records": len(launches), "device_activities": len(activities),
+                      "other_host_records": sum(1 for e in host if not e.name.startswith("cu")),
+                      "launches_after_gpu_start": sum(
+                          1 for a in activities if a[2] is not None and a[2] > a[0])}}
 
 
 def _step(fn):
-    """An engine step: its wall time, spans and boundaries. Reads `OFF` once per step, which
-    switches every wrapper in this process. The first step of a request opens its boundaries,
-    and the step that finishes it hands them to the reader thread. While `TRACE` is present, the
-    first step also opens one profiler session, and the finishing step closes it and logs the
-    request's timeline."""
+    """An engine step. Without a session it passes straight through after one file check; the
+    first step that finds `TRACE` opens the session, and the first step that finds `STOP` closes
+    it (before running). In a session, the step's start and end are boundaries, and the step that
+    finishes a request files that request's boundaries under its end time."""
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
-        _state["on"] = not OFF.exists()
-        if not _state["on"]:
+        global _live, _in_step, _owner, _marks, _append
+        if _session is None:
+            if not TRACE.exists() or STOP.exists():
+                return fn(self, *args, **kwargs)
+            _open_session()
+        elif STOP.exists():
+            _close_session()
             return fn(self, *args, **kwargs)
-        _state.update(dict.fromkeys(_COUNTERS, 0))
-        if _state["prof"] is None and TRACE.exists():
-            _state["prof"] = torch.profiler.profile(
-                activities=[torch.profiler.ProfilerActivity.CPU,
-                            torch.profiler.ProfilerActivity.CUDA])
-            _state["prof"].start()
-            _state["tracing"] = True
-        _bounds["active"] = not _capturing()
-        _bounds["stream"] = torch.cuda.current_stream()
-        _state["in_step"] = True
-        start = time.perf_counter_ns()
-        _mark("base")
+        _owner = threading.get_ident()
+        _live = MARKS and not _capturing()
+        _in_step = True
+        start = _perf()
+        if _live:
+            _append((start, "base"))
         try:
-            if _state["prof"] is None:
-                result = fn(self, *args, **kwargs)
-            else:
-                with torch.profiler.record_function("isb_step"):
-                    result = fn(self, *args, **kwargs)
+            result = fn(self, *args, **kwargs)
         finally:
-            _state["in_step"] = False
-        _mark("between")
-        end = time.perf_counter_ns()
-        event = {"event": "step", "start": start, "end": end,
-                 **{k: _state[k] for k in _COUNTERS}}
+            _in_step = False
+        end = _perf()
+        if _live:
+            _append((end, "between"))
         outputs = result[0] if isinstance(result, tuple) else None
-        event["finished"] = sum(1 for eco in (outputs or {}).values()
-                                for out in eco.outputs if out.finished)
-        if event["finished"]:
-            _submit_bounds(end)
-            if _state["prof"] is not None:
-                torch.cuda.synchronize()
-                _state["prof"].stop()
-                _state["tracing"] = False
-                event["trace"] = {**_step_trace(_state["prof"]),
-                                  "marks_off_step_stream": _bounds["off_stream"]}
-                _bounds["off_stream"] = 0
-                _state["prof"] = None
-        _log(event)
+        finished = sum(1 for eco in (outputs or {}).values() for out in eco.outputs
+                       if out.finished)
+        if finished:
+            _finished.append({"end": end, "marks": _marks})
+            _marks = []
+            _append = _marks.append
+            _live = False
+        _log({"event": "step", "start": start, "end": end, "finished": finished})
         return result
     return wrapper
 
@@ -313,8 +321,8 @@ def _step(fn):
 def _arrival(fn):
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
-        if _state["on"]:
-            _log({"event": "arrival", "t": time.perf_counter_ns()})
+        if _session is not None:
+            _log({"event": "arrival", "t": _perf()})
         return fn(self, *args, **kwargs)
     return wrapper
 
@@ -364,8 +372,8 @@ def install_engine():
 def _sent(fn):
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
-        if _state["on"]:
-            _client["sent"].append(time.perf_counter_ns())
+        if _on:
+            _client["sent"].append(_perf())
         return fn(self, *args, **kwargs)
     return wrapper
 
@@ -373,8 +381,8 @@ def _sent(fn):
 def _sent_async(fn):
     @functools.wraps(fn)
     async def wrapper(self, *args, **kwargs):
-        if _state["on"]:
-            _client["sent"].append(time.perf_counter_ns())
+        if _on:
+            _client["sent"].append(_perf())
         return await fn(self, *args, **kwargs)
     return wrapper
 
@@ -383,8 +391,8 @@ def _received(fn):
     @functools.wraps(fn)
     def wrapper(self, engine_core_outputs, *args, **kwargs):
         result = fn(self, engine_core_outputs, *args, **kwargs)
-        if _state["on"] and any(out.finished for out in engine_core_outputs):
-            _client["received"].append(time.perf_counter_ns())
+        if _on and any(out.finished for out in engine_core_outputs):
+            _client["received"].append(_perf())
         return result
     return wrapper
 
@@ -400,9 +408,11 @@ def install_client():
 
 
 def _events():
+    """Every complete line of the log. A line the engine is still writing has no newline yet; it
+    is left for the next read."""
     if not LOG.exists():
         return []
-    return [json.loads(line) for line in LOG.read_text().splitlines() if line]
+    return [json.loads(line) for line in LOG.read_text().split("\n")[:-1] if line]
 
 
 def _reset():
@@ -412,16 +422,16 @@ def _reset():
 
 
 def _trial(call):
-    """One timed call: its six boundaries, the engine steps between them, and the request's
-    boundary record (waited for after the call, outside the timed interval)."""
+    """One timed call: its six boundaries and the engine steps between them. The request's
+    region boundaries and the GPU activities arrive with the session's export."""
     from .timing import sync_cuda
 
     _reset()
     sync_cuda()
-    t0 = time.perf_counter_ns()
+    t0 = _perf()
     call()
     sync_cuda()
-    t7 = time.perf_counter_ns()
+    t7 = _perf()
     events = _events()
     arrivals = [e["t"] for e in events if e["event"] == "arrival"]
     steps = [e for e in events if e["event"] == "step"]
@@ -433,69 +443,84 @@ def _trial(call):
     t1, t2 = _client["sent"][-1], arrivals[-1]
     t3, t4 = finishing[-1]["end"], _client["received"][-1]
     window = [e for e in steps if t2 <= e["start"] and e["end"] <= t3]
-    deadline = time.monotonic() + 60
-    while True:
-        bounds = [e for e in events if e["event"] == "bounds" and e["end"] == t3]
-        if bounds:
-            break
-        if time.monotonic() > deadline:
-            raise RuntimeError("the engine logged no boundary record for the finishing step")
-        time.sleep(0.001)
-        events = _events()
-    return {"t": [t0, t1, t2, t3, t4, t7], "steps": window, "bounds": bounds[0],
-            "requests": len(_client["sent"])}
+    return {"t": [t0, t1, t2, t3, t4, t7], "steps": window, "requests": len(_client["sent"])}
 
 
-def _stretches(t2, t3, bounds):
-    """Engine time t2..t3 (ns) charged per segment ("engine", "hook", "readout"): each boundary's
-    event time on the host clock, kept in order and inside the window, closes the stretch the
-    previous region opened. Before the first boundary the engine is between steps."""
-    marks, gpu_ms = bounds["marks"], bounds["gpu_ms"]
-    end = t3 - t2                                   # times from here on are ns after t2
-    offset = max(c - t2 - g * 1e6 for (c, _), g in zip(marks, gpu_ms))
+def _attribute(t2, t3, marks, activities):
+    """Engine time t2..t3 (ns) charged per segment ("engine", "hook", "readout"), with the device
+    activities inside the window and their kinds. `marks`: (host time, kind starting there);
+    `activities`: [gpu start, gpu end, launch or None, launched by the engine thread]."""
+    times = [c for c, _ in marks]
+    kinds = [k for _, k in marks]
     charged = dict.fromkeys(("engine", "hook", "readout"), 0.0)
-    previous, kind = 0, "between"
-    for (_, next_kind), g in zip(marks, gpu_ms):
-        at = min(max(offset + g * 1e6, previous), end)
-        charged[_SEGMENT[kind]] += at - previous
-        previous, kind = at, next_kind
-    charged[_SEGMENT[kind]] += end - previous
-    return charged
+
+    def region(t):
+        i = bisect.bisect_right(times, t) - 1
+        return kinds[i] if i >= 0 else "between"
+
+    def idle(a, b):                     # the GPU waits: charge the host regions open meanwhile
+        i = bisect.bisect_right(times, a) - 1
+        while a < b:
+            nxt = times[i + 1] if i + 1 < len(times) else b
+            stop = min(b, nxt)
+            charged[_SEGMENT[kinds[i] if i >= 0 else "between"]] += stop - a
+            a, i = stop, i + 1
+
+    placed, unmatched, other = [], 0.0, 0.0
+    for start, end, launch, engine_thread in activities:
+        a, b = max(start, t2), min(end, t3)
+        if a >= b:
+            continue
+        if launch is None:
+            kind, unmatched = "base", unmatched + b - a
+        elif not engine_thread:
+            kind, other = "base", other + b - a
+        else:
+            kind = region(launch)
+        placed.append((a, b, kind))
+    placed.sort()
+    covered = t2
+    for a, b, kind in placed:
+        if b <= covered:
+            continue
+        if a > covered:
+            idle(covered, a)
+        charged[_SEGMENT[kind]] += b - max(a, covered)
+        covered = b
+    idle(covered, t3)
+    return charged, placed, unmatched, other
 
 
-def _summarize_traced(traced):
-    """The traced call's GPU time per kind (ms), with the timeline it came from (logged by the
-    step that finished the request); diagnostics and the span attribution's kernel time."""
-    (timeline,) = [step["trace"] for step in traced["steps"] if "trace" in step]
-    return {
-        "kernels_ms": {kind: sum(b - a for a, b, k in timeline["kernels"] if k == kind) * 1e-3
-                       for kind in _KINDS},
-        "unmatched_kernel_ms": timeline["unmatched_kernel_us"] * 1e-3,
-        "marks_off_step_stream": timeline["marks_off_step_stream"],
-        "e2e_wall_ms": (traced["t"][-1] - traced["t"][0]) * 1e-6,
-        "timeline": timeline,
-    }
+def _host_time(t2, t3, marks):
+    """Host time (ns) inside hook and readout regions within t2..t3."""
+    out = {"hook": 0.0, "readout": 0.0}
+    for (c, kind), (n, _) in zip(marks, marks[1:] + [(t3, None)]):
+        if kind in out:
+            out[kind] += max(0, min(n, t3) - max(c, t2))
+    return out
 
 
-def _decompose(trial, traced):
-    """One trial's subphases and raw segments under both attributions; `traced` is
-    `_summarize_traced` of the row's traced call (span attribution only)."""
+def _decompose(trial, marks, activities):
+    """One trial's subphases and raw segments under both attributions."""
     t0, t1, t2, t3, t4, t7 = trial["t"]
     ms = 1e-6
-    total = {k: sum(s[k] for s in trial["steps"]) * ms for k in _COUNTERS}
-    charged = {k: v * ms for k, v in _stretches(t2, t3, trial["bounds"]).items()}
-    kernels = traced["kernels_ms"]
+    charged, placed, unmatched, other = _attribute(t2, t3, marks, activities)
+    charged = {k: v * ms for k, v in charged.items()}
+    host = {k: v * ms for k, v in _host_time(t2, t3, marks).items()}
+    kernels = dict.fromkeys(_KINDS, 0.0)
+    for a, b, kind in placed:
+        kernels["base" if kind == "between" else kind] += (b - a) * ms
+    interp, readout = host["hook"] + host["readout"], host["readout"]
     sub = {"client_prep": (t1 - t0) * ms, "request_transfer": (t2 - t1) * ms,
            "engine": (t3 - t2) * ms, "engine_outside_spans": charged["engine"],
            "engine_hook": charged["hook"], "engine_readout": charged["readout"],
-           "engine_interp_host": total["interp_ns"], "engine_readout_host": total["readout_ns"],
+           "engine_interp_host": interp, "engine_readout_host": readout,
            "output_transfer": (t4 - t3) * ms, "client_post": (t7 - t4) * ms}
     events = {
         "engine_outside_spans": charged["engine"],
         "hook_dispatch_and_edit": sub["client_prep"] + sub["request_transfer"] + charged["hook"],
         "readout_and_host_ipc": charged["readout"] + sub["output_transfer"] + sub["client_post"],
     }
-    interp, readout = total["interp_ns"], total["readout_ns"]
     spans = {
         "base_gpu_kernels": kernels["base"],
         "engine_host": (sub["engine"] - kernels["base"] - interp - kernels["hook"]
@@ -509,7 +534,11 @@ def _decompose(trial, traced):
     return {"e2e_wall_ms": (t7 - t0) * ms, "segments_raw_ms": events,
             "segments_raw_spans_ms": spans, "subphases_ms": sub, "boundaries_ordered": ordered,
             "requests": trial["requests"], "engine_steps": len(trial["steps"]),
-            "bounds": trial["bounds"]}
+            "marks": len(marks), "kernels_ms": kernels, "unmatched_kernel_ms": unmatched * ms,
+            "other_thread_kernel_ms": other * ms,
+            "timeline": {"marks": [[(c - t2) * 1e-3, k] for c, k in marks],
+                         "activities": [[(a - t2) * 1e-3, (b - t2) * 1e-3, k]
+                                        for a, b, k in placed]}}
 
 
 def _warm(prepare, warmup):
@@ -521,50 +550,74 @@ def _warm(prepare, warmup):
 
 
 def _uninstrumented(prepare, *, warmup, n_trials):
-    """Wall times (ms) of the same calls with every wrapper passing straight through, in the
-    harness's timing loop (`isb.perf.timing.time_cell`): the baseline for the instrumentation's
-    own cost. The engine process picks up `OFF` at its next step."""
+    """Wall times (ms) of the same calls with no session open, so every engine wrapper passes
+    straight through, in the harness's timing loop (`isb.perf.timing.time_cell`): the baseline for
+    the instrumentation's own cost."""
+    global _on
     from .timing import force_gc, sync_cuda
 
-    OFF.touch()
-    _state["on"] = False
+    _on = False
     try:
         _warm(prepare, warmup)
         times = []
         for _ in range(n_trials):
             call = prepare()
             sync_cuda()
-            start = time.perf_counter_ns()
+            start = _perf()
             call()
             sync_cuda()
-            times.append((time.perf_counter_ns() - start) * 1e-6)
+            times.append((_perf() - start) * 1e-6)
             force_gc()
     finally:
-        OFF.unlink(missing_ok=True)
-        _state["on"] = True
+        _on = True
     return times
 
 
+def _close(prepare, timeout=600):
+    """Have the engine close its session: one more untimed call, whose first step exports."""
+    TRACE.unlink(missing_ok=True)
+    STOP.touch()
+    try:
+        prepare()()
+        deadline = time.monotonic() + timeout
+        while not EXPORT.exists():
+            if time.monotonic() > deadline:
+                raise RuntimeError("the engine exported no trace session")
+            time.sleep(0.01)
+        export = json.loads(EXPORT.read_text())
+    finally:
+        STOP.unlink(missing_ok=True)
+        EXPORT.unlink(missing_ok=True)
+    return export
+
+
 def profile_call(prepare, *, warmup, n_trials):
-    """Time `n_trials` calls uninstrumented; then, instrumented: warm up, trace one call, warm up
-    again (the first call after a profiler session is slow), and time `n_trials` calls; medians
-    per field. Every call is prepared and followed by a collection outside its timed interval, as
-    in `isb.perf.timing.time_cell`."""
+    """Time `n_trials` calls uninstrumented; then open a trace session, warm up (the session
+    opens in the first of these calls), time `n_trials` calls instrumented and close the session;
+    then time `n_trials` calls uninstrumented again. Every trial is decomposed from the export.
+    Every call is prepared and followed by a collection outside its timed interval, as in
+    `isb.perf.timing.time_cell`."""
     from .timing import force_gc
 
     plain = _uninstrumented(prepare, warmup=warmup, n_trials=n_trials)
-    _warm(prepare, warmup)
     TRACE.touch()
     try:
-        traced = _summarize_traced(_trial(prepare()))
+        _warm(prepare, warmup + 1)
+        raw = []
+        for _ in range(n_trials):
+            raw.append(_trial(prepare()))
+            force_gc()
+        export = _close(prepare)
     finally:
         TRACE.unlink(missing_ok=True)
-    force_gc()
-    _warm(prepare, warmup)
-    trials = []
-    for _ in range(n_trials):
-        trials.append(_decompose(_trial(prepare()), traced))
-        force_gc()
+    plain_after = _uninstrumented(prepare, warmup=warmup, n_trials=n_trials)
+    requests = {r["end"]: r["marks"] for r in export["requests"]}
+    trials = [_decompose(t, requests[t["t"][3]], export["activities"]) for t in raw]
+    # the trial whose e2e is the median keeps its timeline, for diagnostics
+    chosen = sorted(range(n_trials), key=lambda i: trials[i]["e2e_wall_ms"])[(n_trials - 1) // 2]
+    timeline = {"trial": chosen, **trials[chosen]["timeline"]}
+    for t in trials:
+        del t["timeline"]
 
     def medians(field):
         return {k: statistics.median(t[field][k] for t in trials) for k in trials[0][field]}
@@ -573,16 +626,24 @@ def profile_call(prepare, *, warmup, n_trials):
         return max(abs(sum(t[field].values()) - t["e2e_wall_ms"]) for t in trials)
 
     e2e = statistics.median(t["e2e_wall_ms"] for t in trials)
-    uninstrumented = statistics.median(plain)
+    before, after = statistics.median(plain), statistics.median(plain_after)
+    uninstrumented = (before + after) / 2
     return {
         "e2e_wall_ms": e2e,
         "uninstrumented_e2e_ms": uninstrumented,
+        "uninstrumented_before_e2e_ms": before,
+        "uninstrumented_after_e2e_ms": after,
+        "uninstrumented_gap_fraction": after / before - 1,
         "uninstrumented_trials_ms": plain,
+        "uninstrumented_after_trials_ms": plain_after,
         "instrumentation_overhead_fraction": e2e / uninstrumented - 1,
         "segments_raw_ms": medians("segments_raw_ms"),
         "segments_raw_spans_ms": medians("segments_raw_spans_ms"),
         "subphases_ms": medians("subphases_ms"),
-        "traced": traced,
+        "kernels_ms": medians("kernels_ms"),
+        "alignment": export["alignment"],
+        "trace": export["trace"],
+        "timeline": timeline,
         "trials": trials,
         # Each trial's segments sum to its e2e by construction; the check is that every boundary
         # was captured in order, once per request, in every trial.
@@ -727,8 +788,13 @@ def split_with_floors(profiles, attribution="events"):
             segments = trials[chosen]["segments_ms"]
             record.update({
                 "e2e_wall_ms": trials[chosen]["e2e_wall_ms"], "reported_trial": chosen,
+                "marks": row["trials"][chosen]["marks"],
                 "uninstrumented_e2e_ms": row["uninstrumented_e2e_ms"],
+                "uninstrumented_before_e2e_ms": row["uninstrumented_before_e2e_ms"],
+                "uninstrumented_after_e2e_ms": row["uninstrumented_after_e2e_ms"],
+                "uninstrumented_gap_fraction": row["uninstrumented_gap_fraction"],
                 "instrumentation_overhead_fraction": row["instrumentation_overhead_fraction"],
+                "clock_bracket_width_ns": row["alignment"]["bracket_width_ns"],
                 "segments_ms": segments, "segments_raw_ms": row["segments_raw_ms"],
                 "segments_raw_spans_ms": row["segments_raw_spans_ms"],
                 "subphases_ms": row["subphases_ms"],
