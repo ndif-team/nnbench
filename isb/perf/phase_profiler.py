@@ -28,10 +28,11 @@ per-request bookkeeping in `Requests`); `readout` while that code runs a lens pr
 norm, the logits processor or `F.linear`), a device-to-host copy (`Tensor.cpu`) or nnsight's
 packing of saves for the return (`Requests.harvest`, `Requests.record_saves`); `base` for the rest
 of a step; `between` outside steps. At every change of kind, and at every step's start and end,
-the engine records the host time c_i and a CUDA event on the current stream. The event completes
-at g_i, when the GPU has finished everything launched before it, and never before c_i; the two
-clocks are aligned at the request's first step, where the GPU is idle (offset = max_i of
-c_i - event time_i). From g_i to g_(i+1) the GPU either runs the kernels launched in region i or
+the engine records the host time c_i and a CUDA event on the step's stream (the current stream at
+the step's start; the traced call counts marks that find another current stream, which would
+break the ordering below). The event completes at g_i, when the GPU has finished everything
+launched before it, and never before c_i; the two clocks are aligned at the request's first
+step, where the GPU is idle (offset = max_i of c_i - event time_i). From g_i to g_(i+1) the GPU either runs the kernels launched in region i or
 waits for that region's host code to launch them, so each such stretch is charged to region i's
 kind: host work that overlaps earlier GPU work is charged to nothing, and nothing is counted
 twice. The stretches telescope from t2 to t3 (clipped to that window, kept in order).
@@ -100,8 +101,11 @@ _state = {"on": True, "interp": 0, "readout": 0, "in_step": False, "tracing": Fa
 _RANGES = {"isb_interp": "hook", "isb_readout": "readout"}       # host ranges of a traced call
 _KINDS = ("base", "hook", "readout")
 _SEGMENT = {"between": "engine", "base": "engine", "hook": "hook", "readout": "readout"}
-# boundaries of the request in flight: host times with the kind that starts there, their events
-_bounds = {"active": False, "marks": [], "events": [], "free": [], "queue": None}
+# boundaries of the request in flight: host times with the kind that starts there, their events,
+# the stream they are recorded on (fetched once per step) and, on a traced call, how many marks
+# found a different current stream
+_bounds = {"active": False, "marks": [], "events": [], "free": [], "queue": None, "stream": None,
+           "off_stream": 0}
 _client = {"sent": [], "received": []}
 
 
@@ -117,14 +121,20 @@ def _new_event():
     return torch.cuda.Event(enable_timing=True)
 
 
+_record = torch._C._CudaEventBase.record     # the event record without torch.cuda.Event's wrapper
+
+
 def _mark(kind):
-    """A boundary of the request in flight: the host region that starts now is `kind`."""
-    if not _bounds["active"] or _capturing():
+    """A boundary of the request in flight: the host region that starts now is `kind`. The step
+    checks for graph capture and fetches the stream once; a mark only records."""
+    if not _bounds["active"]:
         return
+    if _state["tracing"] and torch.cuda.current_stream() != _bounds["stream"]:
+        _bounds["off_stream"] += 1
     free = _bounds["free"]
     event = free.pop() if free else _new_event()
     _bounds["marks"].append((time.perf_counter_ns(), kind))
-    event.record()
+    _record(event, _bounds["stream"])
     _bounds["events"].append(event)
 
 
@@ -265,7 +275,8 @@ def _step(fn):
                             torch.profiler.ProfilerActivity.CUDA])
             _state["prof"].start()
             _state["tracing"] = True
-        _bounds["active"] = True
+        _bounds["active"] = not _capturing()
+        _bounds["stream"] = torch.cuda.current_stream()
         _state["in_step"] = True
         start = time.perf_counter_ns()
         _mark("base")
@@ -290,7 +301,9 @@ def _step(fn):
                 torch.cuda.synchronize()
                 _state["prof"].stop()
                 _state["tracing"] = False
-                event["trace"] = _step_trace(_state["prof"])
+                event["trace"] = {**_step_trace(_state["prof"]),
+                                  "marks_off_step_stream": _bounds["off_stream"]}
+                _bounds["off_stream"] = 0
                 _state["prof"] = None
         _log(event)
         return result
@@ -458,6 +471,7 @@ def _summarize_traced(traced):
         "kernels_ms": {kind: sum(b - a for a, b, k in timeline["kernels"] if k == kind) * 1e-3
                        for kind in _KINDS},
         "unmatched_kernel_ms": timeline["unmatched_kernel_us"] * 1e-3,
+        "marks_off_step_stream": timeline["marks_off_step_stream"],
         "e2e_wall_ms": (traced["t"][-1] - traced["t"][0]) * 1e-6,
         "timeline": timeline,
     }
@@ -669,8 +683,8 @@ def split_with_floors(profiles, attribution="events"):
     config reserves (`gpus`, the tensor-parallel size of these engines). A row's floor is the plain
     request of a compiled `vllm-plain` profile of the same workload, vLLM version and GPU count,
     over the same timed units and token count; a row without one gets an error. Each trial is
-    split, so every trial's segments still sum to its e2e; the record gives the per-segment
-    medians and how far their sum falls from the median e2e."""
+    split, so every trial's segments still sum to its e2e; the record reports the trial whose
+    e2e is the median, with every trial kept."""
     field = ATTRIBUTIONS[attribution]
     floors = {}
     for profile in profiles:
@@ -706,11 +720,13 @@ def split_with_floors(profiles, attribution="events"):
                     "eager_graph_break_tax": _engine_ms(raw) - floor_ms,
                     "hook_dispatch_and_edit": raw["hook_dispatch_and_edit"],
                     "readout_and_host_ipc": raw["readout_and_host_ipc"]}})
-            segments = {k: statistics.median(t["segments_ms"][k] for t in trials)
-                        for k in trials[0]["segments_ms"]}
-            gap = sum(segments.values()) - row["e2e_wall_ms"]
+            # the trial whose e2e is the median (the lower middle one for an even count): its
+            # segments sum to its own e2e
+            ordered = sorted(range(len(trials)), key=lambda i: trials[i]["e2e_wall_ms"])
+            chosen = ordered[(len(ordered) - 1) // 2]
+            segments = trials[chosen]["segments_ms"]
             record.update({
-                "e2e_wall_ms": row["e2e_wall_ms"],
+                "e2e_wall_ms": trials[chosen]["e2e_wall_ms"], "reported_trial": chosen,
                 "uninstrumented_e2e_ms": row["uninstrumented_e2e_ms"],
                 "instrumentation_overhead_fraction": row["instrumentation_overhead_fraction"],
                 "segments_ms": segments, "segments_raw_ms": row["segments_raw_ms"],
@@ -720,9 +736,7 @@ def split_with_floors(profiles, attribution="events"):
                 "conservation": {
                     **row["conservation"],
                     "max_trial_gap_ms": max(abs(sum(t["segments_ms"].values()) - t["e2e_wall_ms"])
-                                            for t in trials),
-                    "median_sum_gap_ms": gap,
-                    "median_sum_gap_fraction": gap / row["e2e_wall_ms"]}})
+                                            for t in trials)}})
     return out
 
 

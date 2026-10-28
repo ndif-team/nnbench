@@ -121,9 +121,7 @@ def combine(directory, attribution):
         print(f"{head} | e2e={r['e2e_wall_ms']:.2f} "
               f"uninstrumented={r['uninstrumented_e2e_ms']:.2f} {seg} | floor={r['floor']} "
               f"F={r['floor_engine_ms']:.2f} | trial_gap={c['max_trial_gap_ms']:.2g} "
-              f"median_sum_gap={c['median_sum_gap_ms']:.3f} "
-              f"({100 * c['median_sum_gap_fraction']:.1f}%) ordered={c['all_ordered']} "
-              f"single={c['single_request']}")
+              f"ordered={c['all_ordered']} single={c['single_request']}")
     print(f"Wrote {out}")
     return 0
 
