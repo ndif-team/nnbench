@@ -6,12 +6,23 @@ benchmark process sees only what reaches the client. The engine's own `collectiv
 rank; the two functions below reset and read the PyTorch allocator's peak there. A callable crosses
 the process boundary only with `VLLM_ALLOW_INSECURE_SERIALIZATION=1` (vllm/v1/serial_utils.py),
 which `allow_callable_rpc` sets before the engine starts; the engine processes inherit it.
+
+The measurement is opt-in (`ISB_WORKER_MEMORY=1` in the launcher's environment, forwarded by each
+vLLM backend's compose.yml): with the flag set, vLLM type-tags and converts every RPC result, which
+slowed vLLM-Lens's 28-layer logit lens by 9-13% on Qwen2.5-7B against the same cell without it
+(interference-check/summary.md). Timed runs leave it unset; memory runs set it.
 """
 from __future__ import annotations
 
 import os
 
 INSECURE_SERIALIZATION = "VLLM_ALLOW_INSECURE_SERIALIZATION"
+REQUESTED = "ISB_WORKER_MEMORY"
+
+
+def requested() -> bool:
+    """Whether this run measures engine-worker memory (`ISB_WORKER_MEMORY=1`)."""
+    return os.environ.get(REQUESTED) == "1"
 
 
 def allow_callable_rpc() -> None:
@@ -41,6 +52,8 @@ class WorkerMemory:
     def __init__(self, be, model):
         self.be, self.model = be, model
         self.unavailable = self.error = None
+        if not requested():
+            self.unavailable = f"not requested ({REQUESTED} unset)"
 
     def _rpc(self, fn):
         if self.unavailable is not None or self.error is not None:

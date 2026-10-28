@@ -24,7 +24,7 @@ from ..methodologies.observations import capture_choices
 from ..methodologies.registry import Unsupported, get_cell, get_realizations
 from ..perf.core import returned_bytes
 from ..perf.timing import time_cell
-from ..perf.worker_memory import WorkerMemory, allow_callable_rpc
+from ..perf.worker_memory import WorkerMemory, allow_callable_rpc, requested as worker_memory_requested
 from ..runfile import save_run
 from ..runs import RunConfig, cell_interface, make_backend, resolve_provenance, spec_coordinates
 from ..sweep.guards import compute_effect_size
@@ -436,7 +436,8 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
 
     outputs, meta = {}, {}
     model = None
-    allow_callable_rpc()                 # before the engine starts: the worker-memory RPC
+    if worker_memory_requested():
+        allow_callable_rpc()             # before the engine starts: the worker-memory RPC
     try:
         model = be.load(spec.repo)
         count = _layer_count(model) if spec.n_layers is not None else None

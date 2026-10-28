@@ -25,6 +25,7 @@ services:
       ISB_BACKEND: ${ISB_BACKEND:-transformer-lens-vllm/default}
       ISB_ENGINE_OPTIONS: ${ISB_ENGINE_OPTIONS}
       ISB_RANKS: ${ISB_RANKS:-1}
+      ISB_WORKER_MEMORY: ${ISB_WORKER_MEMORY:-0}
     volumes:
       - ../..:/workspace:ro
       - ${ISB_JOB_DIR:-../../runs/manual/job}:/job:ro
