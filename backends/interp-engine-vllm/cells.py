@@ -15,12 +15,15 @@ layer applied at every position. Workloads that need a per-position value or a z
 declared unsupported. Outputs carry the unit axis at dim -2.
 """
 import asyncio
+from collections.abc import Mapping
 
 import torch
 import torch.nn.functional as F
 
+from isb.methodologies.jacobian_lens import _load_fitted, _orthogonal
 from isb.methodologies.registry import Unsupported, cell
 from isb.methodologies.steering import _resolve_token
+from isb.tasks.lens_eval import locate
 
 
 def _ids(model, prompts):
@@ -63,6 +66,84 @@ def logit_lens(be, model, units, *, layers="all"):
     rows = torch.stack([a[:, -1, :] for a in acts], dim=1)                     # [n_layers, B, d]
     logits = model.engine.decode_residuals(rows.reshape(-1, rows.shape[-1])).float()
     return logits.reshape(len(idx), len(units), -1)                            # [n_layers, B, vocab]
+
+
+def _jlens_maps(model, transport, d):
+    """The Jacobian-lens transport as fp32 on the client: None (identity), one shared [d, d] map
+    (an int seed, `_orthogonal`, or a tensor) or {layer: [d, d]} (a fitted lens, `_load_fitted`, or
+    a mapping). A seeded or fitted map is built once per loaded model, so the QR and the checkpoint
+    load stay out of the timed readout."""
+    if transport is None:
+        return None
+    key = transport if isinstance(transport, (int, str)) else None
+    if key in model.maps:
+        return model.maps[key]
+    source = (_load_fitted(transport) if isinstance(transport, str)
+              else _orthogonal(d, transport) if isinstance(transport, int) else transport)
+    maps = ({layer: m.float() for layer, m in source.items()} if isinstance(source, Mapping)
+            else source.float())
+    if key is not None:
+        model.maps[key] = maps
+    return maps
+
+
+@cell("jacobian_lens", family="llama", backend="interp_engine")
+def jacobian_lens(be, model, units, *, layers="all", position="last", transport=None):
+    """interp-engine's Jacobian lens (`layer_logits`, lens.py) applies a caller's transport on the
+    client to the fp32 residual (`transport(residual.float(), layer)`) and decodes it with the
+    model's own final norm and unembedding; on vLLM it reads the residual through native
+    extraction (`capture_residuals` -> `capture_resid_post`), which needs `enable_extraction` and
+    stops one layer short of the last (vllm_capture/native.py), and it decodes every position. So
+    this cell composes the same steps: `capture` at `resid_post` of each layer, the row at each
+    prompt's readout position (`locate`), `h @ J_l^T` in fp32 on the client
+    (isb/methodologies/jacobian_lens.py), then `decode_residuals` (vLLM's final norm and
+    `compute_logits` in the worker) once over every row. The fused worker read-out
+    (`set_lens_jacobians` + `lens_capture_readout_stream`) returns top-k probabilities, not logits.
+    [n_layers, B, vocab]"""
+    n = model.n_layers
+    idx = list(range(n)) if layers == "all" else list(layers)
+    positions = [locate(model.tokenizer, unit, position) for unit in units]
+    acts = _capture(model, _ids(model, units), [i % n for i in idx])
+    rows = torch.stack([a[:, pos, :] for a, pos in zip(acts, positions)], dim=1)  # [n_layers, B, d]
+    maps = _jlens_maps(model, transport, rows.shape[-1])
+    if isinstance(maps, Mapping):
+        rows = torch.stack([block.float() @ maps[i].T for block, i in zip(rows, idx)])
+    elif maps is not None:
+        rows = rows.float() @ maps.T
+    logits = model.engine.decode_residuals(rows.reshape(-1, rows.shape[-1]))
+    return logits.reshape(len(idx), len(units), -1)                          # [n_layers, B, vocab]
+
+
+@cell("residual_readout", family="llama", backend="interp_engine")
+def residual_readout(be, model, units, *, layers):
+    """`resid_post.{i}` (`hidden + residual` after layer i) at each prompt's last token, in the
+    engine's dtype as `capture` returns it on CPU (every prompt row crosses; the capture takes no
+    position): [len(layers), B, d_model]."""
+    acts = _capture(model, _ids(model, units), [i % model.n_layers for i in layers])
+    return torch.stack([a[:, -1, :] for a in acts], dim=1)
+
+
+@cell("attention_pattern", family="llama", backend="interp_engine")
+def attention_pattern(be, model, units, *, layers="all"):
+    """`capture_attention` (protocol.py): vLLM's paged kernel never forms the probabilities, so the
+    worker records post-RoPE q/k at each layer's attention op (a forward pre-hook on
+    `self_attn.attn`, vllm_capture/attn.py) and the client rebuilds the scores, expanding the KV
+    heads to the query heads (`repeat_interleave`, the grouping of HF's `repeat_kv`), with the
+    causal mask, and their softmax (`recompute_attn_scores`, `attn_probs_from_scores`). One request
+    per prompt, issued together (the q/k store is per request, vllm_capture/requests.py). The last
+    query's row of `probs` as log-probabilities, like the reference:
+    [n_layers, B, n_heads, k_len]."""
+    if be.backend == "vllm-static":
+        raise Unsupported("vllm-static serves capture_attention only from Address('attn', layer) "
+                          "taps declared at load; static_points='auto' declares resid_post alone, "
+                          "and with graphs replayed the hooked path refuses (vllm_backend.py, "
+                          "_use_static_attn, _require_hooks)")
+    n = model.n_layers
+    idx = list(range(n)) if layers == "all" else [i % n for i in layers]
+    engine = model.engine.model
+    results = _gather(model, [engine.capture_attention(row, idx) for row in _ids(model, units)])
+    return torch.stack([torch.stack([torch.log(r[i]["probs"][:, -1, :]) for r in results])
+                        for i in idx])
 
 
 def _direction(model, token_id):
@@ -181,13 +262,14 @@ def ablation(be, model, units, *, layer=6, target="mlp"):
 
 
 @cell("activation_harvest", family="llama", backend="interp_engine")
-def activation_harvest(be, model, units, *, layer, export=True):
+def activation_harvest(be, model, units, *, layer=None, layers=None, export=True):
     """The documented batch capture, `run_with_cache` over a padded batch and its mask
     (`interp_engine/capture.py`): on vLLM each row runs unpadded as its own `capture` request, the
     requests run concurrently for the scheduler to batch, and each returns on CPU; the Cache pads
-    them to [batch, seq, d_model]. The valid rows are concatenated in prompt order. `export=False`
-    sends the same concurrent requests through `generate_text` for one greedy token, since
-    `run_with_cache` needs a capture point."""
+    them to [batch, seq, d_model]. The valid rows are concatenated in prompt order: [tokens,
+    d_model], or [len(layers), tokens, d_model] for `layers`, which replaces `layer` (one request
+    per prompt captures every listed point). `export=False` sends the same concurrent requests
+    through `generate_text` for one greedy token, since `run_with_cache` needs a capture point."""
     from interp_engine import run_with_cache
 
     ids = _ids(model, units)
@@ -197,9 +279,11 @@ def activation_harvest(be, model, units, *, layer, export=True):
     width = max(map(len, ids))
     tokens = torch.tensor([row + [0] * (width - len(row)) for row in ids])
     mask = (torch.arange(width) < torch.tensor([len(row) for row in ids])[:, None]).long()
-    point = f"resid_post.{layer}"
-    acts = run_with_cache(model.engine.model, tokens, [point], attention_mask=mask)[point]
-    return torch.cat([acts[b, :len(row)] for b, row in enumerate(ids)])       # [tokens, d_model]
+    points = [f"resid_post.{i}" for i in ([layer] if layers is None else layers)]
+    cache = run_with_cache(model.engine.model, tokens, points, attention_mask=mask)
+    stacked = torch.stack([torch.cat([cache[point][b, :len(row)] for b, row in enumerate(ids)])
+                           for point in points])                      # [n_points, tokens, d_model]
+    return stacked if layers is not None else stacked[0]
 
 
 @cell("gen_capture", family="llama", backend="interp_engine")

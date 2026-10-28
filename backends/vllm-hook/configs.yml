@@ -1,5 +1,7 @@
 # IBM vLLM-Hook on vLLM 0.19.1 (the Dockerfile's ARG values). `storage` selects the plugin's
-# activation transport: rpc (its default) or the asynchronous safetensors spill to disk.
+# activation transport: rpc (its default) or the asynchronous safetensors spill to disk. `worker`
+# selects the engine's one worker extension: probe_hidden_states (the default) or probe_hook_qk,
+# the Q/K probe the attention cells read.
 images:
   default: {}
 configs:
@@ -7,3 +9,12 @@ configs:
     image: default
     options: &base {dtype: bfloat16, gpu_memory_utilization: 0.85, enable_prefix_caching: false}
   disk: {image: default, options: {<<: *base, storage: disk-st-async}}
+  qk: {image: default, options: {<<: *base, worker: probe_hook_qk}}
+  qk/disk: {image: default, options: {<<: *base, worker: probe_hook_qk, storage: disk-st-async}}
+  # tensor parallelism: only TP rank 0 captures (probe_hidden_states_worker / probe_hookqk_worker,
+  # install_hooks: `_should_capture`). Hidden states are replicated there; Q/K are head-sharded,
+  # so a qk engine under TP holds rank 0's heads only.
+  tp2: {image: default, options: {<<: *base, tensor_parallel_size: 2}, gpus: 2}
+  tp4: {image: default, options: {<<: *base, tensor_parallel_size: 4}, gpus: 4}
+  disk/tp2: {image: default, options: {<<: *base, storage: disk-st-async, tensor_parallel_size: 2}, gpus: 2}
+  disk/tp4: {image: default, options: {<<: *base, storage: disk-st-async, tensor_parallel_size: 4}, gpus: 4}

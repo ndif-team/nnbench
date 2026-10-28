@@ -8,7 +8,7 @@ TV(alpha=0, alpha=6) at half depth on the control. In-place vs replacement write
 the nnsight cells declare.
 """
 from ..data import DataRef
-from ..sweep.spec import Depth, Effect, Regime, Row, Workload
+from ..sweep.spec import Depth, Effect, FirstLayers, Regime, Row, Workload
 
 _ROME = {"target": " Rome"}
 _SCALES = (("", {}), (", scaled by each token's norm", {"scale_by": "token_norm"}))
@@ -32,4 +32,28 @@ steering = Workload(
     load_patterns=("offline", "concurrent", "open"),
     effect=Effect(baseline={**_ROME, "alpha": 0.0, "layer": _HALF},
                   perturbed=(Row("alpha 6", {**_ROME, "alpha": 6.0, "layer": _HALF}),)),
+)
+
+
+# How the cost of one forward grows with the number of edited layers: the "half depth" row's edit
+# (alpha 6, mean norm) applied at every layer of the first k, k from one layer to every layer below
+# the final (readout) layer. Baseline and effect check sit at the first layer, which every row
+# edits, so a system that sizes its engine to the locations a case touches (nnsight's taps) sees
+# exactly each row's layers.
+_FIRST = FirstLayers(count=1)
+steering_layers = Workload(
+    name="steering_layers", methodology="steering",
+    rows=tuple(
+        Row(f"add toward ' Rome' at {where}", {**_ROME, "alpha": 6.0, "layers": layers})
+        for where, layers in (
+            ("the first layer", FirstLayers(count=1, below_final=True)),
+            ("each of the first seventh of the layers", FirstLayers(1 / 7, below_final=True)),
+            ("each of the first quarter of the layers", FirstLayers(1 / 4, below_final=True)),
+            ("each of the first half of the layers", FirstLayers(1 / 2, below_final=True)),
+            ("each of the first three quarters of the layers", FirstLayers(3 / 4, below_final=True)),
+            ("every layer below the final layer", FirstLayers(1.0, below_final=True)))),
+    regimes=(Regime("interactive", DataRef("counterfact", 100)),),
+    baseline={**_ROME, "alpha": 0.0, "layers": _FIRST},
+    effect=Effect(baseline={**_ROME, "alpha": 0.0, "layers": _FIRST},
+                  perturbed=(Row("alpha 6 at the first layer", {**_ROME, "alpha": 6.0, "layers": _FIRST}),)),
 )

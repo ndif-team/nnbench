@@ -39,16 +39,16 @@ class VLLMSyncBackend(VLLMBackend):
         return VLLM(repo, mode="sync", dispatch=True,
                     gpu_memory_utilization=gpu_memory_utilization, **kw)
 
-    def _collect(self, rows, n, what):
-        """Per-invoke outputs -> one tensor with the units along dim -2."""
+    def _collect(self, rows, n, what, keep_dtype=False):
+        """Per-invoke outputs -> one tensor with the units along dim -2 (fp32 unless `keep_dtype`)."""
         import torch
 
-        mats = [r.detach().float().cpu() for r in rows if r is not None]
+        mats = [(r.detach() if keep_dtype else r.detach().float()).cpu() for r in rows if r is not None]
         if len(mats) != n:
             raise RuntimeError(f"vllm_sync {what} collected {len(mats)}/{n} per-unit outputs")
         return torch.cat(mats, dim=-2) if mats[0].dim() >= 2 else torch.stack(mats)
 
-    def run(self, model, prompts, build):
+    def run(self, model, prompts, build, *, keep_dtype=False):
         prompts = self.many(prompts, "run")
         with model.trace(**SAMPLING) as tracer:
             rows = [None] * len(prompts)
@@ -56,7 +56,7 @@ class VLLMSyncBackend(VLLMBackend):
             for i, p in enumerate(prompts):
                 with tracer.invoke(p):
                     rows[i] = build([i])
-        return self._collect(rows, len(prompts), "run")
+        return self._collect(rows, len(prompts), "run", keep_dtype)
 
     def patch(self, model, clean_prompts, corrupted_prompts, capture, patch):
         clean_prompts, corrupted_prompts = self.paired(clean_prompts, corrupted_prompts, "patch")
@@ -221,6 +221,10 @@ class VLLMSyncBackend(VLLMBackend):
 
     def last(self, t):
         return t[-1:, :]                          # flat [tokens, vocab] -> [1, vocab]
+
+    def collective_rpc(self, model, method, args=()):
+        """Through `model.vllm_entrypoint`, the `vllm.LLM` nnsight runs (docs/models/vllm.md)."""
+        return model.vllm_entrypoint.collective_rpc(method, args=args)
 
     def teardown(self, model) -> None:
         import gc

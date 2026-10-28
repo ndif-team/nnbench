@@ -1,10 +1,12 @@
-"""Workloads (design.md §12.16): one per methodology, naming no model and no system.
+"""Workloads (design.md §12.16): one per methodology, plus one per further question a methodology
+answers (`steering_layers`, `activation_harvest_layers`: cost against the number of layers),
+naming no model and no system.
 
 `instantiate(workload, model)` (isb/sweep/spec.py) resolves one on a model from isb/models.py; a
 resolved case is named `<workload>/<model>` (plus `@<data>` when the data is rebound).
 """
 from .ablation import ablation
-from .activation_harvest import activation_harvest
+from .activation_harvest import activation_harvest, activation_harvest_layers
 from .activation_patching import activation_patching
 from .attention_pattern import attention_pattern
 from .attribution_patching import attribution_patching
@@ -15,11 +17,13 @@ from .gen_steering import gen_steering
 from .jacobian_collect import jacobian_collect
 from .jacobian_lens import jacobian_lens
 from .logit_lens import logit_lens
-from .steering import steering
+from .residual_readout import residual_readout
+from .steering import steering, steering_layers
 
 WORKLOADS = {w.name: w for w in (
     logit_lens, jacobian_lens, steering, gen_steering, activation_patching, gen_patching, ablation,
     attention_pattern, attribution_patching, das, jacobian_collect, activation_harvest, gen_capture,
+    residual_readout, steering_layers, activation_harvest_layers,
 )}
 
 

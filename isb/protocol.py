@@ -159,7 +159,8 @@ PROTOCOLS: dict[str, InterventionSpec] = {
         write_components=("block_output",),
         components=("block_output", "lm_head"), operations=("read", "write"),
         mechanisms=("add_scaled",), capabilities=("full_logits",),
-        semantic_params=("layer", "target", "alpha", "scale_by"), realization_params=("mode", "residual"),
+        semantic_params=("layer", "layers", "target", "alpha", "scale_by"),
+        realization_params=("mode", "residual"),
     ),
     "ablation": _p(
         write_components=("attention_output", "mlp_output"),
@@ -219,7 +220,12 @@ PROTOCOLS: dict[str, InterventionSpec] = {
     "activation_harvest": _p(
         components=("block_output", "lm_head"), operations=("read",),
         capabilities=("full_logits",), extensions=("activation_export",),
-        semantic_params=("layer", "export"), realization_params=("residual",),
+        semantic_params=("layer", "layers", "export"), realization_params=("residual",),
+    ),
+    # the residual stream after each listed layer at each prompt's last token, copied off the device
+    "residual_readout": _p(
+        components=("block_output",), operations=("read",), extensions=("activation_export",),
+        semantic_params=("layers",), realization_params=("residual",),
     ),
     "gen_capture": _p(
         components=("block_output", "lm_head"), operations=("read",),

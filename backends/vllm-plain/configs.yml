@@ -19,8 +19,16 @@ configs:
   0-15-1/eager: {image: 0-15-1, options: {<<: *base, enforce_eager: true}}
   0-19-1: {image: 0-19-1, options: *base}
   0-19-1/eager: {image: 0-19-1, options: {<<: *base, enforce_eager: true}}
+  0-19-1/tp2: {image: 0-19-1, options: {<<: *base, tensor_parallel_size: 2}, gpus: 2}
+  0-19-1/eager/tp2: {image: 0-19-1, options: {<<: *base, enforce_eager: true, tensor_parallel_size: 2}, gpus: 2}
+  0-19-1/tp4: {image: 0-19-1, options: {<<: *base, tensor_parallel_size: 4}, gpus: 4}
+  0-19-1/eager/tp4: {image: 0-19-1, options: {<<: *base, enforce_eager: true, tensor_parallel_size: 4}, gpus: 4}
   0-20-2: {image: 0-20-2, options: *base}
   0-20-2/eager: {image: 0-20-2, options: {<<: *base, enforce_eager: true}}
+  0-20-2/tp2: {image: 0-20-2, options: {<<: *base, tensor_parallel_size: 2}, gpus: 2}
+  0-20-2/eager/tp2: {image: 0-20-2, options: {<<: *base, enforce_eager: true, tensor_parallel_size: 2}, gpus: 2}
+  0-20-2/tp4: {image: 0-20-2, options: {<<: *base, tensor_parallel_size: 4}, gpus: 4}
+  0-20-2/eager/tp4: {image: 0-20-2, options: {<<: *base, enforce_eager: true, tensor_parallel_size: 4}, gpus: 4}
   0-27-1: {image: 0-27-1, options: &unchunked {<<: *base, enable_chunked_prefill: false}}
   0-27-1/eager: {image: 0-27-1, options: {<<: *unchunked, enforce_eager: true}}
   0-27-1/tp2: {image: 0-27-1, options: {<<: *unchunked, tensor_parallel_size: 2}, gpus: 2}
@@ -32,3 +40,4 @@ configs:
   0-28-0/tp2: {image: 0-28-0, options: {<<: *base, tensor_parallel_size: 2}, gpus: 2}
   0-28-0/eager/tp2: {image: 0-28-0, options: {<<: *base, enforce_eager: true, tensor_parallel_size: 2}, gpus: 2}
   0-28-0/tp4: {image: 0-28-0, options: {<<: *base, tensor_parallel_size: 4}, gpus: 4}
+  0-28-0/eager/tp4: {image: 0-28-0, options: {<<: *base, enforce_eager: true, tensor_parallel_size: 4}, gpus: 4}

@@ -48,10 +48,11 @@ class Backend:
     def load(self, repo: str, **kw):
         raise NotImplementedError
 
-    def run(self, model, prompts, build):
+    def run(self, model, prompts, build, *, keep_dtype=False):
         """One forward over `prompts`. `build(rows)` runs inside the trace with the indices (into
         `prompts`) of the units that trace holds and returns the proxy to save. Returns the saved
-        value as a CPU tensor with the units along dim -2."""
+        value as a CPU tensor with the units along dim -2: in fp32, or with `keep_dtype` in the
+        dtype the trace saved (an exported activation, whose volume is part of the measurement)."""
         raise NotImplementedError
 
     def patch(self, model, clean_prompts, corrupted_prompts, capture, patch):
@@ -106,6 +107,14 @@ class Backend:
     def last(self, t):
         """Last-token row of a per-position tensor (residual stream or logits)."""
         raise NotImplementedError
+
+    def collective_rpc(self, model, method, args=()):
+        """Run `method(worker, *args)` in every engine worker process through the engine's own
+        `collective_rpc` and return the per-rank results. Only a backend whose engine runs in
+        separate worker processes (vLLM) has one; the harness reads the workers' peak memory with
+        it (isb/perf/worker_memory.py). A backend that does not override this records why."""
+        raise NotImplementedError(f"{self.name} gives the harness no handle on engine worker "
+                                  f"processes (no collective_rpc override)")
 
     def teardown(self, model) -> None:
         pass

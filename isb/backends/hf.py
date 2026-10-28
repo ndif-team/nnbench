@@ -57,11 +57,11 @@ class HFBackend(Backend):
             kw["device_map"] = self.device_map or device
         return LanguageModel(repo, dispatch=True, attn_implementation=self.attn_implementation, **kw)
 
-    def run(self, model, prompts, build):
+    def run(self, model, prompts, build, *, keep_dtype=False):
         prompts = self.many(prompts, "run")
         with model.trace(prompts):                       # the prompts as one left-padded batch
             saved = build(list(range(len(prompts)))).save()
-        return saved.detach().float().cpu()
+        return saved.detach().cpu() if keep_dtype else saved.detach().float().cpu()
 
     def patch(self, model, clean_prompts, corrupted_prompts, capture, patch):
         clean_prompts, corrupted_prompts = self.paired(clean_prompts, corrupted_prompts, "patch")

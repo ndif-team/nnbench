@@ -1,7 +1,9 @@
 """Steering (activation addition): add a steering vector into a block's residual-stream output and
 read the model's next-token logits. The direction is the target token's unit unembedding row, built
 before the trace; `alpha` is relative to the stream's own per-token norm; `alpha=0` writes nothing.
-`mode` selects the write form, in place into the live buffer or whole-tuple replacement."""
+`mode` selects the write form, in place into the live buffer or whole-tuple replacement. `layers`,
+when given, applies the same edit at each listed block in one forward (each strength relative to
+the stream at that block) and replaces `layer`."""
 from __future__ import annotations
 
 import torch
@@ -45,51 +47,59 @@ def _strength_scale(stream, scale_by, mask=None):
     return ((norms * m).sum(-1, keepdim=True) / m.sum(-1, keepdim=True)).unsqueeze(-1)
 
 
-def _steer_and_read(blocks, model, head, *, layer, direction, alpha, mode, site, residual="plain",
-                    scale_by="mean_norm", masked=False):
-    """Steer blocks[layer] along `direction` and read the next-token logits at `site`. Runs inside
-    a trace. `masked` reads the padded batch's attention mask for the per-unit mean norm (HF)."""
+def _steer_and_read(blocks, model, head, *, layer=None, direction, alpha, mode, site,
+                    residual="plain", scale_by="mean_norm", masked=False, layers=None):
+    """Steer blocks[layer], or each of blocks[layers] in forward order, along `direction` and read
+    the next-token logits at `site`. Runs inside a trace. `masked` reads the padded batch's
+    attention mask for the per-unit mean norm (HF). The direction moves onto a block's device and
+    dtype once, and again only for a block that sits elsewhere (an HF model split over GPUs)."""
     n = len(blocks)
-    if alpha != 0 and layer % n == n - 1:
+    layers = [layer] if layers is None else list(layers)
+    final = [i for i in layers if i % n == n - 1]
+    if alpha != 0 and final:
         raise ValueError(
-            f"steer layer {layer} is the read-out (final) block; pick layer < {n - 1} so the write "
-            f"propagates through at least one block before the readout")
+            f"steer layer {final[0]} is the read-out (final) block; pick layers < {n - 1} so the "
+            f"write propagates through at least one block before the readout")
     with torch.no_grad():
         if alpha != 0:
             mask = _attention_mask(model) if masked else None     # before the model runs past it
-            out = blocks[layer].output
-            is_tuple = isinstance(out, tuple)
-            hidden = out[0] if is_tuple else out
-            stream = _resid(out, residual)
-            scale = _strength_scale(stream, scale_by, mask)
-            vec = (alpha * scale) * direction.to(device=hidden.device, dtype=hidden.dtype)
-            if mode == "inplace":
-                hidden[:] = hidden + vec
-            elif mode == "replace":
-                new_hidden = hidden + vec
-                blocks[layer].output = (new_hidden, *out[1:]) if is_tuple else new_hidden
-            else:
-                raise ValueError(f"unknown steering mode {mode!r}")
+            moved = direction
+            for layer in layers:
+                out = blocks[layer].output
+                is_tuple = isinstance(out, tuple)
+                hidden = out[0] if is_tuple else out
+                stream = _resid(out, residual)
+                scale = _strength_scale(stream, scale_by, mask)
+                if moved.device != hidden.device or moved.dtype != hidden.dtype:
+                    moved = direction.to(device=hidden.device, dtype=hidden.dtype)
+                vec = (alpha * scale) * moved
+                if mode == "inplace":
+                    hidden[:] = hidden + vec
+                elif mode == "replace":
+                    new_hidden = hidden + vec
+                    blocks[layer].output = (new_hidden, *out[1:]) if is_tuple else new_hidden
+                else:
+                    raise ValueError(f"unknown steering mode {mode!r}")
         return final_logits(model, head, site)
 
 
 @cell("steering", family="*", backend="hf", realizations=[{"mode": "inplace"}])
 def steering_hf(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0, mode="replace",
-                scale_by="mean_norm"):
+                scale_by="mean_norm", layers=None):
     direction = (head_direction(model, m.head(model), _resolve_token(model.tokenizer, target))
                  if alpha != 0 else None)
 
     def build(rows):
         return _steer_and_read(
-            m.blocks(model), model, m.head(model), layer=layer, direction=direction, alpha=alpha,
-            mode=mode, site="head", scale_by=scale_by, masked=True)
+            m.blocks(model), model, m.head(model), layer=layer, layers=layers, direction=direction,
+            alpha=alpha, mode=mode, site="head", scale_by=scale_by, masked=True)
 
     return be.run(model, units, build)
 
 
 @cell("steering", family="*", backend="vllm_async", realizations=[{"mode": "inplace"}])
 def steering_vllm(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0, mode="replace",
-                  residual=None, scale_by="mean_norm"):
+                  residual=None, scale_by="mean_norm", layers=None):
     # the stream the strength is relative to follows the family's vLLM denotation (fused on the
     # RMSNorm families, plain on GPT-2) unless the row says otherwise
     residual = residual if residual is not None else m.default_residual(be.name)
@@ -99,7 +109,7 @@ def steering_vllm(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0, mo
 
     def build(rows):
         return _steer_and_read(
-            m.blocks(model), model, m.head(model), layer=layer, direction=direction, alpha=alpha,
-            mode=mode, site="engine", residual=residual, scale_by=scale_by)
+            m.blocks(model), model, m.head(model), layer=layer, layers=layers, direction=direction,
+            alpha=alpha, mode=mode, site="engine", residual=residual, scale_by=scale_by)
 
     return be.run(model, units, build)

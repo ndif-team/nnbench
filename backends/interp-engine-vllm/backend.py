@@ -4,7 +4,8 @@ The shared worker drives the cells in cells.py through this backend object. inte
 methods are async and bound to one event loop; `sync_model` is its documented synchronous facade,
 holding one loop for the model's life.
 """
-from dataclasses import dataclass
+import contextlib
+from dataclasses import dataclass, field
 from importlib import metadata
 
 from isb.backends.base import Backend, prompts_of
@@ -18,10 +19,22 @@ class EngineModel:
     tokenizer: object          # the checkpoint's HF tokenizer, used exactly as the nnsight cells do
     config: object             # the checkpoint's HF config; model identity reads its revision
     n_layers: int
+    maps: dict = field(default_factory=dict)      # J-lens transport maps, built once per model
 
 
 class InterpEngineBackend(Backend):
     name = "interp_engine"
+
+    # The sync facade submits every call to one event loop on its own thread
+    # (`interp_engine/_loop.py`, LoopRunner.run: run_coroutine_threadsafe per call, from any
+    # thread), and `capture` and the per-request lens ops are documented as safe to call
+    # concurrently with other requests (`vllm_backend.py`), so client threads calling the cells at
+    # once overlap on the engine's scheduler (design.md §12.17); nothing to open.
+    concurrent_requests = True
+
+    @contextlib.contextmanager
+    def concurrent_session(self):
+        yield
 
     def __init__(self, backend="vllm", **engine_options):
         # backend: interp-engine's engine choice (load.py). "vllm" hooks the eager forward and
@@ -54,6 +67,15 @@ class InterpEngineBackend(Backend):
 
         model.engine.runner.run(all_of())
 
+    def collective_rpc(self, model, method, args=()):
+        """`AsyncLLM.collective_rpc` of the engine interp-engine builds, one result per rank: the
+        facade's `model` property gives the VLLMModel, whose `engine` attribute holds the AsyncLLM
+        once `warmup` (in `load`) has built it (vllm_backend.py, `_ensure_engine`); the call runs on
+        the facade's loop, the one that engine is bound to. `engine` is backend surface outside
+        the sync protocol, as `unembed_rows` is; the same attribute serves `default` and
+        `vllm-static`."""
+        return model.engine.runner.run(model.engine.model.engine.collective_rpc(method, args=args))
+
     def teardown(self, model) -> None:
         model.engine.shutdown()
 
@@ -63,5 +85,7 @@ def create_backend(spec):
     backend = InterpEngineBackend(**params)
     run = RunConfig(EngineConfig("vllm", mode="interp-engine", params={
         **params, "enforce_eager": backend.backend == "vllm",
+        # load_model's `num_gpus` is vLLM's tensor_parallel_size (load.py), default 1
+        "tensor_parallel_size": int(params.get("num_gpus", 1)),
         "interp_engine": metadata.version("interp-engine")}))
     return backend, run

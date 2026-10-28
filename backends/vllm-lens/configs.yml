@@ -7,3 +7,9 @@ configs:
     image: default
     options: &base {dtype: bfloat16, gpu_memory_utilization: 0.85, enable_prefix_caching: false}
   opt: {image: default, options: {<<: *base, mode: opt}}
+  # tensor parallelism: hooks run on every rank; output_residual_stream captures on TP rank 0 only
+  # (`_worker_ext.py`, install_hooks: `_should_capture`), the stream being replicated there
+  tp2: {image: default, options: {<<: *base, tensor_parallel_size: 2}, gpus: 2}
+  tp4: {image: default, options: {<<: *base, tensor_parallel_size: 4}, gpus: 4}
+  opt/tp2: {image: default, options: {<<: *base, mode: opt, tensor_parallel_size: 2}, gpus: 2}
+  opt/tp4: {image: default, options: {<<: *base, mode: opt, tensor_parallel_size: 4}, gpus: 4}

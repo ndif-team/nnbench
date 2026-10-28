@@ -117,13 +117,13 @@ class VLLMAsyncBackend(VLLMBackend):
 
         return torch.cat(mats, dim=-2) if mats[0].dim() >= 2 else torch.stack(mats)
 
-    def run(self, model, prompts, build):
+    def run(self, model, prompts, build, *, keep_dtype=False):
         prompts = self.many(prompts, "run")
 
         async def one(i, prompt):
             with model.trace(prompt, **_SAMPLING) as tracer:
                 saved = build([i]).save()  # noqa: F841  (the variable name is the saves key)
-            return self._extract(await self._finished(tracer))
+            return self._extract(await self._finished(tracer), keep_dtype)
 
         return self._cat(self._gather([one(i, p) for i, p in enumerate(prompts)]))
 
@@ -275,6 +275,11 @@ class VLLMAsyncBackend(VLLMBackend):
     def last(self, t):
         return t[-1:, :]                          # flat [tokens, vocab] -> [1, vocab]
 
+    def collective_rpc(self, model, method, args=()):
+        """Through `model.vllm_entrypoint`, the `AsyncLLM` nnsight runs (docs/models/vllm.md), on
+        the backend's persistent loop."""
+        return self._run_coro(model.vllm_entrypoint.collective_rpc(method, args=args))
+
     def _saves(self, out, what):
         """The finished output's flat `{name: value}` saves. nnsight 0.8 raises a worker error
         itself; nnsight 0.7 returns it in the saves as `__nnsight_exceptions__: {request_id:
@@ -293,10 +298,10 @@ class VLLMAsyncBackend(VLLMBackend):
         saves = self._saves(out, "trace")
         return [saves[k] for k in keys]
 
-    def _extract(self, out):
+    def _extract(self, out, keep_dtype=False):
         saves = self._saves(out, "trace")
         v = saves["saved"] if "saved" in saves else next(iter(saves.values()))
-        return v.detach().float().cpu()
+        return (v.detach() if keep_dtype else v.detach().float()).cpu()
 
     def _extract_step_rows(self, out, new_tokens, what):
         """The per-step `rows` of one request -> `[new_tokens, 1, ...]`."""

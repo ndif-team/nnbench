@@ -14,7 +14,7 @@ from isb.workloads import WORKLOADS, case  # noqa: E402
 
 
 def test_one_workload_per_methodology_named_by_it():
-    assert all(w.name == w.methodology for w in WORKLOADS.values())
+    assert all(w.name == w.methodology or w.name == f"{w.methodology}_layers" for w in WORKLOADS.values())
 
 
 def test_workloads_reject_realization_params():

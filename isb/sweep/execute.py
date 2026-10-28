@@ -2,7 +2,8 @@
 (isb/runfile.py): `outputs` {(regime name, label): cpu tensor} holds every cell's warm output (an
 alternative realization under its own label, `<row> [k=v]`), the per-unit stacks a multi-unit call
 is scored against (("batched_perprompt" | "offline_perprompt", label)) and ("__meta__",), the
-per-cell perf, errors and effective params; `provenance` is the client/deployment/engine/host
+per-cell perf (with `returned_bytes`, the tensor bytes one call hands the client), errors and
+effective params; `provenance` is the client/deployment/engine/host
 record with the run's coordinates (isb/runs.py `run_coordinates`).
 
 Every regime runs the same way: the baseline cell, the plain request (`be.plain`) and every case,
@@ -21,7 +22,9 @@ from dataclasses import dataclass, field
 
 from ..methodologies.observations import capture_choices
 from ..methodologies.registry import Unsupported, get_cell, get_realizations
+from ..perf.core import returned_bytes
 from ..perf.timing import time_cell
+from ..perf.worker_memory import WorkerMemory, allow_callable_rpc
 from ..runfile import save_run
 from ..runs import RunConfig, cell_interface, make_backend, resolve_provenance, spec_coordinates
 from ..sweep.guards import compute_effect_size
@@ -226,18 +229,31 @@ def _load_record(regime, result):
             "throughput": result.throughput, "load": result.summary()}
 
 
-def _measure(spec, regime, be, prepare):
+def _measure(spec, regime, be, model, prepare):
     """One measurement of `prepare(units)` calls under the regime: `warmup` untimed calls then
     `n_trials` timed calls over the regime's timed units for an execution regime, or the load
     pattern's warm-up and passes for a load regime. Returns (timing record, output): the last
-    timed call's output, or a load regime's list of call outputs (`_run_load`)."""
+    timed call's output, or a load regime's list of call outputs (`_run_load`). The record
+    carries the engine workers' peak memory over the timed calls (a load regime: over its warm-up
+    and passes), read through the backend's `collective_rpc` outside the timed region."""
+    worker = WorkerMemory(be, model)
     if regime.kind in LOAD_KINDS:
+        worker.reset()
         result, out = _run_load(regime, prepare, be)
-        return _load_record(regime, result), out
+        return {**_load_record(regime, result), **worker.record(worker.peak_mb())}, out
     timing, out = time_cell(functools.partial(prepare, _timed_units(regime)),
-                            warmup=spec.warmup, n_trials=spec.n_trials)
+                            warmup=spec.warmup, n_trials=spec.n_trials, worker_memory=worker)
     return {"median_latency_ms": timing.median_ms, "std_latency_ms": timing.std_ms,
-            "peak_mem_mb": timing.peak_mem_mb, "throughput": _throughput(regime, timing)}, out
+            "peak_mem_mb": timing.peak_mem_mb, "throughput": _throughput(regime, timing),
+            **worker.record(timing.worker_peak_mem_mb)}, out
+
+
+def _call_bytes(regime, out):
+    """Bytes of tensor data in one timed call's client-side result: the last timed call of an
+    execution regime, the first kept call of a load pattern."""
+    if regime.kind in LOAD_KINDS:
+        return returned_bytes(out[0]) if out else 0
+    return returned_bytes(out)
 
 
 def _ratio(timing, denominator):
@@ -257,7 +273,7 @@ def _plain(spec, regime, be, model, record):
         return functools.partial(be.plain, model, units, new_tokens=new_tokens)
 
     try:
-        timing, _ = _measure(spec, regime, be, prepare)
+        timing, _ = _measure(spec, regime, be, model, prepare)
     except NotImplementedError as error:
         record.update(unavailable=str(error), error=None)
         return None
@@ -298,7 +314,7 @@ def _execute_regime(spec, regime, iface, be, model, meta, outputs):
     baseline = meta[("__baseline__", name)] = {}
     try:
         _, prepare = bound(spec.baseline.params, baseline)
-        base, _ = _measure(spec, regime, be, prepare)
+        base, _ = _measure(spec, regime, be, model, prepare)
         baseline.update(base)
         _success(baseline)
     except Exception as e:
@@ -310,9 +326,10 @@ def _execute_regime(spec, regime, iface, be, model, meta, outputs):
         case = meta[key] = dict(deepcopy(alternative) or {})
         try:
             call, prepare = bound(params, case)
-            timing, out = _measure(spec, regime, be, prepare)
+            timing, out = _measure(spec, regime, be, model, prepare)
             case.update(timing, overhead_vs_baseline=_ratio(timing, base),
-                        overhead_vs_vanilla=_ratio(timing, plain))   # kept if shaping fails below
+                        overhead_vs_vanilla=_ratio(timing, plain),   # kept if shaping fails below
+                        returned_bytes=_call_bytes(regime, out))
             if regime.kind in LOAD_KINDS:
                 case["error_stage"] = "stack"
                 out = _stack(out)
@@ -419,6 +436,7 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
 
     outputs, meta = {}, {}
     model = None
+    allow_callable_rpc()                 # before the engine starts: the worker-memory RPC
     try:
         model = be.load(spec.repo)
         count = _layer_count(model) if spec.n_layers is not None else None

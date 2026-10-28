@@ -100,6 +100,10 @@ class PlainVLLMBackend(Backend):
 
         self._gather([one(prompt) for prompt in prompts_of(units)])
 
+    def collective_rpc(self, model, method, args=()):
+        """Through the AsyncLLM's own `collective_rpc`, on the persistent loop."""
+        return self._gather([model.llm.collective_rpc(method, args=args)])[0]
+
     def teardown(self, model) -> None:
         import asyncio
 

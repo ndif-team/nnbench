@@ -72,15 +72,15 @@ class VLLMServeBackend(VLLMBackend):
         raise RuntimeError(
             f"nnsight-serve at {self.host} not healthy within {self.HEALTH_TIMEOUT}s: {last_err}")
 
-    def _collect(self, rows, n, what):
+    def _collect(self, rows, n, what, keep_dtype=False):
         import torch
 
-        mats = [r.detach().float().cpu() for r in rows if r is not None]
+        mats = [(r.detach() if keep_dtype else r.detach().float()).cpu() for r in rows if r is not None]
         if len(mats) != n:
             raise RuntimeError(f"vllm_serve {what} collected {len(mats)}/{n} per-unit outputs")
         return torch.cat(mats, dim=-2) if mats[0].dim() >= 2 else torch.stack(mats)
 
-    def run(self, model, prompts, build):
+    def run(self, model, prompts, build, *, keep_dtype=False):
         prompts = self.many(prompts, "run")
         with model.trace(serve=self.host, **_SAMPLING) as tracer:
             rows = [None] * len(prompts)
@@ -88,7 +88,7 @@ class VLLMServeBackend(VLLMBackend):
             for i, p in enumerate(prompts):
                 with tracer.invoke(p):
                     rows[i] = build([i])
-        return self._collect(rows, len(prompts), "run")
+        return self._collect(rows, len(prompts), "run", keep_dtype)
 
     def patch(self, model, clean_prompts, corrupted_prompts, capture, patch):
         clean_prompts, corrupted_prompts = self.paired(clean_prompts, corrupted_prompts, "patch")

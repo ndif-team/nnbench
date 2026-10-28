@@ -275,6 +275,32 @@ class Depth:
 
 
 @dataclass(frozen=True)
+class FirstLayers:
+    """The first layers of the model, `list(range(k))`. `k` is `count` when given, else
+    `round(fraction * n_layers)`, at least one layer. `below_final` caps `k` at `n_layers - 1`,
+    for a write that must leave the final (readout) layer unedited."""
+    fraction: float | None = None
+    count: int | None = None
+    below_final: bool = False
+
+    def __post_init__(self):
+        if (self.fraction is None) == (self.count is None):
+            raise ValueError("FirstLayers takes exactly one of fraction and count")
+        if self.fraction is not None and not 0.0 < self.fraction <= 1.0:
+            raise ValueError("layer fraction must be within (0, 1]")
+        if self.count is not None and self.count < 1:
+            raise ValueError("layer count must be positive")
+
+    def resolve(self, n_layers: int) -> list:
+        k = self.count if self.count is not None else max(1, int(round(self.fraction * n_layers)))
+        if self.below_final:
+            k = min(k, n_layers - 1)
+        if k > n_layers:
+            raise ValueError(f"{k} layers requested of a {n_layers}-layer model")
+        return list(range(k))
+
+
+@dataclass(frozen=True)
 class Asset:
     """A field of a fitted artifact bound to the model (`Model.assets[name][key]`). A row that
     references one requires the model to carry that asset."""
@@ -383,6 +409,8 @@ class NotApplicable(Exception):
 
 def _resolve(value, model, needs: set):
     if isinstance(value, Depth):
+        return value.resolve(model.n_layers)
+    if isinstance(value, FirstLayers):
         return value.resolve(model.n_layers)
     if isinstance(value, Asset):
         needs.add(f"asset:{value.name}")

@@ -5,6 +5,7 @@ Suites never carry intervention semantics: those are the workloads' rows.
 """
 from __future__ import annotations
 
+import dataclasses
 import re
 from dataclasses import dataclass
 
@@ -17,13 +18,16 @@ class Entry:
     default source (batched regimes stay at most 16), `data` ("source[:n]") rebinds every regime,
     `regimes` keeps a subset of regime kinds, `loads` adds load patterns (isb.sweep.spec Offline /
     Concurrent / Open) derived from each workload's own regimes, for the workloads
-    that declare the pattern."""
+    that declare the pattern. `split_rows` runs each row as a case of its own, so each row gets
+    its own job and engine: a system that builds its engine from the locations a case touches
+    (nnsight's `taps`) then serves exactly that row's."""
     workloads: tuple
     models: tuple
     size: int | None = None
     data: str | None = None
     regimes: tuple | None = None
     loads: tuple = ()
+    split_rows: bool = False
 
 
 @dataclass(frozen=True)
@@ -39,8 +43,13 @@ class Suite:
 
 _SMALL = ("logit_lens", "jacobian_lens", "steering", "gen_steering", "activation_patching",
           "gen_patching", "ablation", "attention_pattern", "attribution_patching", "das",
-          "jacobian_collect", "activation_harvest", "gen_capture")
+          "jacobian_collect", "activation_harvest", "gen_capture", "residual_readout",
+          "steering_layers", "activation_harvest_layers")
 _NNSIGHT = ("nnsight-hf/default", "nnsight-vllm/default")
+# Plain vLLM at each release a system under comparison runs (vllm-lens and vllm-hook 0.19.1,
+# TransformerLens 0.20.2, nnsight 0.8.1 0.27.1, interp-engine 0.28.0), compiled and eager.
+_FLOORS = {version: (f"vllm-plain/{version}", f"vllm-plain/{version}/eager")
+           for version in ("0-19-1", "0-20-2", "0-27-1", "0-28-0")}
 
 SUITES = {s.name: s for s in (
     # gpt2 + SmolLM2-135M: every workload on one modest GPU, with every realization the nnsight
@@ -217,6 +226,37 @@ SUITES = {s.name: s for s in (
     Suite("fitted-jlens",
           entries=(Entry(("jacobian_lens",), ("qwen3.5-4b",)),),
           backends=_NNSIGHT, reference="nnsight-hf/default"),
+    # Cost against the number of hooked layers on Qwen2.5-7B, one row per job (each row's engine
+    # serves only that row's layers): the steering edit at the first k layers on every system that
+    # edits the residual stream, and plain vLLM at each of their releases. interp-engine is left
+    # out: its static config bakes taps at every layer whatever the case touches (load_model's
+    # `static_points="auto"` default, interp-engine 1.12.0 load.py).
+    Suite("layer-count-steering",
+          entries=(Entry(("steering_layers",), ("qwen2.5-7b",), split_rows=True),),
+          backends=("nnsight-hf/0-8-1", "nnsight-vllm/0-8-1", "nnsight-vllm/0-8-1/opt/taps",
+                    "transformer-lens-vllm/opt", "vllm-lens/default",
+                    *_FLOORS["0-19-1"], *_FLOORS["0-20-2"], *_FLOORS["0-27-1"]),
+          reference="nnsight-hf/0-8-1", timeout=3600),
+    # The same layer counts as a read on vLLM-Hook, whose worker captures hidden states only:
+    # the residual stream after each of the first k layers at the last token, held in memory
+    # (default) or written to disk (disk), against plain vLLM 0.19.1.
+    Suite("layer-count-readout",
+          entries=(Entry(("residual_readout",), ("qwen2.5-7b",), split_rows=True),),
+          backends=("nnsight-hf/0-8-1", "vllm-hook/default", "vllm-hook/disk", *_FLOORS["0-19-1"]),
+          reference="nnsight-hf/0-8-1", timeout=3600),
+    # Bytes moved from the engine to the client against cost, on every containerized system: the
+    # last-token residual stream of the first k layers (B = 1 and 16), the residual stream at every
+    # valid token of the first k layers, and the every-layer logit lens. Each harvest call holds up
+    # to [n_layers, 1,097 tokens, d_model] on the client, so the harvest keeps its 16 paragraphs.
+    Suite("transfer-volume",
+          entries=(Entry(("residual_readout", "logit_lens"), ("qwen2.5-7b",), size=32,
+                         split_rows=True),
+                   Entry(("activation_harvest_layers",), ("qwen2.5-7b",), split_rows=True)),
+          backends=("nnsight-hf/0-8-1", "nnsight-vllm/0-8-1", "nnsight-vllm/0-8-1/opt/taps",
+                    "vllm-lens/default", "vllm-hook/default", "vllm-hook/disk",
+                    "transformer-lens-vllm/opt", "interp-engine-vllm/default",
+                    "interp-engine-vllm/static", *(b for floors in _FLOORS.values() for b in floors)),
+          reference="nnsight-hf/0-8-1", timeout=3600),
 )}
 
 
@@ -275,11 +315,15 @@ def cases(entries, realizations="default"):
                 except NotApplicable as reason:
                     skipped.append({"case": f"{workload}/{model}", "label": "*", "reason": str(reason)})
                     continue
-                if spec.name in seen:
-                    raise ValueError(f"case {spec.name} is selected twice")
-                seen.add(spec.name)
-                specs.append(spec)
                 skipped += [{"case": spec.name, **row} for row in rows]
+                for one in ([dataclasses.replace(spec, tasks=[task]) for task in spec.tasks]
+                            if entry.split_rows else [spec]):
+                    key = (one.name, tuple(task.label for task in one.tasks))
+                    if any(seen_name == one.name and set(labels) & set(key[1])
+                           for seen_name, labels in seen):
+                        raise ValueError(f"case {one.name} is selected twice")
+                    seen.add(key)
+                    specs.append(one)
     if not specs:
         raise ValueError("the selection contains no case any model can express")
     return specs, skipped

@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,9 +43,9 @@ def _recipe(args):
                     "realizations": suite.realizations, "comparison": suite.comparison,
                     "timeout": suite.timeout}
         # --workload/--model with a suite keep only those of its cases
-        entries = [Entry(tuple(w for w in e.workloads if not args.workload or w in args.workload),
-                         tuple(m for m in e.models if not args.model or m in args.model),
-                         size=e.size, data=e.data, regimes=e.regimes, loads=e.loads)
+        entries = [replace(e, workloads=tuple(w for w in e.workloads
+                                              if not args.workload or w in args.workload),
+                           models=tuple(m for m in e.models if not args.model or m in args.model))
                    for e in suite.entries]
         entries = [e for e in entries if e.workloads and e.models]
         if not entries:
@@ -61,9 +62,9 @@ def _recipe(args):
     if not settings["backends"]:
         raise ValueError("select --backends")
     if args.data or args.regimes or loads:
-        entries = [Entry(e.workloads, e.models, size=e.size, data=args.data or e.data,
-                         regimes=tuple(args.regimes) if args.regimes else e.regimes,
-                         loads=loads or e.loads) for e in entries]
+        entries = [replace(e, data=args.data or e.data,
+                           regimes=tuple(args.regimes) if args.regimes else e.regimes,
+                           loads=loads or e.loads) for e in entries]
     return args.suite, entries, settings
 
 

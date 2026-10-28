@@ -76,6 +76,24 @@ def attach_plain_vllm(rows, results):
                        overhead_vs_plain_vllm_default=row["median_latency_ms"] / default[1])
 
 
+def attach_worker_memory(rows, results):
+    """Each row's engine-worker peak against its own system's no-intervention request in the same
+    regime (`__vanilla__`): `worker_peak_mem_mb_vanilla` and `worker_peak_mem_delta_mb`, both the
+    max over ranks. `results` maps backend -> {"auxiliary_calls"}."""
+    vanilla = {}
+    for backend, result in results.items():
+        for call in result.get("auxiliary_calls", []):
+            role, regime = call["key"]
+            peak = call["record"].get("worker_peak_mem_mb_max")
+            if role == "__vanilla__" and peak is not None:
+                vanilla[(backend, regime)] = peak
+    for row in rows:
+        base = vanilla.get((row["backend"], row.get("workload")))
+        if base is not None and row.get("worker_peak_mem_mb_max") is not None:
+            row.update(worker_peak_mem_mb_vanilla=base,
+                       worker_peak_mem_delta_mb=round(row["worker_peak_mem_mb_max"] - base, 1))
+
+
 def score_experiment(directory, backends, reference=None, comparison="correctness"):
     import torch
     from isb.oracle.equivalence import compare, is_equivalent
@@ -156,9 +174,11 @@ def score_experiment(directory, backends, reference=None, comparison="correctnes
                                      else ("EQUIVALENT", "DIVERGENT"))
                         row.update(state=good if is_equivalent(metrics) else bad, metrics=metrics)
             rows.append(row)
-    attach_plain_vllm(rows, {backend: {"provenance": artifact["provenance"],
-                                       "auxiliary_calls": result.get("auxiliary_calls", [])}
-                             for backend, (result, artifact, _) in loaded.items()})
+    calls = {backend: {"provenance": artifact["provenance"],
+                       "auxiliary_calls": result.get("auxiliary_calls", [])}
+             for backend, (result, artifact, _) in loaded.items()}
+    attach_plain_vllm(rows, calls)
+    attach_worker_memory(rows, calls)
     for row in rows:
         row["performance_eligible"] = performance_eligible(row["state"])
         row["validation_state"] = (
