@@ -13,7 +13,7 @@ against the mean of the two uninstrumented medians, and their gap shows how far 
 timing moves over the row.
 
 Host timestamps are `time.perf_counter_ns()` (CLOCK_MONOTONIC, one clock for every process in the
-container), taken at six boundaries of each timed call:
+container), taken at the boundaries of each timed call (t1 to t4 once per request it sends):
 
   t0  the client starts the call                      t7  the call returns, CUDA synced
   t1  the client calls its engine-core client with the request (SyncMPClient.add_request,
@@ -50,6 +50,9 @@ Subphases (they telescope to e2e = t7 - t0):
   output_transfer = t4 - t3  client_post = t7 - t4
   engine_hook, engine_readout = the engine time charged to hook / readout
   engine_outside_spans = engine - engine_hook - engine_readout
+A call that sends several requests, one after another, sums each subphase over its requests,
+with client_prep also taking the client time from each request's t4 to the next one's t1; each
+request's engine window t2..t3 is charged on its own.
 
 Raw per-run segments, kernel-trace attribution (`segments_raw_ms`):
   engine_outside_spans   = the base model and the engine's own host work, together
@@ -68,8 +71,8 @@ of the GPU time it overlaps:
 the same workload, vLLM version and GPU count (a `vllm-plain` config without enforce_eager,
 profiled in the same chain over the same units). The floor's plain request gives F, its engine
 time outside interpretability code (engine_outside_spans; the same attribution on both sides):
-  base_compiled_engine  = F
-  eager_graph_break_tax = engine time outside interpretability code - F
+  base_compiled_engine  = F x the requests the call sent (`forwards_per_call`)
+  eager_graph_break_tax = engine time outside interpretability code - base_compiled_engine
       (signed; it carries both a forced-eager engine and CUDA graphs run without torch.compile)
   hook_dispatch_and_edit, readout_and_host_ipc: as measured
 
@@ -422,7 +425,7 @@ def _reset():
 
 
 def _trial(call):
-    """One timed call: its six boundaries and the engine steps between them. The request's
+    """One timed call: its boundaries and the engine steps of its requests. The requests'
     region boundaries and the GPU activities arrive with the session's export."""
     from .timing import sync_cuda
 
@@ -432,18 +435,24 @@ def _trial(call):
     call()
     sync_cuda()
     t7 = _perf()
-    events = _events()
+    return _bounds(t0, t7, _client["sent"], _client["received"], _events())
+
+
+def _bounds(t0, t7, sent, received, events):
+    """A call's boundaries: t0, t7 and, per request in the order sent, [t1, t2, t3, t4]. The
+    requests run one after another, so the k-th send, arrival, finishing step and finished output
+    belong to the k-th request; counts that do not pair up raise."""
     arrivals = [e["t"] for e in events if e["event"] == "arrival"]
     steps = [e for e in events if e["event"] == "step"]
-    finishing = [e for e in steps if e["finished"]]
-    if not (_client["sent"] and _client["received"] and arrivals and finishing):
-        raise RuntimeError(f"phase boundaries missing: {len(_client['sent'])} sent, "
+    finishing = [e["end"] for e in steps if e["finished"]]
+    if not (sent and len(sent) == len(arrivals) == len(finishing) == len(received)):
+        raise RuntimeError(f"phase boundaries do not pair up: {len(sent)} sent, "
                            f"{len(arrivals)} arrived, {len(finishing)} finishing steps, "
-                           f"{len(_client['received'])} received")
-    t1, t2 = _client["sent"][-1], arrivals[-1]
-    t3, t4 = finishing[-1]["end"], _client["received"][-1]
-    window = [e for e in steps if t2 <= e["start"] and e["end"] <= t3]
-    return {"t": [t0, t1, t2, t3, t4, t7], "steps": window, "requests": len(_client["sent"])}
+                           f"{len(received)} received")
+    requests = [list(r) for r in zip(sent, arrivals, finishing, received)]
+    window = [e for e in steps if any(t2 <= e["start"] and e["end"] <= t3
+                                      for _, t2, t3, _ in requests)]
+    return {"t0": t0, "t7": t7, "requests": requests, "steps": window}
 
 
 def _attribute(t2, t3, marks, activities):
@@ -501,21 +510,39 @@ def _host_time(t2, t3, marks):
 
 
 def _decompose(trial, marks, activities):
-    """One trial's subphases and raw segments under both attributions."""
-    t0, t1, t2, t3, t4, t7 = trial["t"]
+    """One trial's subphases and raw segments under both attributions. `marks` maps a finishing
+    step's end to the boundaries of the request it finished; each request's engine window
+    t2..t3 is charged on its own and the charges add up."""
+    t0, t7, requests = trial["t0"], trial["t7"], trial["requests"]
     ms = 1e-6
-    charged, placed, unmatched, other = _attribute(t2, t3, marks, activities)
+    charged = dict.fromkeys(("engine", "hook", "readout"), 0.0)
+    host = {"hook": 0.0, "readout": 0.0}
+    placed, unmatched, other, all_marks = [], 0.0, 0.0, []
+    for _, t2, t3, _ in requests:
+        own = marks[t3]
+        c, p, u, o = _attribute(t2, t3, own, activities)
+        for k, v in c.items():
+            charged[k] += v
+        for k, v in _host_time(t2, t3, own).items():
+            host[k] += v
+        placed, unmatched, other, all_marks = placed + p, unmatched + u, other + o, all_marks + own
     charged = {k: v * ms for k, v in charged.items()}
-    host = {k: v * ms for k, v in _host_time(t2, t3, marks).items()}
+    host = {k: v * ms for k, v in host.items()}
     kernels = dict.fromkeys(_KINDS, 0.0)
     for a, b, kind in placed:
         kernels["base" if kind == "between" else kind] += (b - a) * ms
     interp, readout = host["hook"] + host["readout"], host["readout"]
-    sub = {"client_prep": (t1 - t0) * ms, "request_transfer": (t2 - t1) * ms,
-           "engine": (t3 - t2) * ms, "engine_outside_spans": charged["engine"],
+    # client time before each send (from t0 or the previous request's t4) prepares that request;
+    # client time after the last request's t4 handles the result
+    previous = [t0] + [t4 for *_, t4 in requests[:-1]]
+    sub = {"client_prep": sum(t1 - p for p, (t1, *_) in zip(previous, requests)) * ms,
+           "request_transfer": sum(t2 - t1 for t1, t2, _, _ in requests) * ms,
+           "engine": sum(t3 - t2 for _, t2, t3, _ in requests) * ms,
+           "engine_outside_spans": charged["engine"],
            "engine_hook": charged["hook"], "engine_readout": charged["readout"],
            "engine_interp_host": interp, "engine_readout_host": readout,
-           "output_transfer": (t4 - t3) * ms, "client_post": (t7 - t4) * ms}
+           "output_transfer": sum(t4 - t3 for _, _, t3, t4 in requests) * ms,
+           "client_post": (t7 - requests[-1][3]) * ms}
     events = {
         "engine_outside_spans": charged["engine"],
         "hook_dispatch_and_edit": sub["client_prep"] + sub["request_transfer"] + charged["hook"],
@@ -530,13 +557,15 @@ def _decompose(trial, marks, activities):
         "readout_and_host_ipc": (readout + kernels["readout"] + sub["output_transfer"]
                                  + sub["client_post"]),
     }
-    ordered = all(a <= b for a, b in zip(trial["t"], trial["t"][1:]))
+    flat = [t0] + [t for request in requests for t in request] + [t7]
+    ordered = all(a <= b for a, b in zip(flat, flat[1:]))
+    t2 = requests[0][1]                                 # the timeline's origin
     return {"e2e_wall_ms": (t7 - t0) * ms, "segments_raw_ms": events,
             "segments_raw_spans_ms": spans, "subphases_ms": sub, "boundaries_ordered": ordered,
-            "requests": trial["requests"], "engine_steps": len(trial["steps"]),
-            "marks": len(marks), "kernels_ms": kernels, "unmatched_kernel_ms": unmatched * ms,
+            "requests": len(requests), "engine_steps": len(trial["steps"]),
+            "marks": len(all_marks), "kernels_ms": kernels, "unmatched_kernel_ms": unmatched * ms,
             "other_thread_kernel_ms": other * ms,
-            "timeline": {"marks": [[(c - t2) * 1e-3, k] for c, k in marks],
+            "timeline": {"marks": [[(c - t2) * 1e-3, k] for c, k in all_marks],
                          "activities": [[(a - t2) * 1e-3, (b - t2) * 1e-3, k]
                                         for a, b, k in placed]}}
 
@@ -611,8 +640,8 @@ def profile_call(prepare, *, warmup, n_trials):
     finally:
         TRACE.unlink(missing_ok=True)
     plain_after = _uninstrumented(prepare, warmup=warmup, n_trials=n_trials)
-    requests = {r["end"]: r["marks"] for r in export["requests"]}
-    trials = [_decompose(t, requests[t["t"][3]], export["activities"]) for t in raw]
+    marks = {r["end"]: r["marks"] for r in export["requests"]}
+    trials = [_decompose(t, marks, export["activities"]) for t in raw]
     # the trial whose e2e is the median keeps its timeline, for diagnostics
     chosen = sorted(range(n_trials), key=lambda i: trials[i]["e2e_wall_ms"])[(n_trials - 1) // 2]
     timeline = {"trial": chosen, **trials[chosen]["timeline"]}
@@ -646,7 +675,8 @@ def profile_call(prepare, *, warmup, n_trials):
         "timeline": timeline,
         "trials": trials,
         # Each trial's segments sum to its e2e by construction; the check is that every boundary
-        # was captured in order, once per request, in every trial.
+        # was captured in order, once per request, in every trial. A call may send several
+        # requests one after another (`requests` per trial); single_request: every call sent one.
         "conservation": {
             "max_abs_gap_ms": gap("segments_raw_ms"),
             "max_abs_gap_spans_ms": gap("segments_raw_spans_ms"),
@@ -745,7 +775,9 @@ def split_with_floors(profiles, attribution="events"):
     request of a compiled `vllm-plain` profile of the same workload, vLLM version and GPU count,
     over the same timed units and token count; a row without one gets an error. Each trial is
     split, so every trial's segments still sum to its e2e; the record reports the trial whose
-    e2e is the median, with every trial kept."""
+    e2e is the median, with every trial kept. A trial's base is F for each request its call sent
+    (a call that reads a value in one request and writes it in the next runs the engine twice), and
+    the record's `forwards_per_call` is the reported trial's request count."""
     field = ATTRIBUTIONS[attribution]
     floors = {}
     for profile in profiles:
@@ -755,7 +787,7 @@ def split_with_floors(profiles, attribution="events"):
                 if row.get("label") == "__vanilla__" and "error" not in row:
                     key = _floor_key(profile, row)
                     floors[key] = (profile["backend"], statistics.median(
-                        _engine_ms(t[field]) for t in row["trials"]))
+                        _engine_ms(t[field]) / t["requests"] for t in row["trials"]))
     out = []
     for profile in profiles:
         for key, row in profile["rows"].items():
@@ -775,10 +807,10 @@ def split_with_floors(profiles, attribution="events"):
             floor, floor_ms = match
             trials = []
             for trial in row["trials"]:
-                raw = trial[field]
+                raw, base = trial[field], floor_ms * trial["requests"]
                 trials.append({"e2e_wall_ms": trial["e2e_wall_ms"], "segments_ms": {
-                    "base_compiled_engine": floor_ms,
-                    "eager_graph_break_tax": _engine_ms(raw) - floor_ms,
+                    "base_compiled_engine": base,
+                    "eager_graph_break_tax": _engine_ms(raw) - base,
                     "hook_dispatch_and_edit": raw["hook_dispatch_and_edit"],
                     "readout_and_host_ipc": raw["readout_and_host_ipc"]}})
             # the trial whose e2e is the median (the lower middle one for an even count): its
@@ -789,6 +821,7 @@ def split_with_floors(profiles, attribution="events"):
             record.update({
                 "e2e_wall_ms": trials[chosen]["e2e_wall_ms"], "reported_trial": chosen,
                 "marks": row["trials"][chosen]["marks"],
+                "forwards_per_call": row["trials"][chosen]["requests"],
                 "uninstrumented_e2e_ms": row["uninstrumented_e2e_ms"],
                 "uninstrumented_before_e2e_ms": row["uninstrumented_before_e2e_ms"],
                 "uninstrumented_after_e2e_ms": row["uninstrumented_after_e2e_ms"],
