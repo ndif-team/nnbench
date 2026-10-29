@@ -15,9 +15,10 @@ configs:
                                       enable_batching: true, enable_position_interventions: false}}
   # Position interventions widen every hook's scale/bias buffers to (max_num_batched_tokens, width)
   # (source.py, ~2x the hooks' resident memory), which vLLM's memory profiling does not count: at
-  # qwen3-32b TP2 the 0.85 budget runs out while capturing CUDA graphs. The sharded configs leave
-  # that memory outside the engine budget.
+  # qwen3-32b TP2 the 0.85 budget runs out while capturing CUDA graphs, and at llama3.3-70b TP4
+  # (wider hooks, more layers) 0.70 runs out while warming up the sampler. The sharded configs
+  # leave that memory outside the engine budget.
   tp2: {image: default, options: {<<: *base, gpu_memory_utilization: 0.70, tensor_parallel_size: 2}, gpus: 2}
-  tp4: {image: default, options: {<<: *base, gpu_memory_utilization: 0.70, tensor_parallel_size: 4}, gpus: 4}
+  tp4: {image: default, options: {<<: *base, gpu_memory_utilization: 0.55, tensor_parallel_size: 4}, gpus: 4}
   opt/tp2: {image: default, options: {<<: *base, mode: opt, gpu_memory_utilization: 0.70, tensor_parallel_size: 2}, gpus: 2}
-  opt/tp4: {image: default, options: {<<: *base, mode: opt, gpu_memory_utilization: 0.70, tensor_parallel_size: 4}, gpus: 4}
+  opt/tp4: {image: default, options: {<<: *base, mode: opt, gpu_memory_utilization: 0.55, tensor_parallel_size: 4}, gpus: 4}
