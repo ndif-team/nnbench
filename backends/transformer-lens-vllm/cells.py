@@ -40,6 +40,13 @@ def _forward(be, model, prompts, names=(), intervene=None, logits=True):
     for all of them on the batched path. `logits=False` skips the host-side logit rebuild (the
     driver's `return_logits` option)."""
     kwargs = {"names_filter": list(names)}
+    if intervene and be.engine_options.get("tensor_parallel_size", 1) > 1:
+        # A sharded boot runs the engine core in its own process (source.py, boot_vllm), so the
+        # driver's collective_rpc crosses vLLM's msgpack utility channel, which delivers a tensor
+        # as [dtype, shape, data] that validate_spec rejects; the documented list form arrives
+        # intact. One GPU keeps the worker in this process and takes the tensor as is.
+        intervene = {name: {k: v.tolist() if isinstance(v, torch.Tensor) else v
+                            for k, v in spec.items()} for name, spec in intervene.items()}
     if intervene:
         kwargs["intervene"] = intervene
     if not logits:
