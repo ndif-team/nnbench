@@ -17,8 +17,10 @@ configs:
   # (source.py, ~2x the hooks' resident memory), which vLLM's memory profiling does not count: at
   # qwen3-32b TP2 the 0.85 budget runs out while capturing CUDA graphs, and at llama3.3-70b TP4
   # (wider hooks, more layers) 0.70 runs out while warming up the sampler. The sharded configs
-  # leave that memory outside the engine budget.
+  # leave that memory outside the engine budget. At 0.55 the KV cache (8.19 GiB per GPU) holds less
+  # than one request at llama3.3-70b's native 131072-token context, so the four-GPU configs cap the
+  # context at 4096 tokens (the workloads' prompts are under 100 tokens plus 8 decode steps).
   tp2: {image: default, options: {<<: *base, gpu_memory_utilization: 0.70, tensor_parallel_size: 2}, gpus: 2}
-  tp4: {image: default, options: {<<: *base, gpu_memory_utilization: 0.55, tensor_parallel_size: 4}, gpus: 4}
+  tp4: {image: default, options: {<<: *base, gpu_memory_utilization: 0.55, max_model_len: 4096, tensor_parallel_size: 4}, gpus: 4}
   opt/tp2: {image: default, options: {<<: *base, mode: opt, gpu_memory_utilization: 0.70, tensor_parallel_size: 2}, gpus: 2}
-  opt/tp4: {image: default, options: {<<: *base, mode: opt, gpu_memory_utilization: 0.55, tensor_parallel_size: 4}, gpus: 4}
+  opt/tp4: {image: default, options: {<<: *base, mode: opt, gpu_memory_utilization: 0.55, max_model_len: 4096, tensor_parallel_size: 4}, gpus: 4}
