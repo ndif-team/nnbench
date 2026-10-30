@@ -330,5 +330,5 @@ def attention_pattern(be, model, units, *, layers="all"):
 # On the AsyncLLM backend (backend.py, VLLMHookAsyncBackend) the same cells read through
 # `AsyncHook.capture`.
 for _workload, _fn in (("logit_lens", logit_lens), ("steering", steering),
-                       ("gen_steering", gen_steering)):
+                       ("gen_steering", gen_steering), ("gen_capture", gen_capture)):
     cell(_workload, family="llama", backend="vllm_hook_async")(_fn)
