@@ -5,7 +5,8 @@ Denotation, from IBM/vLLM-Hook 0e34fdd source:
   `output[0] + output[1]`, the stream after the layer (`probe_hidden_states_worker.hs_hook`), per
   request from its `query_start_loc` slice. Layers are numbered from 1 ("layer N = output after
   the Nth block"); `last_token` keeps one row per forward, `all_tokens` the request's whole slice.
-  Capture is prefill-only by default.
+  Capture is prefill-only by default; a request's `extra_args["hooks_on"] = "both"` adds every
+  decode forward (`hs_hook`), the last-token row of each in last-token mode.
 - `probe_hook_qk` hooks each attention module `model.layers.<i>.self_attn.attn` (numbered from 0,
   `_common.match_attn`) and records its inputs: the query and key after vLLM applied RoPE
   (vLLM 0.19.1 `qwen2.py`, `Qwen2Attention.forward`: `q, k = self.rotary_emb(positions, q, k)`
@@ -90,21 +91,26 @@ def _requests(tensors, n):
     return rows
 
 
-def _capture(model, prompts, layers, mode):
+def _capture(model, prompts, layers, mode, new_tokens=1):
     """One `HookLLM.generate` over `prompts` capturing the stream after each listed (0-based) layer
-    in hs mode `mode`; returns the outputs and the analyzer's per-layer captures."""
+    in hs mode `mode`; returns the outputs and the analyzer's per-layer captures. With `new_tokens`
+    > 1 each prompt decodes that many greedy tokens and the requests ask for the decode passes too
+    (`extra_args["hooks_on"] = "both"`, probe_hidden_states_worker; generate keeps a caller's
+    extra_args and adds its own defaults)."""
     from vllm import SamplingParams
 
     if model.worker != "probe_hidden_states":
         raise _other_worker(model, "probe_hidden_states", "hidden-state capture")
     if isinstance(model.llm, AsyncHook):           # AsyncLLM: the fields go on each request
-        return model.llm.capture(prompts, [i + 1 for i in layers], mode)
+        return model.llm.capture(prompts, [i + 1 for i in layers], mode, new_tokens)
+    params = (SamplingParams(max_tokens=new_tokens, min_tokens=new_tokens, temperature=0.0, top_p=1.0,
+                             extra_args={"hooks_on": "both"}) if new_tokens > 1
+              else SamplingParams(max_tokens=1, temperature=0.0, top_p=1.0))
     llm = model.llm
     llm._output_layers = [i + 1 for i in layers]          # the worker numbers layers from 1
     previous, llm._hs_mode = llm._hs_mode, mode           # what load_config sets from a config file
     try:
-        outs = llm.generate(list(prompts), SamplingParams(max_tokens=1, temperature=0.0, top_p=1.0),
-                            save_to_disk=model.save_to_disk, use_tqdm=False)
+        outs = llm.generate(list(prompts), params, save_to_disk=model.save_to_disk, use_tqdm=False)
         if model.save_to_disk:
             stats = llm.analyze(analyzer_spec={"reduce": "none"})   # reads this call's run_id
             shutil.rmtree(os.path.join(llm._hook_dir, llm._last_run_id), ignore_errors=True)
@@ -167,6 +173,39 @@ def gen_steering(be, model, units, *, layer=8, target=" Rome", alpha=6.0, new_to
                  scale_by="mean_norm"):
     raise Unsupported(f"{LAST_ROW_STEER}; steering at every decode step steers the last prompt "
                       f"token, not every prompt position")
+
+
+@cell("gen_capture", family="llama", backend="vllm_hook")
+def gen_capture(be, model, units, *, layer, new_tokens, export=True):
+    """The stream after `layer` at each greedy decode step's newest position. In last-token mode the
+    worker keeps the final prefill chunk's last row, then one row per decode forward, so each
+    request yields `new_tokens` passes in step order; the requests' passes come back in prompt
+    order (AsyncHook.capture reads one request at a time; `flush_disk` writes a batch's requests
+    one after another). `export=False` runs the same decode with no hook fields and returns each
+    step's token."""
+    from vllm import SamplingParams
+
+    if not export:
+        if isinstance(model.llm, AsyncHook):
+            outs = model.llm.decode(list(units), new_tokens)
+        else:
+            outs = model.llm.generate(list(units), SamplingParams(
+                max_tokens=new_tokens, min_tokens=new_tokens, temperature=0.0, top_p=1.0),
+                use_hook=False, use_tqdm=False)
+        return torch.stack([torch.tensor(out.outputs[0].token_ids)[:, None] for out in outs],
+                           dim=1)                                               # [new_tokens, B, 1]
+    if not model.save_to_disk and not isinstance(model.llm, AsyncHook) and len(units) > 1:
+        raise Unsupported("HookLLM.generate merges several requests' RPC probes onto outputs[0], "
+                          "keeping each request's first pass (hook_llm.py, generate), so a batch's "
+                          "decode passes are lost; disk storage and the AsyncLLM path keep them")
+    _, by_layer = _capture(model, units, [layer], "last_token", new_tokens)
+    captured = by_layer[f"model.layers.{layer}"]
+    passes = captured.unbind(0) if isinstance(captured, torch.Tensor) else captured
+    rows = torch.cat([p.reshape(-1, p.shape[-1]) for p in passes])
+    if rows.shape[0] != len(units) * new_tokens:
+        raise RuntimeError(f"collected {rows.shape[0]} per-step rows, expected {len(units)} "
+                           f"requests x {new_tokens} steps")
+    return rows.reshape(len(units), new_tokens, -1).transpose(0, 1)             # [new_tokens, B, d]
 
 
 @cell("activation_patching", family="llama", backend="vllm_hook")

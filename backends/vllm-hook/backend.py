@@ -125,22 +125,29 @@ class AsyncHook:
     save_to_disk: bool
     gather: object             # the backend's persistent-loop runner
 
-    def capture(self, prompts, layers, mode):
+    def capture(self, prompts, layers, mode, new_tokens=1):
         """One request per prompt, submitted together, capturing the stream after each listed
         layer (numbered from 1, as the worker numbers them) in hs mode `mode`; returns the finished
-        outputs and `{module: rows}` with every request's passes in prompt order. The artifacts
-        are read on the calling client's thread, off the engine's event loop."""
+        outputs and `{module: rows}` with every request's passes in prompt order. With
+        `new_tokens` > 1 each request decodes that many greedy tokens and asks the worker for its
+        decode passes too (`hooks_on`, default "prefill"). The artifacts are read on the calling
+        client's thread, off the engine's event loop."""
         import uuid
 
         from vllm import SamplingParams
 
         ids = [uuid.uuid4().hex for _ in prompts]
 
+        decode = {"min_tokens": new_tokens} if new_tokens > 1 else {}   # as the vllm-lens decode
+
         def params(request_id):
             extra = {"output_hidden_states": list(layers), "hs_mode": mode}
+            if new_tokens > 1:
+                extra["hooks_on"] = "both"
             if self.save_to_disk:     # the request id names its artifact directory
                 extra.update(save_to_disk=True, run_id=request_id, hook_dir=self.hook_dir)
-            return SamplingParams(max_tokens=1, temperature=0.0, top_p=1.0, extra_args=extra)
+            return SamplingParams(max_tokens=new_tokens, temperature=0.0, top_p=1.0,
+                                  extra_args=extra, **decode)
 
         async def one(prompt, request_id):
             async for out in self.engine.generate(prompt, params(request_id), request_id):
@@ -158,6 +165,23 @@ class AsyncHook:
             for module, rows in stats["hidden_states"].items():
                 by_layer.setdefault(module, []).extend(rows)
         return outs, by_layer
+
+    def decode(self, prompts, new_tokens):
+        """The same greedy decode, one request per prompt with no extra_args, so the worker
+        captures nothing; returns the finished outputs."""
+        import uuid
+
+        from vllm import SamplingParams
+
+        params = SamplingParams(max_tokens=new_tokens, min_tokens=new_tokens, temperature=0.0,
+                                top_p=1.0)
+
+        async def one(prompt):
+            async for out in self.engine.generate(prompt, params, uuid.uuid4().hex):
+                pass
+            return out
+
+        return self.gather([one(prompt) for prompt in prompts])
 
 
 class VLLMHookAsyncBackend(VLLMHookBackend):
