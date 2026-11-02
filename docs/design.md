@@ -1476,7 +1476,8 @@ directory (`isb/jobs/layout.py`). The nnsight systems keep their 0.7+ cells in
 tier).
 
 Job directories mirror the name (`experiments/<id>/<system>/<config>/`). Saved runs were renamed to
-the new names by `scripts/migrate_backend_names.py`; interface names inside artifacts (`hf`,
+the new names by a one-time migration (`scripts/migrate_backend_names.py`, in the history up to
+tag `paper-eval-v1`); interface names inside artifacts (`hf`,
 `vllm_lens_opt`, ...) and image tags are unchanged.
 
 ### 12.16 Workloads, models, realizations and suites (2026-10-10)
