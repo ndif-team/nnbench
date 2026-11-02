@@ -1,0 +1,17 @@
+# interp-engine on vLLM 0.28.0 (the Dockerfile's ARG values). `static` runs its CUDA-graph
+# (vllm-static) backend. `num_gpus` is load_model's tensor-parallel size (load.py; it sets the
+# engine's own `tensor_parallel_size`, so the static buffer fit divides the weights over the ranks).
+images:
+  default: {}
+configs:
+  default:
+    image: default
+    options: &base {dtype: bfloat16, gpu_memory_utilization: 0.85,
+                    extra_vllm_kwargs: {enable_prefix_caching: false}}
+  static:
+    image: default
+    options: {<<: *base, backend: vllm-static}
+  tp2: {image: default, options: {<<: *base, num_gpus: 2}, gpus: 2}
+  tp4: {image: default, options: {<<: *base, num_gpus: 4}, gpus: 4}
+  static/tp2: {image: default, options: {<<: *base, backend: vllm-static, num_gpus: 2}, gpus: 2}
+  static/tp4: {image: default, options: {<<: *base, backend: vllm-static, num_gpus: 4}, gpus: 4}

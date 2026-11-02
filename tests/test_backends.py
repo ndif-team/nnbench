@@ -59,6 +59,37 @@ def test_async_teardown_drains_pending_handlers():
     assert loop.is_closed() and backend._loop is None
 
 
+def test_text_causal_load_passes_automodel_only_to_an_nnsight_that_takes_it(monkeypatch):
+    # nnsight 0.7 picks its auto class from `automodel` and refuses a multimodal wrapper unless the
+    # class is non-default; 0.8 has no such parameter and would forward it into the model constructor
+    import types
+
+    from isb.backends.hf import HFBackend
+
+    AutoModelForCausalLM = type("AutoModelForCausalLM", (), {})
+    transformers = types.ModuleType("transformers")
+    transformers.AutoModelForCausalLM = AutoModelForCausalLM
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    seen = {}
+
+    class AutomodelTaking:                     # nnsight 0.7's LanguageModel signature
+        def __init__(self, repo, *args, automodel=AutoModelForCausalLM, **kwargs):
+            seen["automodel"] = automodel
+
+    class PipelineLoading:                     # nnsight 0.8's LanguageModel signature
+        def __init__(self, repo_id, *args, task=None, **kwargs):
+            seen["kwargs"] = kwargs
+
+    for language_model in (AutomodelTaking, PipelineLoading):
+        fake = types.ModuleType("nnsight")
+        fake.LanguageModel = language_model
+        monkeypatch.setitem(sys.modules, "nnsight", fake)
+        HFBackend(force_text_causal=True).load("org/text-tower-of-a-wrapper", device="cpu")
+    assert issubclass(seen["automodel"], AutoModelForCausalLM)
+    assert seen["automodel"] is not AutoModelForCausalLM
+    assert "automodel" not in seen["kwargs"] and seen["kwargs"]["device_map"] == "cpu"
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

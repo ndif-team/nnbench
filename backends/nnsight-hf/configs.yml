@@ -1,0 +1,39 @@
+# nnsight on HF transformers. backend.py selects the adapter for the installed nnsight release.
+# `default` is the Dockerfile's own ARG values (the development commit, transformers 5.12.1).
+# nnsight's tensor parallelism needs transformers 5.19 (its docs/models/tensor-parallel.md): the
+# 0-8-1-tf5-19 image, with the click that transformers' huggingface-hub needs and the base
+# image's `spin` removed because it pins click below 8.4.
+images:
+  default: {}
+  0-4-6: {NNSIGHT_REF: a5bbbace8a4fe48eef5ce52a63723bbd16c23b89}
+  # 0.4.6 on the library stack of its own release date (torch 2.6, transformers 4.51)
+  0-4-6-era: {NNSIGHT_REF: a5bbbace8a4fe48eef5ce52a63723bbd16c23b89,
+              PYTORCH_IMAGE: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime, TORCH_VERSION: 2.6.0,
+              TRANSFORMERS_VERSION: 4.51.3, ACCELERATE_VERSION: 1.6.0}
+  0-5-15: {NNSIGHT_REF: 79e18487ee86c96712df7561acf4a9ddb8469098}
+  0-7: {NNSIGHT_REF: 884bd1c7b0dbd53be01ade6a18843078d90367b4}
+  0-8-1: {NNSIGHT_REF: de7fec4d207fc8e0deacaa44fb68f8d0412506ef}
+  0-8-1-tf5-19: {NNSIGHT_REF: de7fec4d207fc8e0deacaa44fb68f8d0412506ef, TRANSFORMERS_VERSION: 5.19.0,
+                 CLICK_VERSION: 8.4.2, REMOVE_PACKAGES: spin}
+configs:
+  default: {image: default, options: {}}
+  fp32: {image: default, options: {dtype: float32}}
+  sdpa: {image: default, options: &sdpa {dtype: bfloat16, attn_implementation: sdpa}}
+  # the sdpa config with eager attention, the only HF kernel that returns attention weights: the
+  # attention_pattern reference
+  eager: {image: default, options: {<<: *sdpa, attn_implementation: eager}}
+  0-4-6: {image: 0-4-6, options: *sdpa}
+  0-4-6/era: {image: 0-4-6-era, options: *sdpa}
+  0-4-6/gpu2: {image: 0-4-6, options: {<<: *sdpa, device_map: auto}, gpus: 2}
+  0-5-15: {image: 0-5-15, options: *sdpa}
+  0-5-15/gpu4: {image: 0-5-15, options: {<<: *sdpa, device_map: auto}, gpus: 4}
+  0-7: {image: 0-7, options: *sdpa}
+  0-7/gpu4: {image: 0-7, options: {<<: *sdpa, device_map: auto}, gpus: 4}
+  0-8-1: {image: 0-8-1, options: *sdpa}
+  # device_map=auto: the layers split across the GPUs (accelerate), one process
+  0-8-1/gpu2: {image: 0-8-1, options: {<<: *sdpa, device_map: auto}, gpus: 2}
+  0-8-1/gpu4: {image: 0-8-1, options: {<<: *sdpa, device_map: auto}, gpus: 4}
+  # tp_size: every layer sharded over the GPUs (transformers tensor parallelism); one torchrun
+  # rank per GPU, every rank runs the whole job and rank 0 publishes it (isb/jobs/entry.py)
+  0-8-1/tp2: {image: 0-8-1-tf5-19, options: {<<: *sdpa, tp_size: 2}, gpus: 2, ranks: 2}
+  0-8-1/tp4: {image: 0-8-1-tf5-19, options: {<<: *sdpa, tp_size: 4}, gpus: 4, ranks: 4}

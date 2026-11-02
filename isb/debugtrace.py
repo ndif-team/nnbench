@@ -25,7 +25,7 @@ DRIFT_FLOOR = 1e-3          # relative difference below this reads as kernel noi
 def debug_prompts(spec, k: int = N_DEBUG_PROMPTS) -> list[str]:
     """The companion's inputs: the first k prompts of the spec's first execution regime. Pair and
     labeled-pair units contribute their first (clean) prompt."""
-    return [u[0] if isinstance(u, tuple) else u for u in spec.regimes[0].prompts[:k]]
+    return [u[0] if isinstance(u, tuple) else u for u in spec.regimes[0].units[:k]]
 
 
 def collect_debug(be, model, m, prompts, residual: str) -> tuple[dict, dict]:
@@ -34,7 +34,7 @@ def collect_debug(be, model, m, prompts, residual: str) -> tuple[dict, dict]:
     ("debug_logits", i) = [vocab] final logits through the portable unembed."""
     blocks, ln_f, head = m.blocks(model), m.norm(model), m.head(model)
 
-    def resid_stack():  # named (not a lambda) so nnsight can source-serialize it to the worker
+    def resid_stack(rows):  # named (not a lambda) so nnsight can source-serialize it to the worker
         with torch.no_grad():
             rows = []
             for blk in blocks:
@@ -42,7 +42,7 @@ def collect_debug(be, model, m, prompts, residual: str) -> tuple[dict, dict]:
                 rows.append(h.reshape(-1, h.shape[-1])[-1, :].float())
             return torch.stack(rows)
 
-    def final_logits():  # named for the same serialization reason
+    def final_logits(rows):  # named for the same serialization reason
         with torch.no_grad():
             normed = ln_f(_resid(blocks[-1].output, residual))
             logits = F.linear(normed.float(), head.weight.float())

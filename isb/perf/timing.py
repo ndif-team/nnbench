@@ -64,13 +64,17 @@ class TimingResult:
     warmup: int
     peak_mem_mb: float
     times_ms: list = field(default_factory=list)
+    worker_peak_mem_mb: list | None = None    # per engine-worker rank, over the timed trials
 
 
-def time_cell(prepare_call: Callable[[], Callable[[], Any]], *, warmup: int = 3, n_trials: int = 7):
+def time_cell(prepare_call: Callable[[], Callable[[], Any]], *, warmup: int = 3, n_trials: int = 7,
+              worker_memory=None):
     """Prepare each invocation, warm up, then measure the remaining cell calls.
 
     The factory runs outside the measured interval and returns a fresh zero-argument call.
     Each invocation opens its own trace (vLLM's async generator is single-shot).
+    `worker_memory` (isb/perf/worker_memory.py) resets the engine workers' peak after the warm-up
+    and reads it after the trials, both outside the timed calls.
     Returns ``(TimingResult, last_timed_output)``.
     """
     if n_trials < 1:
@@ -82,6 +86,8 @@ def time_cell(prepare_call: Callable[[], Callable[[], Any]], *, warmup: int = 3,
         call()
         force_gc()
     reset_peak_mem()                       # measure peak over the TIMED trials, after warmup settles
+    if worker_memory is not None:
+        worker_memory.reset()
     times, out = [], None
     for _ in range(n_trials):
         call = prepare_call()
@@ -91,6 +97,7 @@ def time_cell(prepare_call: Callable[[], Callable[[], Any]], *, warmup: int = 3,
         sync_cuda()
         times.append((perf_counter() - t0) * 1000.0)
         force_gc()
+    worker_peaks = worker_memory.peak_mb() if worker_memory is not None else None
     return (
         TimingResult(
             median_ms=statistics.median(times),
@@ -100,6 +107,7 @@ def time_cell(prepare_call: Callable[[], Callable[[], Any]], *, warmup: int = 3,
             warmup=warmup,
             peak_mem_mb=peak_mem_mb(),
             times_ms=times,
+            worker_peak_mem_mb=worker_peaks,
         ),
         out,
     )

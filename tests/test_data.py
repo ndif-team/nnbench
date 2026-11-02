@@ -59,15 +59,20 @@ def test_unknown_source_and_missing_size_are_loud():
         raise AssertionError("generated source without n must raise")
     except ValueError:
         pass
+    try:
+        load_data(DataRef("jlens/order-ops", 56))         # the file holds 55
+        raise AssertionError("asking a file source for more units than it holds must raise")
+    except ValueError as e:
+        assert "lens-eval-order-ops.json holds 55" in str(e)
 
 
 def test_workload_binds_a_dataref_and_carries_its_knobs():
     w = ExecutionRegime("interactive", DataRef("jlens/poetry", n=4))
-    assert len(w.prompts) == 4 and w.data_name == "jlens/poetry"
+    assert len(w.units) == 4 and w.data_name == "jlens/poetry"
     assert w.data_knobs == {"position": "last_newline"}
     # literal lists keep working untouched (the bespoke single-trace specs)
     w2 = ExecutionRegime("interactive", ["p1", "p2"])
-    assert w2.prompts == ["p1", "p2"] and w2.data_knobs == {} and w2.data_name is None
+    assert w2.units == ["p1", "p2"] and w2.data_knobs == {} and w2.data_name is None
 
 
 def test_driver_injects_knobs_under_task_params():
@@ -82,10 +87,10 @@ def test_spec_with_data_swaps_feed_not_procedure():
     spec = case("jacobian_lens/gpt2")
     rebound = spec_with_data(spec, DataRef("jlens/poetry"))
     assert rebound.name == "jacobian_lens/gpt2@jlens-poetry"      # refs/banners never collide
-    assert len(rebound.regimes[0].prompts) == 98
+    assert len(rebound.regimes[0].units) == 98
     assert rebound.regimes[0].data_knobs == {"position": "last_newline"}
     assert rebound.tasks == spec.tasks                            # procedure untouched
-    assert len(spec.regimes[0].prompts) == 93                     # original untouched
+    assert len(spec.regimes[0].units) == 93                     # original untouched
     # unit-kind mismatch is loud: pair data cannot feed a prompt procedure
     try:
         spec_with_data(spec, DataRef("ioi_pairs", 8))
@@ -115,7 +120,7 @@ def test_labeled_pair_source_and_kind_check():
     except ValueError:
         pass
     rebound = spec_with_data(spec, DataRef("mib/ioi_labeled", 5))
-    assert len(rebound.regimes[0].prompts) == 5
+    assert len(rebound.regimes[0].units) == 5
 
 
 def _run_all():
@@ -132,7 +137,7 @@ if __name__ == "__main__":
 
 def test_wikitext_source_and_jacobian_valid_slice():
     prompts, knobs = load_data(DataRef("wikitext"))
-    assert len(prompts) == 100 and knobs == {}
+    assert len(prompts) == 256 and knobs == {}            # the offline sweep's 256 units
     assert all(len(p) >= 150 for p in prompts)            # long enough to clear the sink skip
     from isb.methodologies.jacobian_collect import valid_slice
     assert valid_slice(50, 16) == slice(16, 49)           # sink prefix out, final position out
@@ -141,6 +146,17 @@ def test_wikitext_source_and_jacobian_valid_slice():
         raise AssertionError("too-short prompt must raise")
     except ValueError:
         pass
+
+
+def test_jacobian_cotangent_probes_one_output_dimension_per_copy():
+    import torch
+    from isb.methodologies.jacobian_collect import _one_hot_cotangent
+    t = torch.zeros(2, 5, 4)                                   # two copies of a 5-token prompt, d=4
+    cot = _one_hot_cotangent(t, [0, 1], start=2, skip_first=1)
+    assert cot.shape == t.shape and cot.sum() == 6             # 3 valid positions x 2 copies
+    assert cot[0, 1:4, 2].all() and cot[1, 1:4, 3].all()
+    flat = _one_hot_cotangent(torch.zeros(5, 4), [1], start=2, skip_first=1)   # one vLLM invoke
+    assert flat.shape == (5, 4) and flat[1:4, 3].all() and flat.sum() == 3
 
 
 def test_debug_companion_compare_and_prompts():

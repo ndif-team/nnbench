@@ -24,6 +24,8 @@ activation_patching = Workload(
         for where, depth in (("quarter", _QUARTER), ("three quarters", _THREE_QUARTERS))),
     regimes=(Regime("interactive", DataRef("mib/ioi", 40)),),
     baseline={"patch": False},
+    # causal tracing over a dataset of pairs
+    load_patterns=("offline",),
     effect=Effect(baseline={"patch": False},
                   perturbed=(Row("patched", {"layer": _THREE_QUARTERS, "patch": True}),)),
 )

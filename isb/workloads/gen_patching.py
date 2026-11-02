@@ -23,6 +23,8 @@ gen_patching = Workload(
     rows=(Row("clean residual into corrupt decode at three quarters depth", {"layer": _THREE_QUARTERS}),),
     regimes=(Regime("generation", DataRef("mib/ioi", 12), new_tokens=5),),
     baseline={"layer": _THREE_QUARTERS, "patch": False},
+    # causal tracing over a dataset, through the decode
+    load_patterns=("offline",),
     effect=Effect(baseline={"layer": _THREE_QUARTERS, "patch": False},
                   perturbed=(Row("patched", {"layer": _THREE_QUARTERS, "patch": True}),)),
 )

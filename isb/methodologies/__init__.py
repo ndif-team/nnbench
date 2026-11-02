@@ -10,6 +10,7 @@ from . import gen_steering  # noqa: F401  (import registers the cells)
 from . import jacobian_collect  # noqa: F401  (import registers the cells)
 from . import jacobian_lens  # noqa: F401  (import registers the cells)
 from . import logit_lens  # noqa: F401  (import registers the cells)
+from . import residual_readout  # noqa: F401  (import registers the cells)
 from . import steering  # noqa: F401  (import registers the cells)
 from .registry import CELLS, cell, families_for, get_cell
 

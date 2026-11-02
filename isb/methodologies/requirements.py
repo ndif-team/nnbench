@@ -158,5 +158,6 @@ def _export(params, *, template, family):
 
 @case_description("logit_lens", template=PROTOCOLS["logit_lens"])
 @case_description("attention_pattern", template=PROTOCOLS["attention_pattern"])
+@case_description("residual_readout", template=PROTOCOLS["residual_readout"])
 def _constant(params, *, template, family):
     return template

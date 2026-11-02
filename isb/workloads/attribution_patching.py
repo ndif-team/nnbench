@@ -15,4 +15,6 @@ attribution_patching = Workload(
     rows=(Row("attribute the logit difference to every layer", {"grad": True}),),
     regimes=(Regime("interactive", DataRef("mib/ioi_labeled", 20)),),
     baseline={"grad": False},
+    # a dataset study
+    load_patterns=("offline",),
 )

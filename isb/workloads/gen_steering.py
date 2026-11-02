@@ -23,6 +23,8 @@ gen_steering = Workload(
     # 32 CounterFact prompts, each greedily decoded with the per-step steer
     regimes=(Regime("generation", DataRef("counterfact", 32), new_tokens=8),),
     baseline={**_ROME, "alpha": 0.0, "layer": _HALF},
+    # evaluated over datasets, and a guardrail on live traffic
+    load_patterns=("offline", "concurrent", "open"),
     effect=Effect(baseline={**_ROME, "alpha": 0.0, "layer": _HALF},
                   perturbed=(Row("alpha 6", {**_ROME, "alpha": 6.0, "layer": _HALF}),)),
 )

@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,8 +15,8 @@ from isb.suites import cases
 
 from .contract import PLAN_VERSION, prepare, write_json
 from . import apptainer
-from .local import (LAUNCHERS, ROOT, backend_file, canonical, compose, configuration, default_launcher,
-                    discover, environment, project_name, run_job)
+from .local import (LAUNCHERS, ROOT, canonical, compose_file, config, configuration, default_launcher,
+                    discover, environment, run_job)
 
 
 def _positive(value):
@@ -31,7 +32,7 @@ def _recipe(args):
     from isb.suites import SUITES, Entry, parse_data, parse_load
 
     parse_data(args.data)                            # fail on a malformed source early
-    loads = tuple(parse_load(kind, text) for kind in ("offline", "concurrent")
+    loads = tuple(parse_load(kind, text) for kind in ("offline", "concurrent", "open")
                   for text in getattr(args, kind) or ())
 
     if args.suite:
@@ -42,9 +43,9 @@ def _recipe(args):
                     "realizations": suite.realizations, "comparison": suite.comparison,
                     "timeout": suite.timeout}
         # --workload/--model with a suite keep only those of its cases
-        entries = [Entry(tuple(w for w in e.workloads if not args.workload or w in args.workload),
-                         tuple(m for m in e.models if not args.model or m in args.model),
-                         size=e.size, data=e.data, regimes=e.regimes, loads=e.loads)
+        entries = [replace(e, workloads=tuple(w for w in e.workloads
+                                              if not args.workload or w in args.workload),
+                           models=tuple(m for m in e.models if not args.model or m in args.model))
                    for e in suite.entries]
         entries = [e for e in entries if e.workloads and e.models]
         if not entries:
@@ -61,9 +62,9 @@ def _recipe(args):
     if not settings["backends"]:
         raise ValueError("select --backends")
     if args.data or args.regimes or loads:
-        entries = [Entry(e.workloads, e.models, size=e.size, data=args.data or e.data,
-                         regimes=tuple(args.regimes) if args.regimes else e.regimes,
-                         loads=loads or e.loads) for e in entries]
+        entries = [replace(e, data=args.data or e.data,
+                           regimes=tuple(args.regimes) if args.regimes else e.regimes,
+                           loads=loads or e.loads) for e in entries]
     return args.suite, entries, settings
 
 
@@ -84,24 +85,31 @@ def parser():
     run.add_argument("--model", nargs="+", help="model keys (isb/models.py)")
     run.add_argument("--data", help="SOURCE[:N]: rebind every regime to a registered data source")
     run.add_argument("--regimes", nargs="+",
-                     choices=["interactive", "batched", "generation", "offline", "concurrent"],
+                     choices=["interactive", "batched", "generation", "offline", "concurrent", "open"],
                      help="keep only these regime kinds")
     run.add_argument("--offline", action="append", metavar="UNITS:B[,B...]",
-                     help="add the offline load pattern (design.md §12.17): UNITS units of each "
-                          "workload's batched data, B units per call (or 'all'); replaces the "
-                          "suite's load patterns")
+                     help="add the offline load pattern: UNITS units of each "
+                          "workload's data, B units per call (or 'all'); replaces the suite's load "
+                          "patterns")
     run.add_argument("--concurrent", action="append", metavar="UNITS:C[,C...]",
                      help="add the closed-loop concurrent load pattern: UNITS single-unit requests "
                           "from C clients; replaces the suite's load patterns")
+    run.add_argument("--open", action="append", metavar="UNITS:R[,R...]",
+                     help="add the open-loop load pattern: UNITS single-unit requests arriving at R "
+                          "per second (seeded Poisson); replaces the suite's load patterns")
     run.add_argument("--realizations", choices=["default", "all"],
                      help="each system's documented realization only, or also every alternative its "
                           "cells declare (ad-hoc default: all)")
+    run.add_argument("--labels", nargs="+",
+                     help="keep only the rows with these labels (exact, as a report's label column "
+                          "prints them); baselines, effect checks and plain-request calls still run")
     run.add_argument("--backends", nargs="+",
                      help="config names, <system>/<config>; a bare system name means <system>/default")
     run.add_argument("--reference", help="one of --backends; omit (or '' with --suite) to collect "
                                          "without scoring")
     run.add_argument("--comparison", choices=["correctness", "equivalence"])
-    run.add_argument("--gpu", default="0", help="host GPU index or UUID; passed to backend Compose")
+    run.add_argument("--gpu", default="0", help="host GPU index or UUID; a config reserving several "
+                     "GPUs (configs.yml `gpus`) takes the indices from it on")
     run.add_argument("--timeout", type=_positive, help="seconds per backend job (default 1800)")
     run.add_argument("--seed", type=int, default=0)
     run.add_argument("--launcher", choices=LAUNCHERS, default=None,
@@ -132,13 +140,14 @@ def _run(args):
     if args.reference and args.reference not in args.backends:
         raise ValueError("reference must be one of --backends")
     if not args.gpu or "," in args.gpu:
-        raise ValueError("select one GPU index/UUID; multi-GPU settings belong in backend Compose")
-    specs, skipped = cases(entries, settings["realizations"])
+        raise ValueError("select one GPU index/UUID; a config reserving several GPUs takes the "
+                         "indices from it on (backends/README.md)")
+    specs, skipped = cases(entries, settings["realizations"], labels=args.labels)
     launcher = args.launcher or default_launcher()
     for name in args.backends:
         env = environment(name, args.out, args.out, args.gpu)
         if launcher == "apptainer":
-            apptainer.load_service(backend_file(name), env)
+            apptainer.load_service(compose_file(name), env)
         else:
             configuration(name, env=env)
     # Check scorer availability before spending GPU time, without importing it into the launcher.
@@ -148,7 +157,8 @@ def _run(args):
     directory.mkdir(parents=True, exist_ok=False)
     plan = {"version": PLAN_VERSION, "suite": suite, "backends": args.backends,
             "reference": args.reference, "comparison": args.comparison,
-            "realizations": settings["realizations"], "gpu": args.gpu, "launcher": launcher,
+            "realizations": settings["realizations"], "labels": args.labels,
+            "gpu": args.gpu, "launcher": launcher,
             "experiments": [], "cases": [spec.name for spec in specs], "not_applicable": skipped,
             "status": "preparing"}
     for row in skipped:
@@ -201,16 +211,17 @@ def main(argv=None):
                 print("\n".join(SUITES))
             return 0
         if args.command == "build":
-            # Resolve all names before the first build; do not partially act on a typo.
-            args.backends = [canonical(name) for name in args.backends]
+            # Resolve all names before the first build; do not partially act on a typo. Configs
+            # sharing an image build it once.
+            images = {(c.system, c.image): c for c in (config(name) for name in args.backends)}
             launcher = args.launcher or default_launcher()
-            for name in args.backends:
+            for chosen in images.values():
                 if launcher == "apptainer":
-                    print(f"[build] {name} -> {apptainer.build(backend_file(name), ROOT, dict(os.environ))}",
-                          flush=True)
+                    print(f"[build] {chosen.tag} -> {apptainer.build(chosen, ROOT)}", flush=True)
                 else:
-                    configuration(name)
-                    subprocess.run(compose(name, project_name("isb-build-", name)) + ["build"], check=True)
+                    args_ = [f"--build-arg={k}={v}" for k, v in chosen.build_args.items()]
+                    subprocess.run(["docker", "build", *args_, "--tag", chosen.tag, str(chosen.directory)],
+                                   check=True)
             return 0
         if args.command == "run":
             return _run(args)

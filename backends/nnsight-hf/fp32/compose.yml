@@ -1,9 +1,0 @@
-services:
-  runner:
-    extends: {file: ../compose.base.yml, service: runner}
-    environment:
-      ISB_BACKEND: ${ISB_BACKEND:-nnsight-hf/fp32}
-      ISB_ENGINE_OPTIONS: '{"dtype":"float32"}'
-volumes:
-  model-cache:
-    name: ${ISB_MODEL_CACHE:-isb-model-cache}

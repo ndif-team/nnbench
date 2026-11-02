@@ -1,59 +1,122 @@
-"""Attention-pattern read — read the post-softmax attention probability matrix (design.md §12).
-
-The attention pattern `A = softmax(QK^T / sqrt(d))` is the most direct read on what each head
-attends to. A block's `.output` returns the *value-weighted* result, NOT the probabilities, so the
-weights are reached via `.source` (intermediate ops inside the attention forward, see nnsight
-docs/usage/source.md). For HF eager attention the call is `attn_output, attn_weights =
-attention_interface(...)`, exposed as `attn.source.attention_interface_0.output` (a 2-tuple); element
-`[1]` is `attn_weights` shaped `[batch, n_heads, q_len, k_len]`.
-
-**Backend frontier — this cell exercises the `attn-weights` primitive.** HF eager materializes the
-probability matrix; vLLM's paged/flash attention computes attention implicitly and never materializes
-it (and runs a different forward with no `attention_interface` op), so the read raises -> ERROR. That
-HF-vs-vLLM split is the finding.
-
-We emit `log(A)` for the LAST query token so the equivalence oracle can be reused verbatim: the last
-token attends to every key under the causal mask, so each entry is strictly positive and the log is
-finite, and `softmax(log p) = p` for a row that already sums to 1 — so the oracle's softmax recovers
-the true attention distribution (top-1 = the key each head attends to most, TV = the true
-attention-distribution difference). Requires `attn_implementation="eager"` on HF (the HF backend
-loads that way).
-
-Variance (param, §12): `layers` ("all" | list[int], the observe set, indexed into the model's own
-block list).
-"""
+"""Attention-pattern read: the post-softmax attention probabilities of the last query token, as
+log-probabilities so the oracle's softmax recovers them, `[n_layers, B, n_heads, k_len]`. HF eager
+attention materializes them (GPT-2: `attn.source.attention_interface_1.output[1]`; Llama-tree
+models: `self_attn.output[1]`); sdpa and vLLM's attention kernels never do. On vLLM the gpt2 read
+raises (the recorded verdict); the llama cell reads the kernel's query and key inputs and computes
+the last query's softmax beside the kernel."""
 from __future__ import annotations
 
 import torch
 
-from .registry import cell
+from .registry import Unsupported, cell
 
 
 def _attn_pattern(blocks, *, layers):
-    """Stack the last-query attention pattern (log-probs) over the requested layers. Runs INSIDE a
-    trace. Returns `[n_layers, n_heads, k_len]`."""
+    """Stack the last-query attention pattern (log-probs) over the requested layers. Runs inside a
+    trace."""
     idx = range(len(blocks)) if layers == "all" else layers
     rows = []
-    with torch.no_grad():                                   # forward-only read (required on vLLM)
+    with torch.no_grad():
         for i in idx:
-            # attention_interface_0.output = (attn_output, attn_weights); [1] is [B, heads, q, k].
-            weights = blocks[i].attn.source.attention_interface_0.output[1]
-            last = weights[0, :, -1, :]                     # last-query row -> [n_heads, k_len]
-            rows.append(torch.log(last))                    # log so the oracle's softmax recovers A
-    return torch.stack(rows, dim=0)                         # [n_layers, n_heads, k_len]
+            weights = blocks[i].attn.source.attention_interface_1.output[1]   # [B, heads, q, k]
+            rows.append(torch.log(weights[:, :, -1, :]))                      # [B, heads, k]
+    return torch.stack(rows, dim=0)
 
 
 @cell("attention_pattern", family="gpt2", backend="hf")
-def attention_pattern_gpt2_hf(be, model, prompts, *, layers="all"):
-    def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
+def attention_pattern_gpt2_hf(be, model, units, *, layers="all"):
+    def build(rows):
         return _attn_pattern(model.transformer.h, layers=layers)
-    return be.run(model, prompts, build)
+
+    return be.run(model, units, build)
 
 
 @cell("attention_pattern", family="gpt2", backend="vllm_async")
-def attention_pattern_gpt2_vllm(be, model, prompts, *, layers="all"):
-    # Same explicit code as HF; the divergence is the backend's, not the cell's — vLLM has no
-    # `attention_interface` op to read, so this raises and surfaces as ERROR.
-    def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
+def attention_pattern_gpt2_vllm(be, model, units, *, layers="all"):
+    def build(rows):
         return _attn_pattern(model.transformer.h, layers=layers)
-    return be.run(model, prompts, build)
+
+    return be.run(model, units, build)
+
+
+def _eager_pattern(blocks, *, layers):
+    """HF Llama-tree attention (transformers 5.12.1 `Qwen2Attention.forward`, the same return on
+    Llama and Qwen3) returns `(attn_output, attn_weights)`; under eager, `attn_weights` is
+    `eager_attention_forward`'s softmax over `QK^T * scaling + mask`, `[B, heads, q, k]`, the KV
+    heads already repeated to the query heads. The documented nnsight read is `self_attn.output[1]`
+    (nnsight docs/patterns/attention-patterns.md). A weight that underflowed to zero in the cast to
+    the model dtype (or a left-pad key) is floored at the dtype's smallest normal before the log, so
+    the output stays finite. Runs inside a trace."""
+    idx = range(len(blocks)) if layers == "all" else layers
+    rows = []
+    with torch.no_grad():
+        for i in idx:
+            weights = blocks[i].self_attn.output[1][:, :, -1, :]      # [B, heads, k]
+            rows.append(torch.log(weights.clamp_min(torch.finfo(weights.dtype).tiny)))
+    return torch.stack(rows, dim=0)
+
+
+@cell("attention_pattern", family="llama", backend="hf")
+def attention_pattern_llama_hf(be, model, units, *, layers="all"):
+    if be.attn_implementation != "eager":
+        raise Unsupported(
+            f"attn_implementation={be.attn_implementation!r} returns no attention weights: "
+            "transformers 5.12.1 sdpa_attention_forward returns (attn_output, None) "
+            "(integrations/sdpa_attention.py:104); only eager materializes them")
+
+    def build(rows):
+        return _eager_pattern(model.model.layers, layers=layers)
+
+    return be.run(model, units, build)
+
+
+def _kernel_input_pattern(blocks, *, layers):
+    """The last query's attention log-probabilities from the inputs of vLLM's attention kernel.
+
+    Denotation (vLLM 0.19.1 and 0.27.1, `models/qwen2.py` `Qwen2Attention.forward`; `llama.py` and
+    `qwen3.py` the same order): `qkv_proj` is one fused projection split into q, k, v; Qwen3's
+    q/k norms run next; `rotary_emb` then rotates q and k in place (`layers/rotary_embedding/
+    base.py:221`, "an in-place operation"); `self.attn(q, k, v)` is the kernel. So the kernel module's
+    positional inputs are the post-RoPE query `[tokens, n_heads * head_size]` and key
+    `[tokens, n_kv_heads * head_size]` (`layers/attention/attention.py`, `Attention.forward`), and
+    its softmax scale is the attention module's `scaling` (passed as the kernel's `scale`). Read
+    there, the engine's own RoPE is in the values; nothing is recomputed.
+
+    The served rows are this request's prefill tokens: nnsight refuses a prompt split by chunked
+    prefill (`GPUModelRunner.Requests.refuse_chunked`) and every nnsight-vllm config turns prefix
+    caching off, so the keys are the whole prompt and the last query attends to all of them (full
+    causal attention; the check below refuses a sliding window). Query head `h` reads KV head
+    `h // (n_heads // n_kv_heads)`, as HF's `repeat_kv` and the kernels do. The scores are taken in
+    fp32, the precision of the kernel's softmax. Runs inside a trace, in the worker."""
+    idx = range(len(blocks)) if layers == "all" else layers
+    rows = []
+    with torch.no_grad():
+        for i in idx:
+            attn = blocks[i].self_attn
+            kernel = attn.attn
+            if kernel.sliding_window is not None:
+                raise ValueError(f"layer {i}: sliding-window attention; the last query does not "
+                                 "attend to every prompt key")
+            args, _ = kernel.inputs
+            q, k = args[0], args[1]
+            size = kernel.head_size
+            n_heads, n_kv = q.shape[-1] // size, k.shape[-1] // size
+            query = q[-1].reshape(n_kv, n_heads // n_kv, size).float()      # [kv, group, d]
+            keys = k.reshape(k.shape[0], n_kv, size).float()                 # [tokens, kv, d]
+            scores = torch.einsum("grd,sgd->grs", query, keys).reshape(n_heads, -1) * attn.scaling
+            rows.append(torch.log_softmax(scores, dim=-1))                   # [heads, k]
+    return torch.stack(rows, dim=0).unsqueeze(1)                             # [n_layers, 1, heads, k]
+
+
+@cell("attention_pattern", family="llama", backend="vllm_async")
+def attention_pattern_llama_vllm(be, model, units, *, layers="all"):
+    if len(units) != 1:
+        # k_len is each prompt's own length, and the backends stack units along dim -2 (the heads
+        # axis here), so several units have no shared layout
+        raise ValueError(f"attention_pattern on vLLM takes one unit per call, got {len(units)}")
+    blocks = model.model.layers        # bound outside the block: the block ships no root model
+
+    def build(rows):
+        return _kernel_input_pattern(blocks, layers=layers)
+
+    return be.run(model, units, build)

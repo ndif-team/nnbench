@@ -35,7 +35,7 @@ def test_frozen_builtin_override_and_identity_survive(tmp_path):
     assert spec.protocol.semantic_params == ("saved_option",)
     assert spec.protocol.realization_params == ("mode",)
     assert spec.tasks[0].params == {"saved_option": [1, 2], "mode": "saved"}
-    assert spec.regimes[0].prompts == [("clean", "corrupt")]
+    assert spec.regimes[0].units == [("clean", "corrupt")]
     assert spec.protocol_coverage() == {"status": "described"}
     assert contract.expected_cells(experiment) == {("interactive", "case")}
     assert "protocol_source" not in contract.prepare(spec, tmp_path / "rewritten")["spec"]

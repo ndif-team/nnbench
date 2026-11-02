@@ -75,20 +75,28 @@ reading explicitly checks nothing about the default.
 ## 5a. Hand the backend units, never an engine form
 
 A cell hands each backend primitive the units of one call and nothing about how the engine takes
-them (`isb/backends/base.py`, design.md §12.13 "Unit form"). `patch`, `generate`, `generate_patch`
-and `attribute` take one unit per side; every backend checks that through `Backend.one()` and
-raises `FormError` on more, and the test spy inherits the check, so a cell that passes a batch
-to one of them fails in the no-GPU suite. `run`, `train_patch` and `vjp_batch` take lists. `run`
-hands its list to the engine in the engine's form (HF: one padded batch; vLLM: one invoke per
-prompt), and its `build()` closure takes no arguments. `train_patch` and `vjp_batch` run one padded
-batch on HF and one unit per trace on the async engine, and their closures receive `rows`, the
-indices of the units the current trace holds, to pick their targets. `train_patch`'s step returns
-the loss summed over `rows`, so the gradient is the same in both forms. A cell that drops units
-(taking `prompts[0]` of a several-prompt list), or passes a list because HF would batch it, has
-chosen a form for the engine; on vLLM the recorded error then names the harness's form instead of
-the engine's limit. The DAS train step on PR #17 (2026-10-21) did this: 16-prompt lists to
-`train_patch`, whose contract took one pair, so the async vLLM row recorded "Multiple prompts per
-invoke are not supported" in place of the inference-mode gradient refusal the row exists to record.
+them (`isb/backends/base.py`, design.md §12.13 "Unit form"). Every cell takes `units: list[Unit]`;
+B=1 is a one-element list. `run` and `generate` take a nonempty unit list; `patch`,
+`generate_patch`, `attribute`, `train_patch` and `vjp_batch` take one list per side of equal
+length. Every backend checks that through `Backend.many()` / `Backend.paired()` and raises
+`FormError` on a bare prompt, an empty list or unequal sides, and the test spy inherits the check,
+so a cell in the wrong form fails in the no-GPU suite. The backend runs the list in the engine's
+form (HF: one left-padded batch; the sync vLLM engine: one invoke per unit inside one trace; the
+async engine: one request per unit, gathered), and the closures receive `rows`, the indices of the
+units the current trace holds (`build(rows)`; `step(index)` for each decode step), to pick their
+targets. `train_patch`'s step returns the loss summed over `rows`, so the gradient is the same in
+both forms. A reduction over the sequence must honor the batch: HF's steering `mean_norm` masks the
+pad positions through the attention mask in `model.inputs` and keeps one scale per unit
+(`[B, 1, 1]`); a mean over pad tokens or across prompts is a batch-mixing bug. Read `model.inputs`
+before any block's output: nnsight 0.8 runs the trace body alongside the forward and raises
+`OutOfOrderError` for a module's input once the model has run past it (on 2026-10-24 every HF
+steering row on Qwen3-8B failed until the mask read moved ahead of the block read). A cell that drops
+units (taking `prompts[0]` of a several-prompt list), or passes a list because HF would batch it,
+has chosen a form for the engine; on vLLM the recorded error then names the harness's form instead
+of the engine's limit. The DAS train step on PR #17 (2026-10-21) did this: 16-prompt lists to
+`train_patch`, whose contract then took one pair, so the async vLLM row recorded "Multiple prompts
+per invoke are not supported" in place of the inference-mode gradient refusal the row exists to
+record.
 
 ## 6. Run the new cell before writing anything
 

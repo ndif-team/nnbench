@@ -1,173 +1,230 @@
-"""vLLM **sync** backend infra (design.md §12.3) — the in-process synchronous engine.
+"""vLLM sync backend: nnsight's `VLLM(mode="sync")`, the in-process synchronous engine.
 
-Where `vllm_async` submits a request and drains `tracer.backend` for the finished output's
-nested `.saves`, the SYNC engine runs the trace in-process and pushes saved values back into
-the trace frame — exactly HF's access pattern. So this backend mirrors `hf.py` (read
-`saved.detach()` after the `with`-block), differing only in: `VLLM(mode="sync")` load,
-sampling kwargs on `trace(...)`, vLLM logits shape (`last`), and vLLM engine teardown.
-
-`vllm_sync` is the sync engine mode of the vLLM backend (the engine-mode axis of the L3 sweep,
-design §6), alongside `vllm_async`.
+Several units are one trace with one `tracer.invoke(prompt)` per unit (one request each; the
+engine batches them); a container saved above the invokes gathers them by pre-sized slot. Saved
+values bind back into the trace frame, so this mirrors `hf.py`, differing in the per-invoke form,
+the sampling kwargs and vLLM's flat `[tokens, ...]` shapes.
 """
 from __future__ import annotations
 
 import contextlib
 
+from .base import prompts_of
 from .vllm_base import VLLMBackend
 
-# Greedy, single forward step — the deterministic regime the oracle compares against.
-_SAMPLING = {"temperature": 0.0, "top_p": 1, "max_tokens": 1}
+SAMPLING = {"temperature": 0.0, "top_p": 1, "max_tokens": 1}   # greedy, one step
 
 
 class VLLMSyncBackend(VLLMBackend):
     name = "vllm_sync"
 
-    # dtype + trust_remote_code come from VLLMBackend — the engine-config shared with the async/serve
-    # backends, so the driver can splat the same spec.vllm_kwargs into any of them.
-
     def __init__(self, dtype: str | None = None, trust_remote_code: bool = False,
                  max_model_len: int | None = None, tokenizer: str | None = None,
                  enable_prefix_caching: bool | None = None,
-                 gpu_memory_utilization: float = 0.2):
+                 gpu_memory_utilization: float = 0.2, tensor_parallel_size: int = 1):
         super().__init__(dtype=dtype, trust_remote_code=trust_remote_code,
                          max_model_len=max_model_len, tokenizer=tokenizer,
                          enable_prefix_caching=enable_prefix_caching)
-        # Same role as the async backend's knob: a backend config running the sync engine as
-        # its system under test sizes it through ISB_ENGINE_OPTIONS; the async run's batched twin
-        # passes its own fraction to load().
         self.gpu_memory_utilization = gpu_memory_utilization
+        self.tensor_parallel_size = tensor_parallel_size
 
     def load(self, repo: str, gpu_memory_utilization: float | None = None):
         from nnsight.modeling.vllm import VLLM
 
         if gpu_memory_utilization is None:
             gpu_memory_utilization = self.gpu_memory_utilization
-        return VLLM(
-            repo, mode="sync", dispatch=True,
-            gpu_memory_utilization=gpu_memory_utilization, **self._engine_kwargs(),
-        )
+        kw = self._engine_kwargs()
+        if self.tensor_parallel_size > 1:
+            kw["tensor_parallel_size"] = self.tensor_parallel_size
+        return VLLM(repo, mode="sync", dispatch=True,
+                    gpu_memory_utilization=gpu_memory_utilization, **kw)
 
-    def vanilla(self, model, prompt, *, new_tokens):
-        """A request straight to nnsight's `vllm.LLM` entrypoint with no trace: the same engine and
-        worker, nothing attached."""
-        from vllm import SamplingParams
-
-        model.vllm_entrypoint.generate(
-            [prompt], SamplingParams(temperature=0.0, top_p=1, max_tokens=new_tokens),
-            use_tqdm=False)
-
-    def vanilla_many(self, model, prompts, *, new_tokens):
-        """`vanilla` over several prompts in one `generate` call, which the engine schedules
-        together (`vllm bench throughput`'s request; design.md §12.17)."""
-        from vllm import SamplingParams
-
-        model.vllm_entrypoint.generate(
-            list(prompts), SamplingParams(temperature=0.0, top_p=1, max_tokens=new_tokens),
-            use_tqdm=False)
-
-    def run(self, model, prompts, build):
-        """Single synchronous trace; the saved value binds in-frame (the sync engine
-        push_variables the worker's saves back into the trace frame). N prompts -> the
-        multi-invoke batched path (works on sync; the async submission gate is async-only)."""
-        if isinstance(prompts, (list, tuple)) and len(prompts) > 1:
-            return self.run_batched(model, prompts, build)
-        prompt = prompts[0] if isinstance(prompts, (list, tuple)) else prompts
-        with model.trace(prompt, **_SAMPLING):
-            saved = build().save()
-        return saved.detach().float().cpu()
-
-    def run_batched(self, model, prompts, build):
-        """Batched throughput path: N prompts in ONE sync trace via per-prompt `tracer.invoke`
-        (the documented multi-invoke pattern). Each invoke runs `build()` on its own prompt and
-        stores it in a shared parent-scope list; the per-prompt outputs are concatenated along the
-        batch dim to match HF's `[..., N, vocab]` so the oracle compares per prompt.
-
-        This is the cross-invoke construct the barrier fix unblocked on the sync engine — but
-        SIMPLER than barrier (independent invokes, no cross-invoke value hand-off). vLLM runs each
-        invoke as its OWN request (continuous batching, no left-padding), so unlike HF's padded
-        batch it carries no absolute-position artifact. The async engine cannot do this (the
-        multi-prompt submission gate); the sync engine submits all invokes."""
+    def _collect(self, rows, n, what, keep_dtype=False):
+        """Per-invoke outputs -> one tensor with the units along dim -2 (fp32 unless `keep_dtype`)."""
         import torch
 
-        n = len(prompts)
-        with model.trace(temperature=0.0, top_p=1, max_tokens=1) as tracer:
-            rows = [None] * n
-            rows = rows.save()  # noqa: F841 — parent-scope list; the save collector reads it in-frame
-            for i, p in enumerate(prompts):
-                with tracer.invoke(p):
-                    rows[i] = build()
-        mats = [r.detach().float().cpu() for r in rows if r is not None]
+        mats = [(r.detach() if keep_dtype else r.detach().float()).cpu() for r in rows if r is not None]
         if len(mats) != n:
-            raise RuntimeError(
-                f"vllm_sync batched collected {len(mats)}/{n} per-prompt outputs "
-                "(a multi-invoke submission or save-collection gap)")
-        # each per-prompt output is [..., 1, vocab]; concat on the batch dim -> [..., N, vocab]
+            raise RuntimeError(f"vllm_sync {what} collected {len(mats)}/{n} per-unit outputs")
         return torch.cat(mats, dim=-2) if mats[0].dim() >= 2 else torch.stack(mats)
 
-    def patch(self, model, clean_prompt, corrupted_prompt, capture, patch):
-        """Two-trace activation patching: capture from a clean single-prompt trace, inject in a
-        corrupted one. Two sequential sync traces (like HF), so no multi-invoke/barrier needed."""
-        clean_prompt, corrupted_prompt = self.one(clean_prompt, "patch"), self.one(corrupted_prompt, "patch")
-        with model.trace(clean_prompt, **_SAMPLING):
-            ca = capture().save()
-        clean_act = ca.detach().float().cpu()
-        with model.trace(corrupted_prompt, **_SAMPLING):
-            res = patch(clean_act).save()
-        return res.detach().float().cpu()
+    def run(self, model, prompts, build, *, keep_dtype=False):
+        prompts = self.many(prompts, "run")
+        with model.trace(**SAMPLING) as tracer:
+            rows = [None] * len(prompts)
+            rows = rows.save()                       # pre-sized slots: each invoke merges back its own
+            for i, p in enumerate(prompts):
+                with tracer.invoke(p):
+                    rows[i] = build([i])
+        return self._collect(rows, len(prompts), "run", keep_dtype)
 
-    def attribute(self, model, clean_prompt, corrupt_prompt, acts_of, metric_of, n=None):
-        """The REAL attribution, same flow as HF's — dies at the engine's own first grad refusal
-        (dev: `requires_grad_` raises on the inference tensor; 0.8: the backward session refuses
-        under inference_mode), which is the recorded verdict. A forward-only probe mis-recorded
-        the 0.8 line as SILENTLY_WRONG (its `requires_grad_` is tolerated, so the probe fell
-        through and returned raw activations); see the async twin for the full rationale."""
+    def patch(self, model, clean_prompts, corrupted_prompts, capture, patch):
+        clean_prompts, corrupted_prompts = self.paired(clean_prompts, corrupted_prompts, "patch")
+        n = len(clean_prompts)
+        with model.trace(**SAMPLING) as tracer:     # trace 1: one invoke per clean prompt
+            clean = [None] * n
+            clean = clean.save()
+            for i, p in enumerate(clean_prompts):
+                with tracer.invoke(p):
+                    clean[i] = capture()
+        clean_acts = [c.detach().float().cpu() for c in clean]
+        with model.trace(**SAMPLING) as tracer:     # trace 2: inject each into its corrupted run
+            rows = [None] * n
+            rows = rows.save()
+            for i, p in enumerate(corrupted_prompts):
+                with tracer.invoke(p):
+                    rows[i] = patch(clean_acts[i])
+        return self._collect(rows, n, "patch")
+
+    def train_patch(self, model, source_prompts, base_prompts, capture, step):
+        """Two traces of one invoke per pair: the source captures, then each pair's loss and its
+        backward (`retain_graph=True` on all but the last: nnsight's form for backwards in several
+        invokes of one trace); the engine's own grad refusal is the recorded verdict."""
         import torch
 
-        clean_prompt, corrupt_prompt = self.one(clean_prompt, "attribute"), self.one(corrupt_prompt, "attribute")
-        clean = [None] * n
-        with model.trace(clean_prompt, **_SAMPLING):
-            a = acts_of(model)
-            for L in range(n):
-                clean[L] = a[L].save()
+        sources, bases = self.paired(source_prompts, base_prompts, "train_patch")
+        n = len(sources)
+        with model.trace(**SAMPLING) as tracer:
+            srcs = [None] * n
+            srcs = srcs.save()
+            for i, p in enumerate(sources):
+                with tracer.invoke(p):
+                    srcs[i] = capture()
+        srcs = [s.detach().float().cpu() for s in srcs]
+        with model.trace(**SAMPLING) as tracer:
+            losses = [None] * n
+            losses = losses.save()
+            for i, p in enumerate(bases):
+                with tracer.invoke(p):
+                    loss = step(srcs[i], [i])
+                    losses[i] = loss
+                    with loss.backward(retain_graph=i < n - 1):
+                        pass
+        return torch.stack([l.detach().float().cpu().reshape(()) for l in losses]).sum()
 
-        corrupt = [None] * n
-        grads = [None] * n
-        with model.trace(corrupt_prompt, **_SAMPLING):
-            a = acts_of(model)
-            for L in range(n):
-                a[L].requires_grad_(True)         # dev line: raises here (inference tensor)
-            for L in range(n):
-                corrupt[L] = a[L].save()
-            metric = metric_of(model)
-            with metric.sum().backward():         # 0.8 line: refuses here (inference_mode)
-                for L in range(n - 1, -1, -1):
-                    grads[L] = a[L].grad.save()
+    def vjp_batch(self, model, prompts, acts_of, target_of, make_cotangent, n):
+        """One trace of one invoke per prompt, each taking its own backward (`retain_graph=True` on
+        all but the last); the engine's own grad refusal is the recorded verdict. Returns the `n`
+        per-layer gradients as `[B, seq, d]`."""
+        import torch
 
-        return torch.stack([
-            ((clean[L].float() - corrupt[L].float()) * grads[L].float()).sum().detach().cpu()
-            for L in range(n)
-        ])
+        prompts = self.many(prompts, "vjp_batch")
+        B = len(prompts)
+        with model.trace(**SAMPLING) as tracer:
+            grads = [None] * (B * n)
+            grads = grads.save()                     # slot i * n + L: prompt i, layer L
+            for i, p in enumerate(prompts):
+                with tracer.invoke(p):
+                    acts = acts_of(model)
+                    for a in acts:
+                        a.requires_grad_(True)
+                    target = target_of(model)
+                    metric = (target * make_cotangent(target, [i])).sum()
+                    with metric.backward(retain_graph=i < B - 1):
+                        for L in range(n - 1, -1, -1):
+                            grads[i * n + L] = acts[L].grad
+        return [torch.stack([grads[i * n + L].detach().float().cpu() for i in range(B)])
+                for L in range(n)]
+
+    def attribute(self, model, clean_prompts, corrupt_prompts, acts_of, metric_of, n):
+        """The same flow as HF's; the engine's own first grad refusal is the recorded verdict."""
+        import torch
+
+        pairs = list(zip(*self.paired(clean_prompts, corrupt_prompts, "attribute")))
+        scores = []
+        for i, (clean_prompt, corrupt_prompt) in enumerate(pairs):
+            clean = [None] * n
+            with model.trace(clean_prompt, **SAMPLING):
+                a = acts_of(model)
+                for L in range(n):
+                    clean[L] = a[L].save()
+            corrupt, grads = [None] * n, [None] * n
+            with model.trace(corrupt_prompt, **SAMPLING):
+                a = acts_of(model)
+                for L in range(n):
+                    a[L].requires_grad_(True)
+                for L in range(n):
+                    corrupt[L] = a[L].save()
+                metric = metric_of(model, i)
+                with metric.sum().backward():
+                    for L in range(n - 1, -1, -1):
+                        grads[L] = a[L].grad.save()
+            scores.append(torch.stack([
+                ((clean[L].float() - corrupt[L].float()) * grads[L].float()).sum().detach().cpu()
+                for L in range(n)]))
+        return torch.stack(scores)
+
+    def _step_rows(self, per_unit, new_tokens, what):
+        """One per-step list per unit -> `[new_tokens, B, ...]`."""
+        import torch
+
+        filled = [steps for steps in per_unit if steps is not None]
+        if len(filled) != len(per_unit):
+            raise RuntimeError(f"vllm_sync {what} collected {len(filled)}/{len(per_unit)} units")
+        stacks = []
+        for steps in per_unit:
+            mats = [r.detach().float().cpu() for r in steps if r is not None]
+            if len(mats) != new_tokens:
+                raise RuntimeError(f"vllm_sync {what} collected {len(mats)} per-step rows, "
+                                   f"expected {new_tokens}")
+            stacks.append(torch.stack(mats, dim=0))                 # [new_tokens, 1, ...]
+        return torch.cat(stacks, dim=1)
 
     def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
-        """Per-step decode reads/intervention. With the construct-gap fix, the UNBOUNDED form
-        (`tracer.iter[:]`) preserves its saves on sync (it dropped them all pre-fix), so both
-        realizations collect `new_tokens` rows here."""
-        import torch
+        prompts = self.many(prompts, "generate")
+        with model.trace(temperature=0.0, top_p=1, max_tokens=new_tokens,
+                         min_tokens=new_tokens) as tracer:
+            rows = [None] * len(prompts)
+            rows = rows.save()                       # pre-sized slots: each invoke fills its own
+            for i, p in enumerate(prompts):
+                with tracer.invoke(p):
+                    per_step = []
+                    rows[i] = per_step               # placed before the loop and filled in place
+                    steps = tracer.iter[0:new_tokens] if bounded else tracer.iter[:]
+                    for step in steps:
+                        per_step.append(build_step(step))
+        return self._step_rows(rows, new_tokens, "generation")
 
-        prompt = self.one(prompts, "generate")
-        with model.trace(prompt, temperature=0.0, top_p=1, max_tokens=new_tokens) as tracer:
-            rows = list().save()
-            steps = tracer.iter[0:new_tokens] if bounded else tracer.iter[:]
-            for _step in steps:
-                rows.append(build_step())
-        if len(rows) != new_tokens:
-            raise RuntimeError(
-                f"vllm_sync generation collected {len(rows)} per-step rows, "
-                f"expected {new_tokens}")
-        return torch.cat([r.detach().float().cpu() for r in rows], dim=0)   # [steps, vocab]
+    def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
+                       *, new_tokens, bounded=True):
+        sources, bases = self.paired(source_prompts, base_prompts, "generate_patch")
+        n = len(sources)
+        with model.trace(**SAMPLING) as tracer:
+            clean = [None] * n
+            clean = clean.save()
+            for i, p in enumerate(sources):
+                with tracer.invoke(p):
+                    clean[i] = capture()
+        clean_acts = [c.detach().float().cpu() for c in clean]
+        with model.trace(temperature=0.0, top_p=1, max_tokens=new_tokens,
+                         min_tokens=new_tokens) as tracer:
+            rows = [None] * n
+            rows = rows.save()
+            for i, p in enumerate(bases):
+                with tracer.invoke(p):
+                    per_step = []
+                    rows[i] = per_step
+                    steps = tracer.iter[0:new_tokens] if bounded else tracer.iter[:]
+                    for step in steps:
+                        per_step.append(build_step(clean_acts[i], step))
+        return self._step_rows(rows, new_tokens, "generate_patch")
+
+    def plain(self, model, units, *, new_tokens=1):
+        """One `generate` call to nnsight's `vllm.LLM` entrypoint with no trace, which the engine
+        schedules together."""
+        from vllm import SamplingParams
+
+        model.vllm_entrypoint.generate(
+            prompts_of(units),
+            SamplingParams(temperature=0.0, top_p=1, max_tokens=new_tokens, min_tokens=new_tokens),
+            use_tqdm=False)
 
     def last(self, t):
-        return t[-1:, :]                          # flat [tokens, vocab] -> [1, vocab] (vLLM shape)
+        return t[-1:, :]                          # flat [tokens, vocab] -> [1, vocab]
+
+    def collective_rpc(self, model, method, args=()):
+        """Through `model.vllm_entrypoint`, the `vllm.LLM` nnsight runs (docs/models/vllm.md)."""
+        return model.vllm_entrypoint.collective_rpc(method, args=args)
 
     def teardown(self, model) -> None:
         import gc

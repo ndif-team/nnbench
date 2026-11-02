@@ -1,64 +1,75 @@
-"""Activation harvesting: the residual stream at every prompt token, copied to host memory.
-
-What each read denotes (nnsight 260c555b, transformers 5.12.1, vLLM 0.19.1):
-
-  - HF: a block's output (or its `[0]`) is the residual stream after the block, `[batch, seq, d]`.
-    A batched trace is left-padded to its longest prompt (`TransformersModel._configure_tokenizer`;
-    docs/usage/invoke-and-batching.md, "Every invoke is padded to the whole batch's length"), and
-    each prompt is tokenized on its own by the pipeline's `preprocess`, so prompt i's tokens are the
-    last n_i positions of row i, n_i being its own token count. Pad positions hold computed values,
-    so they are dropped, never exported.
-  - vLLM: a served value is `[tokens, d]` for the request's own rows, with no batch axis and no
-    padding (docs/models/vllm.md, "What your block sees on vLLM"). A fused-residual family's decoder
-    layer returns `(hidden, residual)` and the stream after it is their sum
-    (vllm/model_executor/models/qwen2.py); the default `residual` comes from the family profile.
-
-Both cells copy the read to host memory inside the trace (`.cpu()`): vLLM returns a save on the
-worker's device unless the block moves it, and a served value is the engine's live buffer, which a
-later fused add+norm rewrites, so the copy is also what keeps the read intact (docs/models/vllm.md,
-"Clone what you keep"). The output is `[tokens, d]` in prompt order on both engines, the layout of
-the per-prompt reference. HF collects under `torch.no_grad()`, the documented collection form
-(docs/patterns/probing.md): a trace otherwise runs the forward with autograd on.
-
-`export=False` is the baseline: the same forward, returning each prompt's greedy next token.
-"""
+"""Activation harvesting: the residual stream at every prompt token, copied to host memory,
+`[tokens, d]` in prompt order. HF's batch is left-padded to its longest prompt, so prompt i's tokens
+are the last n_i positions of row i and the pad positions are dropped; vLLM serves each request's
+own `[tokens, d]` with no padding. `export=False` is the baseline: the same forward, returning each
+prompt's greedy next token. `layers`, when given, replaces `layer`: the result is `[len(layers),
+tokens, d]`, each layer's rows in the single-layer order, in the engine's activation dtype."""
 from __future__ import annotations
 
 import torch
 
 from ..profiles import _resid
 from .observations import record_resolved
+from .readout import engine_logits
 from .registry import cell
 
 
+def _layers(layer, layers, export):
+    """The layers a call reads (None for the export=False baseline, which reads none)."""
+    if not export:
+        return None
+    if layers is None and layer is None:
+        raise ValueError("activation_harvest needs `layer` or `layers`")
+    return None if layers is None else list(layers)
+
+
 @cell("activation_harvest", family="*", backend="hf")
-def activation_harvest_hf(be, model, m, prompts, *, layer, export=True, residual="plain"):
-    counts = [len(model.tokenizer(p)["input_ids"]) for p in prompts]
-    if len(prompts) > 1 and model.tokenizer.padding_side != "left":
+def activation_harvest_hf(be, model, m, units, *, layer=None, export=True, residual="plain",
+                          layers=None):
+    counts = [len(model.tokenizer(p)["input_ids"]) for p in units]
+    if len(units) > 1 and model.tokenizer.padding_side != "left":
         raise ValueError(f"the tokenizer pads on the {model.tokenizer.padding_side}; valid tokens are "
                          f"located as each row's last positions, which needs left padding")
+    read = _layers(layer, layers, export)
 
-    def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
-        if not export:
-            return be.last(m.head(model).output).argmax(-1).cpu()
-        h = _resid(m.blocks(model)[layer].output, residual)             # [batch, seq, d]
+    def valid(h, rows):
+        """A padded `[B, seq, d]` stream -> its valid tokens `[tokens, d]`, prompt by prompt."""
         if h.shape[1] != max(counts):
             raise ValueError(f"batch is padded to {h.shape[1]} positions but the longest prompt "
                              f"tokenizes to {max(counts)}; valid tokens cannot be located")
-        return torch.cat([row[row.shape[0] - n:] for row, n in zip(h, counts)]).cpu()
+        return torch.cat([row[row.shape[0] - counts[r]:] for row, r in zip(h, rows)])
+
+    def build(rows):
+        if not export:
+            return be.last(m.head(model).output).argmax(-1, keepdim=True).cpu()     # [B, 1]
+        if read is None:
+            return valid(_resid(m.blocks(model)[layer].output, residual), rows).cpu()   # [tokens, d]
+        blocks = m.blocks(model)
+        return torch.stack([valid(_resid(blocks[i].output, residual), rows)
+                            for i in read])                                # [n_layers, tokens, d]
 
     with torch.no_grad():
-        return be.run(model, prompts, build)
+        if read is None:
+            return be.run(model, units, build)
+        return be.run(model, units, build, keep_dtype=True)
 
 
 @cell("activation_harvest", family="*", backend="vllm_async")
-def activation_harvest_vllm(be, model, m, prompts, *, layer, export=True, residual=None):
+def activation_harvest_vllm(be, model, m, units, *, layer=None, export=True, residual=None,
+                            layers=None):
     residual = residual if residual is not None else m.default_residual(be.name)
     record_resolved(residual=residual)
+    read = _layers(layer, layers, export)
 
-    def build():  # named (not a lambda) so nnsight can source-serialize it to the vLLM worker
+    def build(rows):
         if not export:
-            return model.logits[-1:, :].argmax(-1).cpu()
-        return _resid(m.blocks(model)[layer].output, residual).cpu()    # [tokens, d]
+            return engine_logits(model)[-1:, :].argmax(-1, keepdim=True).cpu()      # [1, 1]
+        if read is None:
+            return _resid(m.blocks(model)[layer].output, residual).cpu()           # [tokens, d]
+        blocks = m.blocks(model)
+        return torch.stack([_resid(blocks[i].output, residual)
+                            for i in read]).cpu()                          # [n_layers, tokens, d]
 
-    return be.run(model, prompts, build)
+    if read is None:
+        return be.run(model, units, build)
+    return be.run(model, units, build, keep_dtype=True)

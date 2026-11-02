@@ -39,6 +39,8 @@ class Family:
     blocks_path: str            # the decoder block list
     norm_path: str              # the final norm before the unembed
     head_path: str = "lm_head"
+    # vLLM's logits processor, the module the lens cells project through on vLLM (no HF counterpart)
+    logits_processor_path: str = "logits_processor"
     # A block-output's DENOTATION is per (family x engine), not per family alone (design §3.2: the
     # same site name means different things per context): HF blocks carry the full residual stream
     # in [0] ("plain") for every family, while vLLM's implementation of RMSNorm families returns
@@ -135,9 +137,15 @@ MODELS = {m.key: m for m in (
     # Qwen3 keeps the Llama tree (q/k norms sit inside self_attn). The 32B is the largest cached
     # checkpoint with full-precision weights (~65 GB in bf16: one 141 GB H200, or an 80 GB card).
     Model("qwen3-32b", "Qwen/Qwen3-32B", "llama", 64, dtype_control="bfloat16"),
-    # 4-bit AWQ (GEMM, group 128); the only 72B weights in the cache (the full-precision repo holds
-    # config and tokenizer only). Loading it on HF needs an AWQ kernel package.
+    # 4-bit AWQ (GEMM, group 128); the only 72B weights in the personal cache. Loading it on HF needs an AWQ kernel package.
+    # Full-precision 72B (145 GB in bf16) lives in the group's shared cache; it needs two H200s:
+    # the */gpu2 and */tp2 configs, with ISB_MODEL_CACHE naming a volume linked to that cache.
+    Model("qwen2.5-72b", "Qwen/Qwen2.5-72B-Instruct", "llama", 80, dtype_control="bfloat16"),
     Model("qwen2.5-72b-awq", "Qwen/Qwen2.5-72B-Instruct-AWQ", "llama", 80, dtype_control="bfloat16"),
+    # Llama-3.3-70B-Instruct in bf16 (132 GiB) from the group's shared cache: four 80 GB A100s,
+    # the */gpu4 and */tp4 configs. Qwen3-8B (same family, one GPU) checks a config before it.
+    Model("llama3.3-70b", "meta-llama/Llama-3.3-70B-Instruct", "llama", 80, dtype_control="bfloat16"),
+    Model("qwen3-8b", "Qwen/Qwen3-8B", "llama", 36, dtype_control="bfloat16"),
     # Text-only checkpoint of a multimodal-wrapper arch: transformers auto-routes it to the text-only
     # ForCausalLM, but nnsight's LanguageModel refuses the repo by model_type (the guard exempts
     # explicit automodels; see HFBackend).

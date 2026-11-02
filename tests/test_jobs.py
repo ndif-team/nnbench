@@ -213,25 +213,33 @@ def test_result_must_account_for_all_cells_and_match_inputs(tmp_path):
         contract.validate_result(output, experiment, "example")
 
 
-def test_discovery_is_directory_based_and_rejects_escape(tmp_path):
-    backend = tmp_path / "backends" / "third-party" / "default"
-    backend.mkdir(parents=True)
-    (backend / "compose.yml").write_text("services: {runner: {image: example}}")
-    (tmp_path / "backends" / "third-party" / "compose.yml").write_text("services: {}")  # not a config
-    assert local.discover(tmp_path) == ["third-party/default"]
-    assert local.backend_file("third-party/default", tmp_path) == backend / "compose.yml"
+def test_discovery_is_the_catalog_and_rejects_escape(tmp_path):
+    system = tmp_path / "backends" / "third-party"
+    system.mkdir(parents=True)
+    (system / "compose.yml").write_text("services: {runner: {image: example}}")
+    (system / "configs.yml").write_text("images: {base: {ENGINE: v1}}\n"
+                                        "configs: {default: {image: base, options: {}}, "
+                                        "tuned/deep: {image: base, options: {k: 1}, gpus: 2}}\n")
+    (tmp_path / "backends" / "stray").mkdir()                      # no configs.yml: not a system
+    assert local.discover(tmp_path) == ["third-party/default", "third-party/tuned/deep"]
+    assert local.compose_file("third-party/default", tmp_path) == system / "compose.yml"
     assert local.canonical("third-party", tmp_path) == "third-party/default"
+    chosen = local.config("third-party/tuned/deep", tmp_path)
+    assert chosen.tag == "isb-third-party-base:local" and chosen.build_args == {"ENGINE": "v1"}
+    assert chosen.options == {"k": 1} and chosen.gpus == 2 and chosen.ranks == 1
     for name in ("../third-party/default", "/tmp", "missing/default", "third-party/child",
-                 "third-party", "third-party/../third-party/default"):
+                 "third-party/../third-party/default", "stray", ""):
         with pytest.raises(ValueError):
-            local.backend_file(name, tmp_path)
+            local.config(name, tmp_path)
 
 
 @pytest.fixture
 def fake_docker(tmp_path, monkeypatch):
-    backend = tmp_path / "backends" / "third-party" / "default"
-    backend.mkdir(parents=True)
-    (backend / "compose.yml").write_text("services: {runner: {image: example}}")
+    system = tmp_path / "backends" / "third-party"
+    system.mkdir(parents=True)
+    (system / "compose.yml").write_text("services: {runner: {image: ${ISB_IMAGE}}}")
+    (system / "configs.yml").write_text("images: {base: {}}\n"
+                                        "configs: {default: {image: base, options: {}}}\n")
     experiment = contract.prepare(specimen(), tmp_path / "job")
     calls = []
     behavior = {"kind": "success"}
@@ -265,9 +273,10 @@ def test_lifecycle_always_cleans_and_validates(tmp_path, fake_docker, kind, stat
     record = local.run_job("third-party/default", tmp_path / "job", experiment, tmp_path / "output", root=tmp_path)
     assert record["status"] == status
     assert record["image_id"] == "sha256:actual-image"
+    launch = next(cmd for cmd in calls if "run" in cmd)
+    assert launch[-1] == "runner"
     assert any("down" in cmd for cmd in calls)
     assert not any("--volumes" in cmd for cmd in calls)
-    assert "third-party" not in next(cmd for cmd in calls if "run" in cmd)[-1:]
     assert json.loads((tmp_path / "output" / "execution.json").read_text())["status"] == status
 
 
@@ -336,6 +345,28 @@ def test_cli_suite_settings_and_overrides():
         _recipe(parser().parse_args(["run", "--suite", "smoke", "--model", "qwen2.5-7b"]))
     with pytest.raises(ValueError, match="--backends"):
         _recipe(parser().parse_args(["run", "--workload", "steering", "--model", "gpt2"]))
+
+
+def test_cli_labels_keep_only_the_listed_rows():
+    run = ["run", "--suite", "nnsight-load-open", "--model", "qwen2.5-7b"]
+    keep = ["add toward ' Rome' at half depth", "every layer, last token",
+            "half depth residual stream, every decode step",
+            "add toward ' Rome' at half depth, every step, scaled by each token's norm"]
+    _, entries, settings = _recipe(parser().parse_args(run))
+    full = {s.name: s for s in cases(entries, settings["realizations"])[0]}
+    args = parser().parse_args([*run, "--labels", *keep])
+    specs, _ = cases(entries, settings["realizations"], labels=args.labels)
+    assert {s.name for s in specs} == set(full)
+    for spec in specs:
+        assert len(spec.tasks) == 1 and spec.tasks[0].label in keep
+        assert spec.tasks[0] in full[spec.name].tasks
+        # the baseline, effect check and regimes are not rows and stay
+        assert (spec.baseline, spec.effect, spec.regimes) == (
+            full[spec.name].baseline, full[spec.name].effect, full[spec.name].regimes)
+    with pytest.raises(ValueError, match="keeps no row of logit_lens"):
+        cases(entries, settings["realizations"], labels=keep[:1] + keep[2:])
+    with pytest.raises(ValueError, match="no case has"):
+        cases(entries, settings["realizations"], labels=[*keep, "add toward ' Paris' at half depth"])
 
 
 def test_cli_records_rows_a_model_cannot_express():

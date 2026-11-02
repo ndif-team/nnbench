@@ -1,8 +1,0 @@
-services:
-  runner:
-    extends: {file: ../compose.base.yml, service: runner}
-    environment:
-      ISB_BACKEND: ${ISB_BACKEND:-vllm-lens/default}
-volumes:
-  model-cache:
-    name: ${ISB_MODEL_CACHE:-isb-model-cache}

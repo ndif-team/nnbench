@@ -425,14 +425,14 @@ def test_aggregate_interactive_scores_over_all_prompts(tmp_path):
 
 def test_pair_unit_workload_aggregates_over_pairs(tmp_path):
     """A patching workload's unit is a (clean, corrupted) PAIR, not a single prompt. Execution runs
-    each pair as its own trace (the cell consumes the 2-element pair) and aggregates the verdict over
-    all pairs, so N pairs stack like N prompts. Here the vllm cell matches hf on 3 of 4 pairs -> top-1
-    0.75 -> NUMERICAL_MISMATCH, which a single-pair check would miss — the multi-trace point, for patching."""
+    each pair as its own call (the cell receives a one-pair unit list) and aggregates the verdict
+    over all pairs, so N pairs stack like N prompts. Here the vllm cell matches hf on 3 of 4 pairs ->
+    top-1 0.75 -> NUMERICAL_MISMATCH, which a single-pair check would miss."""
     pairs = [("c0", "k0"), ("c1", "k1"), ("c2", "k2"), ("c3", "k3")]
 
     def fake(methodology, family, backend):
-        def fn(impl, model, prompts, **params):
-            clean, corrupted = prompts                       # the cell receives the pair as a 2-list
+        def fn(impl, model, units, **params):
+            ((clean, corrupted),) = units                    # one pair unit per call
             i = int(clean[1])                                # "c3" -> 3
             if backend == "vllm_async" and i == 3:
                 return _onehot(7)                            # wrong on the 4th pair only

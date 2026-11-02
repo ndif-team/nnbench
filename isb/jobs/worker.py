@@ -20,6 +20,15 @@ def merge_requirements(required, configured):
 
 def main(create_backend, job=Path("/job"), output=Path("/output")):
     """create_backend(spec) returns (backend instance, descriptive RunConfig)."""
+    if int(os.environ.get("RANK", "0")) > 0:
+        # A torchrun rank other than 0 (HF tensor parallelism): it runs the same job in lockstep so
+        # the collectives line up, but its results duplicate rank 0's and are discarded.
+        with tempfile.TemporaryDirectory(prefix=f"isb-rank{os.environ['RANK']}-") as scratch:
+            return _main(create_backend, job, scratch)
+    return _main(create_backend, job, output)
+
+
+def _main(create_backend, job, output):
     job, output = Path(job), Path(output)
     output.mkdir(parents=True, exist_ok=True)
     identity = {"version": VERSION}
@@ -58,7 +67,7 @@ def main(create_backend, job=Path("/job"), output=Path("/output")):
             metadata = outputs.get(("__meta__",), {})
             cells = []
             requested = expected_cells(experiment)
-            # Alternative realizations the system declared are cells of their own (§12.16).
+            # Alternative realizations the system declared are cells of their own.
             alternatives = {key for key, info in metadata.items()
                             if isinstance(info, dict) and (key[0], info.get("row")) in requested}
             for key in sorted(requested) + sorted(alternatives):
@@ -94,7 +103,7 @@ def main(create_backend, job=Path("/job"), output=Path("/output")):
 
 
 def options():
-    value = json.loads(os.environ.get("ISB_ENGINE_OPTIONS", "{}"))
+    value = json.loads(os.environ.get("ISB_ENGINE_OPTIONS") or "{}")   # unset or empty: none
     if not isinstance(value, dict):
         raise ValueError("ISB_ENGINE_OPTIONS must be a JSON object")
     return value

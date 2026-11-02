@@ -1,7 +1,7 @@
 """vllm_serve backend tests — no GPU.
 
 Covers the backend's own logic: registration, the registry fallback (serve reuses the in-process vLLM
-cell), health polling, the batched-not-yet guard, and the pure tensor/teardown helpers. The full
+cell), health polling, the unit-list form check, and the pure tensor/teardown helpers. The full
 serialize -> POST -> push round-trip needs a meta VLLM model (which requires the CPU platform, i.e. a
 GPU-less container — it crashes on a bare-metal GPU host) plus a live server, so it is exercised by the
 containerized end-to-end test, not here.
@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -58,16 +59,13 @@ def test_last_returns_final_token_row():
     assert torch.equal(out, t[-1:, :])
 
 
-def test_run_rejects_batched_before_touching_model():
+def test_run_refuses_a_bare_prompt_before_touching_model():
+    from isb.backends.base import FormError
+
     be = VLLMServeBackend("http://x")
-    sentinel_model = object()  # must never be touched — the guard fires before model.trace
-    raised = False
-    try:
-        be.run(sentinel_model, ["p1", "p2"], build=None)
-    except NotImplementedError as e:
-        raised = True
-        assert "batched" in str(e).lower()
-    assert raised, "multi-prompt serve must raise NotImplementedError, not silently drop prompts"
+    sentinel_model = object()  # must never be touched: the form check fires before model.trace
+    with pytest.raises(FormError, match="vllm_serve.run takes a nonempty list of units, got str"):
+        be.run(sentinel_model, "p1", build=None)
 
 
 def test_health_wait_returns_on_200():

@@ -52,7 +52,7 @@ class _HF:
         left = model.tokenizer.padding_side == "left"
         batch = torch.stack([torch.cat([pad(a), a] if left else [a, pad(a)]) for a in acts])
         model.trunk.decoder_blocks[1].output = (batch, "attention weights")
-        return build().detach().float().cpu()
+        return build(list(range(len(prompts)))).detach().float().cpu()
 
 
 class _VLLM:
@@ -63,7 +63,7 @@ class _VLLM:
         (prompt,) = prompts
         hidden = _acts(prompt)
         model.trunk.decoder_blocks[1].output = (hidden, 10 * hidden + 3)
-        return build().detach().float().cpu()
+        return build([0]).detach().float().cpu()
 
 
 def test_hf_exports_every_valid_token_in_prompt_order():

@@ -25,6 +25,8 @@ ablation = Workload(
     regimes=(Regime("interactive", DataRef("mib/ioi_prompts", 100)),
              Regime("batched", DataRef("mib/ioi_prompts", 16))),
     baseline={"layer": _HALF, "target": "none"},
+    # circuit discovery over a dataset
+    load_patterns=("offline",),
     effect=Effect(baseline={"layer": _HALF, "target": "none"},
                   perturbed=(Row("attention", {"layer": _HALF, "target": "attn"}, requires=("attn",)),
                              Row("MLP", {"layer": _HALF, "target": "mlp"}, requires=("mlp",)),

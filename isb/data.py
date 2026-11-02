@@ -46,11 +46,18 @@ class Source:
     knobs: dict = field(default_factory=dict)   # per-dataset cell-param defaults
 
 
+def _first(units, n, path):
+    """The first `n` units of a file source (all of them when `n` is not set). Asking for more
+    than the file holds raises, so a run never silently measures fewer units than it states."""
+    if n and n > len(units):
+        raise ValueError(f"{path} holds {len(units)} units; {n} were requested")
+    return units[:n] if n else units
+
+
 def _jlens_loader(slug: str):
     def load(n=None):
         items = json.load(open(_JLENS_DIR / f"{slug}.json"))["items"]
-        prompts = [it["prompt"] for it in items]
-        return prompts[:n] if n else prompts
+        return _first([it["prompt"] for it in items], n, f"data/jlens/{slug}.json")
     return load
 
 
@@ -67,7 +74,7 @@ def _mib_ioi(field_):
             units = [(it["clean"], it["corrupted"], tuple(it["answers"])) for it in items]
         else:
             units = [it["clean"] for it in items]
-        return units[:n] if n else units
+        return _first(units, n, "data/mib/ioi.json")
     return load
 
 
@@ -76,16 +83,14 @@ def _counterfact():
     per-item true/counterfactual targets stay in the file for answer-based metrics."""
     def load(n=None):
         items = json.load(open(_DATA_DIR / "counterfact" / "counterfact.json"))["items"]
-        prompts = [it["prompt"] for it in items]
-        return prompts[:n] if n else prompts
+        return _first([it["prompt"] for it in items], n, "data/counterfact/counterfact.json")
     return load
 
 
 def _wikitext():
     def load(n=None):
         items = json.load(open(_DATA_DIR / "wikitext" / "wikitext.json"))["items"]
-        prompts = [it["prompt"] for it in items]
-        return prompts[:n] if n else prompts
+        return _first([it["prompt"] for it in items], n, "data/wikitext/wikitext.json")
     return load
 
 

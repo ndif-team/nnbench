@@ -1,18 +1,18 @@
-"""vLLM async backend infra (design.md §12.3; the v1-scope decision fixes backends = HF + vLLM-async).
+"""vLLM async backend: nnsight's `VLLM(mode="async")`, the in-process AsyncLLM engine.
 
-`run` owns the `with model.trace(...)` and the async stream in one coroutine; the cell's
-`build()` closure runs inside the trace. After the with-exit submits the request, we
-stream to the finished output and pull the saved value from its nested `.saves`,
-surfacing nnsight's deferred-exception payload as a clean error.
-
-NOTE: multi-prompt under vLLM (continuous batching) is a future step — this handles one
-prompt; the cell interface already accepts a list.
+The async path submits one engine request per trace, so several units run as several single-unit
+coroutines gathered on one persistent event loop; the engine batches them. Each coroutine owns the
+`with model.trace(...)`, drains `tracer.backend` to the finished output and reads the saved value
+from its nested `.saves`.
 """
 from __future__ import annotations
 
 import contextlib
 
+from .base import prompts_of
 from .vllm_base import VLLMBackend
+
+_SAMPLING = {"temperature": 0.0, "top_p": 1, "max_tokens": 1}
 
 
 class VLLMAsyncBackend(VLLMBackend):
@@ -27,44 +27,27 @@ class VLLMAsyncBackend(VLLMBackend):
                  max_model_len: int | None = None,
                  tokenizer: str | None = None,
                  enable_prefix_caching: bool | None = None):
-        # dtype + trust_remote_code + max_model_len are engine-config shared with the sync/serve
-        # backends (see VLLMBackend); the parallelism + memory knobs below are specific to the
-        # in-process async engine.
         super().__init__(dtype=dtype, trust_remote_code=trust_remote_code,
                          max_model_len=max_model_len, tokenizer=tokenizer,
                          enable_prefix_caching=enable_prefix_caching)
-        # Parallelism axes (default 1 == single-GPU, the v1 behaviour). PP>1/TP>1 are forwarded
-        # straight to nnsight's VLLM, which passes them to vLLM. distributed_executor_backend
-        # must be "ray" for multi-node placement; None uses vLLM's default (mp) on one node.
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
         self.distributed_executor_backend = distributed_executor_backend
-        # The 0.2 default is sized for tiny GPT-2; a multi-billion-param model needs a much higher
-        # fraction (e.g. 0.9) just to hold its weights alongside the (max_model_len-capped) KV.
         self.gpu_memory_utilization = gpu_memory_utilization
         self._loop = None
         self._loop_thread = None         # set while a concurrent session runs the loop
 
     def __getstate__(self):
-        # The build closure captures `self.last` (a bound method), so this backend is serialized into
-        # the mediator sent to the worker. The persistent event loop is not picklable (it holds a
-        # `_contextvars.Context`) and the worker never needs it — drop it, and the thread a
-        # concurrent session runs it on, from the pickle.
+        # A build closure captures `self.last`, so this backend travels inside the mediator; the
+        # event loop and its thread are not picklable and the worker never needs them.
         state = self.__dict__.copy()
         state["_loop"] = None
         state["_loop_thread"] = None
         return state
 
     def _run_coro(self, coro):
-        """Drive an async trace on ONE persistent event loop, reused across calls. `asyncio.run`
-        creates AND closes a fresh loop each call, which kills the AsyncLLM engine's background loop
-        and makes the next call raise EngineDeadError — fatal once the engine is amortized across
-        warmup + timed trials (the perf path). So we keep one loop alive for the backend's lifetime.
-
-        We still run each call inside a FRESH copied contextvars Context — exactly what `asyncio.run`
-        does (`copy_context().run(...)`). Without this, `run_until_complete` executes in the live
-        current context and nnsight's mediator serialization captures a `_contextvars.Context`
-        (`TypeError: cannot pickle '_contextvars.Context'`). The copy isolates each call's context."""
+        """Drive a coroutine on the one persistent loop (a fresh loop per call would close the
+        engine's background loop), in a copied contextvars context as `asyncio.run` does."""
         import asyncio
         import contextvars
 
@@ -74,17 +57,21 @@ class VLLMAsyncBackend(VLLMBackend):
             return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
         return contextvars.copy_context().run(self._loop.run_until_complete, coro)
 
-    # Several client threads may submit at once (design.md §12.17): AsyncLLM is a serving engine.
+    def _gather(self, coros):
+        """Run the coroutines together and return their results in order."""
+        import asyncio
+
+        async def _all():
+            return await asyncio.gather(*coros)
+
+        return self._run_coro(_all())
+
+    # Several client threads may submit at once: AsyncLLM is a serving engine.
     concurrent_requests = True
 
     @contextlib.contextmanager
     def concurrent_session(self):
-        """Run the persistent loop on its own thread while clients submit from theirs. Each
-        call's coroutine is scheduled from the client thread, so it runs in a copy of that
-        thread's context (as `run_until_complete` above does). A trace's body runs inside its
-        coroutine up to the `with` exit, which submits it before the first await, so two
-        clients' traces never interleave on the model's one interleaver (nnsight's own server
-        relies on the same property, `nnsight/modeling/vllm/serve/server.py`)."""
+        """Run the persistent loop on its own thread while clients submit from theirs."""
         import asyncio
         import threading
 
@@ -106,120 +93,55 @@ class VLLMAsyncBackend(VLLMBackend):
     def load(self, repo: str, gpu_memory_utilization: float | None = None):
         from nnsight.modeling.vllm import VLLM
 
-        gpu_memory_utilization = (
-            gpu_memory_utilization if gpu_memory_utilization is not None
-            else self.gpu_memory_utilization
-        )
-        kw = self._engine_kwargs()          # dtype + trust_remote_code + max_model_len (shared)
+        if gpu_memory_utilization is None:
+            gpu_memory_utilization = self.gpu_memory_utilization
+        kw = self._engine_kwargs()
         if self.pipeline_parallel_size > 1:
             kw["pipeline_parallel_size"] = self.pipeline_parallel_size
         if self.tensor_parallel_size > 1:
             kw["tensor_parallel_size"] = self.tensor_parallel_size
         if self.distributed_executor_backend is not None:
             kw["distributed_executor_backend"] = self.distributed_executor_backend
-        return VLLM(
-            repo, mode="async", dispatch=True,
-            gpu_memory_utilization=gpu_memory_utilization, **kw,
-        )
+        return VLLM(repo, mode="async", dispatch=True,
+                    gpu_memory_utilization=gpu_memory_utilization, **kw)
 
-    def run(self, model, prompts, build):
-        import asyncio
+    @staticmethod
+    async def _finished(tracer):
+        last = None
+        async for output in tracer.backend:          # the with-exit already submitted the request
+            last = output
+        return last
 
-        if isinstance(prompts, (list, tuple)) and len(prompts) > 1:
-            return self.run_batched(model, prompts, build)        # N prompts -> continuous batching
-        prompt = prompts[0] if isinstance(prompts, (list, tuple)) else prompts
-
-        async def _go():
-            with model.trace(prompt, temperature=0.0, top_p=1, max_tokens=1) as tracer:
-                proxy = build()
-                saved = proxy.save()  # noqa: F841  — the var name IS the async .saves key
-            last = None
-            async for output in tracer.backend:   # with-exit already submitted
-                last = output
-            return self._extract(last)
-
-        return self._run_coro(_go())
-
-    def run_batched(self, model, prompts, build):
-        """Batched throughput path: N prompts in ONE async trace via per-prompt `tracer.invoke`
-        (the documented multi-invoke pattern). Each invoke runs `build()` on its own prompt's
-        activations and stores it in a shared parent-scope list; after draining, the per-prompt
-        outputs are concatenated along the batch dim so they match HF's `[..., N, vocab]` and the
-        oracle can compare per prompt (throughput = N / batch-latency).
-
-        Upstream decided AGAINST async multi-invoke: nnsight's `AsyncVLLMBackend` submits one
-        engine request per trace and raises NotImplementedError for several invokes, pinned by
-        its `test_multi_invoke_raises` (the multi-invoke merge is a sync-engine capability).
-        The sweep therefore routes the batched regime to a sync-mode twin engine
-        (`sweep/execute._load_sync_twin`); this path still runs where no twin can be built
-        (TP/PP runs, twin load failure) and records the engine's refusal — surfaced, not
-        silently passed.
-        """
-        import asyncio
-
+    def _cat(self, mats):
         import torch
 
-        n = len(prompts)
+        return torch.cat(mats, dim=-2) if mats[0].dim() >= 2 else torch.stack(mats)
 
-        async def _go():
-            with model.trace(temperature=0.0, top_p=1, max_tokens=1) as tracer:
-                rows = [None] * n
-                rows = rows.save()  # noqa: F841 — parent-scope list; "rows" is the saves key
-                for i, p in enumerate(prompts):
-                    with tracer.invoke(p):
-                        rows[i] = build()
-            last = None
-            async for output in tracer.backend:
-                last = output
-            collected = self._extract_list(last)                  # ordered, len n (None where not produced)
-            mats = [r.detach().float().cpu() for r in collected if r is not None]
-            if not mats:
-                raise RuntimeError(
-                    "vllm_async batched produced no per-prompt outputs (the async engine "
-                    "runs one request per trace; batched needs the sync-mode twin)"
-                )
-            # each per-prompt output is [..., 1, vocab]; concat on the batch dim -> [..., N, vocab]
-            return torch.cat(mats, dim=-2) if mats[0].dim() >= 2 else torch.stack(mats)
+    def run(self, model, prompts, build, *, keep_dtype=False):
+        prompts = self.many(prompts, "run")
 
-        return self._run_coro(_go())
+        async def one(i, prompt):
+            with model.trace(prompt, **_SAMPLING) as tracer:
+                saved = build([i]).save()  # noqa: F841  (the variable name is the saves key)
+            return self._extract(await self._finished(tracer), keep_dtype)
 
-    def patch(self, model, clean_prompt, corrupted_prompt, capture, patch):
-        import asyncio
+        return self._cat(self._gather([one(i, p) for i, p in enumerate(prompts)]))
 
-        clean_prompt = self.one(clean_prompt, "patch")
-        corrupted_prompt = self.one(corrupted_prompt, "patch")
+    def patch(self, model, clean_prompts, corrupted_prompts, capture, patch):
+        pairs = list(zip(*self.paired(clean_prompts, corrupted_prompts, "patch")))
 
-        async def _go():
-            # both traces in ONE event loop / coroutine: two sequential single-prompt requests on
-            # the same async engine. Avoids the two-`asyncio.run` two-loop hazard, and uses two
-            # separate traces (not two invokes) because vLLM does not share a barrier / cross-invoke
-            # value across invokes — the documented patching recipe (VLLM_GUIDE "Activation Patching").
-            with model.trace(clean_prompt, temperature=0.0, top_p=1, max_tokens=1) as t1:
-                ca = capture().save()  # noqa: F841 — var name IS the async .saves key
-            last1 = None
-            async for output in t1.backend:
-                last1 = output
-            clean_act = self._extract(last1)        # materialized CPU tensor
-
-            with model.trace(corrupted_prompt, temperature=0.0, top_p=1, max_tokens=1) as t2:
+        async def one(clean_prompt, corrupted_prompt):
+            with model.trace(clean_prompt, **_SAMPLING) as t1:
+                ca = capture().save()  # noqa: F841
+            clean_act = self._extract(await self._finished(t1))
+            with model.trace(corrupted_prompt, **_SAMPLING) as t2:
                 res = patch(clean_act).save()  # noqa: F841
-            last2 = None
-            async for output in t2.backend:
-                last2 = output
-            return self._extract(last2)
+            return self._extract(await self._finished(t2))
 
-        return self._run_coro(_go())
+        return self._cat(self._gather([one(c, k) for c, k in pairs]))
 
     def train_patch(self, model, source_prompts, base_prompts, capture, step):
-        """The REAL train step in the async engine's form: one request per trace, so one pair per
-        pair of traces, the gradients of the pairs accumulating on `step`'s trainables (`step` sums
-        the losses of its rows, so the accumulated gradient is HF's padded-batch gradient). On
-        today's vLLM it dies at the engine's own first refusal and that error is the recorded
-        verdict: the dev line raises at the first grad-tracking op on an inference tensor; the 0.8
-        line tolerates `requires_grad_` and refuses at the backward session ("forward runs under
-        torch.inference_mode"). Attempting the real computation (not a probe) keeps the recorded
-        error the engine's own words on every client line, and a line that does support grad
-        would simply work."""
+        """One pair per pair of traces; the pairs' gradients accumulate on `step`'s trainables."""
         import torch
 
         pairs = list(zip(*self.paired(source_prompts, base_prompts, "train_patch")))
@@ -227,291 +149,172 @@ class VLLMAsyncBackend(VLLMBackend):
         async def _go():
             total = torch.zeros(())
             for i, (source_prompt, base_prompt) in enumerate(pairs):
-                with model.trace(source_prompt, temperature=0.0, top_p=1, max_tokens=1) as t1:
-                    s = capture().save()  # noqa: F841 — var name IS the async .saves key
-                last1 = None
-                async for output in t1.backend:
-                    last1 = output
-                src = self._extract(last1)
-
-                with model.trace(base_prompt, temperature=0.0, top_p=1, max_tokens=1) as t2:
+                with model.trace(source_prompt, **_SAMPLING) as t1:
+                    s = capture().save()  # noqa: F841
+                src = self._extract(await self._finished(t1))
+                with model.trace(base_prompt, **_SAMPLING) as t2:
                     loss = step(src, [i])
-                    lv = loss.save()  # noqa: F841 — var name IS the async .saves key
+                    lv = loss.save()  # noqa: F841
                     with loss.backward():
-                        pass                  # grads land on step's external trainables
-                last2 = None
-                async for output in t2.backend:
-                    last2 = output
-                total = total + self._extract(last2).reshape(())
+                        pass
+                total = total + self._extract(await self._finished(t2)).reshape(())
             return total
+
         return self._run_coro(_go())
 
-    def vjp_batch(self, model, prompts, acts_of, target_of, make_cotangent, n=None):
-        """The REAL VJP sweep, same flow as HF — dies at the engine's own first grad refusal
-        (dev: `requires_grad_` on an inference tensor; 0.8: the backward session's
-        inference_mode refusal), which is the recorded verdict. See `train_patch`."""
+    def vjp_batch(self, model, prompts, acts_of, target_of, make_cotangent, n):
         import torch
 
-        prompts = self.many(prompts)
+        prompts = self.many(prompts, "vjp_batch")
 
-        async def _go():
-            per_prompt = []
-            for i, prompt in enumerate(prompts):       # the async engine's form: one request per trace
-                with model.trace(prompt, temperature=0.0, top_p=1, max_tokens=1) as tracer:
-                    grads = [None] * (n or 0)
-                    grads = grads.save()  # noqa: F841 — parent-scope list; "grads" is the saves key
-                    acts = acts_of(model)
-                    for a in acts:
-                        a.requires_grad_(True)
-                    target = target_of(model)
-                    cot = make_cotangent(target, [i])
-                    metric = (target * cot).sum()
-                    with metric.backward():
-                        for L in range(len(acts) - 1, -1, -1):
-                            grads[L] = acts[L].grad
-                last = None
-                async for output in tracer.backend:
-                    last = output
-                (out,) = self._extract_keys(last, ["grads"])
-                per_prompt.append([g.detach().float().cpu() for g in out])
-            if len(per_prompt) == 1:
-                return per_prompt[0]                   # flat [seq, d] per layer, as `last` expects
-            return [torch.stack([p[L] for p in per_prompt]) for L in range(len(per_prompt[0]))]
-        return self._run_coro(_go())
+        async def one(i, prompt):
+            with model.trace(prompt, **_SAMPLING) as tracer:
+                grads = [None] * n
+                grads = grads.save()  # noqa: F841
+                acts = acts_of(model)
+                for a in acts:
+                    a.requires_grad_(True)
+                target = target_of(model)
+                cot = make_cotangent(target, [i])
+                metric = (target * cot).sum()
+                with metric.backward():
+                    for L in range(len(acts) - 1, -1, -1):
+                        grads[L] = acts[L].grad
+            (out,) = self._extract_keys(await self._finished(tracer), ["grads"])
+            return [g.detach().float().cpu() for g in out]
 
-    def attribute(self, model, clean_prompt, corrupt_prompt, acts_of, metric_of, n=None):
-        """The REAL attribution, same flow as HF's — on today's vLLM it dies at the engine's own
-        first grad refusal and that is the recorded verdict (dev: `requires_grad_` raises on the
-        inference tensor; 0.8: `requires_grad_` is tolerated and the backward session refuses
-        under inference_mode). A probe that only ran the forward mis-recorded the 0.8 line as
-        SILENTLY_WRONG: its `requires_grad_` doesn't raise, so the probe fell through and
-        returned raw activations that scored as a wrong attribution. Attempting the real
-        computation keeps every line's verdict the engine's own first error — and a line that
-        supports grad would simply produce the attribution."""
+        per_prompt = self._gather([one(i, p) for i, p in enumerate(prompts)])
+        return [torch.stack([p[L] for p in per_prompt]) for L in range(n)]      # n x [B, seq, d]
+
+    def attribute(self, model, clean_prompts, corrupt_prompts, acts_of, metric_of, n):
+        """The same flow as HF's; the engine's own first grad refusal is the recorded verdict."""
         import torch
 
-        clean_prompt = self.one(clean_prompt, "attribute")
-        corrupt_prompt = self.one(corrupt_prompt, "attribute")
+        pairs = list(zip(*self.paired(clean_prompts, corrupt_prompts, "attribute")))
 
-        async def _go():
-            with model.trace(clean_prompt, temperature=0.0, top_p=1, max_tokens=1) as t1:
-                clean = [None] * (n or 0)
-                clean = clean.save()  # noqa: F841 — parent-scope list; "clean" is the saves key
+        async def one(i, clean_prompt, corrupt_prompt):
+            with model.trace(clean_prompt, **_SAMPLING) as t1:
+                clean = [None] * n
+                clean = clean.save()  # noqa: F841
                 a = acts_of(model)
-                for L in range(len(a)):
+                for L in range(n):
                     clean[L] = a[L]
-            last1 = None
-            async for output in t1.backend:
-                last1 = output
-            (clean_acts,) = self._extract_keys(last1, ["clean"])
-
-            with model.trace(corrupt_prompt, temperature=0.0, top_p=1, max_tokens=1) as t2:
-                corrupt = [None] * (n or 0)
+            (clean_acts,) = self._extract_keys(await self._finished(t1), ["clean"])
+            with model.trace(corrupt_prompt, **_SAMPLING) as t2:
+                corrupt = [None] * n
                 corrupt = corrupt.save()  # noqa: F841
-                grads = [None] * (n or 0)
+                grads = [None] * n
                 grads = grads.save()  # noqa: F841
                 a = acts_of(model)
-                for L in range(len(a)):
-                    a[L].requires_grad_(True)         # dev line: raises here (inference tensor)
-                for L in range(len(a)):
+                for L in range(n):
+                    a[L].requires_grad_(True)
+                for L in range(n):
                     corrupt[L] = a[L]
-                metric = metric_of(model)
-                with metric.sum().backward():         # 0.8 line: refuses here (inference_mode)
-                    for L in range(len(a) - 1, -1, -1):
+                metric = metric_of(model, i)
+                with metric.sum().backward():
+                    for L in range(n - 1, -1, -1):
                         grads[L] = a[L].grad
-            last2 = None
-            async for output in t2.backend:
-                last2 = output
-            corrupt_acts, grad_acts = self._extract_keys(last2, ["corrupt", "grads"])
+            corrupt_acts, grad_acts = self._extract_keys(await self._finished(t2), ["corrupt", "grads"])
             return torch.stack([
                 ((clean_acts[L].float() - corrupt_acts[L].float()) * grad_acts[L].float())
-                .sum().detach().cpu()
-                for L in range(n)
-            ])
-        return self._run_coro(_go())
+                .sum().detach().cpu() for L in range(n)])
+
+        return torch.stack(self._gather([one(i, c, k) for i, (c, k) in enumerate(pairs)]))
 
     def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
         import torch
 
-        prompt = self.one(prompts, "generate")
+        prompts = self.many(prompts, "generate")
 
-        async def _go():
-            with model.trace(prompt, temperature=0.0, top_p=1, max_tokens=new_tokens) as tracer:
-                rows = list().save()  # noqa: F841 — "rows" is the async .saves key; create the
-                # list in THIS frame and let build_step mutate it: the saves collector reads
-                # trace-frame locals, a save made in a nested frame is silently lost
+        async def one(prompt):
+            with model.trace(prompt, temperature=0.0, top_p=1, max_tokens=new_tokens,
+                             min_tokens=new_tokens) as tracer:
+                rows = list().save()  # noqa: F841  (made in the trace frame; appended per step)
                 steps = tracer.iter[0:new_tokens] if bounded else tracer.iter[:]
-                for _step in steps:
-                    rows.append(build_step())
-            last = None
-            async for output in tracer.backend:
-                last = output
-            return self._extract_step_rows(last, new_tokens, "generation")
+                for step in steps:
+                    rows.append(build_step(step))
+            return self._extract_step_rows(await self._finished(tracer), new_tokens, "generation")
 
-        return self._run_coro(_go())
+        return torch.cat(self._gather([one(p) for p in prompts]), dim=1)
 
-    def _extract_step_rows(self, last, new_tokens, what):
-        """Pull the per-step `rows` list off a finished generation output and stack it
-        `[steps, vocab]`. Shared by `generate` and `generate_patch` — both build a saved `rows`
-        list in the trace frame and append one per-step proxy per decode step."""
+    def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
+                       *, new_tokens, bounded=True):
         import torch
 
-        if not hasattr(last, "saves"):
-            # the unbounded realization: the vLLM path never sets a stop bound, the loop overruns
-            # and is unwound by Cancelation BEFORE the body's final push — the finished output
-            # carries no saves (unbounded tracer.iter[:] drops all per-step saves on vLLM;
-            # nnsight vllm-construct-gaps §1)
-            raise RuntimeError(
-                f"vllm_async {what}: finished output carried no saves — unbounded tracer.iter[:] "
-                "drops all per-step saves on the vLLM path"
-            )
-        saves = last.saves
-        while (
-            isinstance(saves, dict)
-            and len(saves) == 1
-            and isinstance(next(iter(saves.values())), dict)
-            and not {"type_name", "message", "traceback"} <= set(saves)
-        ):
-            saves = next(iter(saves.values()))
-        if isinstance(saves, dict) and {"type_name", "message", "traceback"} <= set(saves):
-            msg = (saves.get("message") or "").strip().splitlines()
-            raise RuntimeError(
-                f"worker intervention: {msg[-1] if msg else saves['type_name']}"
-            )
-        v = saves["rows"] if isinstance(saves, dict) and "rows" in saves else (
-            next(iter(saves.values())) if isinstance(saves, dict) else saves
-        )
-        mats = [r.detach().float().cpu() for r in v if r is not None]
-        if len(mats) != new_tokens:
-            raise RuntimeError(
-                f"vllm_async {what} collected {len(mats)} per-step rows, expected {new_tokens}")
-        return torch.cat(mats, dim=0)                 # per-step [1, vocab] -> [steps, vocab]
+        pairs = list(zip(*self.paired(source_prompts, base_prompts, "generate_patch")))
 
-    def generate_patch(self, model, source_prompt, base_prompt, capture, build_step,
-                       *, new_tokens, bounded=True):
-        source_prompt = self.one(source_prompt, "generate_patch")
-        base_prompt = self.one(base_prompt, "generate_patch")
-
-        async def _go():
-            # trace 1: capture the source residual (single forward), like patch()'s clean trace
-            with model.trace(source_prompt, temperature=0.0, top_p=1, max_tokens=1) as t1:
-                ca = capture().save()  # noqa: F841 — var name IS the async .saves key
-            last1 = None
-            async for output in t1.backend:
-                last1 = output
-            clean_act = self._extract(last1)          # materialized CPU tensor
-
-            # trace 2: generate the base prompt, injecting clean_act at prefill + reading per-step
-            with model.trace(base_prompt, temperature=0.0, top_p=1, max_tokens=new_tokens) as tracer:
-                rows = list().save()  # noqa: F841 — build the list HERE; build_step mutates it
+        async def one(source_prompt, base_prompt):
+            with model.trace(source_prompt, **_SAMPLING) as t1:
+                ca = capture().save()  # noqa: F841
+            clean_act = self._extract(await self._finished(t1))
+            with model.trace(base_prompt, temperature=0.0, top_p=1, max_tokens=new_tokens,
+                             min_tokens=new_tokens) as tracer:
+                rows = list().save()  # noqa: F841
                 steps = tracer.iter[0:new_tokens] if bounded else tracer.iter[:]
-                for _step in steps:
-                    rows.append(build_step(clean_act))
-            last = None
-            async for output in tracer.backend:
-                last = output
-            return self._extract_step_rows(last, new_tokens, "generate_patch")
+                for step in steps:
+                    rows.append(build_step(clean_act, step))
+            return self._extract_step_rows(await self._finished(tracer), new_tokens, "generate_patch")
 
-        return self._run_coro(_go())
+        return torch.cat(self._gather([one(s, b) for s, b in pairs]), dim=1)
 
-    def vanilla(self, model, prompt, *, new_tokens):
-        """A request straight to nnsight's AsyncLLM entrypoint with no trace: the same engine and
-        worker, nothing attached."""
+    def plain(self, model, units, *, new_tokens=1):
+        """One request per prompt straight to nnsight's AsyncLLM entrypoint, submitted together."""
         import uuid
 
         from vllm import SamplingParams
 
-        params = SamplingParams(temperature=0.0, top_p=1, max_tokens=new_tokens)
-
-        async def _go():
-            async for _ in model.vllm_entrypoint.generate(prompt, params, uuid.uuid4().hex):
-                pass
-
-        self._run_coro(_go())
-
-    def vanilla_many(self, model, prompts, *, new_tokens):
-        """`vanilla` over several prompts submitted together, which the engine batches."""
-        import asyncio
-        import uuid
-
-        from vllm import SamplingParams
-
-        params = SamplingParams(temperature=0.0, top_p=1, max_tokens=new_tokens)
+        params = SamplingParams(temperature=0.0, top_p=1, max_tokens=new_tokens,
+                                min_tokens=new_tokens)
 
         async def one(prompt):
             async for _ in model.vllm_entrypoint.generate(prompt, params, uuid.uuid4().hex):
                 pass
 
-        async def _go():
-            await asyncio.gather(*(one(p) for p in prompts))
-
-        self._run_coro(_go())
+        self._gather([one(p) for p in prompts_of(units)])
 
     def last(self, t):
         return t[-1:, :]                          # flat [tokens, vocab] -> [1, vocab]
 
+    def collective_rpc(self, model, method, args=()):
+        """Through `model.vllm_entrypoint`, the `AsyncLLM` nnsight runs (docs/models/vllm.md), on
+        the backend's persistent loop."""
+        return self._run_coro(model.vllm_entrypoint.collective_rpc(method, args=args))
+
+    def _saves(self, out, what):
+        """The finished output's flat `{name: value}` saves. nnsight 0.8 raises a worker error
+        itself; nnsight 0.7 returns it in the saves as `__nnsight_exceptions__: {request_id:
+        {type_name, message, traceback, is_control_flow}}`, raised here as nnsight's own client
+        does, skipping control-flow entries such as `tracer.stop()`."""
+        if not hasattr(out, "saves"):
+            raise RuntimeError(f"vllm_async {what}: the finished output carried no saves")
+        saves = dict(out.saves)
+        for error in saves.pop("__nnsight_exceptions__", {}).values():
+            if not error.get("is_control_flow", False):
+                lines = (error.get("message") or "").strip().splitlines()
+                raise RuntimeError(f"worker intervention: {lines[-1] if lines else error['type_name']}")
+        return saves
+
     def _extract_keys(self, out, keys):
-        """Unwrap `.saves` like `_extract` (same nesting + worker-error surfacing), then return
-        the values for `keys` (saves are keyed by the trace body's variable names)."""
-        saves = out.saves
-        while (
-            isinstance(saves, dict)
-            and len(saves) == 1
-            and isinstance(next(iter(saves.values())), dict)
-            and not {"type_name", "message", "traceback"} <= set(saves)
-        ):
-            saves = next(iter(saves.values()))
-        if isinstance(saves, dict) and {"type_name", "message", "traceback"} <= set(saves):
-            msg = (saves.get("message") or "").strip().splitlines()
-            raise RuntimeError(
-                f"worker intervention: {msg[-1] if msg else saves['type_name']}"
-            )
+        saves = self._saves(out, "trace")
         return [saves[k] for k in keys]
 
-    def _extract(self, out):
-        saves = out.saves
-        while (
-            isinstance(saves, dict)
-            and len(saves) == 1
-            and isinstance(next(iter(saves.values())), dict)
-        ):
-            saves = next(iter(saves.values()))
-        if isinstance(saves, dict) and {"type_name", "message", "traceback"} <= set(saves):
-            msg = (saves.get("message") or "").strip().splitlines()
-            raise RuntimeError(
-                f"worker intervention: {msg[-1] if msg else saves['type_name']}"
-            )
+    def _extract(self, out, keep_dtype=False):
+        saves = self._saves(out, "trace")
         v = saves["saved"] if "saved" in saves else next(iter(saves.values()))
-        return v.detach().float().cpu()
+        return (v.detach() if keep_dtype else v.detach().float()).cpu()
 
-    def _extract_list(self, out):
-        """Like `_extract` but the saved value is the batched per-prompt list (`rows`); return it as
-        a Python list (one entry per invoke; entries may be None if not produced)."""
-        if not hasattr(out, "saves"):
-            # nnsight attaches `.saves` only on a finished output whose saves were collected. A
-            # multi-invoke batched trace currently submits fewer requests than invokes upstream, so
-            # the list is never collected — surface that clearly rather than as a raw AttributeError.
+    def _extract_step_rows(self, out, new_tokens, what):
+        """The per-step `rows` of one request -> `[new_tokens, 1, ...]`."""
+        import torch
+
+        saves = self._saves(out, what)
+        v = saves["rows"] if isinstance(saves, dict) and "rows" in saves else (
+            next(iter(saves.values())) if isinstance(saves, dict) else saves)
+        mats = [r.detach().float().cpu() for r in v if r is not None]
+        if len(mats) != new_tokens:
             raise RuntimeError(
-                "vllm_async batched: finished output carried no saves — the engine submitted fewer "
-                "requests than invokes (awaiting the upstream async multi-prompt submission fix)"
-            )
-        saves = out.saves
-        while (
-            isinstance(saves, dict)
-            and len(saves) == 1
-            and isinstance(next(iter(saves.values())), dict)
-            and not {"type_name", "message", "traceback"} <= set(saves)
-        ):
-            saves = next(iter(saves.values()))
-        if isinstance(saves, dict) and {"type_name", "message", "traceback"} <= set(saves):
-            msg = (saves.get("message") or "").strip().splitlines()
-            raise RuntimeError(
-                f"worker intervention: {msg[-1] if msg else saves['type_name']}"
-            )
-        v = saves.get("rows") if isinstance(saves, dict) and "rows" in saves else (
-            next(iter(saves.values())) if isinstance(saves, dict) else saves
-        )
-        return list(v) if isinstance(v, (list, tuple)) else [v]
+                f"vllm_async {what} collected {len(mats)} per-step rows, expected {new_tokens}")
+        return torch.stack(mats, dim=0)
 
     def teardown(self, model) -> None:
         import asyncio
@@ -521,9 +324,8 @@ class VLLMAsyncBackend(VLLMBackend):
 
         with contextlib.suppress(Exception):
             model.vllm_entrypoint.shutdown()
-        if self._loop is not None and not self._loop.is_closed():   # close the loop AFTER engine shutdown
-            # shutdown cancels engine handlers; let their finally blocks run before closing
-            # the loop (otherwise vLLM reports "Event loop is closed" during container exit).
+        if self._loop is not None and not self._loop.is_closed():
+            # let the engine handlers' finally blocks run before the loop closes
             async def drain():
                 pending = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
                 for task in pending:

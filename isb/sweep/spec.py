@@ -1,4 +1,4 @@
-"""Benchmark definitions (design.md §12.16).
+"""Benchmark definitions.
 
 Authoring form: a ``Workload`` (methodology, semantic ``Row`` s, ``Regime`` s with default data,
 baseline, ``Effect``) names no model and no system. ``instantiate(workload, model)`` resolves it on
@@ -23,14 +23,14 @@ class ExecutionRegime:
     """An input regime. Batching is a coverage axis (it can change correctness), so each workload is
     oracle-checked in its own regime, not just timed.
 
-    `prompts` is either a literal unit list (the bespoke single-trace specs) or a `DataRef` naming a
+    `units` is either a literal unit list (the bespoke single-trace specs) or a `DataRef` naming a
     registered source (isb/data.py) — data is a replaceable feed, so the same procedure runs any
-    compatible dataset. A DataRef resolves at construction: its units land in `.prompts` and its
+    compatible dataset. A DataRef resolves at construction: its units land in `.units` and its
     per-dataset cell-param defaults in `.data_knobs` (injected UNDER task params by the driver, so
     an explicit task param always wins)."""
-    kind: str                 # "interactive" (N independent prompts) | "batched" (N prompts) |
+    kind: str                 # "interactive" (N independent units) | "batched" (N units) |
                               # "generation" (greedy multi-token decode; cells read/intervene per step)
-    prompts: object           # list of units, or a DataRef
+    units: object           # list of units, or a DataRef
     new_tokens: int = 0       # generation: decode steps per prompt; injected into cell params by the
                               # driver (the regime axis lives here, not in every task dict)
     aggregate: bool = True    # interactive/generation: run each prompt as its OWN trace and score the
@@ -40,21 +40,23 @@ class ExecutionRegime:
                               # maps).
     data_knobs: dict = field(default_factory=dict)
     data_name: str | None = None
-    # Load patterns (design.md §12.17). offline: the units issued as one sweep, `batch_size` units
+    # Load patterns. offline: the units issued as one sweep, `batch_size` units
     # per call (None = every unit in one call). concurrent: `concurrency` clients each issuing one
-    # unit per call until the units run out. Both keep the outputs of the first `score_units`
-    # units for scoring; the rest are timed only.
+    # unit per call until the units run out. open: one-unit requests arriving at `rate` per second
+    # whatever the system does. All keep the outputs of the first `score_units` units for scoring;
+    # the rest are timed only.
     batch_size: int | None = None
     concurrency: int = 0
+    rate: float = 0.0
     score_units: int = 16
     passes: int = 1           # load patterns: timed sweeps over all units, after one warm-up
 
     def __post_init__(self):
         from ..data import DataRef, load_data
 
-        if isinstance(self.prompts, DataRef):
-            ref = self.prompts
-            self.prompts, knobs = load_data(ref)
+        if isinstance(self.units, DataRef):
+            ref = self.units
+            self.units, knobs = load_data(ref)
             self.data_knobs = {**knobs, **self.data_knobs}
             self.data_name = ref.name
         if self.kind == "generation" and self.new_tokens <= 0:
@@ -67,30 +69,45 @@ class ExecutionRegime:
             raise ValueError("offline batch_size must be positive, or None for every unit at once")
         if self.kind == "concurrent" and self.concurrency < 1:
             raise ValueError("concurrent regime needs concurrency>=1")
-        if self.kind in ("offline", "concurrent") and (self.score_units < 1 or self.passes < 1):
+        if self.kind == "open" and not (self.rate > 0 and _RATE.fullmatch(f"{self.rate:g}")):
+            raise ValueError(f"open regime needs a positive rate written without an exponent, "
+                             f"got {self.rate!r}")
+        if self.kind in LOAD_KINDS and (self.score_units < 1 or self.passes < 1):
             raise ValueError("score_units and passes must be positive")
 
     @property
     def name(self) -> str:
         """The regime's key in outputs and records (see `regime_name`)."""
-        return regime_name(self.kind, self.batch_size, self.concurrency)
+        return regime_name(self.kind, vars(self))
 
 
-REGIME_KINDS = ("interactive", "batched", "generation", "offline", "concurrent")
-LOAD_KINDS = ("offline", "concurrent")
-# ExecutionRegime fields only the load patterns use; other regimes' records leave them out, so
-# their experiment identity is unchanged by the load patterns' existence.
-LOAD_FIELDS = ("batch_size", "concurrency", "score_units", "passes")
-_LOAD_NAME = re.compile(r"(offline/(all|b[1-9][0-9]*)|concurrent/c[1-9][0-9]*)")
+REGIME_KINDS = ("interactive", "batched", "generation", "offline", "concurrent", "open")
+# ExecutionRegime fields each load pattern records; other regimes' records leave every load field
+# out, and each load pattern leaves out the others', so adding a pattern changes no existing
+# experiment identity.
+LOAD_FIELDS = {
+    "offline": ("batch_size", "concurrency", "score_units", "passes"),
+    "concurrent": ("batch_size", "concurrency", "score_units", "passes"),
+    "open": ("rate", "score_units", "passes"),
+}
+LOAD_KINDS = tuple(LOAD_FIELDS)
+ALL_LOAD_FIELDS = tuple(dict.fromkeys(f for fields in LOAD_FIELDS.values() for f in fields))
+_RATE = re.compile(r"(0|[1-9][0-9]*)(\.[0-9]+)?")
+_LOAD_NAME = re.compile(rf"(offline/(all|b[1-9][0-9]*)|concurrent/c[1-9][0-9]*|open/r{_RATE.pattern})")
 
 
-def regime_name(kind: str, batch_size: int | None = None, concurrency: int = 0) -> str:
+def regime_name(kind: str, settings=None) -> str:
     """A regime's key: its kind, plus the load setting for a load pattern, so one run can hold
-    several (`offline/b16`, `offline/all`, `concurrent/c4`; design.md §12.17)."""
+    several (`offline/b16`, `offline/all`, `concurrent/c4`, `open/r8`).
+    `settings` maps the load fields (a regime record, its `load` object, or `vars(regime)`)."""
+    settings = settings or {}
     if kind == "offline":
+        batch_size = settings.get("batch_size")
         return f"offline/{'all' if batch_size is None else f'b{batch_size}'}"
     if kind == "concurrent":
-        return f"concurrent/c{concurrency}"
+        return f"concurrent/c{settings.get('concurrency', 0)}"
+    if kind == "open":
+        return f"open/r{settings.get('rate', 0):g}"
     return kind
 
 
@@ -165,7 +182,7 @@ class CellConfig:
     # checked against the loaded model when set (instantiate sets it from the model row)
     n_layers: int | None = None
     # "default": each row runs the system's documented realization only; "all": also every
-    # alternative the system's cell registration declares (design.md §12.16)
+    # alternative the system's cell registration declares
     realizations: str = "default"
     protocol: InterventionSpec | None = None    # defaults to the methodology's PROTOCOLS entry
     protocol_absence_reason: str | None = None  # required when no protocol describes the methodology
@@ -218,7 +235,7 @@ def spec_with_data(spec: CellConfig, ref) -> CellConfig:
     units, knobs = load_data(ref)
     rebound = []
     for w in spec.regimes:
-        u0 = w.prompts[0] if w.prompts else None
+        u0 = w.units[0] if w.units else None
         current = ("pair_labeled" if isinstance(u0, tuple) and len(u0) == 3
                    else "pair" if isinstance(u0, tuple) else "prompt")
         if unit_kind(ref.name) != current:
@@ -228,12 +245,12 @@ def spec_with_data(spec: CellConfig, ref) -> CellConfig:
         if w.kind == "batched":
             rebound.append(ExecutionRegime("batched", units[:16],
                                            data_knobs=dict(knobs), data_name=ref.name))
-        elif w.kind in ("offline", "concurrent"):     # a load pattern keeps its unit count
-            rebound.append(ExecutionRegime(w.kind, list(units[:len(w.prompts)]),
+        elif w.kind in LOAD_KINDS:                    # a load pattern keeps its unit count
+            rebound.append(ExecutionRegime(w.kind, list(units[:len(w.units)]),
                                            new_tokens=w.new_tokens, aggregate=w.aggregate,
                                            data_knobs=dict(knobs), data_name=ref.name,
                                            batch_size=w.batch_size, concurrency=w.concurrency,
-                                           score_units=w.score_units, passes=w.passes))
+                                           rate=w.rate, score_units=w.score_units, passes=w.passes))
         else:
             rebound.append(ExecutionRegime(w.kind, list(units), new_tokens=w.new_tokens,
                                            aggregate=w.aggregate,
@@ -242,7 +259,7 @@ def spec_with_data(spec: CellConfig, ref) -> CellConfig:
         spec, name=f"{spec.name}@{ref.name.replace('/', '-')}", regimes=rebound)
 
 
-# ---- workloads (design.md §12.16) ---------------------------------------------------------------
+# ---- workloads ---------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Depth:
@@ -255,6 +272,32 @@ class Depth:
 
     def resolve(self, n_layers: int) -> int:
         return min(int(round(self.f * n_layers)), n_layers - 1)
+
+
+@dataclass(frozen=True)
+class FirstLayers:
+    """The first layers of the model, `list(range(k))`. `k` is `count` when given, else
+    `round(fraction * n_layers)`, at least one layer. `below_final` caps `k` at `n_layers - 1`,
+    for a write that must leave the final (readout) layer unedited."""
+    fraction: float | None = None
+    count: int | None = None
+    below_final: bool = False
+
+    def __post_init__(self):
+        if (self.fraction is None) == (self.count is None):
+            raise ValueError("FirstLayers takes exactly one of fraction and count")
+        if self.fraction is not None and not 0.0 < self.fraction <= 1.0:
+            raise ValueError("layer fraction must be within (0, 1]")
+        if self.count is not None and self.count < 1:
+            raise ValueError("layer count must be positive")
+
+    def resolve(self, n_layers: int) -> list:
+        k = self.count if self.count is not None else max(1, int(round(self.fraction * n_layers)))
+        if self.below_final:
+            k = min(k, n_layers - 1)
+        if k > n_layers:
+            raise ValueError(f"{k} layers requested of a {n_layers}-layer model")
+        return list(range(k))
 
 
 @dataclass(frozen=True)
@@ -285,7 +328,7 @@ class Regime:
 
 @dataclass(frozen=True)
 class Offline:
-    """MLPerf Offline / `vllm bench throughput` (design.md §12.17): `units` units of the workload's
+    """MLPerf Offline / `vllm bench throughput`: `units` units of the workload's
     batched regime's data issued as one sweep, `batch_size` units per call (None = every unit in
     one call, the engine schedules them). One regime per entry of `batch_sizes`."""
     units: int
@@ -295,13 +338,23 @@ class Offline:
 
 @dataclass(frozen=True)
 class Concurrent:
-    """Closed-loop serving (`vllm bench serve --max-concurrency`, AIPerf's concurrency sweep;
-    design.md §12.17): `units` units of the workload's single-unit regime (interactive, else
+    """Closed-loop serving (`vllm bench serve --max-concurrency`, AIPerf's concurrency sweep):
+    `units` units of the workload's single-unit regime (interactive, else
     generation), with `c` clients each issuing one unit per call until none are left. One regime
     per entry of `concurrency`."""
     units: int
     concurrency: tuple = (1,)
-    passes: int = 1           # one sweep of `units` requests gives the latency distribution
+    passes: int = 3
+
+
+@dataclass(frozen=True)
+class Open:
+    """Open-loop serving (MLPerf Server, `vllm bench serve --request-rate`):
+    `units` units of the workload's single-unit regime arriving as a seeded Poisson process at
+    `rate` requests per second, whatever the system is doing. One regime per entry of `rates`."""
+    units: int
+    rates: tuple = (1.0,)
+    passes: int = 3
 
 
 @dataclass(frozen=True)
@@ -324,9 +377,16 @@ class Workload:
     effect: Optional[Effect] = None
     warmup: int = 3
     n_trials: int = 7
+    # The load patterns (LOAD_KINDS) that match how this methodology is used: offline for dataset
+    # studies, concurrent and open for interventions on live traffic. A suite's
+    # load applies only to the workloads that declare it.
+    load_patterns: tuple = ()
 
     def __post_init__(self):
-        # Workload params are semantics only; a realization belongs to the system (§12.16).
+        if not set(self.load_patterns) <= set(LOAD_KINDS):
+            raise ValueError(f"workload {self.name!r}: unknown load patterns "
+                             f"{sorted(set(self.load_patterns) - set(LOAD_KINDS))}")
+        # Workload params are semantics only; a realization belongs to the system.
         protocol = protocol_for(self.methodology)
         declared = [row.params for row in self.rows] + [self.baseline]
         if self.effect is not None:
@@ -349,6 +409,8 @@ class NotApplicable(Exception):
 
 def _resolve(value, model, needs: set):
     if isinstance(value, Depth):
+        return value.resolve(model.n_layers)
+    if isinstance(value, FirstLayers):
         return value.resolve(model.n_layers)
     if isinstance(value, Asset):
         needs.add(f"asset:{value.name}")
@@ -402,27 +464,45 @@ def _resized(data, units):
 
 
 def _load_regimes(workload: Workload, load):
-    """The regimes a load pattern derives from `workload`'s own regimes, or the reason it has none.
-    Offline needs a batched regime (cells that take several units per call); concurrent needs a
-    single-unit regime (interactive, else generation). The derived regime keeps the template's data
-    source, resized to the load's unit count, and its decode length."""
-    if isinstance(load, Offline):
-        template = next((r for r in workload.regimes if r.kind == "batched"), None)
+    """The regimes a load pattern derives from `workload`'s own regimes, and the reason for any it
+    leaves out (None when there is none). A load the workload does not declare derives nothing.
+    Offline sweeps the batched regime's data (else the single-unit regime's, else the first
+    interactive regime's), B units per call for every requested B: every cell takes a unit list.
+    A whole-list regime (`aggregate=False`: the cell reduces its units to one output) has no
+    per-unit outputs to chunk, so it sweeps at B=1 only. Concurrent and open issue the single-unit
+    regime's units. The derived regime keeps the template's data source, resized to the load's
+    unit count, and its decode length."""
+    kind = {Offline: "offline", Concurrent: "concurrent", Open: "open"}.get(type(load))
+    if kind is None:
+        raise TypeError(f"unknown load pattern {load!r}")
+    if kind not in workload.load_patterns:
+        return [], (f"{kind} does not match how this workload is used (its load patterns: "
+                    f"{', '.join(workload.load_patterns) or 'none'})")
+    single = next((r for k in ("interactive", "generation") for r in workload.regimes
+                   if r.kind == k and r.aggregate), None)
+    if kind == "offline":
+        template = next((r for r in workload.regimes if r.kind == "batched"), None) or single or next(
+            (r for r in workload.regimes if r.kind == "interactive"), None)
         if template is None:
-            return [], "offline needs a batched regime (this workload's cells take one unit per call)"
+            return [], "offline needs a batched or single-unit regime"
+        sizes, reason = load.batch_sizes, None
+        if template.kind != "batched" and not template.aggregate:
+            sizes = tuple(b for b in load.batch_sizes if b == 1)
+            if len(sizes) < len(load.batch_sizes):
+                reason = ("this workload's cell reduces its whole unit list to one output, so "
+                          "offline runs at B=1 only")
         return [ExecutionRegime("offline", _resized(template.data, load.units), batch_size=b,
-                                passes=load.passes)
-                for b in load.batch_sizes], None
-    if isinstance(load, Concurrent):
-        template = next((r for kind in ("interactive", "generation") for r in workload.regimes
-                         if r.kind == kind and r.aggregate), None)
-        if template is None:
-            return [], "concurrent needs a single-unit interactive or generation regime"
-        return [ExecutionRegime("concurrent", _resized(template.data, load.units),
-                                new_tokens=template.new_tokens, concurrency=c,
-                                passes=load.passes)
+                                new_tokens=template.new_tokens, passes=load.passes)
+                for b in sizes], reason
+    if single is None:
+        return [], f"{kind} needs a single-unit interactive or generation regime"
+    if kind == "concurrent":
+        return [ExecutionRegime("concurrent", _resized(single.data, load.units),
+                                new_tokens=single.new_tokens, concurrency=c, passes=load.passes)
                 for c in load.concurrency], None
-    raise TypeError(f"unknown load pattern {load!r}")
+    return [ExecutionRegime("open", _resized(single.data, load.units), new_tokens=single.new_tokens,
+                            rate=float(r), passes=load.passes)
+            for r in load.rates], None
 
 
 def instantiate(workload: Workload, model, *, data=None, size=None, regimes=None,
@@ -430,8 +510,8 @@ def instantiate(workload: Workload, model, *, data=None, size=None, regimes=None
     """Resolve `workload` on `model` (an isb.models.Model or its key). Returns the CellConfig and
     the rows the model cannot express, as [{"label", "reason"}]. `data` (a DataRef) rebinds every
     regime's source, `size` resizes each regime's default source, `regimes` keeps a subset of kinds,
-    and `loads` (Offline / Concurrent) adds the load-pattern regimes derived from the workload's
-    own (design.md §12.17); a load the workload cannot take is reported as a skipped row."""
+    and `loads` (Offline / Concurrent / Open) adds the load-pattern regimes derived from the workload's
+    own; a load the workload cannot take is reported as a skipped row."""
     from ..models import MODELS
 
     if isinstance(model, str):

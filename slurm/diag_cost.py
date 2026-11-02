@@ -34,7 +34,9 @@ if MODE == "inproc":
 import torch  # noqa: E402
 
 REPO = "Qwen/Qwen2.5-7B-Instruct"
-N, WARMUP, TRIALS = 16, 3, 10
+N, WARMUP, TRIALS = int(os.environ.get("DIAG_N", "16")), 3, 10
+# DIAG_BYREF=1 (inproc): time and profile the byref path itself, at DIAG_N invokes
+BYREF_ONLY = os.environ.get("DIAG_BYREF") == "1"
 
 ACC = defaultdict(float)     # accumulated ms per timer over the current measurement
 CNT = defaultdict(int)
@@ -102,7 +104,8 @@ def install_byref():
 
 
 def main(inputs_path, out_path):
-    prompts = [json.loads(line)["unit"] for line in open(inputs_path)][:N]
+    prompts = [json.loads(line)["unit"] for line in open(inputs_path)]
+    prompts = (prompts * (N // len(prompts) + 1))[:N]   # repeated past the file (prefix caching is off)
     if MODE == "inproc":
         install_byref()            # the engine-side map must hold envoys before load
     instrument(engine_side=(MODE == "inproc"))
@@ -146,6 +149,8 @@ def main(inputs_path, out_path):
     import vllm
     result = {"mode": MODE, "nnsight": version("nnsight"), "vllm": vllm.__version__, "n": N}
     result["envoy_byref_env"] = os.environ.get("NNSIGHT_ENVOY_BYREF") == "1"
+    BYREF["on"] = BYREF_ONLY
+    result["byref_only"] = BYREF_ONLY
     result["vanilla"] = measure(vanilla)
     result["traced"] = measure(traced)
     print(json.dumps(result, indent=1), flush=True)
@@ -174,6 +179,11 @@ def main(inputs_path, out_path):
         pstats.Stats(prof, stream=buf).sort_stats("tottime").print_stats(30)
         result["profile_tottime"] = buf.getvalue()
 
+        if BYREF_ONLY:
+            with open(out_path, "w") as f:
+                json.dump(result, f, indent=1)
+            be.teardown(model)
+            return
         reference = traced()
         BYREF["on"] = True
         try:

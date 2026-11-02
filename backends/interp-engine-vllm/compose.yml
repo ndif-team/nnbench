@@ -1,0 +1,43 @@
+# interp-engine-vllm: the runtime service of every config in configs.yml. The launcher sets ISB_IMAGE (the
+# config's image tag), ISB_ENGINE_OPTIONS (its options as JSON), ISB_GPUS (the host GPUs it
+# reserves, comma-separated) and ISB_RANKS (processes per job); see backends/README.md.
+services:
+  runner:
+    image: ${ISB_IMAGE:-isb-interp-engine-vllm-default:local}
+    working_dir: /workspace
+    entrypoint: [python3, -m, isb.jobs.entry]
+    user: "${ISB_UID:-1000}:${ISB_GID:-1000}"
+    shm_size: 8gb
+    environment:
+      PYTHONPATH: /workspace
+      PYTHONDONTWRITEBYTECODE: "1"
+      USER: isb
+      XDG_CACHE_HOME: /tmp/cache
+      TORCHINDUCTOR_CACHE_DIR: /tmp/torchinductor
+      TRITON_CACHE_DIR: /tmp/triton
+      FLASHINFER_WORKSPACE_BASE: /tmp
+      VLLM_CACHE_ROOT: /tmp/vllm
+      HF_HOME: /models
+      HF_HUB_CACHE: /models/hub
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+      TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-0}
+      ISB_BACKEND: ${ISB_BACKEND:-interp-engine-vllm/default}
+      ISB_ENGINE_OPTIONS: ${ISB_ENGINE_OPTIONS}
+      ISB_RANKS: ${ISB_RANKS:-1}
+      ISB_WORKER_MEMORY: ${ISB_WORKER_MEMORY:-0}
+    volumes:
+      - ../..:/workspace:ro
+      - ${ISB_JOB_DIR:-../../runs/manual/job}:/job:ro
+      - ${ISB_OUTPUT_DIR:-../../runs/manual/output}:/output
+      - model-cache:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${ISB_GPUS:-0}"]
+              capabilities: [gpu]
+volumes:
+  model-cache:
+    name: ${ISB_MODEL_CACHE:-isb-model-cache}

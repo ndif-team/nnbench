@@ -1,0 +1,38 @@
+# nnsight on vLLM. `mode` in a config's options selects the realization (backend.py): sync is
+# nnsight's documented LLM path and the default, async drives AsyncLLM with one request per unit,
+# opt runs installed edits and plain requests (cells_opt.py). Image keys name the nnsight release;
+# `default` is the Dockerfile's own ARG values (the development commit on vLLM 0.19.1).
+images:
+  default: {}
+  0-5-15: {VLLM_IMAGE: vllm/vllm-openai:v0.13.0, NNSIGHT_REF: 79e18487ee86c96712df7561acf4a9ddb8469098}
+  0-7: {VLLM_IMAGE: vllm/vllm-openai:v0.15.1, NNSIGHT_REF: 884bd1c7b0dbd53be01ade6a18843078d90367b4}
+  0-8-1: {VLLM_IMAGE: vllm/vllm-openai:v0.27.1, NNSIGHT_REF: de7fec4d207fc8e0deacaa44fb68f8d0412506ef}
+  # the development commit on the first vLLM with breakable CUDA graphs (taps)
+  0-28-0: {VLLM_IMAGE: vllm/vllm-openai:v0.28.0}
+configs:
+  default:
+    image: default
+    options: &base {dtype: bfloat16, gpu_memory_utilization: 0.85, enable_prefix_caching: false}
+  async: {image: default, options: {<<: *base, mode: async}}
+  fp32: {image: default, options: {<<: *base, dtype: float32}}
+  async/fp32: {image: default, options: {<<: *base, mode: async, dtype: float32}}
+  opt: {image: default, options: {<<: *base, mode: opt}}
+  opt/taps: {image: 0-28-0, options: {<<: *base, mode: opt, taps: auto}}
+  0-5-15: {image: 0-5-15, options: *base}
+  0-5-15/tp4: {image: 0-5-15, options: {<<: *base, tensor_parallel_size: 4}, gpus: 4}
+  0-7: {image: 0-7, options: *base}
+  0-7/tp4: {image: 0-7, options: {<<: *base, tensor_parallel_size: 4}, gpus: 4}
+  0-7/async: {image: 0-7, options: {<<: *base, mode: async}}
+  0-7/async/tp4: {image: 0-7, options: {<<: *base, mode: async, tensor_parallel_size: 4}, gpus: 4}
+  0-8-1: {image: 0-8-1, options: *base}
+  0-8-1/tp2: {image: 0-8-1, options: {<<: *base, tensor_parallel_size: 2}, gpus: 2}
+  0-8-1/tp4: {image: 0-8-1, options: {<<: *base, tensor_parallel_size: 4}, gpus: 4}
+  0-8-1/async: {image: 0-8-1, options: {<<: *base, mode: async}}
+  0-8-1/async/tp2: {image: 0-8-1, options: {<<: *base, mode: async, tensor_parallel_size: 2}, gpus: 2}
+  0-8-1/async/tp4: {image: 0-8-1, options: {<<: *base, mode: async, tensor_parallel_size: 4}, gpus: 4}
+  0-8-1/opt: {image: 0-8-1, options: {<<: *base, mode: opt}}
+  0-8-1/opt/tp2: {image: 0-8-1, options: {<<: *base, mode: opt, tensor_parallel_size: 2}, gpus: 2}
+  0-8-1/opt/tp4: {image: 0-8-1, options: {<<: *base, mode: opt, tensor_parallel_size: 4}, gpus: 4}
+  0-8-1/opt/taps: {image: 0-8-1, options: {<<: *base, mode: opt, taps: auto}}
+  0-8-1/opt/taps/tp2: {image: 0-8-1, options: {<<: *base, mode: opt, taps: auto, tensor_parallel_size: 2}, gpus: 2}
+  0-8-1/opt/taps/tp4: {image: 0-8-1, options: {<<: *base, mode: opt, taps: auto, tensor_parallel_size: 4}, gpus: 4}

@@ -483,7 +483,7 @@ Subspace addresses remain derived-tier Level-1 citizens (§3.2). See
 - **Bulk harvesting** — CACHE-many × large corpus, throughput-bound (SAE data collection);
   implemented as the `offline` load pattern (§12.17)
 - **Multi-tenant / concurrent** — many independent traces vs one engine (nnsight-serve / NDIF);
-  implemented as the closed-loop `concurrent` load pattern (§12.17)
+  implemented as the closed-loop `concurrent` and the `open` load patterns (§12.17)
 
 Regimes are context (§3.6), not protocol semantics — a regime can change *verdicts* (the batched
 absolute-position model-side law failure, formerly "regime effect"), which is why each regime
@@ -987,6 +987,14 @@ to the correct *global* row), to be fixed in nnsight's translation layer — or,
 as an interface caveat. This is distinct from a cell using a *known-wrong* read pattern (e.g. the plain
 residual on a fused-residual family, §12.7), which IS a suite bug to fix in the cell.
 
+Update (2026-10-21): nnsight 0.8.1 documents the caveat as its interface. "Parameters are not [whole]:
+`layer.weight` is this rank's slice", and the logit lens goes through
+`model.logits_processor(model.lm_head, norm(h))` (`docs/models/vllm-parallelism.md` at the tag). So
+`head.weight` in a cell is off the documented form, the second case above. The cells read the
+model's own logits at the documented site (HF `lm_head.output`, vLLM `model.logits`), build the
+steering direction before the trace (`isb/methodologies/readout.py`), and keep the weight matmul as
+a declared alternative.
+
 ### 12.3 What is kept vs dropped from §11
 
 - **Dropped:** `isb/resolve/` (Resolver, FamilyProfile, Binding, read_value, predict), the heavy
@@ -1307,18 +1315,30 @@ unexpected arguments become isolated call errors. Registered templates classify 
 baseline, and effect parameters at authoring time. Runtime classification remains checked because
 datasets, restored templates, and independently extended cells can differ from the built-in suite.
 
-**Unit form.** The cell never chooses the engine form (`isb/backends/base.py`). A cell hands a
-primitive the units of one call; the backend runs them as its engine documents: HF pads several
-prompts into one batch, the async vLLM engine runs one request per trace, the sync engine one
-invoke per prompt. One-unit primitives (`patch`, `generate`, `generate_patch`, `attribute`)
-check their arguments through `Backend.one()` and raise `FormError` on more, in every backend and
-in the test fakes, so a cell in the wrong form fails in the no-GPU suite rather than as an
-engine error on one backend. Several-unit primitives (`train_patch`, `vjp_batch`) pass the
-cell's closure the indices of the units the current trace holds (`rows`), so the closure selects
-targets per unit and the same cell runs batched on HF and one unit per trace on the async engine.
-`train_patch`'s step returns the loss summed over its rows, so the gradient is the same whichever
-way the backend splits the pairs into traces; unequal sides raise `FormError`. An engine error
-recorded for a cell is therefore the engine's answer to its documented form;
+**Unit form (2026-10-24).** The cell never chooses the engine form (`isb/backends/base.py`). Every
+cell takes `units: list[Unit]`, a unit being a prompt, a (clean, corrupted) pair or a labeled
+triple, and hands a primitive the whole list of one call; B=1 is a one-element list. The backend
+runs the list as its engine documents: HF pads the units into one left-padded batch, the sync vLLM
+engine runs one `tracer.invoke` per unit inside one trace, the async engine one request per unit
+gathered together, nnsight 0.5 on vLLM one unit per trace (several units are `Unsupported`). `run`
+and `generate` take a nonempty list (`Backend.many()`); `patch`, `generate_patch`, `attribute`,
+`train_patch` and `vjp_batch` take one list per side of equal length (`Backend.paired()`); every
+backend and the test spy raise `FormError` on a bare prompt, an empty list or unequal sides, so a
+cell in the wrong form fails in the no-GPU suite rather than as an engine error on one backend.
+Closures receive `rows`, the indices of the units the current trace holds (`build(rows)`;
+`step(index)` for each decode step), so one cell selects its per-unit targets batched on HF and per
+invoke on vLLM; `train_patch`'s step returns the loss summed over its rows, so the gradient is the
+same whichever way the backend splits the pairs into traces. On the sync vLLM engine `train_patch`
+and `vjp_batch` run one invoke per unit with a backward in each (`retain_graph=True` on all but the
+last, nnsight 0.8.1's form for backwards in several invokes of one trace); the engine's inference-mode
+refusal is what those rows record. Outputs carry the unit axis at dim -2 (`[B, vocab]`,
+`[L, B, vocab]`, `[T, B, vocab]` over decode steps). A generation call holds every unit to
+`new_tokens` decode steps (HF `min_new_tokens`, vLLM `min_tokens`), so a unit that would stop at EOS
+early produces the same number of rows at every B instead of a row-count error at B=1 and pad-fed
+rows inside a batch (2026-10-24). `be.plain(model, units,
+new_tokens=1)` is the engine's own request over the same list with nothing attached, timed in every
+regime, including the batched and load regimes, as the intervention-overhead denominator. An engine
+error recorded for a cell is therefore the engine's answer to its documented form;
 `scripts/row_diff.py` compares two runs row by row (`docs/writing-workloads.md` §8).
 
 **What gets saved.** Successful effective-call records contain bound parameters, their semantic and
@@ -1377,7 +1397,7 @@ Acceptance checks:
 |---|---|
 | Effective calls | Real signature binding, generic-family binding, defaults with `**kwargs`, isolated invalid cases, baseline/effect/reference records |
 | Concrete requirements | Branch-behavior tests for no-write and no-gradient cases, plus a custom description hook |
-| Unit form | One-unit primitives raise `FormError` on several units in every backend and the test fake, and `train_patch` on unequal sides; the DAS and Jacobian closures take `rows` |
+| Unit form | Every primitive raises `FormError` on a bare unit, an empty list or unequal sides in every backend and the test spy; closures take `rows`; a generation output stacks `[T, B, ...]` |
 | Ownership and timing | Nested mutation across warmups/trials/reference calls cannot alter snapshots; preparation occurs before the clock |
 | Comparison | Parameter, input, decode-length, aggregation, effect, and model-load changes reject comparison; timing-only changes compare; incomplete identity stays unverified |
 | File boundaries | Current jobs round-trip with saved coverage; historical and future versions fail clearly; malformed current artifacts fail validation |
@@ -1411,42 +1431,53 @@ object loads the engine, and the cell returns the same tensor shapes as the nnsi
 **Declared unsupported.** A system that cannot express a workload registers a cell that raises
 `Unsupported(reason)`, naming the missing capability, for example "hooks fire only at decoder-layer
 boundaries; the attention output is not addressable". The worker records `UNSUPPORTED` with that
-reason. A missing registration stays an `ERROR`, because it means the suite lacks the cell, not
-that the system lacks the capability. `UNSUPPORTED` cells are excluded from performance comparison.
+reason. A missing registration is also recorded as `UNSUPPORTED`, with the reason "no cell for
+`<methodology>/<family>/<interface>`", which tells a suite that lacks the cell apart from a system
+that lacks the capability. `UNSUPPORTED` cells are excluded from performance comparison.
 
 **Denominators.** Two ratios, both computed from the same experiment's jobs:
 
-- Intervention overhead: each backend's `vanilla` method issues the system's own request with no
-  intervention attached. The executor times it in the same job and regime as the cells
-  (`__vanilla__` auxiliary record), and each cell records `overhead_vs_vanilla`.
-- Whole-system overhead: `vllm-plain/*` configs run plain vLLM at each engine version in use, with
-  vLLM's default configuration (torch.compile and CUDA graphs), and declare every intervention
-  unsupported. The scorer divides each vLLM-engine row by the plain job's `__vanilla__` latency at
+- Intervention overhead: each backend's `plain` method issues the system's own request with no
+  intervention attached over the regime's units in the regime's call form. The executor times it
+  in the same job, regime and timing loop as the cells (the `__vanilla__` auxiliary record, a wire
+  name kept for saved runs), and each cell records `overhead_vs_vanilla`.
+- Whole-system overhead: `vllm-plain/*` configs run plain vLLM's serving engine (`AsyncLLM`) at each
+  engine version in use, compiled with CUDA graphs or eager, and declare every intervention
+  unsupported. Concurrent and open-loop clients share the engine as they would share a vLLM server.
+  Chunked prefill follows the systems a floor serves: the 0.27.1 floors turn it off, matching
+  nnsight 0.8, which starts vLLM with it off, and the other versions keep vLLM's default. The scorer
+  divides each vLLM-engine row by the plain job's `__vanilla__` latency at
   the same vLLM version and workload (`overhead_vs_plain_vllm`). Plain jobs are identified by the
   engine mode they declare, never by name.
 
 Engine version and eager or CUDA-graph mode are recorded with each result, because an eager
 engine's absolute latency depends on host CPU load.
 
-### 12.15 Backend tree (2026-10-10)
+### 12.15 Backend tree (2026-10-10; catalog form 2026-10-24)
 
 **Backends are `<system>/<config>`.** A top-level directory under `backends/` is one system on one
-engine (`nnsight-vllm`, `interp-engine-vllm`, `vllm-plain`); a directory inside it holding a
-`compose.yml` is one config, and the backend name is that path (`nnsight-vllm/fp32`). The system
-directory owns the image (`Dockerfile`, with versions as build args a config sets), the backend
-object (`backend.py`), the workload implementation (`cells.py`) and the runner service
-(`compose.base.yml`), which each config's `compose.yml` follows with Compose `extends`. A config
-owns its options, image tag and build args, and carries its own `backend.py` / `cells.py` only
-when it needs a separate implementation (`*/opt`, `nnsight-vllm/sync`). Code resolves to the nearest file on the config's
-own path (`isb/jobs/layout.py`); a config that shares another config's implementation nests under
-it (`nnsight-vllm/opt/taps`). No config mounts or builds from a sibling, so the files a config runs
-are exactly the ones on its path. Before this, each config was a flat top-level directory and
-borrowed its parent's code through relative Compose mounts, so a config's code was often in another
-directory. The nnsight systems keep their cells in `isb/methodologies/` (the `hf` / `vllm_async`
-registrations shared with the tests and the micro tier) and have no `cells.py`.
+engine (`nnsight-vllm`, `interp-engine-vllm`, `vllm-plain`) and holds exactly one `Dockerfile`
+(versions as `ARG`s), one `compose.yml` (the runner service, parameterized by `ISB_IMAGE`,
+`ISB_ENGINE_OPTIONS`, `ISB_GPUS` and `ISB_RANKS`), one `configs.yml`, `backend.py` and `cells.py`,
+plus the modules they import (`cells_opt.py` for installed edits; `nnsight04.py`, `nnsight05.py`
+and `cells_nnsight04.py` for the legacy nnsight releases). `configs.yml` lists the system's
+`images` (Dockerfile build arguments keyed by image name; the tag is `isb-<system>-<image>:local`)
+and its `configs`, each naming its image, its engine `options`, and the `gpus` and `ranks` it
+reserves. The backend name is `<system>/<config>`, configs are named
+`<version>[/<mode>][/<flags>][/<tp>]` (`nnsight-vllm/0-8-1/opt/taps/tp4`), and a bare system name
+means `<system>/default`. A realization that needs different code is an option the system's
+`backend.py` dispatches on (`mode: sync | async | opt` for nnsight-vllm, sync being the default;
+`mode: opt` for vllm-lens and transformer-lens-vllm), never a directory, and every config is listed
+explicitly. `bench.py build` builds each distinct (system, image) once; `bench.py run` starts an
+ephemeral container from the config's image with its options as `ISB_ENGINE_OPTIONS` and its GPUs
+reserved (`--gpu N` plus the next `gpus - 1` indices). Nothing is loaded from outside the system
+directory (`isb/jobs/layout.py`). The nnsight systems keep their 0.7+ cells in
+`isb/methodologies/` (the `hf` / `vllm_async` registrations shared with the tests and the micro
+tier).
 
 Job directories mirror the name (`experiments/<id>/<system>/<config>/`). Saved runs were renamed to
-the new names by `scripts/migrate_backend_names.py`; interface names inside artifacts (`hf`,
+the new names by a one-time migration (`scripts/migrate_backend_names.py`, in the history up to
+tag `paper-eval-v1`); interface names inside artifacts (`hf`,
 `vllm_lens_opt`, ...) and image tags are unchanged.
 
 ### 12.16 Workloads, models, realizations and suites (2026-10-10)
@@ -1521,7 +1552,7 @@ keep only those of its cases. Initial suites:
 | `cross-system` | `logit_lens`, `steering`, `gen_steering`, `activation_patching`, `ablation`, `activation_harvest`, `gen_capture` × `qwen2.5-7b` | every system (§12.14) | default |
 | `fitted-jlens` | `jacobian_lens` × `qwen3.5-4b` | nnsight HF and vLLM | default |
 | `nnsight-versions` | `logit_lens`, `steering`, `ablation`, `gen_steering`, `activation_patching` × `qwen2.5-7b`, `qwen3-32b` | nnsight 0.8.1 and 0.7 on HF sdpa and the vLLM sync engine; 0.4.6 on HF | default |
-| `nnsight-load-offline`, `nnsight-load-concurrent` | load patterns only (§12.17) × `qwen2.5-7b`, `qwen3-32b` | nnsight 0.8.1 on HF and vLLM (sync; async for concurrent) | default |
+| `nnsight-load-offline`, `nnsight-load-concurrent`, `nnsight-load-open` | load patterns only (§12.17) × `qwen2.5-7b`, `qwen3-32b` | nnsight 0.8.1 on HF and vLLM (sync; async for concurrent and open) | default |
 
 `slurm/delta-compare.slurm` calls suites; it does not list cases.
 
@@ -1555,7 +1586,7 @@ citing the old names with their run directories.
 Out of scope here: the micro tier, `scripts/perf.py` and `isb/tasks/`, which keep their own entry
 points.
 
-### 12.17 Load patterns: how requests are issued (2026-10-20)
+### 12.17 Load patterns: how requests are issued (2026-10-20; open loop and per-workload patterns 2026-10-21)
 
 **Problem.** Every timed regime so far is one call repeated. `interactive` is MLPerf's SingleStream
 (one unit per call, the next call after the previous returns); `batched` is `vllm bench latency` or
@@ -1565,52 +1596,85 @@ one-token call is a single prefill on either engine (measured 38 ms plain vLLM, 
 Qwen2.5-7B, A100). §5 already listed bulk harvesting and multi-tenant serving as regimes; this
 section adds them as the two standard patterns.
 
-**Patterns.** Two regime kinds, keyed by kind plus setting so a run holds several:
+**Patterns.** Three regime kinds, keyed by kind plus setting so a run holds several:
 
 | Regime | Standard counterpart | Issue | Recorded |
 |---|---|---|---|
 | `offline/b<B>`, `offline/all` | MLPerf Offline; `vllm bench throughput` (`LLM.generate(all prompts)`); SGLang `bench_offline_throughput` | `units` units as one sweep, `B` per call (all at once for `all`), calls back to back | units/s over the median pass; pass time (`median_latency_ms`); per-call latency |
 | `concurrent/c<C>` | closed-loop serving: `vllm bench serve --max-concurrency`, SGLang `bench_serving`, AIPerf's concurrency sweep | `units` single-unit calls from `C` clients, each issuing its next as soon as its previous returns | units/s; request latency p50 (`median_latency_ms`), p90, p99, mean |
+| `open/r<R>` | open-loop serving: MLPerf Server, `vllm bench serve --request-rate` | `units` single-unit calls arriving at `R` per second (seeded Poisson), each issued on arrival whatever the system is doing | achieved units/s; request latency from scheduled arrival, p50 (`median_latency_ms`), p90, p99, mean; offered rate; most requests in flight |
 
-Open-loop arrivals (MLPerf Server, `--request-rate` Poisson/gamma) are not implemented. The survey
-of how these tools issue requests is `docs/inference-benchmark-survey.md`; the background and what
-each pattern tests is `docs/request-patterns.md`.
+Gamma (bursty) arrivals and a request deadline are not implemented: a pass issues a finite number
+of requests, so an overloaded system drains after the last arrival. The survey of how these tools
+issue requests is `docs/inference-benchmark-survey.md`; the background, what each pattern tests and
+which workloads take which pattern is `docs/request-patterns.md`.
+
+**Declared per workload.** Each workload lists the load patterns that match how its methodology is
+used (`Workload.load_patterns`), by who controls the arrival process: `offline` for research jobs,
+where the researcher's own loop over a held dataset is a closed loop (lenses, ablation, the patching
+methods, activation harvesting, Jacobian collection); `concurrent` and `open` only where a
+deployment runs the method once per live request (steering, steered generation, per-step capture);
+and none for a job that is one sequential computation (DAS: each step needs the previous step's
+rotation, and upstream sweeps train one fit after another) or whose per-prompt outputs cannot be
+stacked and scored (the attention pattern, which vLLM also cannot read). Those run single stream in
+their own `interactive` regime. A suite's load applies only to the workloads that declare it; the
+others report it as a skipped row with the reason, so no run times a combination nobody uses. The
+evidence for each declaration is in `docs/request-patterns.md`.
 
 **Derived, not authored.** A load pattern names no data of its own. A suite entry (or `bench run
---offline UNITS:B,... --concurrent UNITS:C,...`) lists `Offline` / `Concurrent` loads, and
-`instantiate` derives the regimes from the workload's own: offline from its batched regime (cells
-that take several units per call), concurrent from its single-unit interactive, else generation,
-regime (decode length kept). The derived regime reuses the template's data source at the load's
-unit count. A workload without the template reports the load as a skipped row with the reason, so
-workloads are unchanged and existing suites run what they ran. Regimes without load settings
-freeze to the same experiment record as before (`LOAD_FIELDS` are dropped from them), and
-coordinates carry a `load` object only on load regimes.
+--offline UNITS:B,... --concurrent UNITS:C,... --open UNITS:R,...`) lists `Offline` /
+`Concurrent` / `Open` loads, and `instantiate` derives the regimes from the workload's own: offline
+from its batched regime, else its single-unit interactive or generation regime, else its first
+interactive regime, at every requested B (every cell takes a unit list, so a chunk of B units is
+one call: B pairs for activation patching, B prompts decoded together for generation steering),
+except a whole-list regime (`aggregate=False`), whose cell reduces its units to one output and so
+sweeps at B=1 only (Jacobian collection, one prompt per call with the mean kept on the client);
+concurrent and open from that single-unit regime (decode length kept). The derived regime reuses
+the template's data source at the load's unit count. Regimes without load settings freeze to the
+same experiment record as before, and each load regime records only its own pattern's settings
+(`LOAD_FIELDS[kind]`), so adding a pattern changes no existing experiment identity; coordinates
+carry a `load` object only on load regimes.
 
-**Timing.** One untimed warm-up (a full pass offline; one request per client concurrently), then
-`passes` timed sweeps (offline 3, concurrent 1: a sweep of `units` requests is the latency
-sample, as the standard tools run one pass of N ≥ 5C requests). A pass is timed between CUDA syncs,
-a request from issue to return; parameter copies are made before the clock as in §12.13
-(`isb/perf/load.py`). The baseline and the plain system (`vanilla_many` offline, `vanilla` per unit
-concurrently) run under the same pattern, giving `overhead_vs_baseline` and `overhead_vs_vanilla`.
+**Timing.** One untimed warm-up (a full pass offline; one request per client concurrently; one
+request open loop), then three timed sweeps for every pattern (2026-10-24; before that date the
+concurrent and open patterns ran one). A pass is timed between CUDA syncs, a request from issue to
+return, or open loop from its scheduled arrival, so an arrival the system is too busy to take counts against it rather than slowing the
+arrivals (the closed loop's coordinated omission). The open loop issues each request on a thread of
+its own; the arrival times are the same for every pass and backend. Parameter copies are made
+before the clock as in §12.13 (`isb/perf/load.py`). The baseline and the plain request (`be.plain`
+over each call's units) run under the same pattern, giving `overhead_vs_baseline` and
+`overhead_vs_vanilla`.
 
 **Concurrency and the serial server.** A backend that declares `concurrent_requests` opens a
 session in which every client submits at once: nnsight's async vLLM backend moves its persistent
 event loop to a thread and schedules each call's coroutine there, so a trace is built and submitted
 before its first await and two traces never interleave on the model's one interleaver (the same
-property nnsight's own server relies on). Any other backend (HF, the sync engine) is driven
-through one lock, which is what a serial server does with concurrent clients: queueing counts toward
-request latency, and the result records `serial: true`. The executor never interleaves calls a
-backend has not declared safe.
+property nnsight's own server relies on). Plain vLLM runs its `AsyncLLM` the same way. Any other
+backend (HF, the sync engine) is driven
+through one first-come, first-served gate, which is what a serial server does with concurrent
+clients: every request after the first waits for those ahead of it, the wait counts toward request
+latency, and the result records `serial: true` (a plain `threading.Lock` lets the client that just
+finished barge ahead of a waiting one, so one client ran most of a pass and the other's request
+carried the whole wait; measured 2026-10-24, two clients on the sync engine, plain requests p50 at
+the service time and p90 at the pass time). The open loop uses the same session or gate. The
+executor never interleaves calls a backend has not declared safe.
 
 **Correctness.** The outputs of the first `score_units` (16) units of the last pass are kept and
 scored; the rest are timed only, since a sweep's full outputs can exceed host memory (an all-layer
 logit lens over 256 prompts is 17 GB). For correctness, an offline cell is scored against the
-reference's per-unit outputs (`offline_perprompt`, recorded once per run like `batched_perprompt`);
-a concurrent cell's calls are single-unit, so it is scored against the reference's same regime.
+reference's per-unit outputs (`offline_perprompt`, recorded once per run like `batched_perprompt`,
+before the cases). An offline call can cover more units than are scored, so the executor keeps the
+leading rows the per-unit outputs fill, since one unit may fill several rows (decode steps, a
+harvest's tokens). Concurrent and open-loop calls are single-unit, so they are scored against the
+reference's same regime.
 Load regimes run no effect guard: the write's non-vacuity is checked in the workload's own regimes.
 
-**Suites.** `nnsight-load-offline` (steering, logit lens, ablation; 256 units, B = 1, 16, 64, all;
-HF against the sync engine) and `nnsight-load-concurrent` (steering, activation patching, steered
-generation; 128 requests, C = 1, 4, 16, 64; HF, the sync engine and the async engine), both on
-nnsight 0.8.1 with HF as the reference. The async engine stays out of offline: its multi-unit calls
-would run on a second, sync engine (§12.14), which does not fit beside a large model.
+**Suites.** `nnsight-load-offline` (steering, logit lens, ablation, activation harvesting; 256
+units, B = 1, 16, 64, all; activation patching and steered generation, 64 units at B = 1; HF against
+the sync engine), `nnsight-load-concurrent` (steering, steered generation, per-step capture; 128
+requests, C = 1, 4, 16, 64; HF, the sync engine and the async engine) and `nnsight-load-open` (the
+same workloads; 128 requests at 4, 16 and 64 per second; HF and the async engine), all on nnsight
+0.8.1 with HF as the reference. The sync engine stays out of the open loop: it serves one request at
+a time like HF, so its open-loop latency follows from its single-request time. The async engine's
+offline rows run each chunk as B gathered requests on the same engine (2026-10-24; the earlier
+second, sync engine is gone).

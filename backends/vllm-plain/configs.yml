@@ -1,0 +1,43 @@
+# Plain vLLM, nothing installed on top: the per-release engine floor. Every image is one vLLM
+# release; `default` runs the release of nnsight-vllm/default's image. The `eager` configs run
+# the same engine without CUDA graphs, the mode nnsight imposes on it. Chunked prefill follows the
+# systems a floor serves: nnsight 0.8 starts vLLM with enable_chunked_prefill=False, so the 0.27.1
+# floors do too; the other releases keep vLLM's default, which vllm-lens and vllm-hook (0.19.1) and
+# nnsight 0.7 (0.15.1) run, while nnsight-vllm/default on 0.19.1 runs with it off.
+images:
+  0-15-1: {VLLM_IMAGE: vllm/vllm-openai:v0.15.1}
+  0-19-1: {VLLM_IMAGE: vllm/vllm-openai:v0.19.1}
+  0-20-2: {VLLM_IMAGE: vllm/vllm-openai:v0.20.2}
+  0-27-1: {VLLM_IMAGE: vllm/vllm-openai:v0.27.1}
+  0-28-0: {VLLM_IMAGE: vllm/vllm-openai:v0.28.0}
+configs:
+  default:
+    image: 0-19-1
+    options: &base {dtype: bfloat16, gpu_memory_utilization: 0.85, enable_prefix_caching: false,
+                    enforce_eager: false}
+  0-15-1: {image: 0-15-1, options: *base}
+  0-15-1/eager: {image: 0-15-1, options: {<<: *base, enforce_eager: true}}
+  0-19-1: {image: 0-19-1, options: *base}
+  0-19-1/eager: {image: 0-19-1, options: {<<: *base, enforce_eager: true}}
+  0-19-1/tp2: {image: 0-19-1, options: {<<: *base, tensor_parallel_size: 2}, gpus: 2}
+  0-19-1/eager/tp2: {image: 0-19-1, options: {<<: *base, enforce_eager: true, tensor_parallel_size: 2}, gpus: 2}
+  0-19-1/tp4: {image: 0-19-1, options: {<<: *base, tensor_parallel_size: 4}, gpus: 4}
+  0-19-1/eager/tp4: {image: 0-19-1, options: {<<: *base, enforce_eager: true, tensor_parallel_size: 4}, gpus: 4}
+  0-20-2: {image: 0-20-2, options: *base}
+  0-20-2/eager: {image: 0-20-2, options: {<<: *base, enforce_eager: true}}
+  0-20-2/tp2: {image: 0-20-2, options: {<<: *base, tensor_parallel_size: 2}, gpus: 2}
+  0-20-2/eager/tp2: {image: 0-20-2, options: {<<: *base, enforce_eager: true, tensor_parallel_size: 2}, gpus: 2}
+  0-20-2/tp4: {image: 0-20-2, options: {<<: *base, tensor_parallel_size: 4}, gpus: 4}
+  0-20-2/eager/tp4: {image: 0-20-2, options: {<<: *base, enforce_eager: true, tensor_parallel_size: 4}, gpus: 4}
+  0-27-1: {image: 0-27-1, options: &unchunked {<<: *base, enable_chunked_prefill: false}}
+  0-27-1/eager: {image: 0-27-1, options: {<<: *unchunked, enforce_eager: true}}
+  0-27-1/tp2: {image: 0-27-1, options: {<<: *unchunked, tensor_parallel_size: 2}, gpus: 2}
+  0-27-1/eager/tp2: {image: 0-27-1, options: {<<: *unchunked, enforce_eager: true, tensor_parallel_size: 2}, gpus: 2}
+  0-27-1/tp4: {image: 0-27-1, options: {<<: *unchunked, tensor_parallel_size: 4}, gpus: 4}
+  0-27-1/eager/tp4: {image: 0-27-1, options: {<<: *unchunked, enforce_eager: true, tensor_parallel_size: 4}, gpus: 4}
+  0-28-0: {image: 0-28-0, options: *base}
+  0-28-0/eager: {image: 0-28-0, options: {<<: *base, enforce_eager: true}}
+  0-28-0/tp2: {image: 0-28-0, options: {<<: *base, tensor_parallel_size: 2}, gpus: 2}
+  0-28-0/eager/tp2: {image: 0-28-0, options: {<<: *base, enforce_eager: true, tensor_parallel_size: 2}, gpus: 2}
+  0-28-0/tp4: {image: 0-28-0, options: {<<: *base, tensor_parallel_size: 4}, gpus: 4}
+  0-28-0/eager/tp4: {image: 0-28-0, options: {<<: *base, enforce_eager: true, tensor_parallel_size: 4}, gpus: 4}

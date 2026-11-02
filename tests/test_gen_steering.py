@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import isb.methodologies  # noqa: F401,E402  (registers cells)
 import isb.sweep.execute as execute_mod  # noqa: E402
 from isb.methodologies.gen_steering import _check_bound, _steer_step  # noqa: E402
+from isb.methodologies.readout import head_direction  # noqa: E402
 from isb.methodologies.registry import CELLS, get_cell  # noqa: E402
 from isb.runfile import load_run  # noqa: E402
 from isb.runs import EngineConfig, RunConfig  # noqa: E402
@@ -82,7 +83,7 @@ def test_steer_step_replacement_write_semantics():
     hidden = torch.ones(2, HID)
     before = hidden.clone()
     blocks = [_Block((hidden, "kv"))]
-    _steer_step(blocks, _Head(), layer=0, token_id=1, alpha=3.0)
+    _steer_step(blocks, None, layer=0, direction=head_direction(None, _Head(), 1), alpha=3.0)
     new_hidden, tail = blocks[0].output[0], blocks[0].output[1]
     assert tail == "kv"                                   # tuple tail preserved
     assert new_hidden.data_ptr() != hidden.data_ptr()     # replacement: NEW tensor,
@@ -95,7 +96,7 @@ def test_steer_step_replacement_write_semantics():
 def test_steer_step_handles_plain_tensor_output():
     hidden = torch.ones(2, HID)
     blocks = [_Block(hidden)]
-    _steer_step(blocks, _Head(), layer=0, token_id=2, alpha=1.0)
+    _steer_step(blocks, None, layer=0, direction=head_direction(None, _Head(), 2), alpha=1.0)
     assert not isinstance(blocks[0].output, tuple)
     assert torch.allclose(blocks[0].output, hidden + torch.tensor([0.0, 0.0, 2.0, 0.0]))
 
@@ -117,9 +118,10 @@ class _GenModel:
             self.h = h
 
     def __init__(self, n_blocks=2):
-        self.transformer = self._TF([_Block(torch.ones(2, HID)) for _ in range(n_blocks)])
+        self.transformer = self._TF([_Block(torch.ones(1, 2, HID)) for _ in range(n_blocks)])
         self.lm_head = _Head()
         self.lm_head.output = torch.zeros(1, 3, VOCAB)
+        self.inputs = ((), {"attention_mask": torch.ones(1, 2, dtype=torch.long)})
 
     def tokenizer(self, text, add_special_tokens=False):
         return {"input_ids": [1]}
@@ -133,8 +135,8 @@ class _GenBackend:
 
     def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
         self.calls.append({"prompts": prompts, "new_tokens": new_tokens, "bounded": bounded})
-        rows = [build_step() for _ in range(new_tokens)]
-        return torch.cat([r.detach().float().cpu() for r in rows], dim=0)
+        rows = [build_step(step) for step in range(new_tokens)]
+        return torch.stack([r.detach().float().cpu() for r in rows], dim=0)
 
 
 def test_hf_cell_plumbs_bound_and_new_tokens_and_steers():
@@ -143,9 +145,9 @@ def test_hf_cell_plumbs_bound_and_new_tokens_and_steers():
     out = fn(be, model, ["p"], layer=0, target="x", alpha=2.0, bound="unbounded", new_tokens=4)
     assert be.calls[0]["new_tokens"] == 4
     assert be.calls[0]["bounded"] is False                # bound="unbounded" -> bounded=False
-    assert out.shape == (4, VOCAB)                        # per-step rows stacked
+    assert out.shape == (4, 1, VOCAB)                     # per-step rows stacked over the unit
     assert isinstance(model.transformer.h[0].output, tuple) or not torch.equal(
-        model.transformer.h[0].output, torch.ones(2, HID))   # the write landed
+        model.transformer.h[0].output, torch.ones(1, 2, HID))   # the write landed
 
 
 def test_hf_cell_alpha_zero_is_pure_readout():
@@ -154,7 +156,7 @@ def test_hf_cell_alpha_zero_is_pure_readout():
     fn = get_cell("gen_steering", "gpt2", "hf")
     out = fn(be, model, ["p"], layer=0, target="x", alpha=0.0, bound="bounded", new_tokens=3)
     assert torch.equal(model.transformer.h[0].output, before)   # no write at all
-    assert out.shape == (3, VOCAB)
+    assert out.shape == (3, 1, VOCAB)
 
 
 # ---- fake-backend sweep over a generation workload -------------------------------------------
