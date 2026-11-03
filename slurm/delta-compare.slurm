@@ -49,7 +49,15 @@ echo "host=$(hostname) git=$(git rev-parse --short HEAD) stage=$1 start=$(date -
 nvidia-smi --query-gpu=index,name,driver_version,memory.used,memory.total --format=csv
 git status --short isb backends
 
-bench() { echo; echo "### $(date -Is) bench.py $*"; $PY scripts/bench.py "$@"; local rc=$?; echo "### rc=$rc"; return $rc; }
+bench() {
+    echo
+    echo "### $(date -Is) bench.py $*"
+    rm -rf /tmp/cache /tmp/torchinductor /tmp/triton /tmp/vllm /tmp/vllm_hook_storage 2>/dev/null || true
+    $PY scripts/bench.py "$@"
+    local rc=$?
+    echo "### rc=$rc"
+    return $rc
+}
 
 # One python per backend image, as scripts/perf.py's ISB_PY_<system> override expects. Each call
 # waits for the GPU to drain afterwards: perf.py starts the next cell's engine at once.
@@ -219,9 +227,9 @@ fair)
     shift
     bench run --suite cross-system --workload "$@" \
         --backends nnsight-hf/fp32 nnsight-hf/default nnsight-hf/0-7 \
-                   nnsight-vllm/default nnsight-vllm/async nnsight-vllm/0-7 vllm-lens/default interp-engine-vllm/default transformer-lens-vllm/default \
-                   vllm-plain/0-15-1 vllm-plain/0-19-1 vllm-plain/0-20-2 vllm-plain/0-28-0 \
-                   vllm-plain/0-15-1/eager vllm-plain/0-19-1/eager vllm-plain/0-20-2/eager vllm-plain/0-28-0/eager \
+                   nnsight-vllm/default nnsight-vllm/0-8-1/async nnsight-vllm/0-7 vllm-lens/default interp-engine-vllm/default transformer-lens-vllm/default \
+                   vllm-plain/0-15-1 vllm-plain/0-19-1 vllm-plain/0-20-2 vllm-plain/0-27-1 vllm-plain/0-28-0 \
+                   vllm-plain/0-15-1/eager vllm-plain/0-19-1/eager vllm-plain/0-20-2/eager vllm-plain/0-27-1/eager vllm-plain/0-28-0/eager \
         --reference nnsight-hf/fp32 --gpu 0 --timeout 3600 --out runs/fair-delta
     exit $?
     ;;
@@ -280,8 +288,8 @@ optimal-smoke)
     # Four prompts per workload through every optimal backend whose image exists.
     out=runs/optimal-smoke
     rc=0
-    opt="nnsight-vllm/opt vllm-lens/opt interp-engine-vllm/static transformer-lens-vllm/opt"
-    [ -f $ISB_APPTAINER_DIR/images/isb-nnsight-vllm-0-28-0_local.sif ] && opt="$opt nnsight-vllm/opt/taps"
+    opt="nnsight-vllm/0-8-1/opt vllm-lens/opt interp-engine-vllm/static transformer-lens-vllm/opt"
+    [ -f $ISB_APPTAINER_DIR/images/isb-nnsight-vllm-0-8-1_local.sif ] && opt="$opt nnsight-vllm/0-8-1/opt/taps"
     bench run --suite cross-system --workload logit_lens steering gen_steering ablation --data counterfact:4 \
         --backends nnsight-hf/fp32 $opt --reference nnsight-hf/fp32 --gpu 0 --out $out || rc=1
     bench run --suite cross-system --workload activation_patching --data mib/ioi:4 \
@@ -294,11 +302,11 @@ optimal)
     shift
     bench run --suite cross-system --workload "$@" \
         --backends nnsight-hf/fp32 \
-                   nnsight-vllm/default nnsight-vllm/async nnsight-vllm/opt nnsight-vllm/opt/taps \
+                   nnsight-vllm/default nnsight-vllm/0-8-1/async nnsight-vllm/0-8-1/opt nnsight-vllm/0-8-1/opt/taps \
                    vllm-lens/default vllm-lens/opt interp-engine-vllm/default interp-engine-vllm/static \
                    transformer-lens-vllm/default transformer-lens-vllm/opt \
-                   vllm-plain/0-15-1 vllm-plain/0-19-1 vllm-plain/0-20-2 vllm-plain/0-28-0 \
-                   vllm-plain/0-15-1/eager vllm-plain/0-19-1/eager vllm-plain/0-20-2/eager vllm-plain/0-28-0/eager \
+                   vllm-plain/0-15-1 vllm-plain/0-19-1 vllm-plain/0-20-2 vllm-plain/0-27-1 vllm-plain/0-28-0 \
+                   vllm-plain/0-15-1/eager vllm-plain/0-19-1/eager vllm-plain/0-20-2/eager vllm-plain/0-27-1/eager vllm-plain/0-28-0/eager \
         --reference nnsight-hf/fp32 --gpu 0 --timeout 3600 --out runs/optimal-delta
     exit $?
     ;;
@@ -407,16 +415,97 @@ large-min)
 large-opt)
     # Each nnsight realization at 72B over two H200s, bf16 throughout: HF device_map (reference) and
     # HF tensor parallel; vLLM TP general cells, installed edits, edits + taps; plain vLLM
-    # 0.28.0 compiled TP. One prompt per call (the realizations' regime), 16 units scored.
+    # 0.27.1 and 0.28.0 compiled + eager TP. One prompt per call (the realizations' regime), 16 units scored.
     rc=0
     for spec in "logit_lens steering ablation gen_steering|counterfact:16" "activation_patching|mib/ioi:16"; do
         ISB_MODEL_CACHE=isb-shared-cache bench run --workload ${spec%%|*} --model qwen2.5-72b \
             --data "${spec##*|}" --regimes interactive generation --realizations default \
             --backends nnsight-hf/0-8-1/gpu2 nnsight-hf/0-8-1/tp2 nnsight-vllm/0-8-1/tp2 \
-                       nnsight-vllm/0-8-1/opt/tp2 nnsight-vllm/0-8-1/opt/taps/tp2 vllm-plain/0-28-0/tp2 \
+                       nnsight-vllm/0-8-1/opt/tp2 nnsight-vllm/0-8-1/opt/taps/tp2 \
+                       vllm-plain/0-27-1/tp2 vllm-plain/0-27-1/eager/tp2 \
+                       vllm-plain/0-28-0/tp2 vllm-plain/0-28-0/eager/tp2 \
             --reference nnsight-hf/0-8-1/gpu2 --gpu 0 --timeout 3600 --out runs/large-opt \
             || rc=1
     done
+    exit $rc
+    ;;
+eval-scale-qwen25-1gpu)
+    # Same-family Qwen2.5-Instruct 1-GPU baseline on H200 (qwen2.5-7b and qwen2.5-14b):
+    # interactive realizations + offline/concurrent/open load sweeps.
+    # Submit: sbatch --partition=gpuH200x8 --gpus=1 --cpus-per-task=16 --mem=240G --time=06:00:00 slurm/delta-compare.slurm eval-scale-qwen25-1gpu
+    rc=0
+    OUT=${ISB_EVAL_OUT:-runs/eval-delta}
+    for model in qwen2.5-7b qwen2.5-14b; do
+        for spec in "logit_lens steering ablation gen_steering|counterfact:16" "activation_patching|mib/ioi:16"; do
+            bench run --workload ${spec%%|*} --model $model --data "${spec##*|}" \
+                --regimes interactive generation --realizations default \
+                --backends nnsight-hf/0-8-1 nnsight-vllm/0-8-1 nnsight-vllm/0-8-1/opt \
+                           nnsight-vllm/0-8-1/opt/taps vllm-plain/0-27-1 vllm-plain/0-27-1/eager \
+                --reference nnsight-hf/0-8-1 --gpu 0 --timeout 3600 --out $OUT/scale-opt-$model || rc=1
+        done
+    done
+    bench run --suite nnsight-load-offline --model qwen2.5-7b \
+        --backends nnsight-hf/0-8-1 nnsight-vllm/0-8-1 nnsight-vllm/0-8-1/opt \
+                   vllm-plain/0-27-1 vllm-plain/0-27-1/eager \
+        --reference nnsight-hf/0-8-1 --gpu 0 --out $OUT/scale-load-offline-7b || rc=1
+    bench run --suite nnsight-load-concurrent --model qwen2.5-7b \
+        --backends nnsight-hf/0-8-1 nnsight-vllm/0-8-1 nnsight-vllm/0-8-1/async \
+                   vllm-plain/0-27-1 vllm-plain/0-27-1/eager \
+        --reference nnsight-hf/0-8-1 --gpu 0 --out $OUT/scale-load-concurrent-7b || rc=1
+    bench run --suite nnsight-load-open --model qwen2.5-7b \
+        --backends nnsight-hf/0-8-1 nnsight-vllm/0-8-1/async \
+                   vllm-plain/0-27-1 vllm-plain/0-27-1/eager \
+        --reference nnsight-hf/0-8-1 --gpu 0 --out $OUT/scale-load-open-7b || rc=1
+    exit $rc
+    ;;
+eval-scale-qwen25-2gpu)
+    # Same-family Qwen2.5-Instruct 2-GPU scaling on 2x H200 (qwen2.5-14b and qwen2.5-72b):
+    # interactive realizations (tp2 vs gpu2) + 72B offline and concurrent load sweeps.
+    # Submit: sbatch --partition=gpuH200x8 --gpus=2 --cpus-per-task=32 --mem=480G --time=08:00:00 slurm/delta-compare.slurm eval-scale-qwen25-2gpu
+    rc=0
+    OUT=${ISB_EVAL_OUT:-runs/eval-delta}
+    for model in qwen2.5-14b qwen2.5-72b; do
+        for spec in "logit_lens steering ablation gen_steering|counterfact:16" "activation_patching|mib/ioi:16"; do
+            ISB_MODEL_CACHE=${ISB_MODEL_CACHE:-isb-shared-cache} bench run \
+                --workload ${spec%%|*} --model $model --data "${spec##*|}" \
+                --regimes interactive generation --realizations default \
+                --backends nnsight-hf/0-8-1/gpu2 nnsight-hf/0-8-1/tp2 \
+                           nnsight-vllm/0-8-1/tp2 nnsight-vllm/0-8-1/opt/tp2 nnsight-vllm/0-8-1/opt/taps/tp2 \
+                           vllm-plain/0-27-1/tp2 vllm-plain/0-27-1/eager/tp2 \
+                --reference nnsight-hf/0-8-1/gpu2 --gpu 0 --timeout 3600 --out $OUT/scale-tp2-$model || rc=1
+        done
+    done
+    ISB_MODEL_CACHE=${ISB_MODEL_CACHE:-isb-shared-cache} bench run \
+        --suite nnsight-large-offline --model qwen2.5-72b \
+        --backends nnsight-hf/0-8-1/gpu2 nnsight-vllm/0-8-1/tp2 \
+                   vllm-plain/0-27-1/tp2 vllm-plain/0-27-1/eager/tp2 \
+        --reference nnsight-hf/0-8-1/gpu2 --gpu 0 --out $OUT/scale-load-offline-72b || rc=1
+    ISB_MODEL_CACHE=${ISB_MODEL_CACHE:-isb-shared-cache} bench run \
+        --suite nnsight-large-concurrent --model qwen2.5-72b \
+        --backends nnsight-hf/0-8-1/gpu2 nnsight-vllm/0-8-1/async/tp2 \
+                   vllm-plain/0-27-1/tp2 vllm-plain/0-27-1/eager/tp2 \
+        --reference nnsight-hf/0-8-1/gpu2 --gpu 0 --out $OUT/scale-load-concurrent-72b || rc=1
+    exit $rc
+    ;;
+eval-scale-llama70b)
+    # Llama-3.3-70B-Instruct on 4x H200 (or 4x A100-80GB): fastest realizations + load sweeps + 13-workload capability.
+    # Submit: sbatch --partition=gpuH200x8 --gpus=4 --cpus-per-task=64 --mem=960G --time=08:00:00 slurm/delta-compare.slurm eval-scale-llama70b
+    rc=0
+    OUT=${ISB_EVAL_OUT:-runs/eval-delta}
+    PLAIN27_TP4="vllm-plain/0-27-1/tp4 vllm-plain/0-27-1/eager/tp4"
+    ISB_MODEL_CACHE=${ISB_MODEL_CACHE:-isb-shared-cache} bench run --suite llama70b-fastest \
+        --backends nnsight-hf/0-8-1/gpu4 nnsight-hf/0-8-1/tp4 nnsight-vllm/0-8-1/tp4 \
+                   nnsight-vllm/0-8-1/opt/tp4 nnsight-vllm/0-8-1/opt/taps/tp4 $PLAIN27_TP4 \
+        --reference nnsight-hf/0-8-1/gpu4 --gpu 0 --out $OUT/stage5a-llama70b-fastest || rc=1
+    ISB_MODEL_CACHE=${ISB_MODEL_CACHE:-isb-shared-cache} bench run --suite llama70b-offline \
+        --backends nnsight-hf/0-8-1/gpu4 nnsight-vllm/0-8-1/tp4 $PLAIN27_TP4 \
+        --reference nnsight-hf/0-8-1/gpu4 --gpu 0 --out $OUT/stage5b-llama70b-offline || rc=1
+    ISB_MODEL_CACHE=${ISB_MODEL_CACHE:-isb-shared-cache} bench run --suite llama70b-concurrent \
+        --backends nnsight-hf/0-8-1/gpu4 nnsight-vllm/0-8-1/async/tp4 $PLAIN27_TP4 \
+        --reference nnsight-hf/0-8-1/gpu4 --gpu 0 --out $OUT/stage5b-llama70b-concurrent || rc=1
+    ISB_MODEL_CACHE=${ISB_MODEL_CACHE:-isb-shared-cache} bench run --suite llama70b-open \
+        --backends nnsight-hf/0-8-1/gpu4 nnsight-vllm/0-8-1/async/tp4 $PLAIN27_TP4 \
+        --reference nnsight-hf/0-8-1/gpu4 --gpu 0 --out $OUT/stage5b-llama70b-open || rc=1
     exit $rc
     ;;
 hftp-smoke)
