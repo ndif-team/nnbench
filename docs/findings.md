@@ -10,6 +10,27 @@ Sections before 2026-10-10 cite the spec names and `isb/specs/` files they ran (
 (`isb/models.py`) and suites (design.md §12.16); their rows and layer choices changed, so the saved
 runs keep the old names as the record of what ran.
 
+Sections before 2026-10-24 name backends in the form of 2026-10-10, one directory per config
+(`nnsight-vllm/sync`, `nnsight-vllm/sync/0-8-1`, `nnsight-hf/sdpa/0-8-1`,
+`nnsight-vllm/opt/0-8-1/taps`). Sections written before 2026-10-10 were renamed to that form on
+that date (commit `c0cf8bf`); the 2026-09-29 section keeps the flat system names of its time
+(`nnsight-vllm`, `vllm-lens`, `interp-engine`, `transformer-lens`) in its tables. The catalog
+that design.md §12.15 dates 2026-10-24 (commit `d360918`, committed 2026-10-25) renames those four
+per-config directories to the configs `nnsight-vllm/default`, `nnsight-vllm/0-8-1`,
+`nnsight-hf/0-8-1` and `nnsight-vllm/0-8-1/opt/taps`. Some names changed meaning with the catalog:
+`nnsight-vllm/default`, `nnsight-vllm/fp32`, `nnsight-vllm/<version>` and their `/tp*` variants
+switched from the async engine to the sync engine, and `nnsight-hf/0-7` switched from eager
+attention to SDPA. Command lines in a section are those of its date (`bench.py --spec`, `--tp`).
+
+Five sections dated 2026-10-20 to 2026-10-22 report numbers measured with an envoy-by-reference
+prototype of nnsight 0.8.1 on vLLM (`backends/nnsight-vllm/envoy_byref` and the `*/byref`
+configs). The catalog commit removed the prototype; each of those sections carries a removal note
+that gives the date as 2026-10-24.
+
+The October 2026 evaluation of the pinned releases (workload support, single requests, offline and
+online load, and model scale from Qwen2.5-7B to Llama-3.3-70B) is reported in
+[results.md](results.md).
+
 ## Smoke tier — logit lens, GPT-2, HF vs vLLM-async (2026-06)
 
 Result (`results/smoke_gpt2.txt`):
@@ -921,6 +942,10 @@ vLLM-Lens general cells in the same job) and `runs/micro-delta/perf/delta_perf_v
 
 ## Client tier — nnsight 0.4.6 / 0.7.0 / 0.8.1 on HF and vLLM, and the per-invoke serialization cost (2026-10-20)
 
+> Removal note (2026-11-11): the item "Prototype, envoys by reference" below ran an
+> envoy-by-reference prototype that was removed on 2026-10-24. No current config reproduces it;
+> `slurm/diag_cost.py`, cited below, still installs the same patch in its `inproc` mode.
+
 Suite `nnsight-versions` (`isb/suites.py`): HF sdpa bf16 and vLLM's sync engine (eager, prefix
 caching off) at each release, nnsight 0.4.6 (2025-04-24) on HF on the current stack and on its own
 (torch 2.6, transformers 4.51), HF 0.8.1 the reference. Qwen2.5-7B-Instruct on an A100-40GB,
@@ -1004,6 +1029,10 @@ a source-identity rejection, `…025923Z-0f7fdd66`, `…025956Z-68a4af7e`, `…0
 
 ## Envoys by reference through the benchmark — stock vs prototype nnsight 0.8.1 on vLLM, Qwen2.5-7B (2026-10-21)
 
+> Removal note (2026-11-11): the byref side of each comparison ran an envoy-by-reference
+> prototype that was removed on 2026-10-24. No current config reproduces it. The stock side is
+> upstream 0.8.1.
+
 The prototype of the 2026-10-20 section as backend configs (`nnsight-vllm/sync/0-8-1/byref`,
 `nnsight-vllm/0-8-1/byref`: the stock 0.8.1 image with `backends/nnsight-vllm/envoy_byref` on
 `PYTHONPATH`), run beside stock 0.8.1 and HF 0.8.1 in the same job, on one A100-SXM4-40GB per job
@@ -1078,6 +1107,10 @@ off nnsight 0.8.1's documented forms), not nnsight findings:
 
 ## Where nnsight's vLLM time goes: prompts × sites (2026-10-21)
 
+> Removal note (2026-11-11): the `vLLM byref` rows ran an envoy-by-reference prototype that was
+> removed on 2026-10-24. No current config reproduces them. The `vLLM stock` rows are upstream
+> 0.8.1.
+
 `slurm/diag_scaling.py`, `runs/nnsight-versions-diag/scaling` (worktree), Qwen2.5-7B bf16, one A100,
 nnsight 0.8.1, short CounterFact prompts, one token; median ms. Per prompt, the body reads the
 last-token residual of the first K blocks and saves the last-token logits; vLLM runs one invoke per
@@ -1108,6 +1141,10 @@ prompt.
   per-invoke cost also grows with the module tree (about 3× from 7B to 72B, as the layer count).
 - The `plain` HF row errored in the script (`AttributeError`); the empty trace stands in for it.
 ## nnsight 0.8.1's fastest realizations, with envoys by reference, Delta (2026-10-21)
+
+> Removal note (2026-11-11): the nnsight-on-vLLM columns of both tables ran an
+> envoy-by-reference prototype that was removed on 2026-10-24. No current config reproduces
+> them. [results.md](results.md) has the same realizations on upstream 0.8.1.
 
 The 2026-10-02 best-realization comparison rerun for nnsight 0.8.1 after the cell rewrite to the
 documented read sites, with the envoy-by-reference prototype as the vLLM baseline. General cells
@@ -1168,6 +1205,10 @@ fp32, one job per group on gpua013: `nnbench-opt081b runs/optimal-081-byref-bf16
 
 
 ## nnsight 0.8.1's fastest realizations at 72B over two H200s, bf16 (2026-10-22)
+
+> Removal note (2026-11-11): the nnsight-on-vLLM columns ran an envoy-by-reference prototype
+> that was removed on 2026-10-24. No current config reproduces them. [results.md](results.md)
+> has upstream 0.8.1 on two and four GPUs.
 
 The 7B comparison of the previous section repeated on Qwen2.5-72B-Instruct, every column bf16 over
 two H200s (gpue02, job 23110478, `nnbench-l72opt`; runs `runs/large-opt/20261022T151806Z-460acb26`

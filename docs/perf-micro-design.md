@@ -106,21 +106,18 @@ prints `RESULT_JSON {...}`. `sweep --plan P --out O` launches one subprocess per
 timeout, collects results, runs teardown, attaches overhead, writes the results file. Mirrors
 the existing `scripts/micro.py` one-backend-per-process pattern.
 
-Environment: one conda env per auto-registering plugin (they cross-fire if co-installed), all
-aligned on the SAME engine build (vLLM 0.19.1 / torch 2.10+cu128 / transformers 4.57.6 / py3.12) by
-cloning a base env and adding only the plugin with `--no-deps`:
-
-- `nnsight_vllm`: env `nnsight-vllm` + `PYTHONPATH=/disk/u/zikai/nnsight/src` (dev branch).
-- `pure_vllm`, `native_eagle`: env `nnsight-vllm` (clean vanilla `LLM`; nnsight does not auto-register).
-- `vllm_lens`: env `bench-vllm-lens` (clone + vllm-lens; registers the `activations` plugin).
-- `vllm_hook`: env `bench-vllm-hook` (clone + vllm-hook; registers `hook_registry` / `vllm_hook`).
-
-Setup script: `/disk/u/zikai/bench-systems/setup_competitor_envs.sh`. Use the env's python directly
-(not `conda run`, which gives false timeouts on vLLM), and always wrap runs in a timeout with an
-orphan check after. The earlier `nnsight-serve-test` env (vLLM 0.15.1) no longer exists; vLLM 0.19.1
-is the branch-target version, so this base is the right one. TODO before the head-to-head run: the
-runner (`scripts/perf.py`) must select the env python per system (it currently launches every cell
-subprocess with one python).
+Environment (updated 2026-11-11): each system's cells run in an interpreter selected for that
+system, because the auto-registering plugins (vLLM-Lens, vLLM-Hook) must not share an environment.
+`scripts/perf.py` launches each cell's subprocess with `ISB_PY_<system>=/path/to/python`, for
+example a wrapper around `apptainer exec` on the system's backend image (`make_wrappers` in
+`slurm/delta-compare.slurm` writes one per image). Without that variable the script falls back to
+its `_SYSTEM_ENV` table of conda environments on the development host. In that table, nnsight,
+plain vLLM and the Eagle scaffold share one environment, and the vLLM-Lens and vLLM-Hook entries
+name environments that no longer exist, so those two systems need the variable. The systems of one
+sweep run the same vLLM build: each Delta plan under `plans/` holds one vLLM version (five plans
+over 0.15.1 and 0.19.1). nnsight is measured as installed in its interpreter, with no
+`PYTHONPATH` override. Call the interpreter directly, and wrap every run in a timeout with an
+orphan check after it.
 
 ## Figures and tables it produces
 
@@ -147,5 +144,5 @@ subprocess with one python).
   `probe_hidden_states` / `probe_hook_qk` / `steer_hook_act`). Not yet run on GPU.
 - `native_eagle.py`: still a scaffold (the `kv_transfer` connector config is unresolved).
 - NVML memory wired in (see the metrics caveat: reservation-dominated, not yet isolating per-op).
-- Remaining before paper-grade numbers: per-system env-python in the runner, a clean uncontended
-  GPU re-run at `n_reps=10`, the memory-metric fix, and the larger model rungs (7-8B, 70B/TP=4).
+- Remaining before paper-grade numbers: a clean uncontended GPU re-run at `n_reps=10`, the
+  memory-metric fix, and the larger model rungs (7-8B, 70B/TP=4).

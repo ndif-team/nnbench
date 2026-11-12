@@ -1,13 +1,18 @@
-# Design — interp-serve-bench (living document)
+# Design: nnbench (living document)
 
 > Status: evolving. Captures decisions as they're made in the design conversation.
 > Current implementation contract: §12.1 and §12.13. Experiment authoring, effective cell calls,
 > artifact versions, and result comparison have explicit ownership and validation boundaries.
 
-> Runner update (2026-09-08): the main CLI now uses independent `backends/<system>/<config>/compose.yml`
-> configurations (§12.15), frozen input jobs, explicit references, and artifact-only scoring. See
-> [the runner contract](../backends/README.md). Historical CLI/shared-Compose examples below
-> describe the preceding runner and are not current launch instructions.
+> Reading order (2026-11-11): the document records decisions in the order they were made, and many
+> section headings carry their date. The sections that describe the current code are §8.1
+> (reporting policy), §12.1 (the matrix and the job contract), §12.13 (execution and artifacts),
+> §12.14 (cross-system comparison), §12.15 (backend tree: one directory per system, whose
+> `configs.yml` catalogs its images and configs), §12.16 (workloads, models, realizations, suites),
+> §12.17 (load patterns) and §12.18 (latency breakdown and run audit). Where another section
+> differs from these, these hold. The main CLI runs frozen input jobs with explicit references and
+> artifact-only scoring; see [the runner contract](../backends/README.md). CLI examples, file paths
+> and backend names in the other sections are those of the section's date.
 
 ## 1. Purpose & positioning
 
@@ -960,8 +965,12 @@ compared against **HF-Llama**, never against GPT-2. `family` is a *grouping key*
 not an abstraction in the code.
 
 **Parallelism divergences are findings to classify, default-owned by nnsight (CORE RULE).** A separate
-axis from the HF-vs-vLLM correctness above is **parallelism-equivalence**: `bench.py --pp/--tp` scores a
-tensor/pipeline-parallel vLLM engine against single-GPU vLLM — the GT2 oracle, emitting `EQUIVALENT` /
+axis from the HF-vs-vLLM correctness above is **parallelism-equivalence**: a run with
+`--comparison equivalence` scores a multi-GPU backend config (`nnsight-vllm/0-8-1/tp2`,
+`nnsight-vllm/0-8-1/tp4`) against the single-GPU config named by `--reference`
+(`nnsight-vllm/0-8-1`). The `parallel` suite holds the cases and the comparison axis, and both the
+single-GPU and multi-GPU configs are passed with `--backends`; until 2026-09-09 the flags were
+`bench.py --pp/--tp`. This is the GT2 oracle, emitting `EQUIVALENT` /
 `DIVERGENT`, a *different question* from correctness (so it does not reuse `SUPPORTED`/`SILENTLY_WRONG`;
 the cell's vs-HF correctness is carried as a separate dimension). The default assumption is that TP/PP
 and single-GPU share **the same behavior and the same interface** — identical intervention code runs
@@ -1007,20 +1016,32 @@ a declared alternative.
 
 ### 12.4 Layout
 
+Updated 2026-11-11 to the tree after §12.13 to §12.18.
+
 ```
 isb/
   protocol.py           # CausaLab-aligned, non-executable intervention semantics
   states.py             # AppState
   methodologies/
-    registry.py         # @cell(methodology, family, backend, variant=...) -> fn ; lookup
-    logit_lens.py       # the cells (+ a local helper if/when reuse appears)
+    registry.py         # @cell(methodology, family, backend, realizations=...) -> fn ; lookup
+    logit_lens.py ...   # the nnsight cells, one module per methodology
+    requirements.py     # case-requirement description hooks
   backends/
-    hf.py vllm_async.py # `be` infra: trace/save/collect/last/stack/teardown + load
-  oracle/equivalence.py # per-family reference comparison (unchanged)
-  sweep/spec.py         # InterventionSpec × TaskSpec × ExecutionRegime bindings
-  runner/run.py         # enumerate cells, group by (methodology,family), HF=control, score
+    base.py             # the `be` primitive contract: unit lists, FormError
+    hf.py vllm_sync.py vllm_async.py vllm_serve.py   # `be` infra per engine form
+  workloads/            # a methodology's rows, data, regimes, effect check; two layer-count sweeps (§12.16)
+  models.py suites.py   # registered checkpoints; run recipes (§12.16)
+  sweep/spec.py         # CellConfig = InterventionSpec × TaskSpec × ExecutionRegime; instantiate
+  sweep/execute.py      # shared cell execution and timing loop
+  perf/                 # timing.py, load.py (§12.17), phase_profiler.py (§12.18), microbenchmarks
+  jobs/                 # cli, frozen experiments, container launchers, worker, artifact scoring (§12.13)
+  oracle/equivalence.py # per-family reference comparison
+  runner/run.py         # evaluate and precision disambiguation for the standalone scorer
+  micro/                # construct probes
   report/applicability.py
-scripts/smoke.py        # enumerate the cells to run; print the map
+  manager/              # saved-report browser and HTML export (§12.12)
+backends/<system>/      # Dockerfile, compose.yml, configs.yml, backend.py, and cells.py except in the nnsight systems (§12.15)
+scripts/bench.py        # list | build | run | score
 ```
 
 ### 12.5 Extension points
@@ -1034,7 +1055,7 @@ scripts/smoke.py        # enumerate the cells to run; print the map
 | semantic variant | a workload row; its params are the template's semantic parameters (§12.16) |
 | realization variant | a `realizations=` entry on the system's cell registration (§12.16) |
 | case-specific requirements | registered case-description function beside the method implementations |
-| backend worker | independent `backends/<system>/<config>/compose.yml` and executable implementing the file contract (§12.15) |
+| backend worker | a `backends/<system>/` directory (Dockerfile, `compose.yml`, `configs.yml`, `backend.py`, `cells.py`; §12.15) implementing the job file contract (§12.13, `backends/README.md`) |
 
 ### 12.6 The primitive model as index (2026-06-11)
 
@@ -1678,3 +1699,31 @@ same workloads; 128 requests at 4, 16 and 64 per second; HF and the async engine
 a time like HF, so its open-loop latency follows from its single-request time. The async engine's
 offline rows run each chunk as B gathered requests on the same engine (2026-10-24; the earlier
 second, sync engine is gone).
+
+### 12.18 Latency breakdown and run audit (2026-10-26 to 2026-10-29)
+
+**Phase profiler** (`isb/perf/phase_profiler.py`, launched by `scripts/profile_phases.py`, one
+container per case and config through the system's own `compose.yml`): where one row's wall time
+goes, measured inside one engine. The profiler builds the backend as `isb.jobs.entry` does and binds
+each row as the harness does, with the harness's warm-up and trial counts. Each row runs three
+times in the same engine (uninstrumented, instrumented, uninstrumented), so a record carries the
+instrumentation's own cost. A call's time is the sum of client preparation, request transfer,
+engine time, output transfer and client post-processing. Engine time is charged instant by instant
+to interpretability-system code (`hook`), to lens projection, device-to-host copies and the packing
+of saves (`readout`), or to the rest of the engine; GPU activity comes from one `torch.profiler`
+session whose clock is fitted to the host clock. Using the compiled `vllm-plain` floor of the same
+workload, vLLM version and GPU count profiled into the same directory, `--combine` splits each
+profile into four segments: the compiled base engine, the eager or graph-break cost (signed),
+hook dispatch and edit, and readout with host transfer. The module docstring holds the contract.
+
+**Run audit** (`scripts/audit_runs.py`): a set of run directories passes when all of these hold.
+Every job completed with an image id. Each job started with under 100 MiB in use on its first GPU;
+the launcher records the `--gpu` index only, so the other GPUs of a multi-GPU config are not
+checked. Every run came from one source commit (or the commits named by `--allow-commits`, each
+with one source hash). The backends of an experiment loaded one model identity. No row is in a
+hard failure state (`JOB_FAILED`, `NO_REFERENCE`, `INCOMPATIBLE`, `INVALID_OUTPUT`). In a run that
+includes a `vllm-plain` config, every timed vLLM row has `overhead_vs_plain_vllm`, the floor of
+its own engine mode; rows of the `opt/taps` and `static` configs run a mode no `vllm-plain` config
+runs and fail this check. Warnings: GPU memory more than 1,024 MiB above the baseline after a job,
+an `INVALID_REFERENCE` row, an `UNSUPPORTED` row without a reason, a latency coefficient of
+variation above 0.20, and a timed vLLM row without `overhead_vs_vanilla`.
