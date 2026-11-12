@@ -64,7 +64,7 @@ prints every config.
 | nnsight on vLLM | 0.8.1 in the `0-8-1` configs and 0.8.2 in `0-8-2` (the same config set); 0.7.0 in `0-7`, 0.5.15 in `0-5-15` | 0.27.1; 0.15.1; 0.13.0 | `nnsight-vllm/0-8-1` (the sync engine, nnsight's documented `LLM` path), `0-8-1/async` (`AsyncLLM`), `0-8-1/opt` (installed edits), `0-8-1/opt/taps` (CUDA-graph taps) |
 | nnsight on HF transformers | 0.8.2 (`0-8-2`), 0.8.1, 0.7.0, 0.5.15 and 0.4.6 (`0-4-6`), on transformers 5.12.1 (5.19.0 in `tp2`, `tp4`; 4.51.3 in `0-4-6/era`) | | `nnsight-hf/0-8-1` (bf16, SDPA attention); `0-8-1/gpu2`, `0-8-1/gpu4` (layers placed across GPUs, `device_map=auto`); `0-8-1/tp2`, `0-8-1/tp4` (transformers tensor parallelism) |
 | vLLM-Lens | 1.2.1 | 0.19.1 | `vllm-lens/default`, `vllm-lens/opt`, `vllm-lens/async` |
-| interp-engine | 1.12.0 | 0.28.0 | `interp-engine-vllm/default` (hooked), `interp-engine-vllm/static` (`vllm-static`) |
+| interp-engine | 1.12.0; 1.14.3 in the `1-14-3` configs (the same config set) | 0.28.0 | `interp-engine-vllm/default` (hooked), `interp-engine-vllm/static` (`vllm-static`) |
 | TransformerLens 4, vLLM bridge | 4.0.0 | 0.20.2 | `transformer-lens-vllm/default`, `transformer-lens-vllm/batched` (`enable_batching`), `transformer-lens-vllm/opt` (headroom, see below) |
 | vLLM-Hook (IBM) | commit `0e34fdd` (`vllm_hook_plugins` 0.2.0) | 0.19.1 | `vllm-hook/default` (rpc storage), `vllm-hook/disk` (`disk-st-async`), `vllm-hook/qk` (the Q/K probe worker) |
 | Plain vLLM | | 0.15.1, 0.19.1, 0.20.2, 0.27.1, 0.28.0, 0.30.0, 0.32.0 | `vllm-plain/<version>` (vLLM's default mode: torch.compile and CUDA graphs) and `vllm-plain/<version>/eager` |

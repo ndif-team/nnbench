@@ -1,21 +1,30 @@
 """interp-engine cells for the cross-system workloads.
 
-Denotation, from interp-engine 1.12.0 source (`interp_engine/vllm_capture/requests.py`,
-`vllm_capture/steering.py`): on vLLM's fused-residual layers `resid_post.L` reads
-`hidden + residual` after layer L, and a `resid_post` steer adds its delta onto the first element,
-so the next layer's fused add carries it. `decode_residuals` runs vLLM's own final norm and
-unembedding in the worker; `unembed_rows` returns rows of the unembedding matrix.
+Denotation, the same in interp-engine 1.12.0 and 1.14.3 (`interp_engine/vllm_capture/_hooks.py`,
+`_sum_residual`; `vllm_capture/requests.py`, `_mk_resid_post_hook`; `vllm_capture/steering.py`): on
+vLLM's fused-residual layers `resid_post.L` reads `hidden + residual` after layer L, and a
+`resid_post` steer adds its delta onto the first element, so the next layer's fused add carries it.
+`decode_residuals` runs vLLM's own final norm and unembedding in the worker; `unembed_rows` returns
+rows of the unembedding matrix.
 
 A call's units go out as independent requests issued together on the facade's loop
-(`asyncio.gather`; `capture` is "safe to call concurrently", vllm_backend.py), the form
-`run_with_cache` itself takes for a batch (capture.py, `_run_with_cache_via_protocol`); the
-request-locked methods (`capture_generation`, `generate_steered`) take turns inside the engine.
-Writes are `AddSpec`, `OrthogonalDecompSpec` and `ProjectionCapSpec`, each one `d_model` vector per
-layer applied at every position. Workloads that need a per-position value or a zeroed submodule are
+(`asyncio.gather`; `capture` is "safe to call concurrently", vllm_backend.py), the form the batch
+capture itself takes (capture.py: `_run_with_cache_via_protocol` at 1.12.0, `_capture_via_protocol`
+at 1.14.3); the request-locked methods (`capture_generation`, `generate_steered`) take turns inside
+the engine. Every write op acts along given `d_model` directions at every position: `AddSpec`,
+`OrthogonalDecompSpec` and `ProjectionCapSpec`, and the lens's norm-scaled add, ablate and swap,
+which 1.12.0 takes as `lens_intervention` dicts and 1.13 on as `NormScaledAddSpec`, `AblateSpec`
+and `SwapSpec` (steer_specs.py). Workloads that need a per-position value or a zeroed submodule are
 declared unsupported. Outputs carry the unit axis at dim -2.
+
+From 1.13 on a steer shared by the requests of a call is a `steer()` block (steer.py: "the usual
+form"; a served call inside it carries the spec as its own per-request steer), `lens_intervention`
+is deprecated in its favour (vllm_backend.py, `_legacy_lens_steering`), and `capture` takes `rows`,
+the prompt rows to return (a static worker then sends only those). `_BLOCKS` selects those forms.
 """
 import asyncio
 from collections.abc import Mapping
+from importlib import metadata
 
 import torch
 import torch.nn.functional as F
@@ -24,6 +33,10 @@ from isb.methodologies.jacobian_lens import _load_fitted, _orthogonal
 from isb.methodologies.registry import Unsupported, cell
 from isb.methodologies.steering import _resolve_token
 from isb.tasks.lens_eval import locate
+
+
+# Whether the installed release has `steer()` blocks, `NormScaledAddSpec` and `capture(rows=)`.
+_BLOCKS = tuple(map(int, metadata.version("interp-engine").split(".")[:2])) >= (1, 13)
 
 
 def _ids(model, prompts):
@@ -51,19 +64,38 @@ def _capture(model, ids, layers, specs=None):
     return [torch.stack([a[to_address(p)] for p in points]) for a in acts]
 
 
+def _rows(model, ids, layers, positions=None, specs=None):
+    """`resid_post` of each layer at one row of every prompt (`positions`, default the last):
+    `[n_layers, B, d_model]`. From 1.13 the request names the row (`capture(rows=)`), so a static
+    worker sends that row alone; 1.12.0 returns every prompt row and the row is picked here."""
+    from interp_engine import to_address
+
+    # `rows` counts from the prompt's start (protocol.py, `checked_rows` refuses anything else)
+    positions = [len(row) - 1 for row in ids] if positions is None else \
+        [pos + len(row) if pos < 0 else pos for pos, row in zip(positions, ids)]
+    if not _BLOCKS:
+        acts = _capture(model, ids, layers, specs)
+        return torch.stack([a[:, pos, :] for a, pos in zip(acts, positions)], dim=1)
+    points = [f"resid_post.{i}" for i in layers]
+    specs = specs or [None] * len(ids)
+    engine = model.engine.model
+    acts = _gather(model, [engine.capture(row, points, steering_spec=spec, rows=[pos])
+                           for row, spec, pos in zip(ids, specs, positions)])
+    return torch.stack([torch.stack([a[to_address(p)][0] for p in points]) for a in acts], dim=1)
+
+
 def _final_logits(model, ids, specs=None):
     """Next-token logits of every prompt's last position: the last layer's residual through the
     model's own final norm and unembedding. [B, vocab]"""
-    acts = _capture(model, ids, [model.n_layers - 1], specs)
-    return model.engine.decode_residuals(torch.stack([a[0, -1] for a in acts])).float()
+    last = _rows(model, ids, [model.n_layers - 1], specs=specs)[0]
+    return model.engine.decode_residuals(last).float()
 
 
 @cell("logit_lens", family="llama", backend="interp_engine")
 def logit_lens(be, model, units, *, layers="all"):
     n = model.n_layers
     idx = list(range(n)) if layers == "all" else [i % n for i in layers]
-    acts = _capture(model, _ids(model, units), idx)
-    rows = torch.stack([a[:, -1, :] for a in acts], dim=1)                     # [n_layers, B, d]
+    rows = _rows(model, _ids(model, units), idx)                               # [n_layers, B, d]
     logits = model.engine.decode_residuals(rows.reshape(-1, rows.shape[-1])).float()
     return logits.reshape(len(idx), len(units), -1)                            # [n_layers, B, vocab]
 
@@ -103,8 +135,7 @@ def jacobian_lens(be, model, units, *, layers="all", position="last", transport=
     n = model.n_layers
     idx = list(range(n)) if layers == "all" else list(layers)
     positions = [locate(model.tokenizer, unit, position) for unit in units]
-    acts = _capture(model, _ids(model, units), [i % n for i in idx])
-    rows = torch.stack([a[:, pos, :] for a, pos in zip(acts, positions)], dim=1)  # [n_layers, B, d]
+    rows = _rows(model, _ids(model, units), [i % n for i in idx], positions)      # [n_layers, B, d]
     maps = _jlens_maps(model, transport, rows.shape[-1])
     if isinstance(maps, Mapping):
         rows = torch.stack([block.float() @ maps[i].T for block, i in zip(rows, idx)])
@@ -117,10 +148,10 @@ def jacobian_lens(be, model, units, *, layers="all", position="last", transport=
 @cell("residual_readout", family="llama", backend="interp_engine")
 def residual_readout(be, model, units, *, layers):
     """`resid_post.{i}` (`hidden + residual` after layer i) at each prompt's last token, in the
-    engine's dtype as `capture` returns it on CPU (every prompt row crosses; the capture takes no
-    position): [len(layers), B, d_model]."""
-    acts = _capture(model, _ids(model, units), [i % model.n_layers for i in layers])
-    return torch.stack([a[:, -1, :] for a in acts], dim=1)
+    engine's dtype as `capture` returns it on CPU: [len(layers), B, d_model]. On 1.12.0 every
+    prompt row crosses (its capture takes no position); from 1.13 the request names the row
+    (`_rows`)."""
+    return _rows(model, _ids(model, units), [i % model.n_layers for i in layers])
 
 
 @cell("attention_pattern", family="llama", backend="interp_engine")
@@ -147,31 +178,43 @@ def attention_pattern(be, model, units, *, layers="all"):
 
 
 def _direction(model, token_id):
-    """The target's unit unembedding row. unembed_rows is vLLM-backend surface outside the sync
-    protocol, so it runs on the facade's loop through the facade's documented `model` property."""
+    """The target's unit unembedding row. On 1.12.0 `unembed_rows` is vLLM-backend surface
+    outside the sync protocol (the facade gained it in 1.13), so it runs on the facade's loop
+    through the facade's documented `model` property, the same call on every release."""
     rows = model.engine.runner.run(model.engine.model.unembed_rows([token_id]))
     return F.normalize(rows[0].float(), dim=0)
 
 
 def _lens_steered_logits(model, ids, *, layer, direction, alpha, max_tokens):
-    """interp-engine's live norm-relative write: the per-request lens 'steer' op adds
-    (strength * ||h||) * d at each token from its own norm, at every forward with steer_generated
-    (vllm_capture/lens/intervene.py). max_fraction caps the added norm at max_fraction * ||h||, so
-    it is set above alpha. Returns the next-token logits of each forward of every prompt:
-    [max_tokens, B, vocab]."""
+    """interp-engine's live norm-relative write: the lens's steer adds (strength * ||h||) * d at
+    each token from its own norm, at every forward, prompt and generated positions alike.
+    max_fraction caps the added norm at max_fraction * ||h||, so it is set above alpha. From 1.13
+    it is a `NormScaledAddSpec` in a `steer()` block around the requests (steer.py; the block's
+    default writes generated positions and masks none; vllm_capture/steering.py,
+    `_modify_norm_scaled_add`); on 1.12.0 it is each request's `lens_intervention` 'steer' op with
+    steer_generated (vllm_capture/lens/intervene.py), the form 1.13 deprecates. Returns the
+    next-token logits of each forward of every prompt: [max_tokens, B, vocab]."""
     from interp_engine import to_address
 
     point = f"resid_post.{model.n_layers - 1}"
     engine = model.engine.model
+    if _BLOCKS:
+        from interp_engine import NormScaledAddSpec, SteeringSpec, steer
 
-    def lens_of(row):
-        return {"specs": [{"op": "steer", "layer": layer, "delta": direction.tolist(),
-                           "strength": float(alpha), "max_fraction": 2.0 * abs(float(alpha))}],
-                "steer_generated": True, "skip_positions": [], "prompt_len": len(row)}
+        spec = SteeringSpec.at(f"resid_post.{layer}", NormScaledAddSpec(
+            vector=direction, strength=float(alpha), max_fraction=2.0 * abs(float(alpha))))
+        with steer(engine, spec):
+            results = _gather(model, [engine.capture_generation(row, [point], max_tokens=max_tokens,
+                                                                temperature=0.0) for row in ids])
+    else:
+        def lens_of(row):
+            return {"specs": [{"op": "steer", "layer": layer, "delta": direction.tolist(),
+                               "strength": float(alpha), "max_fraction": 2.0 * abs(float(alpha))}],
+                    "steer_generated": True, "skip_positions": [], "prompt_len": len(row)}
 
-    results = _gather(model, [engine.capture_generation(row, [point], max_tokens=max_tokens,
-                                                        temperature=0.0, lens_intervention=lens_of(row))
-                              for row in ids])
+        results = _gather(model, [engine.capture_generation(
+            row, [point], max_tokens=max_tokens, temperature=0.0, lens_intervention=lens_of(row))
+            for row in ids])
     rows = []
     for row, (_, acts) in zip(ids, results):
         steps = acts[to_address(point)][len(row) - 1:]          # prompt's last row, then each step
@@ -185,9 +228,10 @@ def _lens_steered_logits(model, ids, *, layer, direction, alpha, max_tokens):
 
 @cell("steering", family="llama", backend="interp_engine")
 def steering(be, model, units, *, layer=8, target=" Rome", alpha=6.0, scale_by="mean_norm"):
-    """`token_norm` is the lens 'steer' op. `mean_norm` has no live form: AddSpec takes a fixed
-    vector, so one request per prompt captures the unsteered stream at `layer` for its mean
-    per-token norm and a second steers with that strength and reads the result."""
+    """`token_norm` is the lens's norm-scaled steer (`_lens_steered_logits`). `mean_norm` has no
+    live form: AddSpec takes a fixed vector, so one request per prompt captures the unsteered
+    stream at `layer` for its mean per-token norm and a second steers with that strength (each
+    request its own explicit `steering_spec`) and reads the result."""
     from interp_engine import AddSpec, LayerSteeringSpec, SteeringSpec
 
     last = model.n_layers - 1
@@ -210,10 +254,10 @@ def steering(be, model, units, *, layer=8, target=" Rome", alpha=6.0, scale_by="
 def gen_steering(be, model, units, *, layer=8, target=" Rome", alpha=6.0, new_tokens=8,
                  scale_by="mean_norm"):
     if scale_by != "token_norm":
-        raise Unsupported("the live norm-relative write (lens 'steer', steer_generated) scales by "
-                          "each token's own norm; a strength from the mean norm over the forward's "
-                          "tokens, which differs at the prefill step, has no live form "
-                          "(vllm_capture/lens/intervene.py)")
+        raise Unsupported("the live norm-relative write (the lens's steer: NormScaledAddSpec, "
+                          "lens_intervention 'steer' on 1.12.0) scales by each token's own norm; a "
+                          "strength from the mean norm over the forward's tokens, which differs at "
+                          "the prefill step, has no live form (vllm_capture/steering.py)")
     direction = _direction(model, _resolve_token(model.tokenizer, target))
     return _lens_steered_logits(model, _ids(model, units), layer=layer, direction=direction,
                                 alpha=alpha, max_tokens=new_tokens)
@@ -235,8 +279,8 @@ def activation_patching(be, model, units, *, layer=6, patch=True, positions="all
                           "mask, so a different value at every position is not expressible; a "
                           "single-position patch is (a masked AddSpec of clean minus corrupt)")
     n = len(units)
-    acts = _capture(model, clean_ids + corrupt_ids, [layer])
-    deltas = [acts[i][0, -1].float() - acts[n + i][0, -1].float() for i in range(n)]
+    last = _rows(model, clean_ids + corrupt_ids, [layer])[0].float()         # [2B, d_model]
+    deltas = [last[i] - last[n + i] for i in range(n)]
     point = f"resid_post.{model.n_layers - 1}"
     captured = [{} for _ in units]
     engine = model.engine.model
@@ -256,20 +300,23 @@ def activation_patching(be, model, units, *, layer=6, patch=True, positions="all
 def ablation(be, model, units, *, layer=6, target="mlp"):
     if target != "none":
         raise Unsupported(f"{target}_out is writable per request, but every write op acts along "
-                          f"one direction (add, orthogonal rescale, projection cap, lens ablate); "
-                          f"zeroing the whole output would take d_model single-direction removals")
+                          f"given directions (add, norm-scaled add, orthogonal rescale, projection "
+                          f"cap, ablate, swap); zeroing the whole output would take d_model "
+                          f"single-direction removals")
     return _final_logits(model, _ids(model, units))
 
 
 @cell("activation_harvest", family="llama", backend="interp_engine")
 def activation_harvest(be, model, units, *, layer=None, layers=None, export=True):
     """The documented batch capture, `run_with_cache` over a padded batch and its mask
-    (`interp_engine/capture.py`): on vLLM each row runs unpadded as its own `capture` request, the
-    requests run concurrently for the scheduler to batch, and each returns on CPU; the Cache pads
-    them to [batch, seq, d_model]. The valid rows are concatenated in prompt order: [tokens,
-    d_model], or [len(layers), tokens, d_model] for `layers`, which replaces `layer` (one request
-    per prompt captures every listed point). `export=False` sends the same concurrent requests
-    through `generate_text` for one greedy token, since `run_with_cache` needs a capture point."""
+    (`interp_engine/capture.py`; from 1.13 the same function is also named `capture`, and
+    `run_with_cache` stays as its alias): on vLLM each row runs unpadded as its own `capture`
+    request, the requests run concurrently for the scheduler to batch, and each returns on CPU;
+    the Cache pads them to [batch, seq, d_model]. The valid rows are concatenated in prompt order:
+    [tokens, d_model], or [len(layers), tokens, d_model] for `layers`, which replaces `layer` (one
+    request per prompt captures every listed point). `export=False` sends the same concurrent
+    requests through `generate_text` for one greedy token, since `run_with_cache` needs a capture
+    point."""
     from interp_engine import run_with_cache
 
     ids = _ids(model, units)

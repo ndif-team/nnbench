@@ -26,10 +26,11 @@ class InterpEngineBackend(Backend):
     name = "interp_engine"
 
     # The sync facade submits every call to one event loop on its own thread
-    # (`interp_engine/_loop.py`, LoopRunner.run: run_coroutine_threadsafe per call, from any
-    # thread), and `capture` and the per-request lens ops are documented as safe to call
-    # concurrently with other requests (`vllm_backend.py`), so client threads calling the cells at
-    # once overlap on the engine's scheduler (design.md §12.17); nothing to open.
+    # (`interp_engine/_loop.py`, LoopRunner.run: one submission per call, from any thread; from
+    # 1.13 it carries the caller's context, so an open `steer()` block reaches the request), and
+    # `capture` and the per-request lens ops are documented as safe to call concurrently with
+    # other requests (`vllm_backend.py`), so client threads calling the cells at once overlap on
+    # the engine's scheduler (design.md §12.17); nothing to open.
     concurrent_requests = True
 
     @contextlib.contextmanager
@@ -72,8 +73,8 @@ class InterpEngineBackend(Backend):
         facade's `model` property gives the VLLMModel, whose `engine` attribute holds the AsyncLLM
         once `warmup` (in `load`) has built it (vllm_backend.py, `_ensure_engine`); the call runs on
         the facade's loop, the one that engine is bound to. `engine` is backend surface outside
-        the sync protocol, as `unembed_rows` is; the same attribute serves `default` and
-        `vllm-static`."""
+        the sync protocol (as `unembed_rows` is on 1.12.0); the same attribute serves `default`
+        and `vllm-static`."""
         return model.engine.runner.run(model.engine.model.engine.collective_rpc(method, args=args))
 
     def teardown(self, model) -> None:
