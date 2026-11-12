@@ -66,7 +66,7 @@ prints every config.
 | vLLM-Lens | 1.2.1; 1.3.0 in the `1-3-0` configs (the same config set) | 0.19.1; 0.30.0 | `vllm-lens/default`, `vllm-lens/opt`, `vllm-lens/async` |
 | interp-engine | 1.12.0; 1.14.3 in the `1-14-3` configs (the same config set) | 0.28.0 | `interp-engine-vllm/default` (hooked), `interp-engine-vllm/static` (`vllm-static`) |
 | TransformerLens 4, vLLM bridge | 4.0.0 | 0.20.2 | `transformer-lens-vllm/default`, `transformer-lens-vllm/batched` (`enable_batching`), `transformer-lens-vllm/opt` (headroom, see below) |
-| vLLM-Hook (IBM) | commit `0e34fdd` (`vllm_hook_plugins` 0.2.0) | 0.19.1 | `vllm-hook/default` (rpc storage), `vllm-hook/disk` (`disk-st-async`), `vllm-hook/qk` (the Q/K probe worker) |
+| vLLM-Hook (IBM) | commit `0e34fdd` (v0.2.0, `vllm_hook_plugins`); v1.0.1, released as MIA (commit `d748ccf`), in the `1-0-1` configs | 0.19.1; 0.32.0 | `vllm-hook/default` (rpc storage), `vllm-hook/disk` (`disk-st-async`), `vllm-hook/qk` (the Q/K probe worker); `vllm-hook/1-0-1` (CUDA graphs, MIA's default), `1-0-1/eager`, `1-0-1/disk`, `1-0-1/qk` |
 | Plain vLLM | | 0.15.1, 0.19.1, 0.20.2, 0.27.1, 0.28.0, 0.30.0, 0.32.0 | `vllm-plain/<version>` (vLLM's default mode: torch.compile and CUDA graphs) and `vllm-plain/<version>/eager` |
 
 The bare `nnsight-vllm/default` and `nnsight-hf/default` configs build nnsight 0.8.0rc1 (commit

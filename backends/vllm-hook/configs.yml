@@ -1,9 +1,12 @@
-# IBM vLLM-Hook on vLLM 0.19.1 (the Dockerfile's ARG values). `storage` selects the plugin's
-# activation transport: rpc (its default) or the asynchronous safetensors spill to disk. `worker`
-# selects the engine's one worker extension: probe_hidden_states (the default) or probe_hook_qk,
-# the Q/K probe the attention cells read.
+# IBM vLLM-Hook: v0.2.0 on vLLM 0.19.1 in the configs without a version (the Dockerfile's ARG
+# values) and v1.0.1, released as MIA, on vLLM 0.32.0 in the `1-0-1` configs. `storage` selects the
+# plugin's activation transport: rpc (its default) or disk (v0.2.0: the asynchronous safetensors
+# spill, disk-st-async; MIA: save_to_disk). `worker` selects the engine's one worker extension: the
+# hidden-state capture (the default: probe_hidden_states, MIA capture_hs) or the Q/K probe the
+# attention cells read (probe_hook_qk, MIA capture_qk).
 images:
   default: {}
+  1-0-1: {VLLM_IMAGE: vllm/vllm-openai:v0.32.0, VLLM_HOOK_REF: d748ccf20bbcc1ffa6a880183bb354f9d00a3a82}
 configs:
   default:
     image: default
@@ -22,3 +25,20 @@ configs:
   tp4: {image: default, options: {<<: *base, tensor_parallel_size: 4}, gpus: 4}
   disk/tp2: {image: default, options: {<<: *base, storage: disk-st-async, tensor_parallel_size: 2}, gpus: 2}
   disk/tp4: {image: default, options: {<<: *base, storage: disk-st-async, tensor_parallel_size: 4}, gpus: 4}
+  # MIA runs every worker under CUDA graphs by default, on vLLM's V2 model runner (README,
+  # "Supported Configurations"); `eager` is its opt-out, the mode v0.2.0 forces. It reserves a 4 GiB
+  # capture buffer per rank outside gpu_memory_utilization (docs/configs.md, "Sizing the capture
+  # aperture"). Its served path is `vllm serve` with MiaClient, so there is no in-process AsyncLLM
+  # config.
+  1-0-1: {image: 1-0-1, options: *base}
+  1-0-1/eager: {image: 1-0-1, options: {<<: *base, enforce_eager: true}}
+  1-0-1/disk: {image: 1-0-1, options: {<<: *base, storage: disk}}
+  1-0-1/qk: {image: 1-0-1, options: {<<: *base, worker: capture_qk}}
+  1-0-1/qk/eager: {image: 1-0-1, options: {<<: *base, worker: capture_qk, enforce_eager: true}}
+  # tensor parallelism: hidden states are captured by layer (rank r takes the layers i with
+  # i % N == r) and Q/K by head, and the readers merge the ranks (examples/README.md, "Tensor
+  # parallelism")
+  1-0-1/tp2: {image: 1-0-1, options: {<<: *base, tensor_parallel_size: 2}, gpus: 2}
+  1-0-1/tp4: {image: 1-0-1, options: {<<: *base, tensor_parallel_size: 4}, gpus: 4}
+  1-0-1/eager/tp2: {image: 1-0-1, options: {<<: *base, enforce_eager: true, tensor_parallel_size: 2}, gpus: 2}
+  1-0-1/eager/tp4: {image: 1-0-1, options: {<<: *base, enforce_eager: true, tensor_parallel_size: 4}, gpus: 4}

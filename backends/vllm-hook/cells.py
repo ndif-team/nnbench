@@ -26,10 +26,26 @@ Denotation, from IBM/vLLM-Hook 0e34fdd source:
   so an engine either reads or steers.
 Workloads outside those forms are declared unsupported with the reason. Outputs carry the unit
 axis at dim -2.
+
+MIA (v1.0.1, d748ccf, on vLLM 0.32.0) keeps those read denotations and the same calls on `MiaLLM`:
+- `capture_hs` records `hidden + residual` after each decoder block, in the CUDA graph
+  (`mia/core/hooks/ops.py`, the capture op) and in the eager hook
+  (`mia/workers/hs_capture_worker.py`, `hs_hook`: `output[0] + output[1]`), layers numbered from 1,
+  the same `last_token` / `all_tokens` modes and `hooks_on` passes. A request names its layers and
+  mode in its own `extra_args` (`output_hidden_states`, `hs_mode`; docs/configs.md, "Per-request
+  arguments"), which `MiaLLM.generate` keeps over the engine's defaults.
+- `capture_qk` records the same post-RoPE query and keys, and `attn_tracker` rebuilds the
+  probabilities (`compute_attention_from_qk`).
+- A batch's probes arrive merged on `outputs[0].probes`, one first pass per request
+  (`mia/llm.py`, `_merge_probes`); `save_to_disk` writes the run under the given `run_id`.
+- `steer` adds `coefficient * dir` at every token of the listed blocks, or the last one
+  (`steering.positions`), on the prefill and decode passes (`steering.phase`); it writes no
+  artifact and returns no activations (docs/configs.md).
 """
 import json
 import os
 import shutil
+import uuid
 
 import torch
 
@@ -37,13 +53,19 @@ from isb.methodologies.jacobian_lens import _load_fitted, _orthogonal
 from isb.methodologies.registry import Unsupported, cell
 from isb.tasks.lens_eval import locate
 
-from .backend import AsyncHook
+from .backend import MIA, QK, READ, AsyncHook
 
 ONE_ENGINE = ("an engine carries one worker extension (HookLLM worker_name), so reading the stream "
               "(probe_hidden_states) and writing it (steer_hook_act) cannot share an engine")
 LAST_ROW_STEER = ("steer_hook_act writes only the last row of each forward "
                   "(steer_activation_worker._apply_steer: slice_view[-1:]), the last prompt token and "
                   "each decoded token; adding at every prompt position is not expressible")
+# MIA's steer worker reaches every token, and the engine that steers still returns nothing to read.
+MIA_STEER = ("the steer worker adds a fixed vector (steering.method add_vector: coefficient * dir "
+             "at the listed blocks) and returns no activations (docs/configs.md: steering writes "
+             "no artifact), and an engine carries one worker (MiaLLM worker_name), so the engine "
+             "that steers cannot read the stream: neither the norm the strength is relative to "
+             "nor the steered next-token distribution over the vocabulary")
 
 
 def _other_worker(model, needed, what):
@@ -99,10 +121,12 @@ def _capture(model, prompts, layers, mode, new_tokens=1):
     extra_args and adds its own defaults)."""
     from vllm import SamplingParams
 
-    if model.worker != "probe_hidden_states":
-        raise _other_worker(model, "probe_hidden_states", "hidden-state capture")
+    if model.worker != READ:
+        raise _other_worker(model, READ, "hidden-state capture")
     if isinstance(model.llm, AsyncHook):           # AsyncLLM: the fields go on each request
         return model.llm.capture(prompts, [i + 1 for i in layers], mode, new_tokens)
+    if MIA:
+        return _capture_mia(model, prompts, layers, mode, new_tokens)
     params = (SamplingParams(max_tokens=new_tokens, min_tokens=new_tokens, temperature=0.0, top_p=1.0,
                              extra_args={"hooks_on": "both"}) if new_tokens > 1
               else SamplingParams(max_tokens=1, temperature=0.0, top_p=1.0))
@@ -118,6 +142,30 @@ def _capture(model, prompts, layers, mode, new_tokens=1):
             stats = llm.analyze(analyzer_spec={"reduce": "none"}, probes=outs[0].probes)
     finally:
         llm._hs_mode = previous
+    return outs, stats["hidden_states"]
+
+
+def _capture_mia(model, prompts, layers, mode, new_tokens):
+    """`_capture` on MIA: every request carries its layers (numbered from 1), mode and passes in
+    its own `extra_args`, and a disk run is named by this call, read back and removed. `probes` is
+    read inside the call: MIA delivers an output's capture on first access (examples/README.md,
+    "Where the captured data goes")."""
+    from vllm import SamplingParams
+
+    extra = {"output_hidden_states": [i + 1 for i in layers], "hs_mode": mode}
+    if new_tokens > 1:
+        extra["hooks_on"] = "both"
+    params = SamplingParams(max_tokens=new_tokens, min_tokens=new_tokens, temperature=0.0,
+                            top_p=1.0, extra_args=extra)
+    llm = model.llm
+    if not model.save_to_disk:
+        outs = llm.generate(list(prompts), params, use_tqdm=False)
+        return outs, llm.analyze(analyzer_spec={"reduce": "none"},
+                                 probes=outs[0].probes)["hidden_states"]
+    run_id = uuid.uuid4().hex
+    outs = llm.generate(list(prompts), params, save_to_disk=True, run_id=run_id, use_tqdm=False)
+    stats = llm.analyze(analyzer_spec={"reduce": "none"}, run_id=run_id)
+    shutil.rmtree(os.path.join(model.hook_dir, run_id), ignore_errors=True)
     return outs, stats["hidden_states"]
 
 
@@ -164,6 +212,8 @@ def steering(be, model, units, *, layer=8, layers=None, target=" Rome", alpha=6.
              scale_by="mean_norm"):
     if alpha == 0:
         return _final_logits(model, units)
+    if MIA:
+        raise Unsupported(MIA_STEER)
     raise Unsupported(f"{LAST_ROW_STEER}; a strength from the stream's norm also needs a read, and "
                       f"{ONE_ENGINE}")
 
@@ -171,6 +221,8 @@ def steering(be, model, units, *, layer=8, layers=None, target=" Rome", alpha=6.
 @cell("gen_steering", family="llama", backend="vllm_hook")
 def gen_steering(be, model, units, *, layer=8, target=" Rome", alpha=6.0, new_tokens=8,
                  scale_by="mean_norm"):
+    if MIA:
+        raise Unsupported(MIA_STEER)
     raise Unsupported(f"{LAST_ROW_STEER}; steering at every decode step steers the last prompt "
                       f"token, not every prompt position")
 
@@ -195,6 +247,10 @@ def gen_capture(be, model, units, *, layer, new_tokens, export=True):
         return torch.stack([torch.tensor(out.outputs[0].token_ids)[:, None] for out in outs],
                            dim=1)                                               # [new_tokens, B, 1]
     if not model.save_to_disk and not isinstance(model.llm, AsyncHook) and len(units) > 1:
+        if MIA:
+            raise Unsupported("MiaLLM.generate merges several requests' probes onto outputs[0], "
+                              "keeping each request's first pass (mia/llm.py, _merge_probes), so a "
+                              "batch's decode passes are not on it; disk storage keeps them")
         raise Unsupported("HookLLM.generate merges several requests' RPC probes onto outputs[0], "
                           "keeping each request's first pass (hook_llm.py, generate), so a batch's "
                           "decode passes are lost; disk storage and the AsyncLLM path keep them")
@@ -212,6 +268,11 @@ def gen_capture(be, model, units, *, layer, new_tokens, export=True):
 def activation_patching(be, model, units, *, layer=6, patch=True, positions="all"):
     if not patch:
         return _final_logits(model, [unit[1] for unit in units])   # the corrupt runs, unpatched
+    if MIA:
+        raise Unsupported("a patch writes a value read from another run: the steer worker adds one "
+                          "vector from a file to the positions it steers (steering.vector_path), "
+                          "and an engine carries one worker (MiaLLM worker_name), so the engine "
+                          "that steers reads neither the clean stream nor the patched output")
     if positions != "last":
         raise Unsupported(LAST_ROW_STEER)
     raise Unsupported("a last-token patch is an add_vector of clean minus corrupt at the last row, "
@@ -309,16 +370,20 @@ def attention_pattern(be, model, units, *, layers="all"):
     over the prompt (`compute_attention_from_qk`, GQA heads repeated); the log is user code."""
     from vllm import SamplingParams
 
-    if model.worker != "probe_hook_qk":
-        raise _other_worker(model, "probe_hook_qk", "Q/K capture")
+    if model.worker != QK:
+        raise _other_worker(model, QK, "Q/K capture")
     n = model.n_layers
     idx = list(range(n)) if layers == "all" else [i % n for i in layers]
     llm = model.llm
     params = SamplingParams(max_tokens=1, temperature=0.0, top_p=1.0, extra_args={"output_qk": idx})
-    outs = llm.generate(list(units), params, save_to_disk=model.save_to_disk, use_tqdm=False)
+    # MIA names a disk run by an argument; v0.2.0 keeps the last run's id on the engine object
+    run_id = uuid.uuid4().hex if MIA else None
+    outs = llm.generate(list(units), params, save_to_disk=model.save_to_disk, use_tqdm=False,
+                        **({"run_id": run_id} if MIA and model.save_to_disk else {}))
     if model.save_to_disk:
-        weights = llm.analyzer.compute_attention_from_qk(run_id=llm._last_run_id)
-        shutil.rmtree(os.path.join(llm._hook_dir, llm._last_run_id), ignore_errors=True)
+        run_id = run_id or llm._last_run_id
+        weights = llm.analyzer.compute_attention_from_qk(run_id=run_id)
+        shutil.rmtree(os.path.join(model.hook_dir, run_id), ignore_errors=True)
     else:
         weights = llm.analyzer.compute_attention_from_qk(probes=outs[0].probes)
     if len(weights) != len(units):
