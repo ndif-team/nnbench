@@ -15,6 +15,9 @@ images:
   0-8-1: {NNSIGHT_REF: de7fec4d207fc8e0deacaa44fb68f8d0412506ef}
   0-8-1-tf5-19: {NNSIGHT_REF: de7fec4d207fc8e0deacaa44fb68f8d0412506ef, TRANSFORMERS_VERSION: 5.19.0,
                  CLICK_VERSION: 8.4.2, REMOVE_PACKAGES: spin}
+  0-8-2: {NNSIGHT_REF: b0f3b648722455ef406334b0849f79639c352ece}
+  0-8-2-tf5-19: {NNSIGHT_REF: b0f3b648722455ef406334b0849f79639c352ece, TRANSFORMERS_VERSION: 5.19.0,
+                 CLICK_VERSION: 8.4.2, REMOVE_PACKAGES: spin}
 configs:
   default: {image: default, options: {}}
   fp32: {image: default, options: {dtype: float32}}
@@ -37,3 +40,8 @@ configs:
   # rank per GPU, every rank runs the whole job and rank 0 publishes it (isb/jobs/entry.py)
   0-8-1/tp2: {image: 0-8-1-tf5-19, options: {<<: *sdpa, tp_size: 2}, gpus: 2, ranks: 2}
   0-8-1/tp4: {image: 0-8-1-tf5-19, options: {<<: *sdpa, tp_size: 4}, gpus: 4, ranks: 4}
+  0-8-2: {image: 0-8-2, options: *sdpa}
+  0-8-2/gpu2: {image: 0-8-2, options: {<<: *sdpa, device_map: auto}, gpus: 2}
+  0-8-2/gpu4: {image: 0-8-2, options: {<<: *sdpa, device_map: auto}, gpus: 4}
+  0-8-2/tp2: {image: 0-8-2-tf5-19, options: {<<: *sdpa, tp_size: 2}, gpus: 2, ranks: 2}
+  0-8-2/tp4: {image: 0-8-2-tf5-19, options: {<<: *sdpa, tp_size: 4}, gpus: 4, ranks: 4}
