@@ -1466,7 +1466,9 @@ that lacks the capability. `UNSUPPORTED` cells are excluded from performance com
   engine version in use, compiled with CUDA graphs or eager, and declare every intervention
   unsupported. Concurrent and open-loop clients share the engine as they would share a vLLM server.
   Chunked prefill follows the systems a floor serves: the 0.27.1 floors turn it off, matching
-  nnsight 0.8, which starts vLLM with it off, and the other versions keep vLLM's default. The scorer
+  nnsight 0.8, which starts vLLM with it off, and the other versions keep vLLM's default. The
+  model runner follows them the same way: vLLM 0.30.0 and later run the V2 runner by default, and
+  the eager 0.30.0 floors select V1 (`v2_model_runner: false`), which vllm-lens 1.3.0 imposes. The scorer
   divides each vLLM-engine row by the plain job's `__vanilla__` latency at
   the same vLLM version and workload (`overhead_vs_plain_vllm`). Plain jobs are identified by the
   engine mode they declare, never by name.

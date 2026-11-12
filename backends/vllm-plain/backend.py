@@ -7,8 +7,11 @@ what a user gets from plain vLLM; `vllm-plain/<version>/eager` sets enforce_eage
 eager-only systems run in, so their overhead is not confounded with the CUDA-graph gap
 (`isb/jobs/score.py`, `attach_plain_vllm`). The engine is vLLM's serving engine (AsyncLLM), so
 concurrent and open-loop clients are batched together as a vLLM server batches them.
+`v2_model_runner` states the model runner for a config whose system imposes one: vLLM 0.30.0 runs
+its V2 runner unless told otherwise, and vllm-lens 1.3.0 selects V1.
 """
 import contextlib
+import os
 from dataclasses import dataclass
 
 from isb.backends.base import Backend, prompts_of
@@ -28,11 +31,12 @@ class PlainVLLMBackend(Backend):
     # Several client threads may submit at once: AsyncLLM is a serving engine.
     concurrent_requests = True
 
-    def __init__(self, *, enforce_eager, **engine_options):
+    def __init__(self, *, enforce_eager, v2_model_runner=None, **engine_options):
         # Every config states the mode: attach_plain_vllm pairs baselines on it. Stats logging is
         # off unless a config asks for it, as `vllm.LLM` sets it.
         self.engine_options = {"disable_log_stats": True, **engine_options,
                                "enforce_eager": enforce_eager}
+        self.v2_model_runner = v2_model_runner     # None: the release's own choice
         self._loop = None
         self._loop_thread = None         # set while a concurrent session runs the loop
 
@@ -42,6 +46,10 @@ class PlainVLLMBackend(Backend):
         from vllm.usage.usage_lib import UsageContext
         from vllm.v1.engine.async_llm import AsyncLLM
 
+        if self.v2_model_runner is not None:
+            # vLLM reads the runner from the environment when it builds the engine config
+            # (vllm/config/vllm.py, `use_v2_model_runner`); the engine-core process inherits it.
+            os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if self.v2_model_runner else "0"
         # LLM_CLASS: the scheduler defaults `vllm.LLM` derives (max_num_batched_tokens, max_num_seqs)
         llm = AsyncLLM.from_engine_args(AsyncEngineArgs(model=repo, **self.engine_options),
                                         usage_context=UsageContext.LLM_CLASS)
@@ -125,4 +133,7 @@ class PlainVLLMBackend(Backend):
 def create_backend(spec):
     params = merge_requirements(spec.vllm_kwargs, options())
     backend = PlainVLLMBackend(**params)
-    return backend, RunConfig(EngineConfig("vllm", mode="plain", params=backend.engine_options))
+    recorded = dict(backend.engine_options)
+    if backend.v2_model_runner is not None:
+        recorded["v2_model_runner"] = backend.v2_model_runner
+    return backend, RunConfig(EngineConfig("vllm", mode="plain", params=recorded))
