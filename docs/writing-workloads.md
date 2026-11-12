@@ -30,7 +30,8 @@ settle it, read the code at the pinned version:
   after the layer is their sum, because the next layer's norm performs the add.
 - **The interpretability system's dispatch**, for what it hands user code and how a returned value
   is written back. vLLM-Lens 1.2.1 post-hooks receive the summed stream, and a returned tensor is
-  applied as a delta onto the first element (`_worker_ext.py`, `_apply_hook_delta`).
+  applied as a delta onto the first element (`_worker_ext.py`, `_apply_hook_delta`); 1.3.0 stores
+  it in the first element and zeroes the second (`_helpers/_hook_output.py`).
 
 Record the denotation in the cell's docstring with the file and version it came from.
 

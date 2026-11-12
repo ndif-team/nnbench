@@ -1,22 +1,27 @@
 """vLLM-Lens cells for the cross-system workloads.
 
-Each cell expresses the workload row's semantics with vLLM-Lens 1.2.1's own mechanisms: `Hook`
-functions on decoder layers (post-hooks see the summed residual stream, and a returned tensor
-replaces it) and `output_residual_stream` capture. A call's units go out as one `generate` over all
-their prompts, each request carrying its own hook or capture: the worker runs a request's hook on
-that request's token slice with that request's own `ctx.saved` (`_worker_ext.py`, `_hook_inner`:
-per-request `query_start_loc` slices and `store[req_id]` contexts) and returns `hook_results` and
-`activations` per request, in prompt order. Readouts run on the worker inside a hook, as in
-vLLM-Lens's logit-lens example: the model's final norm, then the unembedding weight from
-`ctx.get_parameter`. Outputs carry the unit axis at dim -2. Under tensor parallelism every rank
-runs each hook on the replicated stream and the plugin merges the ranks' `ctx.saved` dicts, so
-readouts are computed and kept on rank 0 only (`_rank0`).
+Each cell expresses the workload row's semantics with vLLM-Lens's own mechanisms, the same in
+1.2.1 and 1.3.0: `Hook` functions on decoder layers (post-hooks see the summed residual stream,
+and a returned tensor replaces it) and `output_residual_stream` capture. A call's units go out as
+one `generate` over all their prompts, each request carrying its own hook or capture: the worker
+runs a request's hook on that request's token slice with that request's own `ctx.saved`
+(`_worker_ext.py`, `_hook_inner`: per-request `query_start_loc` slices and `store[req_id]`
+contexts) and returns `hook_results` and `activations` per request, in prompt order. Readouts run
+on the worker inside a hook, as in vLLM-Lens's logit-lens example: the model's final norm, then
+the unembedding weight from `ctx.get_parameter`. Outputs carry the unit axis at dim -2. Under
+tensor parallelism every rank runs each hook on the replicated stream and the plugin merges the
+ranks' `ctx.saved` dicts, so readouts are computed and kept on rank 0 only (`_rank0`).
 
-Registered for family "llama" (vLLM module paths `model.norm`, `lm_head`; vLLM-Lens itself finds
-decoder layers only under `model.layers`-style trees).
+Registered for family "llama" (vLLM module paths `model.norm`, `lm_head`; vLLM-Lens 1.2.1 finds
+decoder layers only under `model.layers`-style trees, `_get_layers`, and 1.3.0 from the attention
+modules vLLM registers, `_discover_layer_modules`).
+
+1.3.0 adds a capture of the attention kernel's query and key (`output_qk`), which the
+attention-pattern cell reads when that release is installed (`_QK`).
 """
 import functools
 import sys
+from importlib import metadata
 
 import cloudpickle
 import torch
@@ -31,6 +36,9 @@ from isb.tasks.lens_eval import locate
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 
 _GREEDY = {"temperature": 0.0, "top_p": 1.0}
+
+# Whether the installed release captures the attention kernel's query and key (`output_qk`).
+_QK = tuple(map(int, metadata.version("vllm-lens").split(".")[:2])) >= (1, 3)
 
 
 def _rank0():
@@ -268,11 +276,13 @@ def ablation(be, model, units, *, layer=6, target="mlp"):
 def _prefill_transplant(clean, layer, last):
     """Replace the request's residual at `layer` with its clean snapshot on the request's first
     forward only (the prefill, which holds the whole prompt), then read the next-token logits at the
-    last layer on every forward. The returned stream is applied as a delta onto the layer's first
-    element (`_worker_ext.py`, `_apply_hook_delta`), so the summed stream after the layer becomes
-    the clean one at every prompt position, and the decode steps carry it through the request's
-    own KV cache. `clean=None` reads only. The prefill's shape goes to `ctx.saved["patched"]`: a
-    hook that raises is logged and skipped by the plugin (`_make_hook`), so the client checks it."""
+    last layer on every forward. The returned stream is written into the layer's output (1.2.1
+    adds the difference onto the first element, `_worker_ext.py`, `_apply_hook_delta`; 1.3.0 stores
+    it there and zeroes the second, `_helpers/_hook_output.py`), so the summed stream after the
+    layer becomes the clean one at every prompt position, and the decode steps carry it through
+    the request's own KV cache. `clean=None` reads only. The prefill's shape goes to
+    `ctx.saved["patched"]`: a hook that raises is logged and skipped by the plugin (`_make_hook`),
+    so the client checks it."""
     def transplant(ctx, h):
         out = None
         if clean is not None and ctx.layer_idx == layer and "patched" not in ctx.saved:
@@ -404,11 +414,31 @@ def residual_readout(be, model, units, *, layers):
 
 @cell("attention_pattern", family="llama", backend="vllm_lens")
 def attention_pattern(be, model, units, *, layers="all"):
-    raise Unsupported("vLLM-Lens 1.2.1 hooks only decoder layers (`_worker_ext.py`, "
-                      "`install_hooks`: register_forward_pre_hook/register_forward_hook on each "
-                      "layer of `_get_layers`) and hands a hook the layer's hidden-state slice; it "
-                      "has no capture of the attention module's query and key (Q/K capture, "
-                      "`output_qk` and `vllm_lens/attention.py`, arrives in 1.3.0)")
+    """vLLM-Lens 1.3.0's attention read (README "Attention pattern capture"): `output_qk` records
+    the post-RoPE query and key at the input of each listed layer's attention kernel, each
+    request's own token slice (`_worker_ext.py`, `_qk_hook_inner`: a forward pre-hook on vLLM's
+    `Attention`), with the kernel's parameters, and `vllm_lens.attention.attention_patterns`
+    replays the softmax on the client in fp32 over the request's positions, the prompt's at
+    max_tokens=1: `(n_heads, n_prompt, n_prompt)` per layer. The last query's row as
+    log-probabilities, like the reference: `[n_layers, B, n_heads, k_len]`. 1.2.1 has no capture
+    inside a layer."""
+    if not _QK:
+        raise Unsupported("vLLM-Lens 1.2.1 hooks only decoder layers (`_worker_ext.py`, "
+                          "`install_hooks`: register_forward_pre_hook/register_forward_hook on "
+                          "each layer of `_get_layers`) and hands a hook the layer's hidden-state "
+                          "slice; it has no capture of the attention module's query and key (Q/K "
+                          "capture, `output_qk` and `vllm_lens/attention.py`, arrives in 1.3.0)")
+    from vllm import SamplingParams
+    from vllm_lens.attention import attention_patterns
+
+    n = model.n_layers
+    idx = list(range(n)) if layers == "all" else [i % n for i in layers]
+    params = SamplingParams(max_tokens=1, min_tokens=1, **_GREEDY,
+                            extra_args={"output_qk": sorted(set(idx))})
+    outs = model.llm.generate(list(units), params, use_tqdm=False)
+    return torch.stack([torch.stack([
+        torch.log(attention_patterns(out.activations, layer=i)[:, -1, :]) for out in outs])
+        for i in idx])
 
 
 def _captured(model, prompts, layers, max_tokens, export):

@@ -4,7 +4,9 @@ The shared worker drives the cells in cells.py through this backend object; `mod
 engine options selects the fastest documented realization (cells_opt.py), and `async_llm: true`
 runs the same cells on vLLM's serving engine, AsyncLLM, one request per prompt (`_AsyncLLMEngine`).
 vLLM-Lens registers through vLLM's general_plugins entry point and forces enforce_eager on every
-engine.
+engine. 1.3.0 (the `1-3-0` configs, on vLLM 0.30.0) also selects vLLM's V1 model runner, whose
+state its hooks read: it sets VLLM_USE_V2_MODEL_RUNNER=0 unless the environment already names a
+runner (`_activations_plugin.py`).
 """
 import contextlib
 from dataclasses import dataclass, field

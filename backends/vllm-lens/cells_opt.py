@@ -1,17 +1,18 @@
 """vLLM-Lens cells in the fastest documented realization (backend `vllm_lens_opt`).
 
-Identical to the system's cells (backends/vllm-lens/cells.py) except where vLLM-Lens 1.2.1 offers
-a faster or a documented-but-unused path: the logit lens stacks every layer's last row and reads
-them out with one unembedding pass at the last layer (instead of one full-vocab pass per layer),
-and ablation is expressed through hooks (a pre-hook's input on vLLM's Qwen2 layers is the previous
-layer's MLP output, so zeroing it removes that MLP; the attention output is removed by recomputing
-the layer's MLP from the stream without it). A call's units go out as one `generate` over all their
-prompts, each request hooked on its own token slice with its own `ctx.saved`, and come back in
-prompt order; outputs carry the unit axis at dim -2. Readouts are computed and kept on
-tensor-parallel rank 0 only (`_rank0`), as in cells.py.
+Identical to the system's cells (backends/vllm-lens/cells.py) except where vLLM-Lens (1.2.1 and
+1.3.0) offers a faster or a documented-but-unused path: the logit lens stacks every layer's last
+row and reads them out with one unembedding pass at the last layer (instead of one full-vocab pass
+per layer), and ablation is expressed through hooks (a pre-hook's input on vLLM's Qwen2 layers is
+the previous layer's MLP output, so zeroing it removes that MLP; the attention output is removed
+by recomputing the layer's MLP from the stream without it). A call's units go out as one
+`generate` over all their prompts, each request hooked on its own token slice with its own
+`ctx.saved`, and come back in prompt order; outputs carry the unit axis at dim -2. Readouts are
+computed and kept on tensor-parallel rank 0 only (`_rank0`), as in cells.py.
 
-Registered for family "llama" (vLLM module paths `model.norm`, `lm_head`; vLLM-Lens itself finds
-decoder layers only under `model.layers`-style trees).
+Registered for family "llama" (vLLM module paths `model.norm`, `lm_head`; vLLM-Lens 1.2.1 finds
+decoder layers only under `model.layers`-style trees, `_get_layers`, and 1.3.0 from the attention
+modules vLLM registers, `_discover_layer_modules`).
 """
 import functools
 import sys
@@ -282,7 +283,7 @@ def _prefill_transplant(clean, layer, last):
 
 @cell("gen_patching", family="llama", backend="vllm_lens_opt")
 def gen_patching(be, model, units, *, layer=9, new_tokens=8, patch=True):
-    """As in cells.py: vLLM-Lens 1.2.1 has no faster documented form of a prefill transplant
+    """As in cells.py: vLLM-Lens has no faster documented form of a prefill transplant
     under decode. Capture every clean residual at `layer` with output_residual_stream, then
     greedily decode each corrupt prompt `new_tokens` steps with its pair's clean residual
     transplanted at the prefill, reading each step's next-token logits: `[new_tokens, B, vocab]`
@@ -369,15 +370,6 @@ def jacobian_lens(be, model, units, *, layers="all", position="last", transport=
     return stacked[[hooked.index(i) for i in idx]]                              # [n_layers, B, vocab]
 
 
-@cell("attention_pattern", family="llama", backend="vllm_lens_opt")
-def attention_pattern(be, model, units, *, layers="all"):
-    raise Unsupported("vLLM-Lens 1.2.1 hooks only decoder layers (`_worker_ext.py`, "
-                      "`install_hooks`: register_forward_pre_hook/register_forward_hook on each "
-                      "layer of `_get_layers`) and hands a hook the layer's hidden-state slice; it "
-                      "has no capture of the attention module's query and key (Q/K capture, "
-                      "`output_qk` and `vllm_lens/attention.py`, arrives in 1.3.0)")
-
-
 def _hooks_request(model, prompts, hooks, *, read_index):
     """One `generate` over `prompts` with the same several hooks on every request (each request
     keeps its own contexts); returns each request's saved dict of hook `read_index`."""
@@ -422,8 +414,10 @@ def ablation(be, model, units, *, layer=6, target="mlp"):
     raise ValueError(f"unknown ablation target {target!r}")
 
 
-from .cells import activation_harvest, gen_capture, residual_readout  # noqa: E402
+from .cells import (  # noqa: E402
+    activation_harvest, attention_pattern, gen_capture, residual_readout)
 
+cell("attention_pattern", family="llama", backend="vllm_lens_opt")(attention_pattern)
 cell("residual_readout", family="llama", backend="vllm_lens_opt")(residual_readout)
 cell("activation_harvest", family="llama", backend="vllm_lens_opt")(activation_harvest)
 cell("gen_capture", family="llama", backend="vllm_lens_opt")(gen_capture)

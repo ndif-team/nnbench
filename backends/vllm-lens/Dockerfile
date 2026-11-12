@@ -2,7 +2,8 @@
 ARG VLLM_IMAGE=vllm/vllm-openai:v0.19.1
 FROM ${VLLM_IMAGE}
 ARG VLLM_LENS_VERSION=1.2.1
-# --no-deps keeps the image's vLLM; vllm-lens 1.2.1 declares vllm>=0.16.0.
+# --no-deps keeps the image's vLLM: vllm-lens 1.2.1 declares vllm>=0.16.0, and 1.3.0 requires
+# vllm==0.30.0, the engine of the image its build arguments name (configs.yml).
 RUN python3 -m pip install --no-cache-dir --no-deps "vllm-lens==${VLLM_LENS_VERSION}" \
     && python3 -m pip install --no-cache-dir "cloudpickle>=3.0.0" "zstandard>=0.23.0" \
     && mkdir -p /models /outputs \
