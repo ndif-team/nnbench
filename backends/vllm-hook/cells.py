@@ -367,7 +367,9 @@ def attention_pattern(be, model, units, *, layers="all"):
     probe: per request, `output_qk` lists the read layers (the worker numbers attention modules
     from 0), the worker records the post-RoPE query at the last token and the keys of the whole
     prompt, and the `attn_tracker` analyzer's own reconstruction gives each head's probabilities
-    over the prompt (`compute_attention_from_qk`, GQA heads repeated); the log is user code."""
+    over the prompt (`compute_attention_from_qk`, GQA heads repeated); the log is user code, and a
+    probability that is zero in the analyzer's dtype is floored at that dtype's smallest normal
+    first, as in the HF cell, so the output stays finite."""
     from vllm import SamplingParams
 
     if model.worker != QK:
@@ -388,8 +390,9 @@ def attention_pattern(be, model, units, *, layers="all"):
         weights = llm.analyzer.compute_attention_from_qk(probes=outs[0].probes)
     if len(weights) != len(units):
         raise RuntimeError(f"reconstructed {len(weights)} requests' attention, expected {len(units)}")
-    return torch.stack([torch.stack([torch.log(w[f"model.layers.{i}.self_attn.attn"]["attention"])
-                                     for w in weights]) for i in idx])
+    probs = [[w[f"model.layers.{i}.self_attn.attn"]["attention"] for w in weights] for i in idx]
+    return torch.stack([torch.stack([torch.log(p.clamp_min(torch.finfo(p.dtype).tiny)) for p in layer])
+                        for layer in probs])
 
 
 # On the AsyncLLM backend (backend.py, VLLMHookAsyncBackend) the same cells read through

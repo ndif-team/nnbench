@@ -420,8 +420,8 @@ def attention_pattern(be, model, units, *, layers="all"):
     `Attention`), with the kernel's parameters, and `vllm_lens.attention.attention_patterns`
     replays the softmax on the client in fp32 over the request's positions, the prompt's at
     max_tokens=1: `(n_heads, n_prompt, n_prompt)` per layer. The last query's row as
-    log-probabilities, like the reference: `[n_layers, B, n_heads, k_len]`. 1.2.1 has no capture
-    inside a layer."""
+    log-probabilities, like the reference, a zero probability floored at the dtype's smallest
+    normal before the log: `[n_layers, B, n_heads, k_len]`. 1.2.1 has no capture inside a layer."""
     if not _QK:
         raise Unsupported("vLLM-Lens 1.2.1 hooks only decoder layers (`_worker_ext.py`, "
                           "`install_hooks`: register_forward_pre_hook/register_forward_hook on "
@@ -436,9 +436,9 @@ def attention_pattern(be, model, units, *, layers="all"):
     params = SamplingParams(max_tokens=1, min_tokens=1, **_GREEDY,
                             extra_args={"output_qk": sorted(set(idx))})
     outs = model.llm.generate(list(units), params, use_tqdm=False)
-    return torch.stack([torch.stack([
-        torch.log(attention_patterns(out.activations, layer=i)[:, -1, :]) for out in outs])
-        for i in idx])
+    probs = [[attention_patterns(out.activations, layer=i)[:, -1, :] for out in outs] for i in idx]
+    return torch.stack([torch.stack([torch.log(p.clamp_min(torch.finfo(p.dtype).tiny)) for p in layer])
+                        for layer in probs])
 
 
 def _captured(model, prompts, layers, max_tokens, export):
