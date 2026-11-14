@@ -133,9 +133,13 @@ class _GenBackend:
     def __init__(self):
         self.calls = []
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False):
-        self.calls.append({"prompts": prompts, "new_tokens": new_tokens, "bounded": bounded})
-        rows = [build_step(step) for step in range(new_tokens)]
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False,
+                 tokens=False):
+        self.calls.append({"prompts": prompts, "new_tokens": new_tokens, "bounded": bounded,
+                           "per_step": build_step is not None, "tokens": tokens})
+        rows = [None if build_step is None else build_step(step) for step in range(new_tokens)]
+        if tokens:                       # the tokens the decode produced, as the backends return
+            return torch.zeros(new_tokens, len(prompts), 1, dtype=torch.long)
         return torch.stack([r.detach() if keep_dtype else r.detach().float() for r in rows], dim=0)
 
 
@@ -145,7 +149,8 @@ def test_hf_cell_plumbs_bound_and_new_tokens_and_steers():
     out = fn(be, model, ["p"], layer=0, target="x", alpha=2.0, bound="unbounded", new_tokens=4)
     assert be.calls[0]["new_tokens"] == 4
     assert be.calls[0]["bounded"] is False                # bound="unbounded" -> bounded=False
-    assert out.shape == (4, 1, 1) and out.dtype == torch.long   # timed: each step's greedy token
+    assert be.calls[0]["tokens"] and be.calls[0]["per_step"]   # timed: steer per step, tokens back
+    assert out.shape == (4, 1, 1) and out.dtype == torch.long
     assert isinstance(model.transformer.h[0].output, tuple) or not torch.equal(
         model.transformer.h[0].output, torch.ones(1, 2, HID))   # the write landed
 
@@ -158,6 +163,14 @@ def test_hf_cell_alpha_zero_is_pure_readout():
              check=True)
     assert torch.equal(model.transformer.h[0].output, before)   # no write at all
     assert out.shape == (3, 1, VOCAB)                     # checked: per-step logits
+
+
+def test_hf_cell_alpha_zero_timed_is_a_decode_with_no_per_step_work():
+    be, model = _GenBackend(), _GenModel()
+    out = get_cell("gen_steering", "gpt2", "hf")(be, model, ["p"], layer=0, target="x", alpha=0.0,
+                                                 bound="unbounded", new_tokens=3)
+    assert be.calls[0]["tokens"] and not be.calls[0]["per_step"]
+    assert out.shape == (3, 1, 1)
 
 
 # ---- fake-backend sweep over a generation workload -------------------------------------------

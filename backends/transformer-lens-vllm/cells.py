@@ -199,7 +199,7 @@ def _fixed_edit(be, model, units, sites, direction, alpha):
     the fixed value `alpha / len(sites) * n * d`, `n` the first site's unsteered mean norm measured
     once per loaded engine (isb/methodologies/steering.py, `calibrated_strengths`). `add` takes exactly such a value, so
     the steered forward needs no capture first and the batched path runs a call as one forward."""
-    strengths = calibrated_strengths(be, sites, alpha, units,
+    strengths = calibrated_strengths(be, model, sites, alpha, units,
                                      functools.partial(mean_norms, be, model))
     return {f"blocks.{site}.hook_out": {"op": "add", "value": k * direction}
             for site, k in zip(sites, strengths)}

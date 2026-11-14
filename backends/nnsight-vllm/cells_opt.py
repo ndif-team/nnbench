@@ -27,6 +27,7 @@ Registered for family "llama" (vLLM Qwen2 paths `model.layers`, `model.norm`, `l
 Jacobian lens for every family through its profile. Outputs carry the unit axis at dim -2.
 """
 import functools
+import types
 
 import torch
 
@@ -169,7 +170,7 @@ def steering(be, model, units, *, layer=8, target=" Rome", alpha=6.0, scale_by="
         if scale_by == CALIBRATED and alpha != 0:       # no edit is installed during the read
             measure = functools.partial(mean_norms, be, model, blocks, residual="fused",
                                         masked=False)
-            strengths = calibrated_strengths(be, list(idx), alpha, units, measure)
+            strengths = calibrated_strengths(be, model, list(idx), alpha, units, measure)
         with model.edit(name=EDIT) as (tracer, edit):
             if alpha != 0:
                 direction = None
@@ -304,9 +305,11 @@ def jacobian_lens(be, model, m, units, *, layers="all", position="last", residua
     serialized onto every request with what it references (vllm-editing.md, "When to edit instead
     of trace"); for the fitted Qwen3.5-4B lens that is the 31 transport maps on each request. Here
     the maps go to the engine once, with the edit: stacked `[n_layers, d, d]` (one `[d, d]` for a
-    seeded map) in the engine's dtype and placed on the GPU before the edit is installed, so the
-    worker unpickles them onto its device once (`GPUModelRunner.Requests.register` deserializes an
-    edit once; each request's copy shares its locals) and a request moves no transport bytes.
+    seeded map) in the engine's dtype on the host, held by one object that every request's copy of
+    the block shares (`GPUModelRunner.Requests` deserializes an edit once and copies only the
+    lists, dicts and sets its block binds from outside). Each worker moves them onto the served
+    value's device on its first request (vllm.md, "Where tensors live": a referenced tensor arrives
+    in every worker as it was sent) and keeps them there, so later requests move no transport bytes.
 
     Sites, as in the general cell: a vLLM decoder layer's output is `(hidden, residual)` whose sum
     is the stream after the layer ("fused", vllm.md "What your block sees on vLLM"); the row at the
@@ -348,8 +351,7 @@ def jacobian_lens(be, model, m, units, *, layers="all", position="last", residua
             J = maps
         else:
             J = orthogonal(head.weight.shape[-1], maps)   # one seeded [d, d] for every layer
-        if J is not None:
-            J = J.to(device="cuda", dtype=dtype)
+        held = None if J is None else types.SimpleNamespace(maps=J.to(dtype=dtype))
         with model.edit(name=EDIT) as (tracer, edit):
             rows = []
             for i in idx:
@@ -357,9 +359,12 @@ def jacobian_lens(be, model, m, units, *, layers="all", position="last", residua
                 rows.append(out[0][pos] + out[1][pos] if residual == "fused"
                             else _resid(out, residual)[pos])
             h = torch.stack(rows)                                          # [n_layers, d]
-            if J is not None:
-                h = (torch.bmm(J, h.unsqueeze(-1)).squeeze(-1) if J.dim() == 3
-                     else h @ J.T)                                         # J_l @ h_l per layer
+            if held is not None:
+                if held.maps.device != h.device:          # this worker's first request
+                    held.maps = held.maps.to(h.device)
+                jmaps = held.maps           # a block-local name: an outer name the block reads ships
+                h = (torch.bmm(jmaps, h.unsqueeze(-1)).squeeze(-1) if jmaps.dim() == 3
+                     else h @ jmaps.T)                                     # J_l @ h_l per layer
             lens = processor(head, norm(h)).cpu().save()                   # [n_layers, vocab]
         be.remember_edit(key, edit)
     saves = be.run_edit(model, units)

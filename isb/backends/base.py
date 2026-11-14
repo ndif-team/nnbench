@@ -87,18 +87,25 @@ class Backend:
         `((act_clean - act_corrupt) * grad).sum()` per pair and layer. Needs autograd."""
         raise NotImplementedError
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False,
+                 tokens=False):
         """Greedy decode of `new_tokens` steps over `prompts`; `build_step(step)` runs once per
         decode step and returns that step's proxy (`[B_trace, ...]`). Returns `[new_tokens, B, ...]`
         on the host, fp32 unless `keep_dtype` (as `run`). `bounded` selects `tracer.iter[0:N]`
-        (True) or `tracer.iter[:]` (False)."""
+        (True) or `tracer.iter[:]` (False). With `tokens`, `build_step` returns nothing and the call
+        returns the tokens the decode produced, `[new_tokens, B, 1]`, read as the engine documents
+        them (HF: the ids `generate` returns; vLLM: the sampled token at each step).
+        `build_step=None` is a decode with no per-step work. An unbounded loop ends only when a
+        step asks for a forward the run does not make, so its `build_step` touches the model at
+        every step."""
         raise NotImplementedError
 
-    def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
-                       *, new_tokens, bounded=True, keep_dtype=False):
-        """`patch` composed with `generate`: `capture()` runs in a forward over the sources,
-        `build_step(clean, step)` once per decode step of the bases with the snapshot in the dtype
-        it was saved in. Returns `[new_tokens, B, ...]` as `generate` returns it."""
+    def generate_patch(self, model, source_prompts, base_prompts, capture, inject, build_step,
+                       *, new_tokens, bounded=True, keep_dtype=False, tokens=False):
+        """`patch` composed with `generate`: `capture()` runs in a forward over the sources, then
+        `inject(clean)` on the first forward of the bases (the prefill) with the snapshot in the
+        dtype it was saved in, and `build_step(step)` once per decode step. Returns what
+        `generate` returns."""
         raise NotImplementedError
 
     def plain(self, model, units, *, new_tokens=1):

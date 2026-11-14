@@ -4,18 +4,22 @@ backend's arity probe (`be.arity`): a tuple output is read at `[0]` and replaced
 same length, a bare tensor is read and replaced whole. Python control flow on values runs on
 parameters, never on proxies. Writes follow the 0.4 README: assignment to `.output` replaces it,
 `[:]` writes in place. Outputs carry the unit axis at dim -2. A timed call returns the user's result
-(the greedy next token of a write, a read in the model's dtype), a check call what the scorer
-compares (the next-token logits, a read in fp32), as the shared cells do.
+(the greedy next token of a write, the tokens a generation produced, a read in the model's dtype), a
+check call what the scorer compares (the next-token logits, a read in fp32), as the shared cells do.
 """
 from __future__ import annotations
+
+import weakref
 
 import torch
 import torch.nn.functional as F
 
+from isb.methodologies.readout import per_model
 from isb.methodologies.registry import cell
 from isb.methodologies.steering import resolve_token
 
 BACKEND = "hf_nnsight_0_4"
+_DIRECTIONS = weakref.WeakKeyDictionary()
 
 
 def _read(out, arity):
@@ -64,10 +68,15 @@ def _device(envoy):
     return next(envoy._module.parameters()).device
 
 
-def _direction(head, token_id, envoy):
-    """Unit unembedding row of `token_id`, built before the trace, on `envoy`'s device."""
-    row = head._module.weight[token_id].detach().float()
-    return F.normalize(row, dim=0).to(device=_device(envoy), dtype=head._module.weight.dtype)
+def _direction(be, model, head, target, envoy):
+    """Unit unembedding row of `target`'s token on `envoy`'s device, built before the trace on the
+    first call and kept for the loaded model's later calls."""
+    known = per_model(_DIRECTIONS, be, model)
+    if (target, envoy.path) not in known:
+        row = head._module.weight[resolve_token(model.tokenizer, target)].detach().float()
+        known[target, envoy.path] = F.normalize(row, dim=0).to(device=_device(envoy),
+                                                               dtype=head._module.weight.dtype)
+    return known[target, envoy.path]
 
 
 @cell("logit_lens", family="*", backend=BACKEND, realizations=[{"unembed": "weight"}])
@@ -95,7 +104,7 @@ def steering(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0, mode="r
         raise ValueError(f"steer layer {layer} is the read-out block; pick layer < {n - 1}")
     if mode not in ("inplace", "replace"):
         raise ValueError(f"unknown steering mode {mode!r}")
-    direction = _direction(head, resolve_token(model.tokenizer, target), blocks[layer])
+    direction = _direction(be, model, head, target, blocks[layer]) if alpha != 0 else None
     (a_layer,) = be.arity(model, [blocks[layer]])
 
     def build(rows):
@@ -140,10 +149,12 @@ def activation_patching(be, model, m, units, *, layer=6, patch=True, positions="
         return be.run(model, corrupted, build, keep_dtype=not check)
     if positions not in ("all", "last"):
         raise ValueError(f"unknown patch positions {positions!r} (expected 'all' or 'last')")
-    tokenize = model.tokenizer
-    for clean_prompt, corrupted_prompt in zip(clean, corrupted):
-        if len(tokenize(clean_prompt)["input_ids"]) != len(tokenize(corrupted_prompt)["input_ids"]):
-            raise ValueError("clean/corrupted token lengths must match for position-aligned patching")
+    if check:                   # the check calls run the timed calls' units in the same regime
+        tokenize = model.tokenizer
+        for clean_prompt, corrupted_prompt in zip(clean, corrupted):
+            if len(tokenize(clean_prompt)["input_ids"]) != len(tokenize(corrupted_prompt)["input_ids"]):
+                raise ValueError("clean/corrupted token lengths must match for position-aligned "
+                                 "patching")
 
     # the snapshot is a real tensor: move it with real values (torch 2.6 rejects proxy arguments)
     dtype = next(model._model.parameters()).dtype
@@ -168,7 +179,7 @@ def activation_patching(be, model, m, units, *, layer=6, patch=True, positions="
 def gen_steering(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0, new_tokens=8,
                  scale_by="mean_norm", check=False):
     blocks, head = m.blocks(model), m.head(model)
-    direction = _direction(head, resolve_token(model.tokenizer, target), blocks[layer])
+    direction = _direction(be, model, head, target, blocks[layer]) if alpha != 0 else None
     (a_layer,) = be.arity(model, [blocks[layer]])
 
     def step(index):
@@ -177,6 +188,8 @@ def gen_steering(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0, new
             hidden = _read(out, a_layer)
             vec = (alpha * _scale(hidden, scale_by, _mask(model, hidden))) * direction
             _replace(blocks[layer], out, a_layer, hidden + vec)
-        return _final_logits(head) if check else _next_token(head)
+        if check:
+            return _final_logits(head)
 
-    return be.generate(model, units, step, new_tokens=new_tokens, keep_dtype=not check)
+    return be.generate(model, units, step if alpha != 0 or check else None,
+                       new_tokens=new_tokens, keep_dtype=not check, tokens=not check)

@@ -30,7 +30,7 @@ from dataclasses import dataclass, field, replace
 
 from ..methodologies.observations import capture_choices
 from ..methodologies.registry import Unsupported, get_cell, get_realizations
-from ..oracle.checks import timed_check_for
+from ..oracle.checks import stop_tokens, timed_check_for
 from ..perf.core import returned_bytes
 from ..perf.timing import time_cell
 from ..perf.worker_memory import WorkerMemory, allow_callable_rpc, requested as worker_memory_requested
@@ -289,13 +289,16 @@ def _checked(regime, call, be, model):
     return check(_timed_units(regime))()
 
 
-def _timed_check(methodology, regime, timed, checked):
+def _timed_check(methodology, regime, timed, checked, stops):
     """The last timed output (a load pattern's kept calls, stacked) against the check output of
-    the same leading units: `{"passed", **metrics}` from the methodology's timed check."""
+    the same leading units: `{"passed", **metrics}` from the methodology's timed check, given
+    `stops()`, the engine's stop tokens, when it takes them."""
     if regime.kind in LOAD_KINDS:
         timed = _stack(timed)
     rows = min(t.shape[-2] if t.dim() >= 2 else t.shape[0] for t in (timed, checked))
-    passed, metrics = timed_check_for(methodology)(_first_rows(timed, rows), _first_rows(checked, rows))
+    check = timed_check_for(methodology)
+    extra = {"stops": stops()} if "stops" in inspect.signature(check).parameters else {}
+    passed, metrics = check(_first_rows(timed, rows), _first_rows(checked, rows), **extra)
     return {"passed": passed, **metrics}
 
 
@@ -400,7 +403,9 @@ def _execute_regime(spec, regime, iface, be, model, meta, outputs):
                     out = _first_rows(out, per_unit.shape[-2 if per_unit.dim() >= 2 else 0])
             outputs[(name, label)] = out
             if timed_out is not None:
-                case["timed_check"] = _timed_check(spec.methodology, regime, timed_out, out)
+                case["timed_check"] = _timed_check(
+                    spec.methodology, regime, timed_out, out,
+                    lambda: stop_tokens(model.tokenizer, spec.repo))
             _success(case)
         except Unsupported as e:
             if not timed:

@@ -211,7 +211,9 @@ class VLLMAsyncBackend(VLLMBackend):
 
         return torch.stack(self._gather([one(i, c, k) for i, (c, k) in enumerate(pairs)]))
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False,
+                 tokens=False):
+        """With `tokens`, each step's sampled token (`model.samples`, docs/models/vllm.md)."""
         import torch
 
         prompts = self.many(prompts, "generate")
@@ -222,14 +224,15 @@ class VLLMAsyncBackend(VLLMBackend):
                 rows = list().save()  # noqa: F841  (made in the trace frame; appended per step)
                 steps = tracer.iter[0:new_tokens] if bounded else tracer.iter[:]
                 for step in steps:
-                    rows.append(build_step(step))
+                    row = None if build_step is None else build_step(step)
+                    rows.append(model.samples if tokens else row)
             return self._extract_step_rows(await self._finished(tracer), new_tokens, "generation",
-                                           keep_dtype)
+                                           keep_dtype or tokens)
 
         return torch.cat(self._gather([one(p) for p in prompts]), dim=1)
 
-    def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
-                       *, new_tokens, bounded=True, keep_dtype=False):
+    def generate_patch(self, model, source_prompts, base_prompts, capture, inject, build_step,
+                       *, new_tokens, bounded=True, keep_dtype=False, tokens=False):
         import torch
 
         pairs = list(zip(*self.paired(source_prompts, base_prompts, "generate_patch")))
@@ -241,11 +244,13 @@ class VLLMAsyncBackend(VLLMBackend):
             with model.trace(base_prompt, temperature=0.0, top_p=1, max_tokens=new_tokens,
                              min_tokens=new_tokens) as tracer:
                 rows = list().save()  # noqa: F841
+                inject(clean_act)                    # outside the loop: the first forward
                 steps = tracer.iter[0:new_tokens] if bounded else tracer.iter[:]
                 for step in steps:
-                    rows.append(build_step(clean_act, step))
-            return self._extract_step_rows(await self._finished(tracer), new_tokens, "generate_patch",
-                                           keep_dtype)
+                    row = None if build_step is None else build_step(step)
+                    rows.append(model.samples if tokens else row)
+            return self._extract_step_rows(await self._finished(tracer), new_tokens,
+                                           "generate_patch", keep_dtype or tokens)
 
         return torch.cat(self._gather([one(s, b) for s, b in pairs]), dim=1)
 

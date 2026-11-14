@@ -30,6 +30,23 @@ def test_generated_tokens_are_compared_up_to_the_first_flip():
     assert not generated_tokens_match(torch.tensor([0, 2, 0])[:, None, None], logits)[0]
 
 
+def test_a_token_sampled_with_the_stop_tokens_masked_matches_the_best_other_token():
+    """An engine holding a generation to its minimum length masks the stop tokens: where a stop
+    token tops the check logits, the timed token is the best other one. Without the stop tokens
+    named, that token fails; a token below the best non-stop token fails either way."""
+    from isb.oracle.checks import tokens_match
+
+    logits = torch.tensor([[0.0, 20.0, 5.0, 40.0], [3.0, 1.0, 9.0, 2.0]])     # token 3 a stop
+    timed = torch.tensor([[1], [2]])
+    assert tokens_match(timed, logits, stops={3})[0]
+    assert not tokens_match(timed, logits)[0]
+    assert not tokens_match(torch.tensor([[2], [2]]), logits, stops={3})[0]
+    assert tokens_match(torch.tensor([[3], [2]]), logits, stops={3})[0]        # the raw argmax
+    steps = logits[:, None, :]                                       # [steps, B=1, vocab]
+    assert generated_tokens_match(timed[:, :, None], steps, stops=[3])[0]
+    assert not generated_tokens_match(timed[:, :, None], steps)[0]
+
+
 def test_a_timed_read_and_attention_probabilities_match_their_check_forms():
     """A read returned in the model's dtype matches its fp32 check copy; timed attention
     probabilities match the check call's log-probabilities; a different read fails either way."""

@@ -111,7 +111,8 @@ def audit_run_dir(run_dir: Path) -> tuple[list[str], list[str], dict]:
             if med and not cell.get("saturated") and not backend.startswith(("nnsight-hf/", "vllm-plain/")):
                 if cell.get("overhead_vs_vanilla") is None:
                     warnings.append(f"{loc} -> timed vLLM row missing overhead_vs_vanilla")
-                if has_plain_vllm and cell.get("overhead_vs_plain_vllm") is None:
+                # no floor matched; a matched floor that saturated leaves the ratio None by design
+                if has_plain_vllm and cell.get("plain_vllm") is None:
                     errors.append(f"{loc} -> timed vLLM row missing overhead_vs_plain_vllm (check matching vllm-plain version/eager config)")
 
     summary = {

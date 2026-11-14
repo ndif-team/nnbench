@@ -169,7 +169,9 @@ class VLLMSyncBackend(VLLMBackend):
             stacks.append(torch.stack(mats, dim=0))                 # [new_tokens, 1, ...]
         return torch.cat(stacks, dim=1)
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False,
+                 tokens=False):
+        """With `tokens`, each step's sampled token (`model.samples`, docs/models/vllm.md)."""
         prompts = self.many(prompts, "generate")
         with model.trace(temperature=0.0, top_p=1, max_tokens=new_tokens,
                          min_tokens=new_tokens) as tracer:
@@ -181,11 +183,12 @@ class VLLMSyncBackend(VLLMBackend):
                     rows[i] = per_step               # placed before the loop and filled in place
                     steps = tracer.iter[0:new_tokens] if bounded else tracer.iter[:]
                     for step in steps:
-                        per_step.append(build_step(step))
-        return self._step_rows(rows, new_tokens, "generation", keep_dtype)
+                        row = None if build_step is None else build_step(step)
+                        per_step.append(model.samples if tokens else row)
+        return self._step_rows(rows, new_tokens, "generation", keep_dtype or tokens)
 
-    def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
-                       *, new_tokens, bounded=True, keep_dtype=False):
+    def generate_patch(self, model, source_prompts, base_prompts, capture, inject, build_step,
+                       *, new_tokens, bounded=True, keep_dtype=False, tokens=False):
         sources, bases = self.paired(source_prompts, base_prompts, "generate_patch")
         n = len(sources)
         with model.trace(**SAMPLING) as tracer:
@@ -203,10 +206,12 @@ class VLLMSyncBackend(VLLMBackend):
                 with tracer.invoke(p):
                     per_step = []
                     rows[i] = per_step
+                    inject(clean_acts[i])            # outside the loop: the first forward
                     steps = tracer.iter[0:new_tokens] if bounded else tracer.iter[:]
                     for step in steps:
-                        per_step.append(build_step(clean_acts[i], step))
-        return self._step_rows(rows, new_tokens, "generate_patch", keep_dtype)
+                        row = None if build_step is None else build_step(step)
+                        per_step.append(model.samples if tokens else row)
+        return self._step_rows(rows, new_tokens, "generate_patch", keep_dtype or tokens)
 
     def plain(self, model, units, *, new_tokens=1):
         """One `generate` call to nnsight's `vllm.LLM` entrypoint with no trace, which the engine

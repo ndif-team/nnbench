@@ -4,7 +4,7 @@ generate_patch backend plumbing) — no GPU; torch + fakes only.
 Pins (1) the prefill-only injection semantics (the shape-gated write that lands at prefill and
 leaves decode steps untouched — the part the GPU run then measures across backends), (2) the
 clean-snapshot capture, (3) the cell plumbing through a fake generate_patch (capture once, inject
-per step, baseline path uses plain generate with no capture), and (4) a fake-backend sweep over a
+once, baseline path uses plain generate with no capture), and (4) a fake-backend sweep over a
 generation workload consuming a clean/corrupt PAIR (aggregate=False). The composition's actual
 cross-backend verdict is the GPU run's job, not fakeable here.
 """
@@ -119,19 +119,28 @@ class _PatchBackend:
     def __init__(self):
         self.calls = []
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False):
-        self.calls.append({"kind": "generate", "prompts": prompts,
-                           "new_tokens": new_tokens, "bounded": bounded})
-        rows = [build_step(step) for step in range(new_tokens)]
-        return torch.stack([r.detach() if keep_dtype else r.detach().float() for r in rows], dim=0)
+    def _rows(self, model, build_step, new_tokens, keep_dtype, tokens):
+        rows = []
+        for step in range(new_tokens):
+            row = None if build_step is None else build_step(step)
+            rows.append(model.samples if tokens else row)
+        return torch.stack([r.detach() if keep_dtype or tokens else r.detach().float()
+                            for r in rows], dim=0)
 
-    def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
-                       *, new_tokens, bounded=True, keep_dtype=False):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False,
+                 tokens=False):
+        self.calls.append({"kind": "generate", "prompts": prompts, "new_tokens": new_tokens,
+                           "bounded": bounded, "per_step": build_step is not None,
+                           "tokens": tokens})
+        return self._rows(model, build_step, new_tokens, keep_dtype, tokens)
+
+    def generate_patch(self, model, source_prompts, base_prompts, capture, inject, build_step,
+                       *, new_tokens, bounded=True, keep_dtype=False, tokens=False):
         self.calls.append({"kind": "generate_patch", "sources": source_prompts,
-                           "bases": base_prompts, "new_tokens": new_tokens, "bounded": bounded})
-        clean = capture()                                # one capture, like trace 1
-        rows = [build_step(clean, step) for step in range(new_tokens)]
-        return torch.stack([r.detach() if keep_dtype else r.detach().float() for r in rows], dim=0)
+                           "bases": base_prompts, "new_tokens": new_tokens, "bounded": bounded,
+                           "per_step": build_step is not None, "tokens": tokens})
+        inject(capture())                                # one capture, injected at the prefill
+        return self._rows(model, build_step, new_tokens, keep_dtype, tokens)
 
 
 def test_patched_cell_captures_then_injects():
@@ -143,26 +152,27 @@ def test_patched_cell_captures_then_injects():
     assert c["kind"] == "generate_patch"
     assert c["sources"] == ["clean prompt"] and c["bases"] == ["corrupt prompt"]
     assert c["new_tokens"] == 4 and c["bounded"] is False       # bound="unbounded" -> bounded=False
-    assert out.shape == (4, 1, 1) and out.dtype == torch.long   # timed: each step's greedy token
+    assert c["tokens"] and not c["per_step"]         # timed: the decode's tokens, no per-step read
+    assert out.shape == (4, 1, 1) and out.dtype == torch.long
     # the capture (layer-0 residual) was injected at the fake prefill (whole-tuple replace)
     assert torch.equal(model.transformer.h[0].output[0], torch.zeros(3, HID))
 
 
-def test_cell_injects_exactly_once_even_for_one_token_prompt():
-    # Regression: shape-only prefill detection re-injects on EVERY decode step of a one-token prompt
-    # (decode hidden shares the prefill's [1, hidden] shape). The first-forward flag must inject
-    # exactly once regardless of prompt length — else the method silently changes outside the
-    # length>1 benchmark prompts.
+def test_a_check_call_reads_every_step_and_injects_only_at_the_prefill():
+    # A one-token prompt's decode steps share the prefill's [1, hidden] shape, so a per-step
+    # closure that injected would re-inject on every step; the transplant is `inject`, run once.
     be, model = _PatchBackend(), _PatchModel(prompt_len=1)
     calls = []
     orig = gen_patching._inject_transplant
     gen_patching._inject_transplant = lambda *a, **k: calls.append(1)
     try:
         fn = get_cell("gen_patching", "gpt2", "hf")
-        fn(be, model, [("a", "b")], layer=0, bound="bounded", new_tokens=5, patch=True)
+        out = fn(be, model, [("a", "b")], layer=0, bound="bounded", new_tokens=5, patch=True,
+                 check=True)
     finally:
         gen_patching._inject_transplant = orig
     assert calls == [1], f"expected exactly one injection over 5 decode steps, got {len(calls)}"
+    assert out.shape == (5, 1, VOCAB)                            # each step's next-token logits
 
 
 def test_baseline_cell_uses_generate_with_no_capture():
@@ -174,13 +184,13 @@ def test_baseline_cell_uses_generate_with_no_capture():
     assert out.shape == (3, 1, 1)
 
 
-def test_vllm_cell_reads_engine_samples_timed_and_engine_logits_checked():
+def test_vllm_cell_returns_the_decode_tokens_timed_and_engine_logits_checked():
     be, model = _PatchBackend(), _PatchModel(prompt_len=3)
     fn = get_cell("gen_patching", "gpt2", "vllm_async")
     model.samples = torch.tensor([[5]])
     out = fn(be, model, [("clean", "corrupt")], layer=0, bound="bounded", new_tokens=2, patch=True)
-    assert be.calls[0]["kind"] == "generate_patch"
-    assert torch.equal(out, torch.tensor([[[5]], [[5]]]))         # model.samples per step
+    assert be.calls[0]["kind"] == "generate_patch" and be.calls[0]["tokens"]
+    assert torch.equal(out, torch.tensor([[[5]], [[5]]]))         # the engine's token per step
     out = fn(be, model, [("clean", "corrupt")], layer=0, bound="bounded", new_tokens=2, patch=True,
              check=True)
     assert out.shape == (2, 1, VOCAB)                            # reads model.logits[-1:, :]

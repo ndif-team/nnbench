@@ -43,12 +43,16 @@ class Tokenizer:
         return [1]
 
 
+class LoadedModel(SimpleNamespace):
+    """A subclass, so the per-model caches can hold it by weak reference as they hold a real one."""
+
+
 def model_fixture():
     blocks = [OutputSpy(torch.ones(2, 3)) for _ in range(2)]
     for block in blocks:
         block.mlp = OutputSpy(torch.ones(2, 3))
         block.attn = OutputSpy(torch.ones(2, 3))
-    return SimpleNamespace(
+    return LoadedModel(
         transformer=SimpleNamespace(h=blocks, ln_f=lambda x: x),
         lm_head=SimpleNamespace(weight=torch.eye(3), output=torch.ones(1, 2, 3)),
         logits=torch.ones(2, 3), samples=torch.zeros(1, 1, dtype=torch.long),
@@ -83,17 +87,20 @@ class BackendSpy(Backend):
         self.units.append(self.paired(clean, corrupted, "patch"))
         return patch(capture())
 
-    def generate(self, model, prompts, step, *, new_tokens, bounded, keep_dtype=False):
+    def generate(self, model, prompts, step, *, new_tokens, bounded, keep_dtype=False,
+                 tokens=False):
         self.calls.append("generate")
         self.units.append(self.many(prompts, "generate"))
-        return torch.stack([step(index) for index in range(new_tokens)])
+        rows = [None if step is None else step(index) for index in range(new_tokens)]
+        return torch.stack([model.samples if tokens else row for row in rows])
 
-    def generate_patch(self, model, clean, corrupted, *, capture, build_step, new_tokens, bounded,
-                       keep_dtype=False):
+    def generate_patch(self, model, clean, corrupted, capture, inject, step, *, new_tokens,
+                       bounded, keep_dtype=False, tokens=False):
         self.calls.append("generate_patch")
         self.units.append(self.paired(clean, corrupted, "generate_patch"))
-        value = capture()
-        return torch.stack([build_step(value, index) for index in range(new_tokens)])
+        inject(capture())
+        rows = [None if step is None else step(index) for index in range(new_tokens)]
+        return torch.stack([model.samples if tokens else row for row in rows])
 
     def session(self, model, build):
         self.calls.append("session")
@@ -132,7 +139,7 @@ def test_primitives_refuse_a_bare_unit_and_unequal_sides_before_touching_the_eng
     bare, two, one = "one prompt", ["one prompt", "another prompt"], ["base"]
     kwargs = {"generate": {"new_tokens": 2}, "generate_patch": {"new_tokens": 2}}.get(primitive, {})
     args = {"run": (None, bare, None), "patch": (None, bare, one, None, None),
-            "generate": (None, bare, None), "generate_patch": (None, bare, one, None, None),
+            "generate": (None, bare, None), "generate_patch": (None, bare, one, None, None, None),
             "attribute": (None, bare, one, None, None, 1)}
     with pytest.raises(FormError, match=f"{cls}.{primitive} takes a nonempty list of units, got str"):
         fn(*args[primitive], **kwargs)

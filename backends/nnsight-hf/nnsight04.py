@@ -7,6 +7,7 @@ cells_nnsight04.py spell their reads and writes for it under its own interface n
 are tensors once the trace exits. backend.py selects it when nnsight 0.4 is installed.
 """
 from isb.backends.base import Backend, prompts_of
+from isb.backends.hf import generated, greedy
 
 
 class NNsight04Backend(Backend):
@@ -72,21 +73,29 @@ class NNsight04Backend(Backend):
         res = res.detach().cpu()
         return res if keep_dtype else res.float()
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False,
+                 tokens=False):
         """0.4's per-step form: inside `model.all()` every module access refers to each call in
         turn, so the body runs once per decode step and rows collect in an `nnsight.list()`. The
-        body is recorded once as a graph, so `build_step` gets no step index (None)."""
+        body is recorded once as a graph, so `build_step` gets no step index (None). With `tokens`,
+        the ids `generate` returns (`model.generator.output`, the 0.4 README)."""
         import nnsight
         import torch
 
         if not bounded:
             raise ValueError("nnsight 0.4 has no unbounded iteration; its form is model.all()")
         prompts = self.many(prompts, "generate")
-        with model.generate(prompts, max_new_tokens=new_tokens, min_new_tokens=new_tokens,
-                            do_sample=False, pad_token_id=model.tokenizer.eos_token_id):
+        with model.generate(prompts, **greedy(new_tokens), pad_token_id=model.tokenizer.eos_token_id):
             rows = nnsight.list().save()
-            with model.all():
-                rows.append(build_step(None))
+            if build_step is not None:
+                with model.all():
+                    row = build_step(None)
+                    if not tokens:
+                        rows.append(row)
+            if tokens:
+                ids = model.generator.output.save()
+        if tokens:
+            return generated(ids, new_tokens)
         rows = list(rows)
         if len(rows) != new_tokens:
             raise RuntimeError(f"collected {len(rows)} per-step rows, expected {new_tokens}")
@@ -104,8 +113,7 @@ class NNsight04Backend(Backend):
             if new_tokens == 1:
                 out = model._model(**inputs).logits[:, -1, :].argmax(-1, keepdim=True)
             else:
-                out = model._model.generate(**inputs, max_new_tokens=new_tokens,
-                                            min_new_tokens=new_tokens, do_sample=False,
+                out = model._model.generate(**inputs, **greedy(new_tokens),
                                             pad_token_id=model.tokenizer.eos_token_id)
         return out.cpu()
 

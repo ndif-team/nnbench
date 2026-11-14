@@ -178,7 +178,9 @@ def _read_last(last):
 
 def _transplant(clean, layer, positions, last):
     """Replace the request's residual at `layer` with its clean snapshot (`None`: no patch), and
-    read the next-token logits at `last` (`None`: no read)."""
+    read the next-token logits at `last` (`None`: no read). With the read (a check call), a
+    transplant the hook returns leaves `ctx.saved["patched"]`: a hook that raises is logged and
+    skipped by the plugin (`_make_hook`), so the client checks it."""
     def transplant(ctx, h):
         if clean is not None and ctx.layer_idx == layer:
             if clean.shape != h.shape:
@@ -186,6 +188,8 @@ def _transplant(clean, layer, positions, last):
             patched = clean.to(device=h.device, dtype=h.dtype)
             if positions == "last":                        # keep the corrupt rows, swap the last
                 patched = torch.cat([h[:-1], patched[-1:]])
+            if last is not None:
+                ctx.saved["patched"] = True
             return patched
         if ctx.layer_idx == last and _rank0():
             _append(ctx, "rows", _readout(ctx, h))
@@ -263,7 +267,7 @@ def _steer_args(be, model, units, steered, target, alpha, scale_by):
         token_id = resolve_token(model.tokenizer, target)
         share = alpha / len(steered)
         if scale_by == CALIBRATED:
-            strengths = calibrated_strengths(be, steered, alpha, units,
+            strengths = calibrated_strengths(be, model, steered, alpha, units,
                                              functools.partial(mean_norms, model))
             model.steers[key] = _fixed_vectors(model, token_id, steered, strengths)
         elif scale_by == "token_norm":
@@ -325,7 +329,8 @@ def activation_patching(be, model, units, *, layer=6, patch=True, positions="all
     """Capture every clean residual at `layer` with output_residual_stream, then replace each
     corrupt run's residual there with its pair's (`patch=False`: the corrupt runs alone). A timed
     call sends the transplant alone and returns each corrupt request's generated token, `[B, 1]`;
-    a check call also reads the corrupt run's next-token logits at the last layer, `[B, vocab]`."""
+    a check call also reads the corrupt run's next-token logits at the last layer, `[B, vocab]`,
+    and checks every request took the transplant."""
     from vllm import SamplingParams
 
     clean_prompts = [unit[0] for unit in units]
@@ -342,7 +347,12 @@ def activation_patching(be, model, units, *, layer=6, patch=True, positions="all
                               [layer]) if patch else None)
         return _generated_tokens(model, corrupt_prompts, patches)                  # [B, 1]
     fns = [_transplant(clean, layer, positions, last) for clean in cleans]
-    return _logits(_hooked(model, corrupt_prompts, fns, [layer, last] if patch else [last]))
+    saved = _hooked(model, corrupt_prompts, fns, [layer, last] if patch else [last])
+    if patch and not all(s.get("patched") for s in saved):
+        raise ValueError("a transplant raised in its hook, which vLLM-Lens logs and skips, so the "
+                         "corrupt run came back unpatched; clean/corrupted prompts must be "
+                         "length-matched for position-aligned patching")
+    return _logits(saved)
 
 
 @cell("ablation", family="llama", backend="vllm_lens")

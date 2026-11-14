@@ -1,8 +1,8 @@
 """Generation-time steering: the steering write applied at every decode step of a greedy
-generation, returning each step's greedy token (`[new_tokens, B, 1]`); a check call returns each
-step's next-token logits instead (`[new_tokens, B, vocab]`). The write is a whole-tuple
+generation, returning the tokens the decode produced (`[new_tokens, B, 1]`); a check call returns
+each step's next-token logits instead (`[new_tokens, B, vocab]`). The write is a whole-tuple
 replacement; `bound` selects the iteration form, `tracer.iter[0:N]` (bounded) or `tracer.iter[:]`
-(unbounded). `alpha=0` writes nothing."""
+(unbounded). `alpha=0` writes nothing, so its timed call is a decode with no per-step work."""
 from __future__ import annotations
 
 import torch
@@ -10,7 +10,7 @@ import torch
 from ..oracle.checks import generated_tokens_match, timed_check_of
 from ..profiles import _resid
 from .observations import record_resolved
-from .readout import checkpoint_direction, checkpoint_of, final_logits, next_token
+from .readout import checkpoint_direction, checkpoint_of, final_logits
 from .registry import cell
 from .steering import _attention_mask, _strength_scale, cached_head_direction, resolve_token
 
@@ -48,10 +48,12 @@ def gen_steering_hf(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0,
         if alpha != 0:
             _steer_step(m.blocks(model), model, layer=layer, direction=direction, alpha=alpha,
                         scale_by=scale_by, masked=True)
-        return (final_logits if check else next_token)(model, m.head(model), "head")
+        if check:
+            return final_logits(model, m.head(model), "head")
 
-    return be.generate(model, units, step, new_tokens=new_tokens, bounded=(bound == "bounded"),
-                       keep_dtype=not check)
+    return be.generate(model, units, step if alpha != 0 or check else None,
+                       new_tokens=new_tokens, bounded=(bound == "bounded"), keep_dtype=not check,
+                       tokens=not check)
 
 
 @cell("gen_steering", family="*", backend="vllm_async", realizations=[{"bound": "unbounded"}])
@@ -68,7 +70,9 @@ def gen_steering_vllm(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0
         if alpha != 0:
             _steer_step(m.blocks(model), model, layer=layer, direction=direction, alpha=alpha,
                         residual=residual, scale_by=scale_by)
-        return (final_logits if check else next_token)(model, None, "engine")
+        if check:
+            return final_logits(model, None, "engine")
 
-    return be.generate(model, units, step, new_tokens=new_tokens, bounded=(bound == "bounded"),
-                       keep_dtype=not check)
+    return be.generate(model, units, step if alpha != 0 or check else None,
+                       new_tokens=new_tokens, bounded=(bound == "bounded"), keep_dtype=not check,
+                       tokens=not check)

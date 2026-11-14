@@ -56,18 +56,21 @@ class NNsight05SyncBackend(VLLMSyncBackend):
         res = res.detach().cpu()
         return res if keep_dtype else res.float()
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False,
+                 tokens=False):
+        """With `tokens`, each step's sampled token, the output of the `model.samples` module."""
         prompt = self.one(prompts, "generate")
         it = slice(0, new_tokens) if bounded else slice(None)
         with model.trace(prompt, temperature=0.0, top_p=1, max_tokens=new_tokens,
                          min_tokens=new_tokens) as tracer:
             rows = list().save()
             with tracer.iter[it] as step:
-                rows.append(build_step(step))
-        return self._step_rows([rows], new_tokens, "generation", keep_dtype)
+                row = None if build_step is None else build_step(step)
+                rows.append(model.samples.output if tokens else row)
+        return self._step_rows([rows], new_tokens, "generation", keep_dtype or tokens)
 
-    def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
-                       *, new_tokens, bounded=True, keep_dtype=False):
+    def generate_patch(self, model, source_prompts, base_prompts, capture, inject, build_step,
+                       *, new_tokens, bounded=True, keep_dtype=False, tokens=False):
         sources, bases = self.paired(source_prompts, base_prompts, "generate_patch")
         source = self.one(sources, "generate_patch")
         with model.trace(source, **SAMPLING):
@@ -77,9 +80,11 @@ class NNsight05SyncBackend(VLLMSyncBackend):
         with model.trace(bases[0], temperature=0.0, top_p=1, max_tokens=new_tokens,
                          min_tokens=new_tokens) as tracer:
             rows = list().save()
+            inject(clean_act)                        # outside the loop: the first forward
             with tracer.iter[it] as step:
-                rows.append(build_step(clean_act, step))
-        return self._step_rows([rows], new_tokens, "generate_patch", keep_dtype)
+                row = None if build_step is None else build_step(step)
+                rows.append(model.samples.output if tokens else row)
+        return self._step_rows([rows], new_tokens, "generate_patch", keep_dtype or tokens)
 
     def train_patch(self, model, source_prompts, base_prompts, capture, step):
         """One pair: the source capture, then the loss and its backward, each its own trace; the

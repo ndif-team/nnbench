@@ -99,7 +99,7 @@ def _checked_cells(calls):
     return fake
 
 
-def _run(tmp, monkeypatch, spec, calls, met=None):
+def _run(tmp, monkeypatch, spec, calls, met=None, timed_check=None):
     from isb.oracle import checks
     from isb.runfile import load_run
 
@@ -107,7 +107,7 @@ def _run(tmp, monkeypatch, spec, calls, met=None):
         (met if met is not None else []).append((timed, checked))
         return True, {}
 
-    monkeypatch.setattr(checks, "TIMED", {"m": meets})
+    monkeypatch.setattr(checks, "TIMED", {"m": timed_check or meets})
     monkeypatch.setattr(execute_mod, "get_cell", _checked_cells(calls))
     monkeypatch.setattr(execute_mod, "make_backend", lambda run, spec: _FakeBackend())
     monkeypatch.setattr(execute_mod, "resolve_provenance", lambda run: {
@@ -143,6 +143,27 @@ def test_check_calls_follow_every_timed_call_and_meet_its_result(tmp_path, monke
                                  and torch.equal(checked, onehots) for timed, checked in met)
     record = out[("__meta__",)][("batched", "t")]
     assert record["timed_output"] == "result" and record["timed_check"] == {"passed": True}
+
+
+def test_a_timed_check_that_takes_stop_tokens_gets_the_loaded_checkpoints(tmp_path, monkeypatch):
+    """A timed check that takes `stops` receives the loaded tokenizer's end id and the end ids of
+    the checkpoint's generation config."""
+    import json
+    from types import SimpleNamespace
+
+    (tmp_path / "generation_config.json").write_text(json.dumps({"eos_token_id": [6, 7]}))
+    model = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=5))
+    monkeypatch.setattr(_FakeBackend, "load", lambda self, repo: model)
+    got = []
+
+    def takes_stops(timed, checked, stops=()):
+        got.append(stops)
+        return True, {}
+
+    spec = _spec()
+    spec.repo = str(tmp_path)
+    _run(tmp_path, monkeypatch, spec, [], timed_check=takes_stops)
+    assert got and all(stops == {5, 6, 7} for stops in got)
 
 
 def test_a_check_run_makes_the_check_calls_only(tmp_path, monkeypatch):

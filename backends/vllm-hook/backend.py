@@ -65,7 +65,7 @@ class HookModel:
     save_to_disk: bool
     worker: str                # the engine's worker extension (WORKERS)
     weights: dict = field(default_factory=dict)   # the final norm + unembedding: "host" as stored,
-                                                  # a dtype for the GPU copy a timed readout keeps
+                                                  # "gpu" the fp32 copy a timed readout keeps
     transports: dict = field(default_factory=dict)   # J-lens transport spec -> maps, built once
     # disk runs a call has read back, removed between calls (`between_calls`), outside the timer
     finished_runs: list = field(default_factory=list)

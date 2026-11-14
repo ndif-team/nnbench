@@ -89,7 +89,7 @@ def _das_cell(be, model, m, units, *, layer, k, train, batch, heldout, lr, seed,
     if train:
         R = torch.nn.Parameter(R.clone())          # the fit trains its own copy
     # the constant rotation goes to the GPU once on HF, whose trace runs in this process
-    copies = engine_copies(be) if site == "head" and not train else None
+    copies = engine_copies(be, model) if site == "head" and not train else None
 
     def answer_id(unit):
         """First token of the corrupted prompt's answer, with no special prefix (Llama-3's BOS)."""

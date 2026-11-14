@@ -4,6 +4,20 @@ from __future__ import annotations
 from .base import Backend, prompts_of
 
 
+def greedy(new_tokens):
+    """`generate` arguments for a greedy decode held to exactly `new_tokens` tokens: no sampling,
+    and no repetition penalty from the checkpoint's generation config (Qwen2.5-Instruct sets 1.05),
+    the rule vLLM's explicit sampling parameters decode by."""
+    return {"max_new_tokens": new_tokens, "min_new_tokens": new_tokens, "do_sample": False,
+            "repetition_penalty": 1.0}
+
+
+def generated(ids, new_tokens):
+    """The last `new_tokens` columns of `generate`'s ids `[B, prompt + new]` as each step's token,
+    `[new_tokens, B, 1]` on the host."""
+    return ids[:, -new_tokens:].T.unsqueeze(-1).cpu()
+
+
 def _takes_automodel(language_model) -> bool:
     """Whether this nnsight's LanguageModel picks its auto class from `automodel` (0.7, whose
     multimodal-wrapper guard a non-default class opts out of). 0.8 loads through the text-generation
@@ -134,28 +148,45 @@ class HFBackend(Backend):
                 for L in range(n)]))
         return torch.stack(scores)                                   # [B, n]
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False,
+                 tokens=False):
+        """The units decode in one invoke; with `tokens`, a second, empty invoke reads the ids
+        `generate` returns (`tracer.result`), where the read still runs after an unbounded loop
+        (nnsight docs/usage/iteration.md, "When the step count is unknown")."""
         prompts = self.many(prompts, "generate")
         it = slice(0, new_tokens) if bounded else slice(None)
-        with model.generate(prompts, max_new_tokens=new_tokens, min_new_tokens=new_tokens,
-                            do_sample=False) as tracer:
-            rows = list().save()
-            for step in tracer.iter[it]:
-                rows.append(build_step(step))
+        with model.generate(**greedy(new_tokens)) as tracer:
+            with tracer.invoke(prompts):
+                rows = list().save()
+                if build_step is not None:
+                    for step in tracer.iter[it]:
+                        rows.append(build_step(step))
+            if tokens:
+                with tracer.invoke():
+                    ids = tracer.result.save()
+        if tokens:
+            return generated(ids, new_tokens)
         return self._steps(rows, new_tokens, "generation", keep_dtype)
 
-    def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
-                       *, new_tokens, bounded=True, keep_dtype=False):
+    def generate_patch(self, model, source_prompts, base_prompts, capture, inject, build_step,
+                       *, new_tokens, bounded=True, keep_dtype=False, tokens=False):
         sources, bases = self.paired(source_prompts, base_prompts, "generate_patch")
         with model.trace(sources):                  # trace 1: snapshot the source activations
             ca = capture().save()
         clean_act = ca.detach()                     # stays where the trace saved it
         it = slice(0, new_tokens) if bounded else slice(None)
-        with model.generate(bases, max_new_tokens=new_tokens, min_new_tokens=new_tokens,
-                            do_sample=False) as tracer:
-            rows = list().save()
-            for step in tracer.iter[it]:
-                rows.append(build_step(clean_act, step))
+        with model.generate(**greedy(new_tokens)) as tracer:
+            with tracer.invoke(bases):
+                rows = list().save()
+                inject(clean_act)                   # outside the loop: the first forward
+                if build_step is not None:
+                    for step in tracer.iter[it]:
+                        rows.append(build_step(step))
+            if tokens:
+                with tracer.invoke():
+                    ids = tracer.result.save()
+        if tokens:
+            return generated(ids, new_tokens)
         return self._steps(rows, new_tokens, "generate_patch", keep_dtype)
 
     def _steps(self, rows, new_tokens, what, keep_dtype=False):
@@ -178,8 +209,7 @@ class HFBackend(Backend):
             if new_tokens == 1:
                 out = model._module(**inputs).logits[:, -1, :].argmax(-1, keepdim=True)
             else:
-                out = model._module.generate(**inputs, max_new_tokens=new_tokens,
-                                             min_new_tokens=new_tokens, do_sample=False)
+                out = model._module.generate(**inputs, **greedy(new_tokens))
         return out.cpu()
 
     def last(self, t):

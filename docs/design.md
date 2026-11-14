@@ -1347,7 +1347,11 @@ refusal is what those rows record. Outputs carry the unit axis at dim -2 (`[B, v
 `new_tokens` decode steps (HF `min_new_tokens`, vLLM `min_tokens`), so a unit that would stop at EOS
 early produces the same number of rows at every B instead of a row-count error at B=1 and pad-fed
 rows inside a batch (2026-10-24). interp-engine's generation requests take no minimum length, so a
-unit there that stops at EOS early raises. `be.plain(model, units,
+unit there that stops at EOS early raises. A generation call takes a per-step closure only when the
+case does work at every step (`build_step=None` otherwise): an unbounded `tracer.iter[:]` ends only
+when a step asks the model for a forward the run does not make, so a step that touches no module
+never ends. `generate_patch` calls `inject(clean)` once, on the first forward of the bases (the
+prefill), outside the step loop. `be.plain(model, units,
 new_tokens=1)` is the engine's own request over the same list with nothing attached, timed in every
 regime, including the batched and load regimes, as the intervention-overhead denominator. An engine
 error recorded for a cell is therefore the engine's answer to its documented form;
@@ -1385,27 +1389,33 @@ cells is always found. The timed results, check outputs and timed checks, on eve
 | methodology | timed result | check output | timed check |
 |---|---|---|---|
 | steering, ablation, activation patching, DAS | greedy next token `[B, 1]` | next-token logits `[B, vocab]` | `tokens_match` |
-| generation-time steering and patching | each step's token `[T, B, 1]` | per-step logits `[T, B, vocab]` | `generated_tokens_match` |
+| generation-time steering and patching | the tokens the decode produced `[T, B, 1]` | per-step logits `[T, B, vocab]` | `generated_tokens_match` |
 | logit lens, Jacobian lens, activation harvest, per-step capture | the read as the system returns it | the read in fp32: cast, or projected in fp32 where the timed call projects in the engine's dtype | `read_matches` |
 | attention pattern | probabilities | log-probabilities | `probabilities_match` |
 
 The next token is the engine's own sample (`model.samples` on nnsight's vLLM, the generated id of a
 plain request with an installed edit or of the system's own request), or the argmax of the logits
 the system's documented call returns where it returns no token (HF's head, the TransformerLens
-bridge's default realization).
+bridge's default realization). A generation returns the tokens the decode produced: on HF the ids
+`generate` returns, read in a second, empty invoke (`tracer.result`; `model.generator.output` on
+nnsight 0.5 and 0.4), and on nnsight's vLLM the token sampled at each step. HF decodes greedily
+without the checkpoint's repetition penalty (`repetition_penalty=1.0`; Qwen2.5-Instruct's generation
+config sets 1.05), the rule vLLM's explicit sampling parameters decode by.
 A cell declares `check` only where its check call differs from its timed call. The reads the
-TransformerLens bridge returns in fp32, interp-engine's Jacobian lens, activation harvest and
+TransformerLens bridge returns in fp32, vLLM-Hook's logit lens and Jacobian lens (projected in fp32
+in both calls, as vLLM-Hook's analyzers replay the final norm on fp32 features), interp-engine's
+Jacobian lens, activation harvest and
 per-step capture, and the activation harvest and per-step capture of the opt realization, vLLM-Hook
 and vLLM-Lens return one value for both and record `timed_output: "check"`. vLLM-Lens's Jacobian
 lens and per-step capture declare `check` for a guard alone (each request's captured row count, an
 early stop) and return the engine's dtype from both calls; the every-layer activation harvest also
 returns the engine's dtype from both, since an fp32 copy would double the largest read the suite
-makes. Requests that hold every unit to its token count with `min_tokens` (nnsight's vLLM
-generations, vLLM-Lens, vLLM-Hook) sample with the stop tokens masked, while the
-check logits are read before the sampler, so a step whose top logit is a stop token fails the timed
-check unless the best other token is within its margin. No saved run has such a step.
-`tokens_match` passes when each timed token is the check logits' argmax or its logit is below the
-top logit by at most 2% of the top logit's magnitude; `generated_tokens_match` applies that per unit
+makes. Requests that hold every unit to its token count (`min_tokens` on vLLM, `min_new_tokens` on
+HF) decode with the stop tokens masked (the tokenizer's EOS and the checkpoint generation config's
+`eos_token_id`), while the check logits are read before the sampler, so the token checks measure a
+timed token that is not a stop token against the best logit among the non-stop tokens, and a stop
+token against the top logit. `tokens_match` passes when each timed token is the check logits'
+argmax or its logit is below the top logit by at most 2% of the top logit's magnitude; `generated_tokens_match` applies that per unit
 up to the first step whose token is not the argmax (after it the two calls continue different
 prefixes); `read_matches` and `probabilities_match` apply the equivalence gate, the latter to the
 log of the timed probabilities floored at their dtype's smallest normal. DAS measures the seeded
@@ -1415,7 +1425,9 @@ layer) and Jacobian collection (the fitted maps; its forward-only baseline retur
 model's dtype) return one value for both. The backend primitives take `keep_dtype` for a timed
 result; a snapshot passed between two traces stays in the dtype it was saved in, on the GPU on HF
 and on the host on vLLM, whose saves arrive by pickle. HF's plain request ends with the next token
-or the generated ids on the host.
+or the generated ids on the host. The TransformerLens bridge's default plain request is its forward
+with no logits returned (`return_type=None`), so a token row's `overhead_vs_vanilla` there includes
+the bridge's host-side logit rebuild.
 
 **What gets saved.** Successful effective-call records contain bound parameters, their semantic and
 realization split when available, and a case-level protocol description or explicit template-level

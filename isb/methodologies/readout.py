@@ -27,7 +27,7 @@ import torch
 import torch.nn.functional as F
 
 SITES = ("head", "engine")
-# backend -> {(id(source), device, dtype): (source, its copy)}, kept by `moved`
+# backend -> (its loaded model, {(id(source), device, dtype): (source, its copy)}), kept by `moved`
 _ENGINE_COPIES = weakref.WeakKeyDictionary()
 
 
@@ -73,15 +73,25 @@ def next_token(model, head, site):
     raise ValueError(f"unknown read site {site!r} (expected one of {SITES})")
 
 
-def engine_copies(be):
-    """The copies `moved` keeps for every later call of `be`'s loaded engine. For HF only, whose
-    trace runs in this process: a block shipped with each vLLM request carries the host tensor."""
-    return _ENGINE_COPIES.setdefault(be, {})
+def per_model(table, be, model):
+    """`table`'s dict for the model `be` has loaded (`table` maps a backend to it): a new one once
+    `be` loads another model, so a kept value never outlives the model it was built from."""
+    held = table.get(be)
+    if held is None or held[0]() is not model:
+        held = table[be] = (weakref.ref(model), {})
+    return held[1]
+
+
+def engine_copies(be, model):
+    """The copies `moved` keeps for every later call of the engine `be` has loaded, `model`. For HF
+    only, whose trace runs in this process: a block shipped with each vLLM request carries the host
+    tensor."""
+    return per_model(_ENGINE_COPIES, be, model)
 
 
 def moved(t, like, copies):
     """`t` on `like`'s device and dtype, copied once per `copies`: a dict for one call, or
-    `engine_copies(be)` for a constant a user places on the GPU once. `t` must be the same object
+    `engine_copies(be, model)` for a constant a user places on the GPU once. `t` must be the same object
     on every call that shares `copies` (a cached spec's tensor, never a per-call copy)."""
     key = (id(t), like.device, like.dtype)
     if key not in copies:

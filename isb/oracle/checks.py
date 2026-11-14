@@ -8,11 +8,14 @@ every other methodology gets `default`, the equivalence oracle's top-1 and total
 
 A timed check relates a timed call's result to the check call's output for the same units, for a
 methodology whose cells return the user's result when timed (`check=False`) and a scored output
-when checked: `timed_check(timed, checked) -> (passed, metrics)`. A failure means the timed call did
-not compute what the check call did, a contract violation. The shared forms below cover a token
+when checked: `timed_check(timed, checked) -> (passed, metrics)`, and a check that takes `stops`
+also receives the engine's stop tokens (`stop_tokens`). A failure means the timed call did not
+compute what the check call did, a contract violation. The shared forms below cover a token
 against logits, generated tokens against per-step logits, and a read against its scored copy.
 """
 from __future__ import annotations
+
+import functools
 
 from .equivalence import compare, is_equivalent
 
@@ -27,27 +30,59 @@ def default(expected, actual, case):
     return is_equivalent(metrics), metrics
 
 
-def tokens_match(timed, checked):
+@functools.lru_cache(maxsize=None)
+def _config_stops(repo):
+    from transformers import GenerationConfig
+
+    try:
+        eos = GenerationConfig.from_pretrained(repo).eos_token_id
+    except OSError:                                      # a checkpoint without generation_config.json
+        return ()
+    return tuple(eos) if isinstance(eos, (list, tuple)) else (eos,)
+
+
+def stop_tokens(tokenizer, repo):
+    """The token ids an engine masks while it holds a generation to its minimum length (vLLM's
+    `min_tokens`, HF's `min_new_tokens`): the tokenizer's end-of-sequence id and the end ids of
+    the checkpoint's generation config."""
+    return frozenset(i for i in (tokenizer.eos_token_id, *_config_stops(repo)) if i is not None)
+
+
+def _gaps(logits, tokens, stops):
+    """Each token's logit below the top logit, and that top: over the whole vocabulary for a stop
+    token, and over the other tokens for any other token, since an engine holding a generation to
+    its minimum length samples with the stop tokens masked."""
+    import torch
+
+    top = logits.max(-1).values
+    stops = [i for i in stops if i < logits.shape[-1]]
+    if stops:
+        masked = logits.clone()
+        masked[..., stops] = -torch.inf
+        top = torch.where(torch.isin(tokens, torch.tensor(stops)), top, masked.max(-1).values)
+    return top - logits.gather(-1, tokens[..., None]).squeeze(-1), top
+
+
+def tokens_match(timed, checked, stops=()):
     """A timed call's greedy next tokens `[B, 1]` against the check call's next-token logits
-    `[B, vocab]` for the same units: each token is the check's argmax, or its logit is within
-    NEAR_TIE of the top one. A token outside the vocabulary or a nonfinite logit fails, with no
-    gap to report."""
+    `[B, vocab]` for the same units: each token is the check's argmax (among the tokens that are
+    not `stops`, for a token that is not one), or its logit is within NEAR_TIE of that top. A token
+    outside the vocabulary or a nonfinite logit fails, with no gap to report."""
     tokens = timed.reshape(-1).long()
     logits = checked.reshape(len(tokens), -1).float()
     if int(tokens.max()) >= logits.shape[-1] or not bool(logits.isfinite().all()):
         return False, {"tokens_matched": None, "max_gap": None, "units": len(tokens)}
-    top = logits.max(-1).values
-    gap = top - logits.gather(-1, tokens[:, None]).squeeze(-1)
+    gap, top = _gaps(logits, tokens, stops)
     return bool((gap <= NEAR_TIE * top.abs()).all()), {
         "tokens_matched": float((gap == 0).float().mean()), "max_gap": float(gap.max()),
         "units": len(tokens)}
 
 
-def generated_tokens_match(timed, checked):
+def generated_tokens_match(timed, checked, stops=()):
     """A timed generation's tokens `[steps, B, 1]` against the check call's per-step logits
-    `[steps, B, vocab]`: per unit, each step's token is the check's argmax up to the first step
-    where it is not, whose token must be within NEAR_TIE of the top logit; after that step the two
-    calls continue different prefixes and are not compared."""
+    `[steps, B, vocab]`: per unit, each step's token is the check's argmax (as `tokens_match`
+    takes it) up to the first step where it is not, whose token must be within NEAR_TIE of the
+    top logit; after that step the two calls continue different prefixes and are not compared."""
     import torch
 
     steps, units = checked.shape[0], checked.shape[-2]
@@ -55,8 +90,7 @@ def generated_tokens_match(timed, checked):
     logits = checked.reshape(steps, units, -1).float()
     if int(tokens.max()) >= logits.shape[-1] or not bool(logits.isfinite().all()):
         return False, {"steps_matched": None, "max_gap": None, "units": units}
-    top = logits.max(-1).values                                          # [steps, B]
-    gap = top - logits.gather(-1, tokens[..., None]).squeeze(-1)         # [steps, B]
+    gap, top = _gaps(logits, tokens, stops)                              # [steps, B]
     flipped = gap > 0
     flips = flipped.any(0)
     first = torch.where(flips, flipped.int().argmax(0), torch.full((units,), steps - 1))

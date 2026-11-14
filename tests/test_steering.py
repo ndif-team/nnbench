@@ -231,3 +231,31 @@ def test_token_norm_scales_each_position_by_its_own_stream_norm():
     direction = torch.nn.functional.normalize(_Head().weight[1], dim=0)
     expected = 2.0 * (sub_block + residual).norm(dim=-1, keepdim=True) * direction
     assert torch.allclose(added, expected)               # row 0 scaled by 1.0, row 1 by 4.0
+
+
+def test_a_backend_that_loads_another_model_builds_its_steering_direction_from_that_model():
+    """The kept direction belongs to the model it was read from: after the same backend loads a
+    model with another unembedding, the direction comes from the new head."""
+    from types import SimpleNamespace
+
+    from isb.methodologies.steering import cached_head_direction
+
+    class Tokenizer:
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [2]}
+
+    class Model:
+        def __init__(self, row):
+            self.tokenizer = Tokenizer()
+            self.lm = torch.nn.Linear(3, 4, bias=False)
+            with torch.no_grad():
+                self.lm.weight[2] = torch.tensor(row)
+
+    class Backend:
+        pass
+
+    profile = SimpleNamespace(head=lambda model: model.lm)
+    be, first, second = Backend(), Model([3.0, 0.0, 0.0]), Model([0.0, 0.0, 5.0])
+    assert cached_head_direction(be, first, profile, " x").tolist() == [1.0, 0.0, 0.0]
+    assert cached_head_direction(be, second, profile, " x").tolist() == [0.0, 0.0, 1.0]
+    assert cached_head_direction(be, first, profile, " x").tolist() == [1.0, 0.0, 0.0]

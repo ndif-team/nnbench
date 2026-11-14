@@ -18,9 +18,9 @@ Denotation, from IBM/vLLM-Hook 0e34fdd source:
   plugin merges the requests' probes onto `outputs[0].probes` as a list in request order
   (`hook_llm.py`, `generate`); on the disk path `flush_disk` writes the batch's requests into one
   artifact in request order. The `hidden_states` analyzer returns those rows per layer.
-- The plugin returns hidden states only, with no unembedding. The next-token readout is user code:
-  the checkpoint's final RMSNorm and `lm_head` weights, applied to the last rows on the GPU, in the
-  stream's dtype in a timed call and in fp32 in a check call.
+- The plugin returns hidden states only, with no unembedding. A readout over the vocabulary is user
+  code: the checkpoint's final RMSNorm and `lm_head` weights applied to captured rows on the GPU in
+  fp32, as vLLM-Hook's analyzers replay the norm on fp32 features (`ScienceHallucinationAnalyzer`).
 - `steer_hook_act`, the steering worker, adds a fixed vector (`add_vector`) or adjusts a projection
   (`adjust_rs`) at the LAST row of each forward of one layer: the last prompt token, and each decoded
   token when `apply_at_all_positions` is true (commit afdf36a). It is a separate worker extension,
@@ -96,26 +96,24 @@ def _stored_weights(model):
     return model.weights["host"]
 
 
-def _weights(model, dtype, keep):
-    """The final norm and unembedding on the GPU in `dtype`: kept for later calls when `keep` (the
+def _weights(model, keep):
+    """The final norm and unembedding on the GPU in fp32: kept for later calls when `keep` (the
     readout a timed call runs), else for this call only, so the GPU holds no weights that only check
     calls use."""
-    if dtype in model.weights:
-        return model.weights[dtype]
-    weights = {key: w.to("cuda", dtype) for key, w in _stored_weights(model).items()}
+    if "gpu" in model.weights:
+        return model.weights["gpu"]
+    weights = {key: w.to("cuda", torch.float32) for key, w in _stored_weights(model).items()}
     if keep:
-        model.weights[dtype] = weights
+        model.weights["gpu"] = weights
     return weights
 
 
-def _project(model, rows, dtype, keep):
-    """Final RMSNorm in fp32, cast back to `dtype` as vLLM-Hook's analyzers replay it
-    (`ScienceHallucinationAnalyzer._apply_rmsnorm`), then the unembedding in `dtype`, on the GPU;
-    the result on the host. rows: [n, d_model] -> [n, vocab]. `keep` as `_weights`."""
-    w = _weights(model, dtype, keep)
+def _project(model, rows, keep):
+    """Final RMSNorm, then the unembedding, on the GPU in fp32; the result on the host.
+    rows: [n, d_model] -> [n, vocab]. `keep` as `_weights`."""
+    w = _weights(model, keep)
     x = rows.to("cuda", torch.float32)
-    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + model.config.rms_norm_eps)
-    x = (x * w["norm"].float()).to(dtype)
+    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + model.config.rms_norm_eps) * w["norm"]
     return (x @ w["unembed"].T).cpu()
 
 
@@ -215,8 +213,7 @@ def _token_rows(model, prompts, layers):
 def _final_logits(model, prompts):
     """The check form of a next token: the stream after the last layer projected in fp32,
     `[B, vocab]`."""
-    return _project(model, _last_rows(model, prompts, [model.n_layers - 1])[0], torch.float32,
-                    keep=False)
+    return _project(model, _last_rows(model, prompts, [model.n_layers - 1])[0], keep=False)
 
 
 def _plain_tokens(model, prompts):
@@ -236,15 +233,13 @@ def _plain_tokens(model, prompts):
 
 
 @cell("logit_lens", family="llama", backend="vllm_hook")
-def logit_lens(be, model, units, *, layers="all", check=False):
-    """The final RMSNorm and unembedding applied to the stream after each read layer at each
-    prompt's last token, `[n_layers, B, vocab]` on the host. A timed call projects in the stream's
-    dtype, a check call in fp32 (`_project`)."""
+def logit_lens(be, model, units, *, layers="all"):
+    """The final RMSNorm and unembedding applied in fp32 to the stream after each read layer at
+    each prompt's last token, `[n_layers, B, vocab]` on the host (`_project`)."""
     n = model.n_layers
     idx = list(range(n)) if layers == "all" else [i % n for i in layers]
     rows = _last_rows(model, units, idx)                                       # [n_layers, B, d]
-    logits = _project(model, rows.reshape(-1, rows.shape[-1]),
-                      torch.float32 if check else rows.dtype, keep=not check)
+    logits = _project(model, rows.reshape(-1, rows.shape[-1]), keep=True)
     return logits.reshape(len(idx), len(units), -1)                            # [n_layers, B, vocab]
 
 
@@ -362,12 +357,11 @@ def _transport(model, transport, layers, dtype):
 
 
 @cell("jacobian_lens", family="llama", backend="vllm_hook")
-def jacobian_lens(be, model, units, *, layers="all", position="last", transport=None, check=False):
+def jacobian_lens(be, model, units, *, layers="all", position="last", transport=None):
     """The J-lens readout `[n_layers, B, vocab]` on the host: the stream after each read layer at
     each prompt's readout position (`last_token` capture for the last token, `all_tokens` for any
-    other), `J_l @ h` in the stream's dtype, then the checkpoint's final RMSNorm and unembedding on
-    the client GPU, since the plugin has no unembedding. A timed call projects in the stream's
-    dtype, a check call in fp32 (`_project`)."""
+    other), `J_l @ h` in the stream's dtype, then the checkpoint's final RMSNorm and unembedding in
+    fp32 on the client GPU (`_project`), since the plugin has no unembedding."""
     n = model.n_layers
     idx = list(range(n)) if layers == "all" else [i % n for i in layers]
     positions = [locate(model.tokenizer, unit, position) for unit in units]
@@ -380,8 +374,7 @@ def jacobian_lens(be, model, units, *, layers="all", position="last", transport=
     maps = _transport(model, transport, idx, x.dtype)
     if maps is not None:
         x = x @ maps.T if maps.dim() == 2 else x @ maps.transpose(1, 2)        # per layer: h @ J_l.T
-    logits = _project(model, x.reshape(-1, x.shape[-1]), torch.float32 if check else x.dtype,
-                      keep=not check)
+    logits = _project(model, x.reshape(-1, x.shape[-1]), keep=True)
     return logits.reshape(len(idx), len(units), -1)                            # [n_layers, B, vocab]
 
 

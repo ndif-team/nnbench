@@ -107,7 +107,7 @@ def _padded_positions(model, units, positions):
 def jacobian_lens_hf(be, model, m, units, *, layers="all", position="last", unembed="module",
                      residual="plain", transport=None, check=False):
     # a seed or a fitted spec resolves to the same cached maps on every call: placed once
-    copies = engine_copies(be) if isinstance(transport, (int, str)) else None
+    copies = engine_copies(be, model) if isinstance(transport, (int, str)) else None
     if isinstance(transport, str):
         transport = load_fitted(transport)
     positions = _padded_positions(model, units, _positions(model, units, position))

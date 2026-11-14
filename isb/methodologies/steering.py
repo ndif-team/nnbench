@@ -26,7 +26,8 @@ import torch
 from ..oracle.checks import timed_check_of, tokens_match
 from ..profiles import _resid
 from .observations import record_resolved
-from .readout import checkpoint_direction, checkpoint_of, final_logits, head_direction, next_token
+from .readout import (checkpoint_direction, checkpoint_of, final_logits, head_direction,
+                      next_token, per_model)
 from .registry import cell
 
 timed_check_of("steering")(tokens_match)
@@ -52,28 +53,30 @@ def _attention_mask(model):
 
 
 CALIBRATED = "calibrated_mean_norm"
-_CALIBRATED_NORMS = weakref.WeakKeyDictionary()      # backend -> {layer: unsteered mean norm}
-_HEAD_DIRECTIONS = weakref.WeakKeyDictionary()       # backend -> {target: unit unembedding row}
+# backend -> (its loaded model, {layer: unsteered mean norm}), kept by `per_model`
+_CALIBRATED_NORMS = weakref.WeakKeyDictionary()
+# backend -> (its loaded model, {target: unit unembedding row}), kept by `per_model`
+_HEAD_DIRECTIONS = weakref.WeakKeyDictionary()
 
 
 def cached_head_direction(be, model, m, target):
     """The target token's unit unembedding row from the loaded head (HF): built on the first call,
     the warm-up, and reused by the timed calls of the loaded engine."""
-    known = _HEAD_DIRECTIONS.setdefault(be, {})
+    known = per_model(_HEAD_DIRECTIONS, be, model)
     if target not in known:
         known[target] = head_direction(model, m.head(model), resolve_token(model.tokenizer, target))
     return known[target]
 
 
-def calibrated_strengths(be, layers, alpha, units, measure):
+def calibrated_strengths(be, model, layers, alpha, units, measure):
     """The strength of each of `layers` under `scale_by="calibrated_mean_norm"`, the same for all:
     `alpha / len(layers)` times the unsteered stream's mean per-token norm at the first of them.
     `measure(prompts, layers)` returns such norms from one plain forward of the system's own read;
     it runs on the first prompt of the first call that needs a layer's norm, and the value is kept
-    for the loaded engine, so every later call (the harness's timed ones among them) adds fixed
-    vectors and reads nothing."""
+    for the engine `be` has loaded, `model`, so every later call (the harness's timed ones among
+    them) adds fixed vectors and reads nothing."""
     first = min(layers)
-    known = _CALIBRATED_NORMS.setdefault(be, {})
+    known = per_model(_CALIBRATED_NORMS, be, model)
     if first not in known:
         (known[first],) = measure(units[:1], [first])
     return [alpha / len(layers) * known[first]] * len(layers)
@@ -161,8 +164,8 @@ def steering_hf(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0, mode
     if scale_by == CALIBRATED and alpha != 0:
         measure = functools.partial(mean_norms, be, model, m.blocks(model), residual="plain",
                                     masked=True)
-        strengths = calibrated_strengths(be, [layer] if layers is None else list(layers), alpha,
-                                         units, measure)
+        strengths = calibrated_strengths(be, model, [layer] if layers is None else list(layers),
+                                         alpha, units, measure)
 
     def build(rows):
         return _steer_and_read(
@@ -186,8 +189,8 @@ def steering_vllm(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0, mo
     if scale_by == CALIBRATED and alpha != 0:
         measure = functools.partial(mean_norms, be, model, m.blocks(model), residual=residual,
                                     masked=False)
-        strengths = calibrated_strengths(be, [layer] if layers is None else list(layers), alpha,
-                                         units, measure)
+        strengths = calibrated_strengths(be, model, [layer] if layers is None else list(layers),
+                                         alpha, units, measure)
 
     def build(rows):
         return _steer_and_read(

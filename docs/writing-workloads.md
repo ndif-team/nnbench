@@ -118,8 +118,9 @@ Steering is the example: the timed call returns the greedy next token (`next_tok
 head's argmax on HF, the engine's own sample `model.samples` on vLLM, nnsight 0.8.2
 docs/models/vllm.md) with `keep_dtype=True`, so no cast runs; the check call returns the next-token
 logits at the documented read site (`final_logits`). A read returns its value as the system
-returns it when timed and, where that is not fp32, in fp32 when checked; a generation write returns
-each step's token. A cell whose two forms would be the same tensor declares no `check`. A system
+returns it when timed and, where that is not fp32, in fp32 when checked; a timed generation returns
+the tokens the decode produced (`tokens=True`: HF's `generate` ids, vLLM's sample at each step) and
+passes a per-step closure only when the case does work at every step. A cell whose two forms would be the same tensor declares no `check`. A system
 that cannot produce the check output raises `Unsupported` from its check calls only, and its timed
 rows still record.
 
