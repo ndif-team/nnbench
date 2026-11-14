@@ -21,11 +21,14 @@ from __future__ import annotations
 import functools
 import json
 import os
+import weakref
 
 import torch
 import torch.nn.functional as F
 
 SITES = ("head", "engine")
+# backend -> {(id(source), device, dtype): (source, its copy)}, kept by `moved`
+_ENGINE_COPIES = weakref.WeakKeyDictionary()
 
 
 def engine_logits(model):
@@ -47,6 +50,43 @@ def final_logits(model, head, site):
     if site == "head":
         return head.output[:, -1, :]
     raise ValueError(f"unknown read site {site!r} (expected one of {SITES})")
+
+
+def engine_samples(model):
+    """The token ids vLLM's sampler drew this step at the engine site, `[1, 1]`. Runs INSIDE a
+    trace. nnsight 0.7 and later expose them as the `model.samples` property; 0.5 as the output of
+    the `model.samples` wrapper module."""
+    from nnsight.intervention.envoy import Envoy
+
+    samples = model.samples
+    return samples.output if isinstance(samples, Envoy) else samples
+
+
+def next_token(model, head, site):
+    """The last token's greedy next token, the result a user reads; runs inside a trace. "head":
+    the argmax of the head's last-position logits (HF), `[B, 1]`; "engine": the token the engine
+    drew under the backends' greedy sampling (`engine_samples`), `[1, 1]`."""
+    if site == "engine":
+        return engine_samples(model)
+    if site == "head":
+        return head.output[:, -1, :].argmax(-1, keepdim=True)
+    raise ValueError(f"unknown read site {site!r} (expected one of {SITES})")
+
+
+def engine_copies(be):
+    """The copies `moved` keeps for every later call of `be`'s loaded engine. For HF only, whose
+    trace runs in this process: a block shipped with each vLLM request carries the host tensor."""
+    return _ENGINE_COPIES.setdefault(be, {})
+
+
+def moved(t, like, copies):
+    """`t` on `like`'s device and dtype, copied once per `copies`: a dict for one call, or
+    `engine_copies(be)` for a constant a user places on the GPU once. `t` must be the same object
+    on every call that shares `copies` (a cached spec's tensor, never a per-call copy)."""
+    key = (id(t), like.device, like.dtype)
+    if key not in copies:
+        copies[key] = (t, t.to(device=like.device, dtype=like.dtype))    # holding t keeps its id
+    return copies[key][1]
 
 
 def head_direction(model, head, token_id):

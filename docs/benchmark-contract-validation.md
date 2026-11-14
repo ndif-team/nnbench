@@ -50,9 +50,10 @@ findings are outside this refactor.
 
 - Python authoring uses `CellConfig(regimes=...)` and `TaskSpec(label, params)`; `(params, label)`
   task tuples remain accepted. Historical aliases and the task tuple iterator are retired.
-- Jobs use wire version 2 and run coordinates use schema 3. Other versions are rejected with a
-  rerun instruction. The follow-up removes historical readers and the obsolete v1 fixture;
-  existing run files are left untouched.
+- Jobs are written at wire version 3 and run coordinates at version 4 (`isb/jobs/schema.py`);
+  readers accept wire versions 2 and 3 and coordinate versions 3 and 4. Other versions are
+  rejected with a rerun instruction. The follow-up removes historical readers and the obsolete v1
+  fixture; existing run files are left untouched.
 - Methodology templates remain torch-free. Optional case-description hooks are registered beside
   the cell implementations and receive already-bound parameters.
 - Timing keeps trial preparation outside the measured interval. Effect checks use the same full

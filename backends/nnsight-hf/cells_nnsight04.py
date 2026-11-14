@@ -3,7 +3,9 @@ readout) spelled in 0.4's graph API. A module output's structure is fixed before
 backend's arity probe (`be.arity`): a tuple output is read at `[0]` and replaced by a tuple of the
 same length, a bare tensor is read and replaced whole. Python control flow on values runs on
 parameters, never on proxies. Writes follow the 0.4 README: assignment to `.output` replaces it,
-`[:]` writes in place. Outputs carry the unit axis at dim -2.
+`[:]` writes in place. Outputs carry the unit axis at dim -2. A timed call returns the user's result
+(the greedy next token of a write, a read in the model's dtype), a check call what the scorer
+compares (the next-token logits, a read in fp32), as the shared cells do.
 """
 from __future__ import annotations
 
@@ -11,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from isb.methodologies.registry import cell
-from isb.methodologies.steering import _resolve_token
+from isb.methodologies.steering import resolve_token
 
 BACKEND = "hf_nnsight_0_4"
 
@@ -50,6 +52,11 @@ def _final_logits(head):
     return head.output[:, -1, :]
 
 
+def _next_token(head):
+    """The greedy next token, `[B, 1]` (isb/methodologies/readout.py `next_token`, "head")."""
+    return head.output[:, -1, :].argmax(-1, keepdim=True)
+
+
 def _device(envoy):
     """Where a module's weights live: under `device_map` the layers sit on different GPUs. 0.4
     cannot move a real tensor to a proxy's device (torch 2.6 rejects proxy arguments), so a vector
@@ -64,7 +71,7 @@ def _direction(head, token_id, envoy):
 
 
 @cell("logit_lens", family="*", backend=BACKEND, realizations=[{"unembed": "weight"}])
-def logit_lens(be, model, m, units, *, layers="all", unembed="module"):
+def logit_lens(be, model, m, units, *, layers="all", unembed="module", check=False):
     blocks, norm, head = m.blocks(model), m.norm(model), m.head(model)
     idx = list(range(len(blocks))) if layers == "all" else list(layers)
     arity = be.arity(model, [blocks[i] for i in idx])
@@ -76,19 +83,19 @@ def logit_lens(be, model, m, units, *, layers="all", unembed="module"):
             lens.append(F.linear(normed, head.weight) if unembed == "weight" else head(normed))
         return torch.stack(lens, dim=0)                              # [n_layers, B, vocab]
 
-    return be.run(model, units, build)
+    return be.run(model, units, build, keep_dtype=not check)
 
 
 @cell("steering", family="*", backend=BACKEND, realizations=[{"mode": "inplace"}])
 def steering(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0, mode="replace",
-             scale_by="mean_norm"):
+             scale_by="mean_norm", check=False):
     blocks, head = m.blocks(model), m.head(model)
     n = len(blocks)
     if alpha != 0 and layer % n == n - 1:
         raise ValueError(f"steer layer {layer} is the read-out block; pick layer < {n - 1}")
     if mode not in ("inplace", "replace"):
         raise ValueError(f"unknown steering mode {mode!r}")
-    direction = _direction(head, _resolve_token(model.tokenizer, target), blocks[layer])
+    direction = _direction(head, resolve_token(model.tokenizer, target), blocks[layer])
     (a_layer,) = be.arity(model, [blocks[layer]])
 
     def build(rows):
@@ -100,13 +107,13 @@ def steering(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0, mode="r
                 hidden[:] = hidden + vec
             else:
                 _replace(blocks[layer], out, a_layer, hidden + vec)
-        return _final_logits(head)
+        return _final_logits(head) if check else _next_token(head)
 
-    return be.run(model, units, build)
+    return be.run(model, units, build, keep_dtype=not check)
 
 
 @cell("ablation", family="*", backend=BACKEND)
-def ablation(be, model, m, units, *, layer=6, target="mlp"):
+def ablation(be, model, m, units, *, layer=6, target="mlp", check=False):
     blocks, head = m.blocks(model), m.head(model)
     module = m.submodule(blocks[layer], "mlp" if target == "none" else target)
     (a_target,) = be.arity(model, [module])
@@ -115,21 +122,22 @@ def ablation(be, model, m, units, *, layer=6, target="mlp"):
         if target != "none":
             out = module.output
             _replace(module, out, a_target, torch.zeros_like(_read(out, a_target)))
-        return _final_logits(head)
+        return _final_logits(head) if check else _next_token(head)
 
-    return be.run(model, units, build)
+    return be.run(model, units, build, keep_dtype=not check)
 
 
 @cell("activation_patching", family="*", backend=BACKEND)
-def activation_patching(be, model, m, units, *, layer=6, patch=True, positions="all"):
+def activation_patching(be, model, m, units, *, layer=6, patch=True, positions="all",
+                        check=False):
     clean = [unit[0] for unit in units]
     corrupted = [unit[1] for unit in units]
     blocks, head = m.blocks(model), m.head(model)
     (a_layer,) = be.arity(model, [blocks[layer]])
     if not patch:
         def build(rows):
-            return _final_logits(head)
-        return be.run(model, corrupted, build)
+            return _final_logits(head) if check else _next_token(head)
+        return be.run(model, corrupted, build, keep_dtype=not check)
     if positions not in ("all", "last"):
         raise ValueError(f"unknown patch positions {positions!r} (expected 'all' or 'last')")
     tokenize = model.tokenizer
@@ -151,16 +159,16 @@ def activation_patching(be, model, m, units, *, layer=6, patch=True, positions="
         if positions == "last":
             value = torch.cat([hidden[..., :-1, :], value[..., -1:, :]], dim=-2)
         _replace(blocks[layer], out, a_layer, value)
-        return _final_logits(head)
+        return _final_logits(head) if check else _next_token(head)
 
-    return be.patch(model, clean, corrupted, capture=capture, patch=patch_fn)
+    return be.patch(model, clean, corrupted, capture=capture, patch=patch_fn, keep_dtype=not check)
 
 
 @cell("gen_steering", family="*", backend=BACKEND)
 def gen_steering(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0, new_tokens=8,
-                 scale_by="mean_norm"):
+                 scale_by="mean_norm", check=False):
     blocks, head = m.blocks(model), m.head(model)
-    direction = _direction(head, _resolve_token(model.tokenizer, target), blocks[layer])
+    direction = _direction(head, resolve_token(model.tokenizer, target), blocks[layer])
     (a_layer,) = be.arity(model, [blocks[layer]])
 
     def step(index):
@@ -169,6 +177,6 @@ def gen_steering(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0, new
             hidden = _read(out, a_layer)
             vec = (alpha * _scale(hidden, scale_by, _mask(model, hidden))) * direction
             _replace(blocks[layer], out, a_layer, hidden + vec)
-        return head.output[:, -1, :]
+        return _final_logits(head) if check else _next_token(head)
 
-    return be.generate(model, units, step, new_tokens=new_tokens)
+    return be.generate(model, units, step, new_tokens=new_tokens, keep_dtype=not check)

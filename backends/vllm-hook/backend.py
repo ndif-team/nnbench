@@ -6,7 +6,8 @@ built-in worker and its analyzer (docs/configs.md, "Selecting a configuration fr
 for the attention cells. The plugin registers through vLLM's general_plugins entry point and
 forces enforce_eager on every engine (`_hook_plugin._patched_create_engine_config`). An engine
 carries one worker extension, so one engine reads hidden states or Q/K, and neither steers
-(`steer_hook_act` is a different worker).
+(`steer_hook_act` is a different worker). Each engine serves one untimed captured request at load
+(`_with_hooks`), so its worker's hooks are in place before any timed call.
 
 Storage is the documented per-request axis (docs/configs.md): "rpc" returns probes on the output
 (`HookLLM.generate` default); "disk-st-async" writes a safetensors artifact from a background
@@ -63,8 +64,31 @@ class HookModel:
     hook_dir: str              # the artifact root of disk runs
     save_to_disk: bool
     worker: str                # the engine's worker extension (WORKERS)
-    weights: dict = field(default_factory=dict)   # final norm + unembedding from the checkpoint
+    weights: dict = field(default_factory=dict)   # the final norm + unembedding: "host" as stored,
+                                                  # a dtype for the GPU copy a timed readout keeps
     transports: dict = field(default_factory=dict)   # J-lens transport spec -> maps, built once
+    # disk runs a call has read back, removed between calls (`between_calls`), outside the timer
+    finished_runs: list = field(default_factory=list)
+
+
+def _with_hooks(model):
+    """`model` after one untimed captured request. The plugin installs its worker's forward hooks on
+    the first request that captures and keeps them for every later forward (v0.2.0
+    `_hook_plugin.py`, `_patched_llm_generate` and `_patched_generate`; MIA `core/_plugin.py`,
+    `_patched_llm_generate`, on an eager engine), so every timed call, a plain request included,
+    runs on the engine in that state whatever ran before it. A CUDA-graph MIA engine installs its
+    capture as the model loads (`core/hooks/install.py`, `patch_worker_load_model`)."""
+    from vllm import SamplingParams
+
+    if model.worker != READ:                      # the Q/K probe numbers attention modules from 0
+        extra = {"output_qk": [0]}
+    elif isinstance(model.llm, AsyncHook):        # AsyncLLM: the fields go on the request
+        model.llm.capture(["The"], [1], "last_token")
+        return model
+    else:                                         # the hidden-state worker numbers layers from 1
+        extra = {"output_hidden_states": [1], "hs_mode": "last_token"}
+    model.llm.generate(["The"], SamplingParams(max_tokens=1, extra_args=extra), use_tqdm=False)
+    return model
 
 
 class VLLMHookBackend(Backend):
@@ -123,11 +147,13 @@ class VLLMHookBackend(Backend):
                       enforce_eager=self.enforce_eager, **self.engine_options)
         if not MIA:                     # on MIA each request names its own mode (cells.py)
             llm._hs_mode = "last_token"     # load_config sets it from hidden_states.mode
-        return HookModel(llm, llm.tokenizer, config, config.num_hidden_layers, repo,
-                         self.hook_dir, save_to_disk=self.storage != "rpc", worker=self.worker)
+        return _with_hooks(HookModel(llm, llm.tokenizer, config, config.num_hidden_layers, repo,
+                                     self.hook_dir, save_to_disk=self.storage != "rpc",
+                                     worker=self.worker))
 
     def plain(self, model, units, *, new_tokens=1):
-        """A plain generate on the plugin's engine: use_hook=False clears extra_args."""
+        """A plain generate on the plugin's engine: use_hook=False clears extra_args, so the
+        worker's hooks, installed at load (`_with_hooks`), capture nothing."""
         from vllm import SamplingParams
 
         model.llm.generate(prompts_of(units),
@@ -139,6 +165,12 @@ class VLLMHookBackend(Backend):
         """Through `HookLLM.llm`, the `vllm.LLM` it wraps (hook_llm.py, `HookLLM.__init__`), whose
         `collective_rpc` is vLLM's own (vLLM 0.19.1 `entrypoints/llm.py`, `LLM.collective_rpc`)."""
         return model.llm.llm.collective_rpc(method, args=args)
+
+    def between_calls(self, model) -> None:
+        """Remove the disk runs the previous calls read back: a user keeps captured data, so the
+        removal is the benchmark's and stays out of the timed calls."""
+        while model.finished_runs:
+            shutil.rmtree(model.finished_runs.pop(), ignore_errors=True)
 
     def teardown(self, model) -> None:
         model.llm.llm_engine.engine_core.shutdown()
@@ -160,6 +192,7 @@ class AsyncHook:
     hook_dir: str
     save_to_disk: bool
     gather: object             # the backend's persistent-loop runner
+    finished_runs: list = field(default_factory=list)   # read-back disk runs, HookModel's list
 
     def capture(self, prompts, layers, mode, new_tokens=1):
         """One request per prompt, submitted together, capturing the stream after each listed
@@ -195,7 +228,7 @@ class AsyncHook:
         for out, request_id in zip(outs, ids):
             if self.save_to_disk:
                 stats = self.analyzer.analyze(analyzer_spec={"reduce": "none"}, run_id=request_id)
-                shutil.rmtree(os.path.join(self.hook_dir, request_id), ignore_errors=True)
+                self.finished_runs.append(os.path.join(self.hook_dir, request_id))
             else:
                 stats = self.analyzer.analyze(analyzer_spec={"reduce": "none"}, probes=out.probes)
             for module, rows in stats["hidden_states"].items():
@@ -264,9 +297,10 @@ class VLLMHookAsyncBackend(VLLMHookBackend):
         llm = AsyncHook(engine, analyzer, self.hook_dir, self.storage != "rpc", self._gather)
         # The clients' own tokenizer: the engine's renderer tokenizes with its instance, and a
         # fast tokenizer raises "Already borrowed" under concurrent calls.
-        return HookModel(llm, AutoTokenizer.from_pretrained(repo), config,
-                         config.num_hidden_layers, repo, self.hook_dir,
-                         save_to_disk=llm.save_to_disk, worker=self.worker)
+        return _with_hooks(HookModel(llm, AutoTokenizer.from_pretrained(repo), config,
+                                     config.num_hidden_layers, repo, self.hook_dir,
+                                     save_to_disk=llm.save_to_disk, worker=self.worker,
+                                     finished_runs=llm.finished_runs))
 
     def _gather(self, coros):
         """Run the coroutines together on the one persistent loop (a fresh loop per call would close
@@ -304,7 +338,8 @@ class VLLMHookAsyncBackend(VLLMHookBackend):
             self._loop_thread = None
 
     def plain(self, model, units, *, new_tokens=1):
-        """One request per prompt with no extra_args, so the patch installs and sends nothing."""
+        """One request per prompt with no extra_args: the patch sends no RPC for it, and the
+        worker's hooks, installed at load (`_with_hooks`), capture nothing."""
         import uuid
 
         from vllm import SamplingParams

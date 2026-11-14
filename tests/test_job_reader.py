@@ -54,7 +54,7 @@ def test_restoration_defers_parameter_classification_for_saved_calls(tmp_path):
         replace(restored, protocol_source="authored")
 
 
-@pytest.mark.parametrize("version", [0, 1, 3, True, 2.0, "2"])
+@pytest.mark.parametrize("version", [0, 1, 4, True, 3.0, "3"])
 def test_noncurrent_versions_are_rejected_at_every_boundary(tmp_path, version):
     job, experiment = fixture_job(tmp_path)
     experiment["version"] = version
@@ -63,6 +63,15 @@ def test_noncurrent_versions_are_rejected_at_every_boundary(tmp_path, version):
         contract.restore_spec(job)
     with pytest.raises(ValueError, match="version"):
         contract.wire_spec(experiment)
+
+
+def test_previous_experiment_version_is_read_but_not_run(tmp_path):
+    job, experiment = fixture_job(tmp_path)
+    experiment["version"] = 2
+    resign(job, experiment)
+    assert contract.wire_spec(experiment)["tasks"]
+    with pytest.raises(ValueError, match="version 2"):
+        contract.restore_spec(job)
 
 
 @pytest.mark.parametrize("damage,known_identity", [

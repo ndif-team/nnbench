@@ -23,15 +23,13 @@ SEVERAL = ("nnsight 0.5's vLLM path returns each invoke's saves by variable name
 
 
 class NNsight05SyncBackend(VLLMSyncBackend):
-    def load(self, repo: str, gpu_memory_utilization: float | None = None):
+    def load(self, repo: str):
         from nnsight.modeling.vllm import VLLM
 
-        if gpu_memory_utilization is None:
-            gpu_memory_utilization = self.gpu_memory_utilization
         kw = self._engine_kwargs()
         if self.tensor_parallel_size > 1:
             kw["tensor_parallel_size"] = self.tensor_parallel_size
-        return VLLM(repo, dispatch=True, gpu_memory_utilization=gpu_memory_utilization, **kw)
+        return VLLM(repo, dispatch=True, gpu_memory_utilization=self.gpu_memory_utilization, **kw)
 
     def one(self, prompts, primitive):
         """The single unit a 0.5 trace takes; several raise `Unsupported`."""
@@ -40,23 +38,25 @@ class NNsight05SyncBackend(VLLMSyncBackend):
             raise Unsupported(SEVERAL)
         return prompts[0]
 
-    def run(self, model, prompts, build):
+    def run(self, model, prompts, build, *, keep_dtype=False):
         prompt = self.one(prompts, "run")
         with model.trace(prompt, **SAMPLING):
             saved = build([0]).save()
-        return saved.detach().float().cpu()
+        saved = saved.detach().cpu()
+        return saved if keep_dtype else saved.float()
 
-    def patch(self, model, clean_prompts, corrupted_prompts, capture, patch):
+    def patch(self, model, clean_prompts, corrupted_prompts, capture, patch, *, keep_dtype=False):
         clean_prompts, corrupted_prompts = self.paired(clean_prompts, corrupted_prompts, "patch")
         clean_prompt = self.one(clean_prompts, "patch")
         with model.trace(clean_prompt, **SAMPLING):
             ca = capture().save()
-        clean_act = ca.detach().float().cpu()
+        clean_act = ca.detach().cpu()
         with model.trace(corrupted_prompts[0], **SAMPLING):
             res = patch(clean_act).save()
-        return res.detach().float().cpu()
+        res = res.detach().cpu()
+        return res if keep_dtype else res.float()
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False):
         prompt = self.one(prompts, "generate")
         it = slice(0, new_tokens) if bounded else slice(None)
         with model.trace(prompt, temperature=0.0, top_p=1, max_tokens=new_tokens,
@@ -64,22 +64,22 @@ class NNsight05SyncBackend(VLLMSyncBackend):
             rows = list().save()
             with tracer.iter[it] as step:
                 rows.append(build_step(step))
-        return self._step_rows([rows], new_tokens, "generation")
+        return self._step_rows([rows], new_tokens, "generation", keep_dtype)
 
     def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
-                       *, new_tokens, bounded=True):
+                       *, new_tokens, bounded=True, keep_dtype=False):
         sources, bases = self.paired(source_prompts, base_prompts, "generate_patch")
         source = self.one(sources, "generate_patch")
         with model.trace(source, **SAMPLING):
             ca = capture().save()
-        clean_act = ca.detach().float().cpu()
+        clean_act = ca.detach().cpu()
         it = slice(0, new_tokens) if bounded else slice(None)
         with model.trace(bases[0], temperature=0.0, top_p=1, max_tokens=new_tokens,
                          min_tokens=new_tokens) as tracer:
             rows = list().save()
             with tracer.iter[it] as step:
                 rows.append(build_step(clean_act, step))
-        return self._step_rows([rows], new_tokens, "generate_patch")
+        return self._step_rows([rows], new_tokens, "generate_patch", keep_dtype)
 
     def train_patch(self, model, source_prompts, base_prompts, capture, step):
         """One pair: the source capture, then the loss and its backward, each its own trace; the
@@ -88,7 +88,7 @@ class NNsight05SyncBackend(VLLMSyncBackend):
         source = self.one(sources, "train_patch")
         with model.trace(source, **SAMPLING):
             s = capture().save()
-        src = s.detach().float().cpu()
+        src = s.detach().cpu()
         with model.trace(bases[0], **SAMPLING):
             loss = step(src, [0])
             lv = loss.save()

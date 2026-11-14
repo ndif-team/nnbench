@@ -1,12 +1,11 @@
-"""Correctness identity and current coordinate boundary validation."""
-import copy
+"""Run coordinates and their boundary validation."""
 from dataclasses import replace
 
 import pytest
 
 from isb.jobs import contract
-from isb.manager.model import comparable
-from isb.runs import procedure, run_coordinates, spec_coordinates, read_coordinates
+from isb.jobs.schema import COORDINATES_VERSION
+from isb.runs import run_coordinates, spec_coordinates, read_coordinates
 from isb.sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime, TaskSpec
 
 
@@ -21,40 +20,18 @@ def test_spec_coordinates_match_frozen_job_inputs(tmp_path):
     spec = specimen()
     frozen = contract.prepare(spec, tmp_path / "job")
     coords = spec_coordinates(spec, "hf")
-    assert coords["schema"] == 3 and coords["identity_complete"]
+    assert coords["schema"] == COORDINATES_VERSION and coords["identity_complete"]
     assert coords["inputs_sha256"] == frozen["inputs_sha256"]
     assert coords["config"]["baseline"] == {"params": {"alpha": 0}, "label": "baseline"}
-    assert procedure(coords) == procedure(spec_coordinates(spec, "vllm_async"))
 
 
-@pytest.mark.parametrize("change", [
-    {"tasks": [TaskSpec("steer", {"alpha": 0})]},
-    {"regimes": [ExecutionRegime("generation", ["one", "two"], new_tokens=20)]},
-    {"regimes": [ExecutionRegime("generation", ["one", "two"], new_tokens=2, aggregate=False)]},
-    {"regimes": [ExecutionRegime("generation", ["one", "two"], new_tokens=2, data_knobs={"alpha": 3})]},
-    {"regimes": [ExecutionRegime("generation", ["one", "different"], new_tokens=2)]},
-    {"regimes": [ExecutionRegime("generation", ["two", "one"], new_tokens=2)]},
-    {"baseline": BaselineSpec({"alpha": 1})},
-    {"effect": EffectSpec({"alpha": 0}, {"alpha": 7})},
-    {"effect": EffectSpec({"alpha": 0}, {"alpha": 6}, tv_floor=0.8)},
-    {"hf_kwargs": {"revision": "other"}}, {"vllm_kwargs": {"trust_remote_code": True}},
-])
-def test_every_procedure_setting_prevents_accidental_comparison(change):
-    spec = specimen()
-    base = {"coordinates": spec_coordinates(spec, "hf")}
-    variant = {"coordinates": spec_coordinates(replace(spec, **change), "hf")}
-    assert not comparable(base, variant)
-    assert comparable(base, copy.deepcopy(base))
-
-
-@pytest.mark.parametrize("change", [{"warmup": 2}, {"n_trials": 3}, {"dtype_control": "float16"}])
-def test_timing_controls_are_recorded_without_blocking_correctness(change, tmp_path):
+@pytest.mark.parametrize("change", [{"warmup": 2}, {"n_trials": 3}])
+def test_timing_controls_are_recorded_in_coordinates_and_job_identity(change, tmp_path):
     spec = specimen()
     changed = replace(spec, **change)
     base = spec_coordinates(spec, "hf")
     variant = spec_coordinates(changed, "vllm_async")
     assert base["config"] != variant["config"]
-    assert comparable({"coordinates": base}, {"coordinates": variant})
     # The submitted Docker recipe still includes measurement settings in job identity.
     assert contract.prepare(spec, tmp_path / "base")["id"] != contract.prepare(changed, tmp_path / "other")["id"]
 
@@ -69,12 +46,19 @@ def test_coordinate_and_reader_snapshots_own_nested_values():
     assert upgraded["cases"][0]["params"]["layers"] == [1, 2]
 
 
-@pytest.mark.parametrize("version", [None, 0, 1, 2, 4, 99, "3", 3.0, True])
+@pytest.mark.parametrize("version", [None, 0, 1, 2, 5, 99, "3", 3.0, True])
 def test_unknown_coordinate_versions_are_rejected(version):
     coords = spec_coordinates(specimen(), "hf")
     coords["schema"] = version
-    with pytest.raises(ValueError, match="schema"):
+    with pytest.raises(ValueError, match="coordinate version"):
         read_coordinates(coords)
+
+
+def test_previous_coordinate_version_is_read():
+    coords = spec_coordinates(specimen(), "hf")
+    coords["schema"] = 3
+    coords["config"]["dtype_control"] = "float32"      # version 3 recorded it
+    assert read_coordinates(coords)["identity_complete"]
 
 
 def test_missing_identity_cannot_be_declared_complete():
@@ -91,18 +75,18 @@ def test_missing_identity_cannot_be_declared_complete():
     {"methodology": None}, {"family": ""}, {"repo": None}, {"cases": []}, {"regimes": []},
     {"cases": [{"label": "task"}]}, {"cases": [{"params": {}}]},
     {"regimes": [{"kind": "interactive"}]}, {"data": None},
+    {"regimes": [{"kind": "burst", "units": 2, "data": None, "new_tokens": 0, "aggregate": True,
+                  "data_knobs": {}}]},
 ])
 def test_malformed_current_coordinate_shapes_fail_clearly(change):
     coords = {**spec_coordinates(specimen(), "hf"), **change}
     with pytest.raises(ValueError):
         read_coordinates(coords)
-    with pytest.raises(ValueError):
-        comparable({"coordinates": coords}, {"coordinates": copy.deepcopy(coords)})
 
 
 @pytest.mark.parametrize("field,value", [
-    ("warmup", None), ("warmup", True), ("warmup", -1), ("n_trials", 0), ("n_trials", "7"),
-    ("dtype_control", None), ("hf_kwargs", None), ("vllm_kwargs", []), ("baseline", None),
+    ("warmup", None), ("warmup", True), ("warmup", -1), ("n_trials", -1), ("n_trials", "7"),
+    ("hf_kwargs", None), ("vllm_kwargs", []), ("baseline", None),
     ("baseline", {"label": "base", "params": None}), ("effect", {}),
     ("effect", {"baseline_params": {}, "perturbed_params": {}, "tv_floor": float("nan"), "top1_ceiling": 0.5}),
 ])

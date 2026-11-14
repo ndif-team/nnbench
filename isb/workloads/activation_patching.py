@@ -6,8 +6,8 @@ each a unit the cell consumes via two single-prompt traces. The verdict aggregat
 Baseline = patch=False (corrupted run, no transplant); effect-size = TV(unpatched, patched) at three
 quarters depth on the control.
 
-At bf16 the patched top-1 can flip on a near-tie: precision degradation, not a bug, separated by the
-dtype control (the two-trace patch is faithful at fp32, top1=1.00, tv≈0.001).
+At bf16 the patched top-1 can flip on a near-tie; the two-trace patch matches at fp32 (top1=1.00,
+tv≈0.001).
 """
 from ..data import DataRef
 from ..sweep.spec import Depth, Effect, Regime, Row, Workload

@@ -28,8 +28,9 @@ class ExecutionRegime:
     compatible dataset. A DataRef resolves at construction: its units land in `.units` and its
     per-dataset cell-param defaults in `.data_knobs` (injected UNDER task params by the driver, so
     an explicit task param always wins)."""
-    kind: str                 # "interactive" (N independent units) | "batched" (N units) |
-                              # "generation" (greedy multi-token decode; cells read/intervene per step)
+    kind: str                 # a key of REGIME_KINDS: "interactive" (N independent units) |
+                              # "batched" (N units) | "generation" (greedy multi-token decode; cells
+                              # read/intervene per step) | a load pattern (below)
     units: object           # list of units, or a DataRef
     new_tokens: int = 0       # generation: decode steps per prompt; injected into cell params by the
                               # driver (the regime axis lives here, not in every task dict)
@@ -43,8 +44,9 @@ class ExecutionRegime:
     # Load patterns. offline: the units issued as one sweep, `batch_size` units
     # per call (None = every unit in one call). concurrent: `concurrency` clients each issuing one
     # unit per call until the units run out. open: one-unit requests arriving at `rate` per second
-    # whatever the system does. All keep the outputs of the first `score_units` units for scoring;
-    # the rest are timed only.
+    # whatever the system does. All score the first `score_units` units from check calls after the
+    # timed passes and keep those units' last timed outputs for the timed check; the rest are timed
+    # only.
     batch_size: int | None = None
     concurrency: int = 0
     rate: float = 0.0
@@ -81,25 +83,47 @@ class ExecutionRegime:
         return regime_name(self.kind, vars(self))
 
 
-REGIME_KINDS = ("interactive", "batched", "generation", "offline", "concurrent", "open")
-# ExecutionRegime fields each load pattern records; other regimes' records leave every load field
-# out, and each load pattern leaves out the others', so adding a pattern changes no existing
-# experiment identity.
-LOAD_FIELDS = {
-    "offline": ("batch_size", "concurrency", "score_units", "passes"),
-    "concurrent": ("batch_size", "concurrency", "score_units", "passes"),
-    "open": ("rate", "score_units", "passes"),
+@dataclass(frozen=True)
+class RegimeKind:
+    """What every module needs to know about a regime kind. `latency` is what a record's
+    `median_latency_ms` is the median of ("call": an execution regime's timed calls; "pass": whole
+    offline passes; "request": the passes' requests, from issue or, open loop, from scheduled
+    arrival); `load` the ExecutionRegime fields a load pattern records, each leaving out the
+    others', so a new pattern changes no existing experiment identity; `effect` whether the effect
+    check (non-vacuity guard) runs in this regime."""
+    latency: str
+    load: tuple = ()
+    effect: bool = False
+
+
+REGIME_KINDS = {
+    "interactive": RegimeKind("call", effect=True),
+    "batched": RegimeKind("call"),
+    "generation": RegimeKind("call", effect=True),
+    "offline": RegimeKind("pass", ("batch_size", "concurrency", "score_units", "passes")),
+    "concurrent": RegimeKind("request", ("batch_size", "concurrency", "score_units", "passes")),
+    "open": RegimeKind("request", ("rate", "score_units", "passes")),
 }
+LOAD_FIELDS = {kind: k.load for kind, k in REGIME_KINDS.items() if k.load}
 LOAD_KINDS = tuple(LOAD_FIELDS)
 ALL_LOAD_FIELDS = tuple(dict.fromkeys(f for fields in LOAD_FIELDS.values() for f in fields))
 _RATE = re.compile(r"(0|[1-9][0-9]*)(\.[0-9]+)?")
 _LOAD_NAME = re.compile(rf"(offline/(all|b[1-9][0-9]*)|concurrent/c[1-9][0-9]*|open/r{_RATE.pattern})")
 
 
+def regime_kind(kind_or_name: str) -> RegimeKind:
+    """The table entry of a regime kind, or of the kind a regime key (`regime_name`) starts with."""
+    kind = kind_or_name.split("/")[0] if isinstance(kind_or_name, str) else kind_or_name
+    if kind not in REGIME_KINDS:
+        raise ValueError(f"unknown regime kind {kind!r}")
+    return REGIME_KINDS[kind]
+
+
 def regime_name(kind: str, settings=None) -> str:
     """A regime's key: its kind, plus the load setting for a load pattern, so one run can hold
     several (`offline/b16`, `offline/all`, `concurrent/c4`, `open/r8`).
     `settings` maps the load fields (a regime record, its `load` object, or `vars(regime)`)."""
+    regime_kind(kind)
     settings = settings or {}
     if kind == "offline":
         batch_size = settings.get("batch_size")
@@ -174,9 +198,8 @@ class CellConfig:
     tasks: list                                 # [TaskSpec] or [(params, label)]; normalized to TaskSpec
     baseline: BaselineSpec
     effect: Optional[EffectSpec] = None         # None for read methodologies (no write to guard)
-    dtype_control: str = "float32"              # control precision for the SILENTLY_WRONG-vs-DEGRADED re-check
     warmup: int = 3
-    n_trials: int = 7
+    n_trials: int = 3
     hf_kwargs: dict = field(default_factory=dict)
     vllm_kwargs: dict = field(default_factory=dict)
     # checked against the loaded model when set (instantiate sets it from the model row)
@@ -376,7 +399,7 @@ class Workload:
     baseline: dict
     effect: Optional[Effect] = None
     warmup: int = 3
-    n_trials: int = 7
+    n_trials: int = 3
     # The load patterns (LOAD_KINDS) that match how this methodology is used: offline for dataset
     # studies, concurrent and open for interventions on live traffic. A suite's
     # load applies only to the workloads that declare it.
@@ -554,7 +577,6 @@ def instantiate(workload: Workload, model, *, data=None, size=None, regimes=None
         family=model.family, repo=model.repo,
         regimes=kept,
         tasks=tasks, baseline=BaselineSpec(_bind(workload.baseline, (), model)), effect=effect,
-        dtype_control=model.dtype_control,
         warmup=workload.warmup if warmup is None else warmup,
         n_trials=workload.n_trials if n_trials is None else n_trials,
         hf_kwargs=deepcopy(model.hf_kwargs), vllm_kwargs=deepcopy(model.vllm_kwargs),

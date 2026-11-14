@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import signal
 import subprocess
 import sys
@@ -13,7 +12,8 @@ from pathlib import Path
 
 from isb.suites import cases
 
-from .contract import PLAN_VERSION, prepare, write_json
+from .contract import prepare, write_json
+from .schema import PLAN_VERSION
 from . import apptainer
 from .local import (LAUNCHERS, ROOT, canonical, compose_file, config, configuration, default_launcher,
                     discover, environment, run_job)
@@ -116,6 +116,10 @@ def parser():
                      help="docker or apptainer (default: ISB_LAUNCHER, else docker)")
     run.add_argument("--out", type=Path, default=Path("runs"), help="parent of a new unique run directory")
     run.add_argument("--strict", action="store_true", help="nonzero exit for failed execution/output checks; numerical uncertainty is nonblocking")
+    run.add_argument("--check", action="store_true",
+                     help="a check run: only the correctness checks' untimed calls, with no "
+                          "timed trials, baseline or plain requests (a concurrent or open-loop "
+                          "check pass keeps the pattern's warm-up request)")
     scoring = commands.add_parser("score")
     scoring.add_argument("run", type=Path)
     scoring.add_argument("--strict", action="store_true")
@@ -143,6 +147,9 @@ def _run(args):
         raise ValueError("select one GPU index/UUID; a config reserving several GPUs takes the "
                          "indices from it on (backends/README.md)")
     specs, skipped = cases(entries, settings["realizations"], labels=args.labels)
+    if args.check:
+        for spec in specs:
+            spec.warmup = spec.n_trials = 0
     launcher = args.launcher or default_launcher()
     for name in args.backends:
         env = environment(name, args.out, args.out, args.gpu)

@@ -24,14 +24,26 @@ from collections.abc import Mapping
 import torch
 import torch.nn.functional as F
 
-from isb.methodologies.jacobian_lens import _load_fitted, _orthogonal
+from isb.methodologies.jacobian_lens import load_fitted, orthogonal
 from isb.methodologies.registry import Unsupported, cell
-from isb.methodologies.steering import CALIBRATED, _resolve_token, calibrated_strengths
-from isb.tasks.lens_eval import locate
+from isb.methodologies.steering import CALIBRATED, resolve_token, calibrated_strengths
+from isb.data import locate
 
 
 def _ids(model, prompt):
     return model.tokenizer(prompt)["input_ids"]
+
+
+def _wire(be, intervene):
+    """`intervene` in the form the driver's RPC delivers intact. A sharded boot runs the engine
+    core in its own process (source.py, boot_vllm), so the driver's collective_rpc crosses vLLM's
+    msgpack utility channel, which delivers a tensor as [dtype, shape, data] that validate_spec
+    rejects; the documented list form arrives intact. One GPU keeps the worker in this process and
+    takes the tensor as is."""
+    if intervene and be.engine_options.get("tensor_parallel_size", 1) > 1:
+        return {name: {k: v.tolist() if isinstance(v, torch.Tensor) else v
+                       for k, v in spec.items()} for name, spec in intervene.items()}
+    return intervene
 
 
 def _forward(be, model, prompts, names=(), intervene=None, logits=True):
@@ -40,13 +52,7 @@ def _forward(be, model, prompts, names=(), intervene=None, logits=True):
     for all of them on the batched path. `logits=False` skips the host-side logit rebuild (the
     driver's `return_logits` option)."""
     kwargs = {"names_filter": list(names)}
-    if intervene and be.engine_options.get("tensor_parallel_size", 1) > 1:
-        # A sharded boot runs the engine core in its own process (source.py, boot_vllm), so the
-        # driver's collective_rpc crosses vLLM's msgpack utility channel, which delivers a tensor
-        # as [dtype, shape, data] that validate_spec rejects; the documented list form arrives
-        # intact. One GPU keeps the worker in this process and takes the tensor as is.
-        intervene = {name: {k: v.tolist() if isinstance(v, torch.Tensor) else v
-                            for k, v in spec.items()} for name, spec in intervene.items()}
+    intervene = _wire(be, intervene)
     if intervene:
         kwargs["intervene"] = intervene
     if not logits:
@@ -67,6 +73,14 @@ def _final_logits(be, model, prompts, intervene=None):
     """Each prompt's last-position logits: [B, vocab]."""
     results = _forward(be, model, prompts, intervene=intervene)
     return torch.stack([out[-1] for out, _ in results]).float()
+
+
+def _next_token(be, model, prompts, intervene=None):
+    """Each prompt's greedy next token, `[B, 1]` int64, read the documented way: the bridge's
+    forward with its logits, then the last position's argmax (docs/source/content/drivers.md;
+    demos/vLLM_Bridge_Integration_Test.ipynb, step 6, `logits[0, -1].argmax()`)."""
+    return torch.stack([out[-1].argmax(-1, keepdim=True)
+                        for out, _ in _forward(be, model, prompts, intervene=intervene)])
 
 
 def _last_rows(be, model, prompts, names, positions=None, intervene=None):
@@ -92,6 +106,16 @@ def _weight(model, name):
     return model.weights[name]
 
 
+def _direction(model, target):
+    """The unit unembedding row of `target`'s token (`resolve_token`), fp32 on the host, built once
+    per loaded model and kept with the fetched weights."""
+    key = ("direction", target)
+    if key not in model.weights:
+        token_id = resolve_token(model.tokenizer, target)
+        model.weights[key] = F.normalize(_weight(model, "unembedding")[token_id], dim=0)
+    return model.weights[key]
+
+
 def _lens_logits(model, rows):
     """The final RMSNorm and the unembedding on the host in fp32, as the driver rebuilds its own
     logits. rows: [..., d_model] fp32."""
@@ -103,7 +127,7 @@ def _lens_logits(model, rows):
 
 def _jlens_maps(model, transport, d, device="cpu"):
     """The Jacobian-lens transport as fp32 on `device`: None (identity), one shared [d, d] map (an
-    int seed, `_orthogonal`, or a tensor) or {layer: [d, d]} (a fitted lens, `_load_fitted`, or a
+    int seed, `orthogonal`, or a tensor) or {layer: [d, d]} (a fitted lens, `load_fitted`, or a
     mapping). A seeded or fitted map is built once per loaded model and device and kept with the
     fetched weights, so the QR and the checkpoint load stay out of the timed readout."""
     if transport is None:
@@ -111,8 +135,8 @@ def _jlens_maps(model, transport, d, device="cpu"):
     key = f"jlens:{device}:{transport}" if isinstance(transport, (int, str)) else None
     if key in model.weights:
         return model.weights[key]
-    source = (_load_fitted(transport) if isinstance(transport, str)
-              else _orthogonal(d, transport) if isinstance(transport, int) else transport)
+    source = (load_fitted(transport) if isinstance(transport, str)
+              else orthogonal(d, transport) if isinstance(transport, int) else transport)
     maps = ({layer: m.to(device, torch.float32) for layer, m in source.items()}
             if isinstance(source, Mapping) else source.to(device, torch.float32))
     if key is not None:
@@ -161,7 +185,7 @@ def _steer_edits(be, model, prompts, sites, direction, alpha):
     return edits
 
 
-def _mean_norms(be, model, prompts, layers):
+def mean_norms(be, model, prompts, layers):
     """The unsteered stream's mean per-token norm at each of `layers` (`blocks.{i}.hook_out`),
     averaged over `prompts`: one capture forward with no intervention."""
     names = [f"blocks.{i}.hook_out" for i in layers]
@@ -176,9 +200,54 @@ def _fixed_edit(be, model, units, sites, direction, alpha):
     once per loaded engine (isb/methodologies/steering.py, `calibrated_strengths`). `add` takes exactly such a value, so
     the steered forward needs no capture first and the batched path runs a call as one forward."""
     strengths = calibrated_strengths(be, sites, alpha, units,
-                                     functools.partial(_mean_norms, be, model))
+                                     functools.partial(mean_norms, be, model))
     return {f"blocks.{site}.hook_out": {"op": "add", "value": k * direction}
             for site, k in zip(sites, strengths)}
+
+
+def _steer_requests(be, model, units, layer, layers, target, alpha, scale_by):
+    """The steered requests of one steering call in unit order, as (prompts, intervene) pairs:
+    every unit with no spec at `alpha=0`, every unit with the one fixed edit under
+    `scale_by="calibrated_mean_norm"` (`_fixed_edit`), else each unit alone with the edits its
+    capture forwards measured (`_steer_edits`). Timed calls and check calls make these requests."""
+    sites = _steer_layers(model, layer, layers, alpha)
+    if alpha == 0:
+        return [(units, None)]
+    if scale_by == "token_norm":
+        raise Unsupported("'add' carries one width-shaped value per hook; a strength proportional "
+                          "to each token's own norm needs a different value at every position "
+                          "(intervention_specs.validate_spec)")
+    direction = _direction(model, target)
+    if scale_by == CALIBRATED:
+        return [(units, _fixed_edit(be, model, units, sites, direction, alpha))]
+    edits = _steer_edits(be, model, units, sites, direction, alpha / len(sites))
+    return [([prompt], edit) for prompt, edit in zip(units, edits)]
+
+
+def _patch_requests(be, model, units, layer, patch, positions):
+    """The patched requests of one patching call in unit order, as (prompts, intervene) pairs: the
+    corrupt prompts with no spec at `patch=False`, else each corrupt prompt alone with a `set` of
+    its clean prompt's `blocks.{layer}.hook_out` last row at the corrupt run's last position
+    (`pos`, which needs boot_vllm(enable_position_interventions=True)), read by a capture forward
+    of the clean prompt. Timed calls and check calls make these requests."""
+    if not patch:
+        return [([unit[1] for unit in units], None)]
+    if positions != "last":
+        raise Unsupported("an intervention carries one width-shaped value per hook; writing a "
+                          "different clean activation at every position in one forward is not "
+                          "expressible; a single-position patch is ('set' with 'pos')")
+    if be.batching:
+        raise Unsupported("the eager batched path applies interventions to the whole tensor and "
+                          "takes no 'pos' (driver.py, _validate_interventions; boot_vllm refuses "
+                          "enable_position_interventions with enable_batching, source.py)")
+    name = f"blocks.{layer}.hook_out"
+    requests = []
+    for clean_prompt, corrupt_prompt in units:
+        (_, cache), = _forward(be, model, [clean_prompt], [name], logits=False)
+        last = len(_ids(model, corrupt_prompt)) - 1
+        requests.append(([corrupt_prompt],
+                         {name: {"op": "set", "value": cache[name][-1], "pos": last}}))
+    return requests
 
 
 @cell("logit_lens", family="llama", backend="transformer_lens")
@@ -214,27 +283,16 @@ def residual_readout(be, model, units, *, layers):
 
 @cell("steering", family="llama", backend="transformer_lens")
 def steering(be, model, units, *, layer=8, layers=None, target=" Rome", alpha=6.0,
-             scale_by="mean_norm"):
+             scale_by="mean_norm", check=False):
     """`add` takes a fixed value, so a strength relative to the stream's own norm needs a capture
-    forward per steered layer before the steered forward (`_steer_edits`). `layers` steers every
-    listed layer in one forward and replaces `layer`. Each listed layer gets
-    `alpha / len(layers)`. `scale_by="calibrated_mean_norm"` instead adds fixed values measured
-    once per loaded engine (`_fixed_edit`): no capture before the steered forward."""
-    sites = _steer_layers(model, layer, layers, alpha)
-    if alpha == 0:
-        return _final_logits(be, model, units)
-    if scale_by == "token_norm":
-        raise Unsupported("'add' carries one width-shaped value per hook; a strength proportional "
-                          "to each token's own norm needs a different value at every position "
-                          "(intervention_specs.validate_spec)")
-    token_id = _resolve_token(model.tokenizer, target)
-    direction = F.normalize(_weight(model, "unembedding")[token_id], dim=0)
-    if scale_by == CALIBRATED:
-        return _final_logits(be, model, units,
-                             _fixed_edit(be, model, units, sites, direction, alpha))  # [B, vocab]
-    edits = _steer_edits(be, model, units, sites, direction, alpha / len(sites))
-    return torch.cat([_final_logits(be, model, [prompt], edit)
-                      for prompt, edit in zip(units, edits)])                # [B, vocab]
+    forward per steered layer before the steered forward (`_steer_edits`); `scale_by=
+    "calibrated_mean_norm"` adds fixed values measured once per loaded engine instead (`_fixed_edit`).
+    `layers` steers every listed layer in one forward, `alpha / len(layers)` each. A timed call
+    returns each unit's greedy next token `[B, 1]`, a check call the next-token logits `[B, vocab]`,
+    from the same requests (at `alpha=0`, the unsteered request)."""
+    requests = _steer_requests(be, model, units, layer, layers, target, alpha, scale_by)
+    read = _final_logits if check else _next_token
+    return torch.cat([read(be, model, prompts, edit) for prompts, edit in requests])
 
 
 @cell("gen_steering", family="llama", backend="transformer_lens")
@@ -246,51 +304,45 @@ def gen_steering(be, model, units, *, layer=8, target=" Rome", alpha=6.0, new_to
 
 
 @cell("activation_patching", family="llama", backend="transformer_lens")
-def activation_patching(be, model, units, *, layer=6, patch=True, positions="all"):
+def activation_patching(be, model, units, *, layer=6, patch=True, positions="all", check=False):
     """`positions="last"`: capture the clean block output, then `set` it at the corrupt run's last
-    position (`pos`, which needs boot_vllm(enable_position_interventions=True))."""
-    if not patch:
-        return _final_logits(be, model, [unit[1] for unit in units])   # the corrupt runs, unpatched
-    if positions != "last":
-        raise Unsupported("an intervention carries one width-shaped value per hook; writing a "
-                          "different clean activation at every position in one forward is not "
-                          "expressible; a single-position patch is ('set' with 'pos')")
-    if be.batching:
-        raise Unsupported("the eager batched path applies interventions to the whole tensor and "
-                          "takes no 'pos' (driver.py, _validate_interventions; boot_vllm refuses "
-                          "enable_position_interventions with enable_batching, source.py)")
-    name = f"blocks.{layer}.hook_out"
-    rows = []
-    for clean_prompt, corrupt_prompt in units:
-        (_, cache), = _forward(be, model, [clean_prompt], [name], logits=False)
-        clean_last = cache[name][-1].float()
-        corrupt_len = len(_ids(model, corrupt_prompt))
-        rows.append(_final_logits(be, model, [corrupt_prompt],
-                                  {name: {"op": "set", "value": clean_last, "pos": corrupt_len - 1}}))
-    return torch.cat(rows)                                                   # [B, vocab]
+    position (`_patch_requests`). A timed call returns each unit's greedy next token `[B, 1]`, a
+    check call the next-token logits `[B, vocab]`, from the same requests (at `patch=False`, the
+    unpatched corrupt request)."""
+    requests = _patch_requests(be, model, units, layer, patch, positions)
+    read = _final_logits if check else _next_token
+    return torch.cat([read(be, model, prompts, edit) for prompts, edit in requests])
 
 
 @cell("ablation", family="llama", backend="transformer_lens")
-def ablation(be, model, units, *, layer=6, target="mlp"):
-    if target == "none":
-        return _final_logits(be, model, units)
-    return _final_logits(be, model, units, {f"blocks.{layer}.{target}.hook_out": {"op": "suppress"}})
+def ablation(be, model, units, *, layer=6, target="mlp", check=False):
+    """`suppress` zeroes `blocks.{layer}.{target}.hook_out` (the `self_attn` or `mlp` module
+    output) at every position; `target="none"` sends no spec. A timed call returns each unit's
+    greedy next token `[B, 1]`, a check call the next-token logits `[B, vocab]`, from the same
+    requests."""
+    site = f"blocks.{layer}.{target}.hook_out"
+    intervene = None if target == "none" else {site: {"op": "suppress"}}
+    read = _final_logits if check else _next_token
+    return read(be, model, units, intervene)
 
 
 @cell("activation_harvest", family="llama", backend="transformer_lens")
 def activation_harvest(be, model, units, *, layer=None, layers=None, export=True):
     """The worker copies each `blocks.{i}.hook_out` buffer to host memory as wire bytes
     (`worker_extension.py`, `tl_read_captures`; the batched path copies every request's rows in the
-    hook). Each prompt's valid rows, in prompt order: [tokens, d_model], or [len(layers), tokens,
-    d_model] for `layers`, which replaces `layer`. `export=False` runs the same forwards with no
-    capture and no logit rebuild, the backend's plain request, which returns no output."""
-    idx = [layer] if layers is None else list(layers)
-    names = [f"blocks.{i}.hook_out" for i in idx] if export else []
-    caches = [cache for _, cache in _forward(be, model, units, names, logits=False)]
+    hook). Each prompt's valid rows, in prompt order and the engine's dtype: [tokens, d_model], or
+    [len(layers), tokens, d_model] for `layers`, which replaces `layer`. `export=False` is the
+    baseline: the same requests with no capture and no logit rebuild, so the rows' overhead over it
+    is the export's cost. It returns no output: the bridge's forward drops the token vLLM
+    generated, and the documented token read (`_next_token`) rebuilds every position's logits on
+    the host, which the harvest rows never do."""
     if not export:
+        _forward(be, model, units, [], logits=False)
         return None
-    stacked = torch.stack([torch.cat([cache[name] for cache in caches]) for name in names])
-    return stacked if layers is not None else stacked[0]
+    names = [f"blocks.{i}.hook_out" for i in ([layer] if layers is None else layers)]
+    caches = [cache for _, cache in _forward(be, model, units, names, logits=False)]
+    reads = [torch.cat([cache[name] for cache in caches]) for name in names]
+    return reads[0] if layers is None else torch.stack(reads)
 
 
 @cell("attention_pattern", family="llama", backend="transformer_lens")

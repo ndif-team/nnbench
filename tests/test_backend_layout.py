@@ -88,6 +88,21 @@ def test_entry_resolves_the_system_code_without_importing_engines():
     assert layout.module_name(BACKENDS / "vllm-lens/cells_opt.py") == "backends.vllm-lens.cells_opt"
 
 
+def test_opt_taps_name_each_family_blocks_where_vllm_mounts_them():
+    import importlib
+
+    from isb.sweep.spec import instantiate
+    from isb.workloads import WORKLOADS
+
+    spec_taps = importlib.import_module("backends.nnsight-vllm.backend_opt").spec_taps
+    lens, _ = instantiate(WORKLOADS["jacobian_lens"], "qwen3.5-4b")    # behind `language_model.`
+    assert spec_taps(lens) == ["language_model.model.layers.*.output"]
+    steer, _ = instantiate(WORKLOADS["steering"], "gpt2")
+    assert spec_taps(steer) and all(t.startswith("transformer.h.") for t in spec_taps(steer))
+    ablate, _ = instantiate(WORKLOADS["ablation"], "gpt2")               # gpt2 names it `attn`
+    assert any(t.endswith(".attn.output") for t in spec_taps(ablate))
+
+
 @pytest.mark.parametrize("text,error", [
     ("images: {a: {}}\nconfigs: {default: {image: b}}\n", "names image"),
     ("images: {a: {}}\nconfigs: {default: {image: a, extra: 1}}\n", "takes"),

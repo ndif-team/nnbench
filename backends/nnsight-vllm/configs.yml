@@ -9,7 +9,7 @@ images:
   0-8-1: {VLLM_IMAGE: vllm/vllm-openai:v0.27.1, NNSIGHT_REF: de7fec4d207fc8e0deacaa44fb68f8d0412506ef}
   # 0.8.2 requires vllm>=0.27.1,<0.28
   0-8-2: {VLLM_IMAGE: vllm/vllm-openai:v0.27.1, NNSIGHT_REF: b0f3b648722455ef406334b0849f79639c352ece}
-  # the development commit on the first vLLM with breakable CUDA graphs (taps)
+  # the development commit on vLLM 0.28.0
   0-28-0: {VLLM_IMAGE: vllm/vllm-openai:v0.28.0}
 configs:
   default:

@@ -1,229 +1,65 @@
-"""Manager tests (isb/manager.py), no GPU: directory model, one-baseline resolution,
-archive/discard as file moves, and the rendered pages."""
-import sys
-from pathlib import Path
+"""Manager tests (isb/manager), no GPU: the pages over a job bundle, imported construct-probe and
+performance run files, and archive/discard as file moves."""
+from isb.jobs.contract import prepare, write_json
+from isb.jobs.schema import PLAN_VERSION, REPORT_VERSION, WIRE_VERSION
+from isb.manager import Collection, archive, discard, dispatch, export_html, perf_points, rollup
+from isb.manager.model import import_run_files
+from isb.runfile import save_run
+from isb.runs import run_coordinates
+from isb.sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from test_execute_score import _execute as execute_fixture, _spec  # noqa: E402
-
-import isb.manager as manager  # noqa: E402
-from isb.runs import run_coordinates  # noqa: E402
-
-
-def _current(spec):
-    """Make `spec` the current definition of its case name for the manager."""
-    from unittest.mock import patch
-    return patch("isb.workloads.case", lambda name: spec if name == spec.name else None)
+REFERENCE, CANDIDATE = "nnsight-hf/default", "nnsight-vllm/default"
+GROUP = "run/exp"
 
 
-def _execute(path, name, engine, **kwargs):
-    execute_fixture(path, name, engine, **kwargs)
+def _bundle(parent, name="run"):
+    """One experiment on two backends: the reference ran; the candidate is a numerical mismatch
+    in both regimes."""
+    root = parent / name
+    spec = CellConfig("lens", "logit_lens", "gpt2", "gpt2", [ExecutionRegime("interactive", ["a"]),
+                      ExecutionRegime("batched", ["a"])], [({}, "task")], BaselineSpec({}))
+    experiment = prepare(spec, root / "experiments" / "exp")
+    write_json(root / "plan.json", {"version": PLAN_VERSION, "experiments": ["exp"], "backends": [REFERENCE, CANDIDATE],
+                                    "reference": REFERENCE, "comparison": "correctness",
+                                    "status": "completed"})
+    for backend, kind, commit, latency in ((REFERENCE, "transformers", "c-base", 2.), (CANDIDATE, "vllm", "c-cand", 1.)):
+        directory = root / "experiments" / "exp" / backend
+        directory.mkdir(parents=True)
+        (directory / "result.pt").write_bytes(b"never loaded by the manager")
+        write_json(directory / "execution.json", {"status": "completed", "backend": backend,
+                                                  "experiment_id": experiment["id"], "image_id": "sha256:x"})
+        write_json(directory / "result.json", {
+            "version": WIRE_VERSION, "status": "completed", "backend": backend,
+            "experiment_id": experiment["id"], "inputs_sha256": experiment["inputs_sha256"],
+            "cells": [{"regime": regime, "label": "task", "state": "RAN", "error": None,
+                       "median_latency_ms": latency, "latency_kind": "call",
+                       "overhead_vs_baseline": 1.5}
+                      for regime in ("interactive", "batched")],
+            "provenance": {"engine": {"kind": kind, "mode": "sync"}, "deployment": {},
+                           "client": {"nnsight": {"commit": commit}}, "coordinates": {"interface": "hf"}}})
+    write_json(root / "report.json", {"version": REPORT_VERSION, "run": name, "experiments": [{
+        "experiment_id": experiment["id"], "reference": REFERENCE, "comparison": "correctness",
+        "cells": [{"backend": backend, "regime": regime, "label": "task", "state": state,
+                   "metrics": {"top1_agree": .5, "tv": .2, "max_abs": 1.}}
+                  for backend, state in ((REFERENCE, "RAN"), (CANDIDATE, "NUMERICAL_MISMATCH"))
+                  for regime in ("interactive", "batched")]}]})
+    return root
 
 
-def _import(path):
-    from isb.manager.model import import_legacy
-    import_legacy(str(path))
-
-
-def _collection(tmp_path):
-    """A directory with one transformers baseline and one vllm run that is wrong on one prompt."""
-    _execute(tmp_path, "base", "transformers")
-    _execute(tmp_path, "cand", "vllm", wrong_on="p1")
-    _import(tmp_path)
-    return manager.load_dir(str(tmp_path))
-
-
-def test_legacy_import_never_guesses_precision_control(tmp_path):
-    from unittest.mock import patch
-    _execute(tmp_path, "base", "transformers")
-    _execute(tmp_path, "candidate", "vllm")
-    _execute(tmp_path, "unrelated-fp32", "vllm")
-    with _current(_spec()), patch("isb.sweep.score.score_runs", return_value=[]) as score:
-        _import(tmp_path)
-    assert score.call_count == 3
-    for call in score.call_args_list:
-        assert len(call.args) == 4 and "ctl" not in call.kwargs
-
-
-def test_import_keeps_incomplete_current_coordinates_browsable_without_rescoring(tmp_path):
-    from unittest.mock import patch
-    from isb.runfile import save_run
-    from isb.runs import spec_coordinates
-
-    coords = spec_coordinates(_spec(), "hf")
-    coords["inputs_sha256"] = None
-    coords["config"] = None
-    coords["identity_complete"] = False
-    save_run(str(tmp_path), "historical", {}, {"coordinates": coords, "engine": {"kind": "transformers"}})
-    with _current(_spec()), patch("isb.sweep.score.score_runs") as score:
-        _import(tmp_path)
-    assert not score.called
-    col = manager.Collection(str(tmp_path))
-    assert "historical" in col.entries and col.results["historical"] is None
-    assert any("identity is incomplete" in warning for warning in col.warnings)
-
-
-def test_import_does_not_score_with_a_changed_current_spec(tmp_path):
-    from dataclasses import replace
-    from unittest.mock import patch
-    from isb.runfile import save_run
-    from isb.runs import spec_coordinates
-
-    spec = _spec()
-    save_run(str(tmp_path), "saved", {}, {"coordinates": spec_coordinates(spec, "hf"),
-                                           "engine": {"kind": "transformers"}})
-    with _current(replace(spec, hf_kwargs={"force_text_causal": True})), \
-         patch("isb.sweep.score.score_runs") as score:
-        _import(tmp_path)
-    assert not score.called
-    col = manager.Collection(str(tmp_path))
-    assert any("current spec does not match" in warning for warning in col.warnings)
-
-
-def test_changed_legacy_artifact_requires_explicit_reimport(tmp_path):
-    _collection(tmp_path)
-    with (tmp_path / "cand.pt").open("ab") as stream:
-        stream.write(b"changed")
-    col = manager.Collection(str(tmp_path))
-    assert "cand" not in col.entries
-    assert any("changed after import" in warning for warning in col.warnings)
-
-
-def test_baseline_single_transformers_run_and_marker_override(tmp_path):
-    entries = _collection(tmp_path)
-    assert manager.baselines_of(str(tmp_path), entries) == {"xs": "base"}   # only tf run of xs
-    (tmp_path / "BASELINE").write_text("cand\n")
-    assert manager.baselines_of(str(tmp_path), entries) == {"xs": "cand"}   # marker wins
-    (tmp_path / "BASELINE").write_text("missing\n")
-    assert manager.baselines_of(str(tmp_path), entries) == {}               # names no file
-
-
-def test_overview_cards_carry_rollup_of_the_scored_run(tmp_path):
-    _collection(tmp_path)
-    with _current(_spec()):
-        _import(tmp_path)
-        page = manager.render_overview(str(tmp_path), inbox=str(tmp_path / "inbox"))
-    # every cell of cand is wrong on p1, so nothing passes -> the rollup is SILENTLY_WRONG
-    # (assert the rendered chip, not the stylesheet: the CSS also contains state names)
-    assert ">SILENTLY_WRONG</span>" in page
-    assert "/method/m" in page                                     # card links the methodology
-    assert "data -" not in page                                    # no run coordinates on a card
-
-
-def test_method_page_is_the_model_x_backend_matrix(tmp_path):
-    _collection(tmp_path)
-    with _current(_spec()):
-        _import(tmp_path)
-        page = manager.render_method(str(tmp_path), "m", inbox=str(tmp_path / "inbox"))
-    assert "Model × backend" in page
-    assert "/spec/xs" in page                                      # matrix row links the model
-    assert ">SILENTLY_WRONG</span>" in page                        # the model x backend rollup
-
-
-def test_spec_page_shows_states_metrics_and_stack(tmp_path):
-    _collection(tmp_path)
-    with _current(_spec()):
-        _import(tmp_path)
-        page = manager.render_spec(str(tmp_path), "xs", inbox=str(tmp_path / "inbox"))
-    assert ">NUMERICAL_MISMATCH</span>" in page                    # unresolved numerical difference
-    assert " ms</span>" in page                                 # measurement remains visible
-    assert "top1=" in page and "tv=" in page                       # oracle metrics per cell
-    assert "c-cand" in page                                        # stack commit shown
-    # the baseline run leads with its own section: stack + latencies, no verdicts
-    assert ">BASELINE</span>" in page and "c-base" in page
-    assert page.index("c-base") < page.index("c-cand")
-
-
-def test_spec_page_has_operating_point_figure(tmp_path):
-    _collection(tmp_path)
-    with _current(_spec()):
-        _import(tmp_path)
-        page = manager.render_spec(str(tmp_path), "xs", inbox=str(tmp_path / "inbox"))
-    assert "<svg" in page and "median latency (ms)" in page
-    # cand has two timed cells (interactive + batched) -> two points
-    assert page.count("<circle") >= 2 + 1                          # points + one legend swatch
-    assert "overhead" in page
-
-
-def test_perf_points_include_baseline_and_skip_errored_cells(tmp_path):
-    entries = _collection(tmp_path)
-    pts = manager.perf_points(entries, list(entries))
-    assert {p["run"] for p in pts} == {"base", "cand"}             # baseline is a config too
-    assert all(p["lat"] > 0 and p["ovh"] > 0 for p in pts)
-
-
-def test_rollup_verdicts(tmp_path=None):
-    assert manager.rollup(["SUPPORTED", "SUPPORTED_DEGRADED"]) == "SUPPORTED"
-    assert manager.rollup(["SUPPORTED", "ERROR"]) == "LIMITED"
-    assert manager.rollup(["ERROR", "ERROR"]) == "ERROR"
-    assert manager.rollup(["SILENTLY_WRONG", "ERROR"]) == "SILENTLY_WRONG"
-    assert manager.rollup(["SUPPORTED", "SILENTLY_WRONG"]) == "LIMITED"
-
-
-def _construct_run(dirpath, name="micro-async", engine_kind="vllm"):
-    from isb.runfile import save_run
-    iface = "vllm_async" if engine_kind == "vllm" else "hf"
+def _construct_run(directory, name="constructs-async"):
     meta = {("probe", "input_boundary"): {"state": "SUPPORTED", "note": "x==y", "latency_s": 1.0},
             ("probe", "barrier"): {"state": "ERROR", "note": "not shared", "latency_s": 2.0}}
-    prov = {"client": {"nnsight": {"commit": "c-micro"}, "vllm": "0.19.1", "transformers": None},
-            "deployment": {"kind": "local"},
-            "engine": {"kind": engine_kind, "mode": "async", "params": {}},
+    prov = {"client": {"nnsight": {"commit": "c-probe"}, "vllm": "0.19.1", "transformers": None},
+            "deployment": {"kind": "local"}, "engine": {"kind": "vllm", "mode": "async", "params": {}},
             "host": {"hostname": "testbox", "gpus": []},
             "coordinates": run_coordinates(spec="constructs", methodology="constructs", family="gpt2",
-                                           repo="gpt2", interface=iface,
-                                           cases=[{"label": name} for name in ("input_boundary", "barrier")])}
-    save_run(str(dirpath), name, {("__meta__",): meta}, prov)
-    _import(dirpath)
+                                           repo="gpt2", interface="vllm_async",
+                                           cases=[{"label": label} for label in ("input_boundary", "barrier")])}
+    save_run(str(directory), name, {("__meta__",): meta}, prov)
+    import_run_files(str(directory))
 
 
-def test_lone_construct_run_is_never_the_fallback_baseline(tmp_path):
-    _construct_run(tmp_path, name="constructs-hf", engine_kind="transformers")
-    entries = manager.load_dir(str(tmp_path))
-    assert manager.baselines_of(str(tmp_path), entries) == {}      # probe runs self-check
-
-
-def test_overview_matches_the_reviewed_design(tmp_path):
-    _collection(tmp_path)
-    with _current(_spec()):
-        _import(tmp_path)
-        page = manager.render_overview(str(tmp_path), inbox=str(tmp_path / "inbox"))
-    assert "How to read the map" in page                           # legend panel
-    assert "setup of the runs in this directory" in page           # backends table
-    assert "HF-nnsight" in page and "vllm-nnsight" in page
-
-
-def test_backend_page_shows_construct_support_from_construct_run(tmp_path):
-    _construct_run(tmp_path, name="micro-async")
-    page = manager.render_backend("vllm_async", str(tmp_path))
-    assert "Construct support" in page and "barrier" in page
-    assert ">ERROR</span>" in page and "not shared" in page
-
-
-def test_construct_runs_stay_off_the_method_cards(tmp_path):
-    """Construct probes surface as construct support on backend pages; they get no methodology
-    card, and 'micro' names only the perf op-cost benchmark."""
-    _collection(tmp_path)
-    _construct_run(tmp_path, name="constructs-async")
-    page = manager.render_overview(str(tmp_path), inbox=str(tmp_path / "inbox"))
-    assert "/spec/constructs" not in page                          # no method card
-    assert "perf micro" in page                                    # op-cost pointer instead
-    backend = manager.render_backend("vllm_async", str(tmp_path))
-    assert "Construct support" in page or "Construct support" in backend
-    run_page = manager.render_run(str(tmp_path), "constructs-async", inbox=str(tmp_path / "inbox"))
-    assert "SUPPORTED · x==y" in run_page
-
-
-def test_perf_micro_page_is_op_cost(tmp_path):
-    _collection(tmp_path)
-    page = manager.render_micro(str(tmp_path), inbox=str(tmp_path / "inbox"))
-    assert "Primitive op cost" in page and "read, steer, and qk" in page
-    assert "No perf-micro runs" in page                            # none archived yet
-
-
-def _perf_run(dirpath, name="perf-read-q"):
-    from isb.runfile import save_run
+def _perf_run(directory, name="perf-read-q"):
     rows = [
         {"system": "pure_vllm", "op": "none", "footprint": "one", "phase": "decode",
          "median_total_lat_s": 1.0, "median_tok_per_s": 256.0, "overhead_pct": 0.0,
@@ -236,105 +72,145 @@ def _perf_run(dirpath, name="perf-read-q"):
          "error": "HANG > 900s", "cell": "vllm_hook.read", "repo": "q"},
     ]
     prov = {"client": {"nnsight": {"commit": "c-perf"}, "vllm": "0.19.1", "transformers": None},
-            "deployment": {"kind": "local"},
-            "engine": {"kind": "vllm", "mode": "async", "params": {}},
+            "deployment": {"kind": "local"}, "engine": {"kind": "vllm", "mode": "async", "params": {}},
             "host": {"hostname": "t", "gpus": []},
             "coordinates": run_coordinates(spec=name, methodology="perf_micro", family="-",
                                            repo="q", interface="perf")}
-    save_run(str(dirpath), name, {("perf_rows",): rows, ("__meta__",): {}}, prov)
-    _import(dirpath)
+    save_run(str(directory), name, {("perf_rows",): rows, ("__meta__",): {}}, prov)
+    import_run_files(str(directory))
 
 
-def test_perf_micro_runs_render_op_cost_tables(tmp_path):
-    """A perf_micro run file renders per-op tables on /micro (baseline row + measured rows +
-    error rows) and stays off the overview's method cards and backends table."""
-    _collection(tmp_path)
+def _page(tmp_path, route):
+    return dispatch(Collection(str(tmp_path), str(tmp_path / "inbox")), route)
+
+
+def test_overview_cards_carry_the_rollup(tmp_path):
+    _bundle(tmp_path)
+    page = _page(tmp_path, "/")
+    # assert the rendered chip, not the stylesheet: the CSS also contains state names
+    assert ">NUMERICAL_MISMATCH</span>" in page
+    assert "/method/logit_lens" in page                            # card links the methodology
+    assert "How to read the map" in page                           # legend panel
+    assert "setup of the runs in this directory" in page           # backends table
+    assert REFERENCE in page and CANDIDATE in page
+
+
+def test_method_page_is_the_model_x_backend_matrix(tmp_path):
+    _bundle(tmp_path)
+    page = _page(tmp_path, "/method/logit_lens")
+    assert "Model × backend" in page
+    assert f"/spec/{GROUP}" in page
+    assert ">NUMERICAL_MISMATCH</span>" in page
+
+
+def test_spec_page_shows_states_metrics_stack_and_figure(tmp_path):
+    _bundle(tmp_path)
+    page = _page(tmp_path, f"/spec/{GROUP}")
+    assert ">NUMERICAL_MISMATCH</span>" in page and " ms per call</span>" in page
+    assert "top1=" in page and "tv=" in page
+    # the reference leads with its own section
+    assert ">BASELINE</span>" in page and page.index("c-base") < page.index("c-cand")
+    assert "<svg" in page and "median latency (ms)" in page
+    assert page.count("<circle") >= 4 + 1                          # four timed cells + a legend swatch
+
+
+def test_perf_points_cover_every_timed_cell(tmp_path):
+    _bundle(tmp_path)
+    col = Collection(str(tmp_path))
+    points = perf_points(col.entries, list(col.entries))
+    assert {p["run"] for p in points} == {f"{GROUP}/{REFERENCE}", f"{GROUP}/{CANDIDATE}"}
+    assert {p["regime"] for p in points} == {"interactive", "batched"}
+
+
+def test_rollup_verdicts():
+    assert rollup(["SUPPORTED", "SUPPORTED_DEGRADED"]) == "SUPPORTED"
+    assert rollup(["SUPPORTED", "ERROR"]) == "LIMITED"
+    assert rollup(["ERROR", "ERROR"]) == "ERROR"
+    assert rollup(["SILENTLY_WRONG", "ERROR"]) == "SILENTLY_WRONG"
+    assert rollup(["SUPPORTED", "SILENTLY_WRONG"]) == "LIMITED"
+
+
+def test_changed_run_file_requires_explicit_reimport(tmp_path):
+    _construct_run(tmp_path)
+    with (tmp_path / "constructs-async.pt").open("ab") as stream:
+        stream.write(b"changed")
+    col = Collection(str(tmp_path))
+    assert "constructs-async" not in col.entries
+    assert any("changed after import" in warning for warning in col.warnings)
+
+
+def test_import_skips_run_files_that_are_neither_probes_nor_performance(tmp_path):
+    save_run(str(tmp_path), "method", {("__meta__",): {("interactive", "t"): {"error": None}}},
+             {"engine": {"kind": "vllm"}})
+    import_run_files(str(tmp_path))
+    assert not (tmp_path / "method.summary.json").exists()
+
+
+def test_construct_runs_show_on_backend_pages_not_method_cards(tmp_path):
+    _bundle(tmp_path)
+    _construct_run(tmp_path)
+    overview = _page(tmp_path, "/")
+    assert "/spec/constructs" not in overview and "perf micro" in overview
+    backend = _page(tmp_path, "/backend/vllm_async")
+    assert "Construct support" in backend and "barrier" in backend
+    assert ">ERROR</span>" in backend and "not shared" in backend
+    assert "SUPPORTED · x==y" in _page(tmp_path, "/run/constructs-async")
+
+
+def test_perf_micro_page_is_op_cost(tmp_path):
+    _bundle(tmp_path)
+    page = _page(tmp_path, "/micro")
+    assert "Primitive op cost" in page and "read, steer, and qk" in page
+    assert "No perf-micro runs" in page
     _perf_run(tmp_path)
-    page = manager.render_micro(str(tmp_path), inbox=str(tmp_path / "inbox"))
+    page = _page(tmp_path, "/micro")
     assert "pure vLLM (baseline)" in page and "+33.6%" in page
     assert "HANG" in page and ">ERROR</span>" in page
-    overview = manager.render_overview(str(tmp_path), inbox=str(tmp_path / "inbox"))
-    assert "/method/perf_micro" not in overview                    # no method card
-    assert "perf-read-q" not in overview                           # not a backend setup either
+    overview = _page(tmp_path, "/")
+    assert "/method/perf_micro" not in overview and "perf-read-q" not in overview
 
 
-def test_run_without_registered_spec_shows_no_verdict(tmp_path):
-    entries = _collection(tmp_path)
-    baselines = manager.baselines_of(str(tmp_path), entries)
-    results = manager.dir_results(str(tmp_path), entries, baselines)  # "xs" has no current definition
-    assert results == {"base": None, "cand": None}
-    page = manager.render_overview(str(tmp_path), inbox=str(tmp_path / "inbox"))
-    assert "no scored runs" in page
-
-
-def test_archive_and_discard_are_file_moves(tmp_path):
+def test_run_file_archive_and_discard_are_file_moves(tmp_path):
     inbox, dest = tmp_path / "inbox", tmp_path / "col"
-    _execute(inbox, "fresh", "vllm")
-    _execute(inbox, "junk", "vllm")
-    manager.archive("fresh", str(dest), inbox=str(inbox))
-    assert (dest / "fresh.pt").exists() and not (inbox / "fresh.pt").exists()
-    manager.discard("junk", inbox=str(inbox))
+    _construct_run(inbox, "fresh")
+    _construct_run(inbox, "junk")
+    archive("fresh", str(dest), inbox=str(inbox))
+    assert (dest / "fresh.pt").exists() and (dest / "fresh.summary.json").exists()
+    assert not (inbox / "fresh.pt").exists()
+    discard("junk", inbox=str(inbox))
     assert not (inbox / "junk.pt").exists()
 
 
-def test_run_and_inbox_pages_render(tmp_path):
-    _collection(tmp_path)
-    inbox = tmp_path / "inbox"
-    _execute(inbox, "fresh", "vllm")
-    run_page = manager.render_run(str(tmp_path), "base", inbox=str(inbox))
-    assert "base" in run_page and "coordinates" in run_page
-    inbox_page = manager.render_inbox(str(tmp_path), inbox=str(inbox))
-    assert "fresh" in inbox_page and "archive" in inbox_page and "discard" in inbox_page
+def test_run_runs_and_inbox_pages_render(tmp_path):
+    _bundle(tmp_path)
+    _bundle(tmp_path / "inbox", "fresh")
+    run_page = _page(tmp_path, f"/run/{GROUP}/{REFERENCE}")
+    assert "c-base" in run_page and "coordinates" in run_page
+    runs = _page(tmp_path, "/runs")
+    assert ">BASELINE</span>" in runs and CANDIDATE in runs
+    inbox = _page(tmp_path, "/inbox")
+    assert "fresh" in inbox and "archive" in inbox and "discard" in inbox
 
 
-def test_runs_index_marks_the_baseline(tmp_path):
-    _collection(tmp_path)
-    page = manager.render_runs(str(tmp_path), inbox=str(tmp_path / "inbox"))
-    assert ">BASELINE</span>" in page and "cand" in page
-    assert "xs" in page                                            # spec column
-
-
-def test_repo_pages_render(tmp_path=None):
-    idx = manager.render_data_index()
+def test_repo_pages_render():
+    idx = dispatch(None, "/data")
     assert "factual" in idx and "jlens/multihop" in idx
-    src = manager.render_data_source("factual")
+    src = dispatch(None, "/data/factual")
     assert "unit: prompt" in src and "/data/factual/0" in src
-    item = manager.render_data_item("factual", 0)
-    assert "factual · 000" in item
-    models = manager.render_models()
-    assert "llama" in models and "qwen3_5" in models
-    model = manager.render_model("llama")
+    assert "factual · 000" in dispatch(None, "/data/factual/0")
+    assert "llama" in dispatch(None, "/models") and "qwen3_5" in dispatch(None, "/models")
+    model = dispatch(None, "/model/llama")
     assert "residual denotation" in model and "fused" in model
-    backends = manager.render_backends()
-    assert "nnsight-vllm/default" in backends
-    backend = manager.render_backend("vllm_async")
-    assert "vLLM async engine, in-process" in backend              # the setup line
-    assert "micro.py --backend vllm_async" in backend              # no micro run in this dir
-    findings = manager.render_doc("Findings", "docs/findings.md")
-    assert "<h2" in findings and "<table>" in findings             # headings + tables render
+    assert "nnsight-vllm/default" in dispatch(None, "/backends")
+    findings = dispatch(None, "/findings")
+    assert "<h2" in findings and "<table>" in findings
     assert "the-batched-hf-verdict" in findings                    # anchored heading id
 
 
 def test_export_is_selfcontained_and_link_rewritten(tmp_path):
-    _collection(tmp_path)
-    with _current(_spec()):
-        _import(tmp_path)
-        page = manager.export_html(str(tmp_path), inbox=str(tmp_path / "inbox"))
-    assert "/spec/xs" in page and "/model/llama" in page and "/data/factual" in page
+    _bundle(tmp_path)
+    page = export_html(str(tmp_path), str(tmp_path / "inbox"))
+    assert f"/spec/{GROUP}" in page and "/model/gpt2" in page and "/data/factual" in page
     assert "href='/" not in page                                   # every link is hash-routed
     assert "<form" not in page                                     # read-only export
     assert "hashchange" in page
-
-
-def _run_all():
-    import inspect
-    import tempfile
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and inspect.isfunction(fn):
-            with tempfile.TemporaryDirectory() as d:
-                fn(Path(d))
-            print(f"ok {name}")
-
-
-if __name__ == "__main__":
-    _run_all()

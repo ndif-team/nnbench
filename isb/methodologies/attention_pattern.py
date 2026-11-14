@@ -1,5 +1,6 @@
-"""Attention-pattern read: the post-softmax attention probabilities of the last query token, as
-log-probabilities so the oracle's softmax recovers them, `[n_layers, B, n_heads, k_len]`. HF eager
+"""Attention-pattern read: the post-softmax attention probabilities of the last query token,
+`[n_layers, B, n_heads, k_len]`; a check call returns them as log-probabilities so the oracle's
+softmax recovers them. HF eager
 attention materializes them (GPT-2: `attn.source.attention_interface_1.output[1]`; Llama-tree
 models: `self_attn.output[1]`); sdpa and vLLM's attention kernels never do. On vLLM the gpt2 read
 raises (the recorded verdict); the llama cell reads the kernel's query and key inputs and computes
@@ -8,56 +9,61 @@ from __future__ import annotations
 
 import torch
 
+from ..oracle.checks import probabilities_match, timed_check_of
 from .registry import Unsupported, cell
 
+timed_check_of("attention_pattern")(probabilities_match)
 
-def _attn_pattern(blocks, *, layers):
-    """Stack the last-query attention pattern (log-probs) over the requested layers. Runs inside a
-    trace."""
+
+def _attn_pattern(blocks, *, layers, log):
+    """Stack the last-query attention pattern over the requested layers, as log-probabilities when
+    `log`. Runs inside a trace."""
     idx = range(len(blocks)) if layers == "all" else layers
     rows = []
     with torch.no_grad():
         for i in idx:
             weights = blocks[i].attn.source.attention_interface_1.output[1]   # [B, heads, q, k]
-            rows.append(torch.log(weights[:, :, -1, :]))                      # [B, heads, k]
+            last = weights[:, :, -1, :]                                       # [B, heads, k]
+            rows.append(torch.log(last) if log else last)
     return torch.stack(rows, dim=0)
 
 
 @cell("attention_pattern", family="gpt2", backend="hf")
-def attention_pattern_gpt2_hf(be, model, units, *, layers="all"):
+def attention_pattern_gpt2_hf(be, model, units, *, layers="all", check=False):
     def build(rows):
-        return _attn_pattern(model.transformer.h, layers=layers)
+        return _attn_pattern(model.transformer.h, layers=layers, log=check)
 
-    return be.run(model, units, build)
+    return be.run(model, units, build, keep_dtype=not check)
 
 
 @cell("attention_pattern", family="gpt2", backend="vllm_async")
-def attention_pattern_gpt2_vllm(be, model, units, *, layers="all"):
+def attention_pattern_gpt2_vllm(be, model, units, *, layers="all", check=False):
     def build(rows):
-        return _attn_pattern(model.transformer.h, layers=layers)
+        return _attn_pattern(model.transformer.h, layers=layers, log=check)
 
-    return be.run(model, units, build)
+    return be.run(model, units, build, keep_dtype=not check)
 
 
-def _eager_pattern(blocks, *, layers):
+def _eager_pattern(blocks, *, layers, log):
     """HF Llama-tree attention (transformers 5.12.1 `Qwen2Attention.forward`, the same return on
     Llama and Qwen3) returns `(attn_output, attn_weights)`; under eager, `attn_weights` is
     `eager_attention_forward`'s softmax over `QK^T * scaling + mask`, `[B, heads, q, k]`, the KV
     heads already repeated to the query heads. The documented nnsight read is `self_attn.output[1]`
-    (nnsight docs/patterns/attention-patterns.md). A weight that underflowed to zero in the cast to
-    the model dtype (or a left-pad key) is floored at the dtype's smallest normal before the log, so
-    the output stays finite. Runs inside a trace."""
+    (nnsight docs/patterns/attention-patterns.md). With `log`, a weight that underflowed to zero in
+    the cast to the model dtype (or a left-pad key) is floored at the dtype's smallest normal before
+    the log, so the output stays finite. Runs inside a trace."""
     idx = range(len(blocks)) if layers == "all" else layers
     rows = []
     with torch.no_grad():
         for i in idx:
             weights = blocks[i].self_attn.output[1][:, :, -1, :]      # [B, heads, k]
-            rows.append(torch.log(weights.clamp_min(torch.finfo(weights.dtype).tiny)))
+            rows.append(torch.log(weights.clamp_min(torch.finfo(weights.dtype).tiny)) if log
+                        else weights)
     return torch.stack(rows, dim=0)
 
 
 @cell("attention_pattern", family="llama", backend="hf")
-def attention_pattern_llama_hf(be, model, units, *, layers="all"):
+def attention_pattern_llama_hf(be, model, units, *, layers="all", check=False):
     if be.attn_implementation != "eager":
         raise Unsupported(
             f"attn_implementation={be.attn_implementation!r} returns no attention weights: "
@@ -65,13 +71,14 @@ def attention_pattern_llama_hf(be, model, units, *, layers="all"):
             "(integrations/sdpa_attention.py:104); only eager materializes them")
 
     def build(rows):
-        return _eager_pattern(model.model.layers, layers=layers)
+        return _eager_pattern(model.model.layers, layers=layers, log=check)
 
-    return be.run(model, units, build)
+    return be.run(model, units, build, keep_dtype=not check)
 
 
-def _kernel_input_pattern(blocks, *, layers):
-    """The last query's attention log-probabilities from the inputs of vLLM's attention kernel.
+def _kernel_input_pattern(blocks, *, layers, log):
+    """The last query's attention probabilities (log-probabilities when `log`) from the inputs of
+    vLLM's attention kernel.
 
     Denotation (vLLM 0.19.1 and 0.27.1, `models/qwen2.py` `Qwen2Attention.forward`; `llama.py` and
     `qwen3.py` the same order): `qkv_proj` is one fused projection split into q, k, v; Qwen3's
@@ -104,12 +111,13 @@ def _kernel_input_pattern(blocks, *, layers):
             query = q[-1].reshape(n_kv, n_heads // n_kv, size).float()      # [kv, group, d]
             keys = k.reshape(k.shape[0], n_kv, size).float()                 # [tokens, kv, d]
             scores = torch.einsum("grd,sgd->grs", query, keys).reshape(n_heads, -1) * attn.scaling
-            rows.append(torch.log_softmax(scores, dim=-1))                   # [heads, k]
+            rows.append(torch.log_softmax(scores, dim=-1) if log
+                        else torch.softmax(scores, dim=-1))                  # [heads, k]
     return torch.stack(rows, dim=0).unsqueeze(1)                             # [n_layers, 1, heads, k]
 
 
 @cell("attention_pattern", family="llama", backend="vllm_async")
-def attention_pattern_llama_vllm(be, model, units, *, layers="all"):
+def attention_pattern_llama_vllm(be, model, units, *, layers="all", check=False):
     if len(units) != 1:
         # k_len is each prompt's own length, and the backends stack units along dim -2 (the heads
         # axis here), so several units have no shared layout
@@ -117,6 +125,6 @@ def attention_pattern_llama_vllm(be, model, units, *, layers="all"):
     blocks = model.model.layers        # bound outside the block: the block ships no root model
 
     def build(rows):
-        return _kernel_input_pattern(blocks, layers=layers)
+        return _kernel_input_pattern(blocks, layers=layers, log=check)
 
-    return be.run(model, units, build)
+    return be.run(model, units, build, keep_dtype=not check)

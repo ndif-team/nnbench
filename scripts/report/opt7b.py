@@ -10,7 +10,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from build import E, SERIES, chip, figure, fnum, mounts, page_head, provenance, table  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from isb.jobs.schema import REPORT_VERSION, upgrade_rows  # noqa: E402
+from build import E, SERIES, figure, fnum, mounts, page_head, provenance, table  # noqa: E402
 
 HF = "nnsight-hf/0-8-1"   # also the correctness reference
 GEN, OPT, TAPS = "nnsight-vllm/0-8-1", "nnsight-vllm/0-8-1/opt", "nnsight-vllm/0-8-1/opt/taps"
@@ -51,7 +53,7 @@ class Run:
             self.ids.append(d["run"])
             for x in d["experiments"]:
                 spec = x["spec"].split("/")[0]
-                for c in x["cells"]:
+                for c in upgrade_rows(x["cells"], d["version"], REPORT_VERSION):
                     self.cells[(spec, c["label"], c["backend"])] = c
                     if (spec, c["label"]) not in self.order:
                         self.order.append((spec, c["label"]))
@@ -78,9 +80,8 @@ class Run:
     def plain(self, spec, label, b):
         """The engine with nothing attached: plain compiled vLLM for a vLLM cell, plain HF for an HF cell."""
         c = self.get(spec, label, b)
-        regime = c["workload"] if c else "interactive"
-        v = self.vanilla.get((spec, HF if b.startswith("nnsight-hf") else PLAIN, regime))
-        return v * 2 if v and spec == "activation_patching" else v   # patching is two forwards
+        regime = c["regime"] if c else "interactive"
+        return self.vanilla.get((spec, HF if b.startswith("nnsight-hf") else PLAIN, regime))
 
     def vstate(self, spec, label, b):
         if b == HF:
@@ -94,6 +95,11 @@ class Run:
 
     def layers(self):
         return self.prov[HF]["experiment"]["spec"]["n_layers"]
+
+    def calls(self):
+        """The caption's timing protocol, from the runs' own spec."""
+        spec = self.prov[HF]["experiment"]["spec"]
+        return f"Median of {spec['n_trials']} timed calls after {spec['warmup']} warm-ups"
 
     def correctness(self, cols):
         """One sentence counting the scored cells of `cols` by validation outcome."""
@@ -117,7 +123,7 @@ def short(label):
 
 
 def headline_spec(R, fid, spec, label):
-    regime = R.get(spec, label, HF)["workload"]
+    regime = R.get(spec, label, HF)["regime"]
     hf_plain, vl_plain = R.vanilla.get((spec, HF, regime)), R.vanilla.get((spec, PLAIN, regime))
     vals = [[hf_plain, R.ms(spec, label, HF), None],
             [vl_plain, R.ms(spec, label, GEN), min(v for v in (R.ms(spec, label, OPT), R.ms(spec, label, TAPS)) if v)]]
@@ -141,7 +147,7 @@ def full_table(R):
         if spec != cur:
             rows.append({"group": E(dict(SPEC_NAMES)[spec])})
             cur = spec
-        regime = R.get(spec, label, HF)["workload"]
+        regime = R.get(spec, label, HF)["regime"]
         r = [E(short(label)), f"{fnum(R.vanilla.get((spec, HF, regime)))} ms"]
         for b, _, _ in COLS:
             ms, pl = R.ms(spec, label, b), R.plain(spec, label, b)
@@ -183,7 +189,7 @@ def page(run_dir):
     r_gen = {k: gen[k] / hf[k] for k in R.order if gen[k] and hf[k]}
     r_taps = {k: taps[k] / hf[k] for k in R.order if taps[k] and hf[k]}
     one = [k for k in R.order if k[0] in ("steering", "ablation", "activation_patching")]
-    fwd = [k for k in one if k[0] != "activation_patching"]   # one prompt per call, like the plain request
+    fwd = [k for k in one if k[0] != "activation_patching"]   # the steering and ablation rows the text names
     vs_plain = lambda col: {k: col[k] / R.plain(k[0], k[1], GEN) for k in R.order if col[k]}  # noqa: E731
     gen_vs_plain, opt_vs_plain, taps_vs_plain = vs_plain(gen), vs_plain(opt), vs_plain(taps)
     rng = lambda d, ks: f"{fnum(min(d[k] for k in ks), 2)}–{fnum(max(d[k] for k in ks), 2)}"  # noqa: E731
@@ -233,7 +239,7 @@ the lens, which reads and projects all {R.layers()} layers.</li>
     figs = []
     for fid, spec, label, title in HEADLINE:
         specs.append(headline_spec(R, fid, spec, label))
-        figs.append(figure(fid, title, "Median of 7 timed calls after 3 warm-ups. Per engine: the plain engine with nothing attached, "
+        figs.append(figure(fid, title, f"{R.calls()}. Per engine: the plain engine with nothing attached, "
                            "nnsight's general cell, and the fastest documented realization (named under the engine)."))
     parts.append(f'''<section id="best"><h2>Best per engine</h2>
 <div class="prose"><p>For each workload, the engine alone, nnsight's general cell on it, and the fastest form nnsight documents for that
@@ -242,8 +248,8 @@ engine. HF has one form; a missing bar says so.</p></div>
 </section>''')
     parts.append(f'''<section id="table"><h2>All rows</h2>
 <div class="prose"><p>Every row of the five workloads: the plain engines, each nnsight column's median, and its ratio to its own engine
-with nothing attached (plain HF for the HF column, plain compiled vLLM for the vLLM columns; two plain forwards for patching, which runs
-a clean and a corrupted pass).</p></div>
+with nothing attached (plain HF for the HF column, plain compiled vLLM for the vLLM columns), run over the same prompts: both
+prompts of each patching pair.</p></div>
 {full_table(R)}</section>''')
     parts.append('''<section id="changes"><h2>What each realization is</h2>
 <div class="audit">

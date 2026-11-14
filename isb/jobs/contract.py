@@ -7,13 +7,10 @@ import os
 from dataclasses import asdict
 from pathlib import Path
 
-from isb.sweep.spec import ALL_LOAD_FIELDS, LOAD_FIELDS, regime_name
+from isb.sweep.spec import ALL_LOAD_FIELDS, regime_kind, regime_name
 
-VERSION = 2            # experiment/result files this code writes
-VERSIONS = (VERSION,)  # experiment/result files this code reads
-# A result cell carrying `row` and `alternative` is an alternative realization of that row, an
-# additive field: a result without such cells holds the default realizations only.
-PLAN_VERSION = 1       # the launcher's plan.json / report.json
+from .schema import (WIRE_READ, WIRE_VERSION, drop_saturated_floors, require, upgrade_calls,
+                     upgrade_rows)
 
 
 def pack(value):
@@ -60,6 +57,13 @@ def write_json(path, value):
     os.replace(temporary, path)
 
 
+def encode_inputs(regime_units):
+    """inputs.jsonl: one line per unit, {"regime": its regime's index, "unit": the unit}, regimes in
+    order; the bytes an experiment's `inputs_sha256` covers."""
+    return b"".join(canonical({"regime": index, "unit": pack(unit)}) + b"\n"
+                    for index, units in enumerate(regime_units) for unit in units)
+
+
 def prepare(spec, directory, *, seed=0):
     """Materialize the experiment once; containers never look up a spec or dataset. The spec
     record is the dataclass as written: regimes, tasks as {label, params}, the protocol template
@@ -70,8 +74,8 @@ def prepare(spec, directory, *, seed=0):
     # Authoring/restoration validation policy belongs to the in-memory spec.
     record.pop("protocol_source", None)
     if not spec.regimes:
-        raise ValueError("experiment must contain a workload")
-    records = []
+        raise ValueError("experiment must contain a regime")
+    regime_units = []
     kinds = set()
     labels = [task["label"] for task in record["tasks"]]
     if not labels or not all(isinstance(label, str) and label for label in labels) or len(set(labels)) != len(labels):
@@ -79,19 +83,19 @@ def prepare(spec, directory, *, seed=0):
     for index, regime in enumerate(record["regimes"]):
         name = regime_name(regime["kind"], regime)
         if name in kinds:
-            raise ValueError("duplicate workload kinds would collide in output cell keys")
+            raise ValueError("duplicate regimes would collide in output cell keys")
         kinds.add(name)
-        for key in set(ALL_LOAD_FIELDS) - set(LOAD_FIELDS.get(regime["kind"], ())):
+        for key in set(ALL_LOAD_FIELDS) - set(regime_kind(regime["kind"]).load):
             regime.pop(key, None)     # each regime records only its own pattern's settings
         units = regime.pop("units")
         if not units:
-            raise ValueError("empty workload")
+            raise ValueError(f"regime {name} has no units")
         regime["units"] = len(units)
-        records.extend({"workload": index, "unit": pack(unit)} for unit in units)
-    if spec.n_trials < 1 or spec.warmup < 0:
-        raise ValueError("n_trials must be positive and warmup nonnegative")
-    inputs = b"".join(canonical(row) + b"\n" for row in records)
-    experiment = {"version": VERSION, "spec": pack(record), "seed": seed,
+        regime_units.append(units)
+    if spec.n_trials < 0 or spec.warmup < 0:     # n_trials=0: a check run, nothing timed
+        raise ValueError("n_trials and warmup must be nonnegative")
+    inputs = encode_inputs(regime_units)
+    experiment = {"version": WIRE_VERSION, "spec": pack(record), "seed": seed,
                   "inputs_sha256": digest(inputs)}
     experiment["id"] = digest(canonical(experiment))
     directory.mkdir(parents=True, exist_ok=False)
@@ -105,8 +109,7 @@ def check_experiment(experiment):
     if not isinstance(experiment, dict):
         raise ValueError("experiment must be a JSON object")
     body = {k: v for k, v in experiment.items() if k != "id"}
-    if type(experiment.get("version")) is not int or experiment["version"] not in VERSIONS:
-        raise ValueError(f"unsupported experiment version {experiment.get('version')!r}; rerun with current code")
+    require(experiment.get("version"), WIRE_READ, "experiment")
     if digest(canonical(body)) != experiment.get("id"):
         raise ValueError("invalid experiment checksum")
 
@@ -121,9 +124,8 @@ def read_experiment(directory):
 
 
 def wire_spec(experiment):
-    """Validate the frozen current-format spec and retain its saved descriptor."""
-    if type(experiment.get("version")) is not int or experiment["version"] not in VERSIONS:
-        raise ValueError("unsupported experiment version; rerun with current code")
+    """Validate the frozen spec and retain its saved descriptor."""
+    require(experiment.get("version"), WIRE_READ, "experiment")
     record = unpack(experiment["spec"])
     if not isinstance(record, dict):
         raise ValueError("experiment spec must be an object")
@@ -147,18 +149,19 @@ def restore_spec(directory):
     from isb.sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime, TaskSpec
 
     experiment = read_experiment(directory)
+    require(experiment["version"], (WIRE_VERSION,), "experiment")     # a worker runs current ones
     record = wire_spec(experiment)
     regimes = record.pop("regimes")
     units = [[] for _ in regimes]
     for line in (Path(directory) / "inputs.jsonl").read_text().splitlines():
         row = json.loads(line)
-        index = row["workload"]
+        index = row["regime"]
         if type(index) is not int or not 0 <= index < len(regimes):
-            raise ValueError("input workload index is out of range")
+            raise ValueError("input regime index is out of range")
         units[index].append(unpack(row["unit"]))
     for index, regime in enumerate(regimes):
         if regime.pop("units") != len(units[index]):
-            raise ValueError("workload input count mismatch")
+            raise ValueError("regime input count mismatch")
     record["regimes"] = [ExecutionRegime(units=u, **w) for w, u in zip(regimes, units)]
     record["tasks"] = [TaskSpec(**task) for task in record["tasks"]]
     if record["protocol"] is not None:
@@ -176,20 +179,26 @@ def expected_cells(experiment):
 
 
 def validate_result(directory, experiment, backend):
+    """The job's result.json, checked against the experiment, its cells and auxiliary calls in the
+    current fields. A cell carrying `row` and `alternative` is an alternative realization of that
+    row; a result without such cells holds the default realizations only."""
     directory = Path(directory)
     result = json.loads((directory / "result.json").read_text())
-    if (type(result.get("version")) is not int or result["version"] not in VERSIONS or result.get("status") != "completed"
+    require(result.get("version"), WIRE_READ, "result")
+    if (result.get("status") != "completed"
             or result.get("experiment_id") != experiment["id"]
             or result.get("backend") != backend
             or result.get("inputs_sha256") != experiment["inputs_sha256"]):
         raise ValueError("result identity/status does not match requested job")
-    cells = result.get("cells", [])
-    keys = [(row["workload"], row["label"]) for row in cells]
+    calls = upgrade_calls(result.get("auxiliary_calls", []), result["version"])
+    cells = upgrade_rows(result.get("cells", []), result["version"], WIRE_VERSION)
+    result["cells"], result["auxiliary_calls"] = drop_saturated_floors(cells, calls), calls
+    keys = [(row["regime"], row["label"]) for row in cells]
     expected = expected_cells(experiment)
     defaults = {key for key, row in zip(keys, cells) if "row" not in row}
     if len(keys) != len(set(keys)) or defaults != expected:
         raise ValueError("result does not account for every requested cell exactly once")
-    if any((row["workload"], row["row"]) not in expected or not isinstance(row.get("alternative"), dict)
+    if any((row["regime"], row["row"]) not in expected or not isinstance(row.get("alternative"), dict)
            for row in cells if "row" in row):
         raise ValueError("an alternative realization must name a requested row and its params")
     if any(row.get("state") not in {"RAN", "ERROR", "UNSUPPORTED"} for row in cells):

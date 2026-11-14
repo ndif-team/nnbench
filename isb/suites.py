@@ -57,16 +57,16 @@ SUITES = {s.name: s for s in (
     Suite("smoke",
           entries=(Entry(_SMALL, ("gpt2",)), Entry(("logit_lens",), ("smollm2-135m",))),
           backends=_NNSIGHT, reference="nnsight-hf/default", realizations="all"),
-    # Qwen2.5-14B for the TP/PP parallelism-equivalence check (GT2): the candidate
-    # parallel vLLM config is scored against single-GPU vLLM running the SAME cell, so a cell only
-    # needs to run and be deterministic. Multi-GPU settings belong in a backend config; pass it with
-    # `--backends nnsight-vllm/default <tp/pp config> --reference nnsight-vllm/default`. Interactive
-    # and generation regimes only.
+    # Qwen2.5-14B for the tensor-parallel equivalence check: each parallel config is scored
+    # against single-GPU vLLM of the same release running the SAME cell, so a cell only needs to
+    # run and be deterministic. Interactive and generation regimes only. The opt configs run
+    # other cells; they take their own run with the single-GPU opt config as the reference
+    # (`--backends nnsight-vllm/0-8-2/opt nnsight-vllm/0-8-2/opt/tp2 --reference nnsight-vllm/0-8-2/opt`).
     Suite("parallel",
           entries=(Entry(("logit_lens", "steering", "ablation", "activation_patching", "gen_steering"),
                          ("qwen2.5-14b",), size=32, regimes=("interactive", "generation")),),
-          backends=("nnsight-vllm/default",), reference="nnsight-vllm/default",
-          realizations="all", comparison="equivalence"),
+          backends=("nnsight-vllm/0-8-2", "nnsight-vllm/0-8-2/tp2", "nnsight-vllm/0-8-2/tp4"),
+          reference="nnsight-vllm/0-8-2", realizations="all", comparison="equivalence"),
     # NVIDIA Nemotron 3 Nano, a hybrid Mamba-2 + sparse-attention decoder. The
     # residual stream is additive across all block types, so the residual-stream workloads port
     # unchanged; ablation runs its mixer rows. Measured results for the 4B (2026-06-19) are in

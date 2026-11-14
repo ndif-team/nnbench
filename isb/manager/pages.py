@@ -117,7 +117,8 @@ def _legend() -> str:
         [chip("SUPPORTED_DEGRADED"),
          note("numerical check passes at control precision; original mismatch retained")],
         [chip("NUMERICAL_MISMATCH"), note("numerical comparison failed; correctness unresolved; performance remains available")],
-        [chip("INVALID_OUTPUT"), note("output structure or finiteness check failed; diagnostic timing only")],
+        [chip("INVALID_OUTPUT"), note("output structure or finiteness check failed, or the timed "
+                                      "result disagrees with the check output; diagnostic timing only")],
         [chip("SILENTLY_WRONG"), note("legacy or direct-check finding; inspect the recorded evidence")],
         [chip("ERROR"), note("fails with an error")],
         [chip("UNSUPPORTED"), note("the system cannot express this workload; the note names "
@@ -206,6 +207,25 @@ def _effect_summary(effect: dict) -> str:
     return f"effect size: top1={metrics[0]:.2f}, tv={metrics[1]:.3f}{status}"
 
 
+def _latency(c) -> str:
+    """A row's median latency with what it is the median of, its ratio to plain vLLM, or, for a
+    saturated open-loop row, the achieved rate in its place."""
+    from isb.validation import performance_eligible
+
+    if c.saturated:
+        text = (f"saturated, {c.throughput:.1f} units/s achieved" if c.throughput is not None
+                else "saturated")
+    else:
+        text = fmt_ms(c.latency_s * 1000 if c.latency_s is not None else None)
+        if c.latency_s is not None and c.latency_kind:
+            text += f" per {c.latency_kind}"
+        if c.overhead_vs_plain_vllm is not None:
+            text += f", {c.overhead_vs_plain_vllm:.2f}x plain vLLM"
+    if not performance_eligible(c.state):
+        text += " (diagnostic only)"
+    return text
+
+
 def _cell_rows(col: Collection, name: str, cells) -> list[list[str]]:
     """The uniform variant x regime rows for one run. The baseline's rows carry a BASELINE mark
     where a verdict would sit: nothing exists to compare the reference against."""
@@ -216,11 +236,9 @@ def _cell_rows(col: Collection, name: str, cells) -> list[list[str]]:
         metric = (f"top1={m.get('top1_agree', 0):.2f} tv={m.get('tv', float('nan')):.3f} "
                   f"maxabs={m.get('max_abs', float('nan')):.2f}" if m else (c.error or ""))
         state = _BASELINE_CHIP if is_baseline and c.state == "RAN" else chip(c.state)
-        lat = fmt_ms(c.latency_s * 1000 if c.latency_s is not None else None)
-        from isb.validation import performance_eligible
-        if not performance_eligible(c.state):
-            lat += " (diagnostic only)"
-        rows.append([esc(c.label), esc(c.workload), state, mono(lat), mono(metric)])
+        if c.validation_state:
+            state += f" {esc(c.validation_state)}"
+        rows.append([esc(c.label), esc(c.regime), state, mono(_latency(c)), mono(metric)])
     meta = col.load(name)[0].get(("__meta__",), {})
     rows += [[esc("effect guard"), esc(k[1]), "", mono("-"), mono(_effect_summary(e))]
              for k, e in sorted(meta.items(), key=str)
@@ -437,14 +455,14 @@ def spec(col: Collection, spec_name: str) -> str:
     for name in names:
         outputs, prov = col.entries[name]
         head = [heading(2, link(f"/run/{name}", name)), note_html(_stack(prov)),
-                note(f"comparison: {prov.get('view', {}).get('comparison', 'legacy import')} · "
+                note(f"comparison: {prov.get('view', {}).get('comparison', 'none')} · "
                      f"reference: {prov.get('view', {}).get('reference', baseline)}")]
         probes = model.probe_results(outputs)
         cells = col.results.get(name)
         if probes:
             sections += head + [table(_RUN_TABLE_HEADERS, _probe_rows(probes))]
         elif cells is None:
-            sections += head + [note("no saved verdict (legacy spec/data may differ from the reference)")]
+            sections += head + [note("no saved verdict")]
         else:
             sections += head + [table(_RUN_TABLE_HEADERS, _cell_rows(col, name, cells))]
 
@@ -504,7 +522,7 @@ def inbox(col: Collection) -> str:
         from pathlib import Path
         is_bundle = (Path(col.inbox) / name / "plan.json").is_file()
         title = link(f"/inbox-run/{name}", name) if is_bundle else link(f"/run/inbox/{name}", name)
-        description = "complete benchmark run" if is_bundle else "legacy artifact (import summary before viewing)"
+        description = "complete benchmark run" if is_bundle else "run file (import its summary before viewing)"
         token = f"<input type='hidden' name='csrf' value='{esc(col.csrf_token)}'>"
         actions = (f"<form method='post' action='/archive'>"
                    f"{token}"
@@ -646,7 +664,6 @@ _BACKEND_SETUPS = {
     "hf": "nnsight on vanilla transformers, eager, in-process",
     "vllm_async": "nnsight on the vLLM async engine, in-process",
     "vllm_sync": "nnsight on the vLLM sync engine, in-process",
-    "vllm_serve": "nnsight on the vLLM async engine, served over HTTP",
 }
 
 
@@ -683,7 +700,7 @@ def backend(col: Collection, name: str) -> str:
                      table(["construct", "state", "check / note"], rows)]
     if not sections:
         sections = [note_html("No recorded jobs for this backend in the directory. "
-                              + (f"Legacy probes: <code>scripts/micro.py --backend {esc(name)}</code>."
+                              + (f"Construct probes: <code>scripts/constructs.py --backend {esc(name)}</code>."
                                  if name in IMPLS else f"Configuration: <code>backends/{esc(name)}/compose.yml</code>."))]
     return _page(
         col, f"backend / {name}", name,

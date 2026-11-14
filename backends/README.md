@@ -111,7 +111,7 @@ documented batch or concurrent form, and declares a workload the system cannot e
 `Unsupported` with the missing capability. Stay inside the system's public interface (§4a there): a
 faster form that uses its internals is reported as headroom, not as its score.
 
-## Container contract (version 2)
+## Container contract (version 3)
 
 Each system's `compose.yml` defines a service called `runner`. Its entrypoint consumes `/job` and
 writes `/output`. The host supplies these environment variables for Compose interpolation:
@@ -135,17 +135,19 @@ DAS training; the host does not shard its inputs.
 
 The spec record is the Python dataclass as written: `regimes` (units replaced by their count),
 tasks as `{label, params}`, the methodology's protocol template, and, for a methodology without
-one, its `protocol_absence_reason`. All of it is covered by the experiment id. Readers accept
-version 2. Historical version-1 jobs must be rerun. Saved descriptors and absence reasons stay
-frozen when a current job is restored.
+one, its `protocol_absence_reason`. All of it is covered by the experiment id. Each line of
+`inputs.jsonl` is `{"regime": <index into regimes>, "unit": <unit>}`, and each result cell names its
+regime in `regime`. Readers also accept version 2, which called that field `workload`; version-1
+jobs must be rerun. Saved descriptors and absence reasons stay frozen when a current job is
+restored.
 
 These hashes identify runner inputs and artifacts; CausaLab maintains its own document and
 artifact identities. Newly authored methods remain subject to strict protocol validation; saved
 calls are checked against their frozen descriptor at execution, where errors are recorded with the
 affected call.
 
-Independent executables implement this versioned file contract. A pinned version-1-only reader
-must reject version-2 jobs clearly; update the executable before submitting new jobs to it. The
+Independent executables implement this versioned file contract. An executable pinned to an
+older version must reject current jobs clearly; update it before submitting new jobs to it. The
 bundled entrypoints use mounted repository code, so a reader update reaches them through the
 source mount. Dependency changes still require rebuilding the images.
 
@@ -166,8 +168,13 @@ metadata description, and fresh invocation-parameter copies happen outside the m
 
 The worker writes `result.pt` (the outputs/provenance dictionary) followed atomically by
 `result.json` (completion, experiment/backend identity, input/tensor checksums, one execution status
-for every requested cell, timings and provenance). See `isb/jobs/contract.py` and `worker.py` for
-the precise fields. Tensor artifacts are trusted local Python/PyTorch artifacts, not an untrusted
+for every requested cell, timings and provenance). See `isb/jobs/schema.py`, `contract.py` and
+`worker.py` for the precise fields. A timed record carries `median_latency_ms` with `latency_kind`,
+what the median is of: `call` (the timed calls of an execution regime), `pass` (whole offline
+passes) or `request` (the requests of a concurrent or open-loop pass). An open-loop record also
+carries `saturated`, true when the median pass lasted more than 1.1 times the arrival span plus
+the fastest request's latency: the system fell behind, so its latency measures the pass length,
+and no overhead ratio is formed from it. Tensor artifacts are trusted local Python/PyTorch artifacts, not an untrusted
 network interchange format.
 
 The shared worker also writes optional `auxiliary_calls` entries as
@@ -184,8 +191,13 @@ Malformed input and spec-restoration failures also produce an atomic `result.jso
 been verified. These failures publish no successful tensor artifact and exit nonzero.
 
 The launcher records the actual image ID, source content checksum/commit, exit status and isolated
-Compose project in `execution.json`, and captures `execution.log` and `cleanup.log`. Source changes
-during a job invalidate it. Scoring also refuses mismatched source/model revisions/tokenizer
+Compose project in `execution.json`, and captures `execution.log` and `cleanup.log`. Before a job
+starts, it reads every GPU the config reserves (`gpus_before`: used memory and compute processes)
+and waits up to two minutes for a previous job's memory to drain. A reserved GPU still holding
+100 MiB or more, or any compute process, fails the job without launching it: another process's
+kernels would sit inside every timed call. The record also holds each reserved GPU's clocks,
+enforced power limit, power draw, temperature and active clock event reasons as the job starts
+(`gpus_before.clocks`) and as it ends (`gpus_after.clocks`). Source changes during a job invalidate it. Scoring also refuses mismatched source/model revisions/tokenizer
 vocabularies; unresolved model identity cannot silently pass. Models are not automatically pinned
 by the host: the worker records the resolved revision and comparisons require an exact match.
 
@@ -222,7 +234,7 @@ configuration equivalence compares matching workload regimes. There are no autom
 controls. Write-method effect guards must be present and strong for the applicable
 interactive/generation reference, or the verdict is `INVALID_REFERENCE`.
 
-The launcher covers methodology specs. Separate micro/perf entrypoints and the old serve tooling
-under `docker/` are legacy paths, not backends of this runner. Current schema-3 `.pt` files are
-usable by the standalone scorer and by the manager after an explicit `--import-legacy` step; the
-new scorer requires the complete job directory. See [the result-site guide](../docs/result-site.md).
+The launcher covers methodology specs. The construct probes (`scripts/constructs.py`) and the perf
+microbenchmark (`scripts/perf.py`) are separate entrypoints that write `.pt` run files; the manager
+shows them after an explicit `scripts/manager.py --import-run-files`. See
+[the result-site guide](../docs/result-site.md).

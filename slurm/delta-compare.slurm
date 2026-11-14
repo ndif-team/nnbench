@@ -233,7 +233,7 @@ micro)
                 nnsight-vllm-0-7:vllm_async nnsight-vllm-0-7:vllm_sync; do
         img=${pair%%:*}; be=${pair##*:}
         echo "### $(date -Is) constructs $img $be"
-        timeout 2400 $bin/py-$img scripts/micro.py --backend $be --repo openai-community/gpt2 \
+        timeout 2400 $bin/py-$img scripts/constructs.py --backend $be --repo openai-community/gpt2 \
             --out runs/micro-delta/constructs --name $img-$be \
             > runs/micro-delta/constructs/$img-$be.log 2>&1 || { echo "constructs $img $be rc=$?"; rc=1; }
     done

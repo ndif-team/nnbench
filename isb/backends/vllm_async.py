@@ -20,9 +20,7 @@ class VLLMAsyncBackend(VLLMBackend):
 
     def __init__(self, dtype: str | None = None,
                  trust_remote_code: bool = False,
-                 pipeline_parallel_size: int = 1,
                  tensor_parallel_size: int = 1,
-                 distributed_executor_backend: str | None = None,
                  gpu_memory_utilization: float = 0.2,
                  max_model_len: int | None = None,
                  tokenizer: str | None = None,
@@ -30,9 +28,7 @@ class VLLMAsyncBackend(VLLMBackend):
         super().__init__(dtype=dtype, trust_remote_code=trust_remote_code,
                          max_model_len=max_model_len, tokenizer=tokenizer,
                          enable_prefix_caching=enable_prefix_caching)
-        self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
-        self.distributed_executor_backend = distributed_executor_backend
         self.gpu_memory_utilization = gpu_memory_utilization
         self._loop = None
         self._loop_thread = None         # set while a concurrent session runs the loop
@@ -90,20 +86,14 @@ class VLLMAsyncBackend(VLLMBackend):
             thread.join()
             self._loop_thread = None
 
-    def load(self, repo: str, gpu_memory_utilization: float | None = None):
+    def load(self, repo: str):
         from nnsight.modeling.vllm import VLLM
 
-        if gpu_memory_utilization is None:
-            gpu_memory_utilization = self.gpu_memory_utilization
         kw = self._engine_kwargs()
-        if self.pipeline_parallel_size > 1:
-            kw["pipeline_parallel_size"] = self.pipeline_parallel_size
         if self.tensor_parallel_size > 1:
             kw["tensor_parallel_size"] = self.tensor_parallel_size
-        if self.distributed_executor_backend is not None:
-            kw["distributed_executor_backend"] = self.distributed_executor_backend
         return VLLM(repo, mode="async", dispatch=True,
-                    gpu_memory_utilization=gpu_memory_utilization, **kw)
+                    gpu_memory_utilization=self.gpu_memory_utilization, **kw)
 
     @staticmethod
     async def _finished(tracer):
@@ -127,16 +117,16 @@ class VLLMAsyncBackend(VLLMBackend):
 
         return self._cat(self._gather([one(i, p) for i, p in enumerate(prompts)]))
 
-    def patch(self, model, clean_prompts, corrupted_prompts, capture, patch):
+    def patch(self, model, clean_prompts, corrupted_prompts, capture, patch, *, keep_dtype=False):
         pairs = list(zip(*self.paired(clean_prompts, corrupted_prompts, "patch")))
 
         async def one(clean_prompt, corrupted_prompt):
             with model.trace(clean_prompt, **_SAMPLING) as t1:
                 ca = capture().save()  # noqa: F841
-            clean_act = self._extract(await self._finished(t1))
+            clean_act = self._extract(await self._finished(t1), keep_dtype=True)
             with model.trace(corrupted_prompt, **_SAMPLING) as t2:
                 res = patch(clean_act).save()  # noqa: F841
-            return self._extract(await self._finished(t2))
+            return self._extract(await self._finished(t2), keep_dtype)
 
         return self._cat(self._gather([one(c, k) for c, k in pairs]))
 
@@ -151,7 +141,7 @@ class VLLMAsyncBackend(VLLMBackend):
             for i, (source_prompt, base_prompt) in enumerate(pairs):
                 with model.trace(source_prompt, **_SAMPLING) as t1:
                     s = capture().save()  # noqa: F841
-                src = self._extract(await self._finished(t1))
+                src = self._extract(await self._finished(t1), keep_dtype=True)
                 with model.trace(base_prompt, **_SAMPLING) as t2:
                     loss = step(src, [i])
                     lv = loss.save()  # noqa: F841
@@ -221,7 +211,7 @@ class VLLMAsyncBackend(VLLMBackend):
 
         return torch.stack(self._gather([one(i, c, k) for i, (c, k) in enumerate(pairs)]))
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False):
         import torch
 
         prompts = self.many(prompts, "generate")
@@ -233,12 +223,13 @@ class VLLMAsyncBackend(VLLMBackend):
                 steps = tracer.iter[0:new_tokens] if bounded else tracer.iter[:]
                 for step in steps:
                     rows.append(build_step(step))
-            return self._extract_step_rows(await self._finished(tracer), new_tokens, "generation")
+            return self._extract_step_rows(await self._finished(tracer), new_tokens, "generation",
+                                           keep_dtype)
 
         return torch.cat(self._gather([one(p) for p in prompts]), dim=1)
 
     def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
-                       *, new_tokens, bounded=True):
+                       *, new_tokens, bounded=True, keep_dtype=False):
         import torch
 
         pairs = list(zip(*self.paired(source_prompts, base_prompts, "generate_patch")))
@@ -246,14 +237,15 @@ class VLLMAsyncBackend(VLLMBackend):
         async def one(source_prompt, base_prompt):
             with model.trace(source_prompt, **_SAMPLING) as t1:
                 ca = capture().save()  # noqa: F841
-            clean_act = self._extract(await self._finished(t1))
+            clean_act = self._extract(await self._finished(t1), keep_dtype=True)
             with model.trace(base_prompt, temperature=0.0, top_p=1, max_tokens=new_tokens,
                              min_tokens=new_tokens) as tracer:
                 rows = list().save()  # noqa: F841
                 steps = tracer.iter[0:new_tokens] if bounded else tracer.iter[:]
                 for step in steps:
                     rows.append(build_step(clean_act, step))
-            return self._extract_step_rows(await self._finished(tracer), new_tokens, "generate_patch")
+            return self._extract_step_rows(await self._finished(tracer), new_tokens, "generate_patch",
+                                           keep_dtype)
 
         return torch.cat(self._gather([one(s, b) for s, b in pairs]), dim=1)
 
@@ -303,14 +295,14 @@ class VLLMAsyncBackend(VLLMBackend):
         v = saves["saved"] if "saved" in saves else next(iter(saves.values()))
         return (v.detach() if keep_dtype else v.detach().float()).cpu()
 
-    def _extract_step_rows(self, out, new_tokens, what):
-        """The per-step `rows` of one request -> `[new_tokens, 1, ...]`."""
+    def _extract_step_rows(self, out, new_tokens, what, keep_dtype=False):
+        """The per-step `rows` of one request -> `[new_tokens, 1, ...]`, fp32 unless `keep_dtype`."""
         import torch
 
         saves = self._saves(out, what)
         v = saves["rows"] if isinstance(saves, dict) and "rows" in saves else (
             next(iter(saves.values())) if isinstance(saves, dict) else saves)
-        mats = [r.detach().float().cpu() for r in v if r is not None]
+        mats = [(r.detach() if keep_dtype else r.detach().float()).cpu() for r in v if r is not None]
         if len(mats) != new_tokens:
             raise RuntimeError(
                 f"vllm_async {what} collected {len(mats)} per-step rows, expected {new_tokens}")

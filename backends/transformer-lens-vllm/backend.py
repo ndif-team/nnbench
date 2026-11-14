@@ -20,7 +20,8 @@ class BridgeModel:
     tokenizer: object          # the checkpoint's HF tokenizer, used exactly as the nnsight cells do
     config: object             # the checkpoint's HF config; model identity reads its revision
     n_layers: int
-    weights: dict = field(default_factory=dict)   # unembedding, final norm, J-lens maps: built once
+    weights: dict = field(default_factory=dict)   # unembedding, final norm, steering directions,
+                                                  # J-lens maps: built once per loaded model
     device: str = "cuda:0"     # where a GPU-side readout projects (the engine shares this process)
 
 
@@ -44,18 +45,27 @@ class TransformerLensBackend(Backend):
                            config.num_hidden_layers)
 
     def plain(self, model, units, *, new_tokens=1):
-        """One forward per prompt (the compiled driver takes one prompt per call), or one forward
-        over every prompt on the batched path, with no captures, no interventions and no host-side
-        logit rebuild. The hooks still run, since they are part of the engine the bridge boots: the
-        compiled identity affine, or on the batched path a copy of every hooked module's rows to
-        host memory (plugin.py, `_make_batched_hook`)."""
+        """One `run_with_cache` per prompt (the compiled driver takes one prompt per call), or one
+        over every prompt on the batched path, with no captures and no interventions, ending with
+        each prompt's greedy next token `[B, 1]`: the argmax at its last position of the logits the
+        bridge returns, which the driver rebuilds on the host at every position (driver.py,
+        `_reconstruct_logits`). The hooks still run, since they are part of the engine the bridge
+        boots: the compiled identity affine, or on the batched path a copy of every hooked module's
+        rows to host memory (plugin.py, `_make_batched_hook`)."""
         import torch
 
         if new_tokens != 1:
             raise NotImplementedError("the vLLM driver runs one forward per call (max_new_tokens=1)")
         rows = [model.tokenizer(prompt)["input_ids"] for prompt in prompts_of(units)]
-        for ids in [rows] if self.batching else [torch.tensor([row]) for row in rows]:
-            model.bridge.run_with_cache(ids, names_filter=[], return_logits=False, return_type=None)
+        if self.batching:                                    # right-padded [B, S_max, vocab]
+            logits, _ = model.bridge.run_with_cache(rows, names_filter=[])
+            return torch.stack([logits[b, len(row) - 1].argmax(-1, keepdim=True)
+                                for b, row in enumerate(rows)])
+        tokens = []
+        for row in rows:                                     # [1, n_tokens, vocab] per prompt
+            logits, _ = model.bridge.run_with_cache(torch.tensor([row]), names_filter=[])
+            tokens.append(logits[0, -1].argmax(-1, keepdim=True))
+        return torch.stack(tokens)
 
     def collective_rpc(self, model, method, args=()):
         """`LLM.collective_rpc` of the vLLM engine the bridge boots, one result per rank. TL 4.0.0
@@ -72,6 +82,17 @@ class TransformerLensBackend(Backend):
 
 class TransformerLensOptBackend(TransformerLensBackend):
     name = "transformer_lens_opt"
+
+    def plain(self, model, units, *, new_tokens=1):
+        """The opt cells' own request with no intervention: the driver's forward with
+        `return_logits=False`, ending with the token vLLM generated for each prompt, `[B, 1]`
+        (cells_opt.py, `_next_tokens`); no logits are rebuilt on the host."""
+        from .cells_opt import _next_tokens
+
+        if new_tokens != 1:
+            raise NotImplementedError("the vLLM driver runs one forward per call "
+                                      "(max_new_tokens=1)")
+        return _next_tokens(self, model, prompts_of(units))
 
 
 def create_backend(spec):

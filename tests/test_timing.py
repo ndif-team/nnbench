@@ -1,8 +1,8 @@
 """Timing-helper tests (isb/perf/timing.py) — no GPU; pure logic with a controlled clock.
 
 We monkeypatch `perf_counter` so the trial durations are deterministic, then assert: warmup calls
-are discarded (not timed), the median/min/std come from the timed trials only, and the last warm
-output is returned (so the oracle can check correctness on the timed run).
+are discarded (not timed), the median/min/std come from the timed trials only, and the last timed
+call's output is returned (the executor's timed check compares it with the check calls' output).
 """
 import sys
 from pathlib import Path
@@ -34,7 +34,7 @@ def test_warmup_discarded_and_stats():
     res, out = _run_with_clock(fn, seq, warmup=2, n_trials=3)
 
     assert calls["n"] == 5                        # 2 warmup + 3 timed
-    assert out == 5                               # last warm output, not a warmup one
+    assert out == 5                               # the last timed call's output, not a warm-up one
     assert res.n_trials == 3 and res.warmup == 2
     assert res.times_ms == [500.0, 250.0, 125.0]  # warmup never timed
     assert res.median_ms == 250.0

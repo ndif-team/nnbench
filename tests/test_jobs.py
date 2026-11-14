@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from isb.jobs import contract, local
+from isb.jobs import contract, schema, local
 from isb.jobs.cli import _recipe, parser
 from isb.suites import cases, parse_data
 from isb.jobs.worker import merge_requirements
@@ -23,10 +23,10 @@ def specimen():
 def completed(output, experiment, backend):
     (output / "result.pt").write_bytes(b"a tensor artifact")
     contract.write_json(output / "result.json", {
-        "version": contract.VERSION, "status": "completed", "backend": backend,
+        "version": schema.WIRE_VERSION, "status": "completed", "backend": backend,
         "experiment_id": experiment["id"], "inputs_sha256": experiment["inputs_sha256"],
         "outputs_sha256": contract.file_digest(output / "result.pt"),
-        "cells": [{"workload": w, "label": label, "state": "RAN"}
+        "cells": [{"regime": w, "label": label, "state": "RAN"}
                   for w, label in sorted(contract.expected_cells(experiment))],
     })
 
@@ -126,6 +126,9 @@ def test_container_worker_preserves_case_requirements_and_backend_identity(tmp_p
     seen = []
 
     class Backend:
+        def between_calls(self, model):
+            pass
+
         name = "custom-interface"
 
         def load(self, repo):
@@ -187,7 +190,7 @@ def test_experiment_integrity_and_no_overwrite(tmp_path):
 @pytest.mark.parametrize("change", [
     {"regimes": [ExecutionRegime("interactive", [])]},
     {"regimes": [ExecutionRegime("interactive", ["a"]), ExecutionRegime("interactive", ["b"])]},
-    {"tasks": [({}, "same"), ({}, "same")]}, {"n_trials": 0},
+    {"tasks": [({}, "same"), ({}, "same")]}, {"n_trials": -1},
 ])
 def test_reject_ambiguous_or_empty_experiment(tmp_path, change):
     with pytest.raises(ValueError):
@@ -380,12 +383,24 @@ def test_cli_records_rows_a_model_cannot_express():
     assert all("block component" in row["reason"] for row in skipped)
 
 
-def test_next_job_waits_for_the_gpu_memory_to_drain(tmp_path, fake_docker, monkeypatch):
+def _gpu(used, *pids):
+    return {"0": {"used_mib": used, "processes": [{"pid": p, "used_mib": used, "name": "python"} for p in pids]}}
+
+
+def test_job_waits_for_the_previous_job_to_drain(tmp_path, fake_docker, monkeypatch):
     experiment, calls, _ = fake_docker
-    readings = iter([1000, 9000, 6000, 1500, 1200])    # before the job, then while draining
-    monkeypatch.setattr(local, "gpu_used_mib", lambda gpu: next(readings))
+    readings = iter([_gpu(9000, 41), _gpu(600), _gpu(14)])    # the previous job's memory draining
+    monkeypatch.setattr(local, "gpu_state", lambda gpus: next(readings))
     monkeypatch.setattr(local.time, "sleep", lambda seconds: None)
     record = local.run_job("third-party/default", tmp_path / "job", experiment, tmp_path / "output", root=tmp_path)
     assert record["status"] == "completed"
-    assert record["gpu_release"]["baseline_mib"] == 1000
-    assert record["gpu_release"]["after_mib"] == 1500    # first reading within 1 GiB of baseline
+    assert record["gpus_before"]["state"] == _gpu(14)
+
+
+def test_job_refuses_a_gpu_another_process_holds(tmp_path, fake_docker, monkeypatch):
+    experiment, calls, _ = fake_docker
+    monkeypatch.setattr(local, "gpu_state", lambda gpus: _gpu(30000, 4242))
+    monkeypatch.setattr(local, "wait_idle", lambda gpus: (local.gpu_state(gpus), 120.0))
+    record = local.run_job("third-party/default", tmp_path / "job", experiment, tmp_path / "output", root=tmp_path)
+    assert record["status"] == "failed" and "pid 4242 python" in record["error"]
+    assert not any("run" in cmd for cmd in calls)            # never launched

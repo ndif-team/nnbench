@@ -5,8 +5,8 @@
 
 Every GET dispatches through the manager's single route registry (isb/manager/pages.py), so the
 server, the export, and the tests always serve the same page set. Browsing reads saved JSON
-reports, never tensors. --import-legacy explicitly unpickles trusted .pt files once to write
-summary sidecars. Binds 127.0.0.1 only; archive/discard require a same-site action token.
+reports, never tensors. --import-run-files loads .pt run files once (tensors and plain containers
+only) to write summary sidecars. Binds 127.0.0.1 only; archive/discard require a same-site action token.
 """
 import argparse
 import secrets
@@ -111,15 +111,14 @@ def main():
     ap.add_argument("--port", type=int, default=6688)
     ap.add_argument("--export", metavar="FILE",
                     help="write the whole site as one self-contained HTML file and exit")
-    ap.add_argument("--import-legacy", action="store_true",
+    ap.add_argument("--import-run-files", action="store_true",
                     help="explicitly load trusted top-level .pt files and save JSON summaries before browsing")
     args = ap.parse_args()
-    if args.import_legacy:
-        from isb.manager.model import import_legacy
-        import isb.methodologies  # noqa: F401 — only the explicit legacy import needs scoring
-        import_legacy(args.dir)
+    if args.import_run_files:
+        from isb.manager.model import import_run_files
+        import_run_files(args.dir)
         if Path(args.inbox).resolve() != Path(args.dir).resolve():
-            import_legacy(args.inbox)
+            import_run_files(args.inbox)
     if args.export:
         Path(args.export).write_text(manager.export_html(args.dir, args.inbox))
         print(f"[manager] exported {args.dir} -> {args.export}")

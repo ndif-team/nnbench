@@ -55,22 +55,24 @@ class NNsight04Backend(Backend):
             self._arity.update(seen)
         return [self._arity[e.path] for e in envoys]
 
-    def run(self, model, prompts, build):
+    def run(self, model, prompts, build, *, keep_dtype=False):
         prompts = self.many(prompts, "run")
         with model.trace(prompts):                       # the prompts as one left-padded batch
             saved = build(list(range(len(prompts)))).save()
-        return saved.detach().float().cpu()
+        saved = saved.detach().cpu()
+        return saved if keep_dtype else saved.float()
 
-    def patch(self, model, clean_prompts, corrupted_prompts, capture, patch):
+    def patch(self, model, clean_prompts, corrupted_prompts, capture, patch, *, keep_dtype=False):
         clean_prompts, corrupted_prompts = self.paired(clean_prompts, corrupted_prompts, "patch")
         with model.trace(clean_prompts):
             ca = capture().save()
-        clean_act = ca.detach().float().cpu()
+        clean_act = ca.detach()                          # stays where the trace saved it
         with model.trace(corrupted_prompts):
             res = patch(clean_act).save()
-        return res.detach().float().cpu()
+        res = res.detach().cpu()
+        return res if keep_dtype else res.float()
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False):
         """0.4's per-step form: inside `model.all()` every module access refers to each call in
         turn, so the body runs once per decode step and rows collect in an `nnsight.list()`. The
         body is recorded once as a graph, so `build_step` gets no step index (None)."""
@@ -88,18 +90,19 @@ class NNsight04Backend(Backend):
         rows = list(rows)
         if len(rows) != new_tokens:
             raise RuntimeError(f"collected {len(rows)} per-step rows, expected {new_tokens}")
-        return torch.stack([r.detach().float().cpu() for r in rows], dim=0)   # [new_tokens, B, ...]
+        return torch.stack([(r.detach() if keep_dtype else r.detach().float()).cpu()
+                            for r in rows], dim=0)                          # [new_tokens, B, ...]
 
     def plain(self, model, units, *, new_tokens=1):
         """The wrapped transformers module called directly on one left-padded batch, no trace. Ends
-        where the cells end: the result copied to the host, so a timer sees the same boundary."""
+        with the user's result copied to the host: the greedy next token, or the generated ids."""
         import torch
 
         inputs = model.tokenizer(prompts_of(units), return_tensors="pt", padding=True)
         inputs = inputs.to(model.device)
         with torch.no_grad():
             if new_tokens == 1:
-                out = model._model(**inputs).logits[:, -1, :]
+                out = model._model(**inputs).logits[:, -1, :].argmax(-1, keepdim=True)
             else:
                 out = model._model.generate(**inputs, max_new_tokens=new_tokens,
                                             min_new_tokens=new_tokens, do_sample=False,

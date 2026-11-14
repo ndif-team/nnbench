@@ -7,7 +7,6 @@ import os
 import subprocess
 import time
 import uuid
-from pathlib import Path
 
 from . import apptainer
 from .contract import digest, file_digest, validate_result, write_json
@@ -82,30 +81,76 @@ def source_identity(root=ROOT):
     return {"commit": commit.stdout.strip(), "source_sha256": digest(content.encode())}
 
 
-def gpu_used_mib(gpu):
-    """Used memory on the selected GPU in MiB; None when nvidia-smi cannot report it."""
+IDLE_MIB = 100     # an idle GPU holds only driver residue, tens of MiB
+
+
+CLOCK_FIELDS = ("clocks.sm", "clocks.max.sm", "clocks.applications.graphics", "clocks.mem",
+                "enforced.power.limit", "power.draw", "temperature.gpu", "persistence_mode",
+                "clocks_event_reasons.active")
+
+
+def _smi(gpus, query, fields=4):
+    result = subprocess.run(["nvidia-smi", "-i", ",".join(gpus), query, "--format=csv,noheader,nounits"],
+                            capture_output=True, text=True, timeout=15)
+    if result.returncode:
+        raise OSError(result.stderr.strip() or f"nvidia-smi exited {result.returncode}")
+    return [[field.strip() for field in line.split(",", fields - 1)]
+            for line in result.stdout.strip().splitlines()]
+
+
+def gpu_clocks(gpus):
+    """Each GPU's clocks, enforced power limit, power draw, temperature and active clock event
+    reasons as nvidia-smi reports them, keyed by index; None when nvidia-smi cannot report them."""
     try:
-        result = subprocess.run(["nvidia-smi", "-i", str(gpu), "--query-gpu=memory.used",
-                                 "--format=csv,noheader,nounits"],
-                                capture_output=True, text=True, timeout=15)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+        rows = _smi(gpus, "--query-gpu=index," + ",".join(CLOCK_FIELDS), len(CLOCK_FIELDS) + 1)
+    except (OSError, subprocess.TimeoutExpired):
         return None
-    value = result.stdout.strip()
-    return int(value) if result.returncode == 0 and value.isdigit() else None
+    return {row[0]: dict(zip(CLOCK_FIELDS, row[1:])) for row in rows}
 
 
-def wait_for_release(gpu, baseline, *, tolerance_mib=1024, timeout=120, poll=1.0):
-    """Wait until the GPU's used memory is back within `tolerance_mib` of `baseline`, at most
-    `timeout` seconds. A finished job's GPU memory can still be draining after `compose down`
-    returns; a vLLM engine that starts meanwhile fails its memory profiling. Returns
-    (used_mib, waited_seconds); used_mib is None when the GPU cannot be read."""
+def gpu_state(gpus):
+    """Used memory (MiB) and compute processes of each GPU in `gpus`, keyed by the index
+    nvidia-smi reports; None when nvidia-smi cannot report them."""
+    try:
+        memory = _smi(gpus, "--query-gpu=index,pci.bus_id,memory.used")
+        apps = _smi(gpus, "--query-compute-apps=gpu_bus_id,pid,used_memory,process_name")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    state = {index: {"used_mib": int(used), "processes": []} for index, _, used in memory}
+    bus = {bus_id: index for index, bus_id, _ in memory}
+    for bus_id, pid, used, name in apps:
+        state[bus[bus_id]]["processes"].append(
+            {"pid": int(pid), "used_mib": int(used) if used.isdigit() else None, "name": name})
+    return state
+
+
+def busy(state):
+    """The GPUs of `state` that hold another process's memory or compute context."""
+    return {index: gpu for index, gpu in state.items()
+            if gpu["used_mib"] >= IDLE_MIB or gpu["processes"]}
+
+
+def wait_idle(gpus, *, timeout=120, poll=1.0):
+    """Wait until no GPU in `gpus` is busy, at most `timeout` seconds: a finished job's memory can
+    still be draining after its container exits. Returns (state, waited_seconds); state is None
+    when nvidia-smi cannot report."""
     start = time.monotonic()
-    used = gpu_used_mib(gpu)
-    while (baseline is not None and used is not None and used > baseline + tolerance_mib
-           and time.monotonic() - start < timeout):
+    state = gpu_state(gpus)
+    while state is not None and busy(state) and time.monotonic() - start < timeout:
         time.sleep(poll)
-        used = gpu_used_mib(gpu)
-    return used, round(time.monotonic() - start, 1)
+        state = gpu_state(gpus)
+    return state, round(time.monotonic() - start, 1)
+
+
+def refuse_busy(state):
+    """Raise when a reserved GPU is busy: another process's kernels and memory traffic would sit
+    inside every timed call, and the job would disturb that process."""
+    occupied = busy(state or {})
+    if occupied:
+        raise RuntimeError("reserved GPU in use before the job: " + "; ".join(
+            f"GPU {index}: {gpu['used_mib']} MiB used"
+            + "".join(f", pid {p['pid']} {p['name']} ({p['used_mib']} MiB)" for p in gpu["processes"])
+            for index, gpu in occupied.items()))
 
 
 def run_job(name, job, experiment, output, *, gpu="0", timeout=1800, root=ROOT, launcher="docker"):
@@ -123,9 +168,12 @@ def run_job(name, job, experiment, output, *, gpu="0", timeout=1800, root=ROOT, 
     record = {"backend": name, "experiment_id": experiment["id"], "project": project,
               "launcher": launcher, "status": "running", "source": source_identity(root)}
     write_json(output / "execution.json", record)
-    baseline_mib = gpu_used_mib(gpu)
     print(f"[run] {name} / {experiment['spec']['name']} → {output}", flush=True)
     try:
+        state, waited = wait_idle(env["ISB_GPUS"].split(","))
+        record["gpus_before"] = {"state": state, "waited_s": waited,
+                                 "clocks": gpu_clocks(env["ISB_GPUS"].split(","))}
+        refuse_busy(state)
         if launcher == "apptainer":
             argv, extra_env = apptainer.command(compose_file(name, root), root, env)
             with (output / "execution.log").open("w") as log:
@@ -151,6 +199,7 @@ def run_job(name, job, experiment, output, *, gpu="0", timeout=1800, root=ROOT, 
     except Exception as error:
         record.update(status="failed", error=str(error))
     finally:
+        record["gpus_after"] = {"clocks": gpu_clocks(env["ISB_GPUS"].split(","))}
         try:
             if launcher == "apptainer":
                 # The process group is gone (run() waited or killed it); the image is the .sif.
@@ -169,9 +218,6 @@ def run_job(name, job, experiment, output, *, gpu="0", timeout=1800, root=ROOT, 
                                              env=env, stdout=log, stderr=subprocess.STDOUT, timeout=30)
                 if cleaned.returncode:
                     record.update(status="failed", cleanup_error="Compose cleanup failed; see cleanup.log")
-            after_mib, waited = wait_for_release(gpu, baseline_mib)
-            record["gpu_release"] = {"baseline_mib": baseline_mib, "after_mib": after_mib,
-                                     "waited_s": waited}
         except Exception as error:
             record.update(status="failed", cleanup_error=str(error))
         write_json(output / "execution.json", record)

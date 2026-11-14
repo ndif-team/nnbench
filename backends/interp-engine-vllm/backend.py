@@ -20,6 +20,7 @@ class EngineModel:
     config: object             # the checkpoint's HF config; model identity reads its revision
     n_layers: int
     maps: dict = field(default_factory=dict)      # J-lens transport maps, built once per model
+    directions: dict = field(default_factory=dict)  # unit unembedding rows by token id, read once
 
 
 class InterpEngineBackend(Backend):
@@ -51,8 +52,15 @@ class InterpEngineBackend(Backend):
         engine = sync_model(load_model(repo, backend=self.backend, **self.engine_options))
         engine.warmup()
         config = AutoConfig.from_pretrained(repo)
-        return EngineModel(engine, AutoTokenizer.from_pretrained(repo), config,
-                           config.num_hidden_layers)
+        model = EngineModel(engine, AutoTokenizer.from_pretrained(repo), config,
+                            config.num_hidden_layers)
+        # The engine wraps its runner's input preparation on the first capture, steer or attention
+        # registration and keeps the wrapper (vllm_capture/_demux.py, `_ensure_patched`); one
+        # untimed captured request puts every timed call, a plain one included, on the engine in
+        # that state.
+        engine.runner.run(engine.model.capture(model.tokenizer("The")["input_ids"],
+                                               ["resid_post.0"]))
+        return model
 
     def plain(self, model, units, *, new_tokens=1):
         """`generate_text` with no capture points and no steering spec, one request per prompt,

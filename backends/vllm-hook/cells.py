@@ -19,7 +19,8 @@ Denotation, from IBM/vLLM-Hook 0e34fdd source:
   (`hook_llm.py`, `generate`); on the disk path `flush_disk` writes the batch's requests into one
   artifact in request order. The `hidden_states` analyzer returns those rows per layer.
 - The plugin returns hidden states only, with no unembedding. The next-token readout is user code:
-  the checkpoint's final RMSNorm and `lm_head` weights, applied to the last rows on the GPU.
+  the checkpoint's final RMSNorm and `lm_head` weights, applied to the last rows on the GPU, in the
+  stream's dtype in a timed call and in fp32 in a check call.
 - `steer_hook_act`, the steering worker, adds a fixed vector (`add_vector`) or adjusts a projection
   (`adjust_rs`) at the LAST row of each forward of one layer: the last prompt token, and each decoded
   token when `apply_at_all_positions` is true (commit afdf36a). It is a separate worker extension,
@@ -44,14 +45,13 @@ MIA (v1.0.1, d748ccf, on vLLM 0.32.0) keeps those read denotations and the same 
 """
 import json
 import os
-import shutil
 import uuid
 
 import torch
 
-from isb.methodologies.jacobian_lens import _load_fitted, _orthogonal
+from isb.methodologies.jacobian_lens import load_fitted, orthogonal
 from isb.methodologies.registry import Unsupported, cell
-from isb.tasks.lens_eval import locate
+from isb.data import locate
 
 from .backend import MIA, QK, READ, AsyncHook
 
@@ -73,9 +73,9 @@ def _other_worker(model, needed, what):
                        f"engine carries one worker extension (HookLLM worker_name)")
 
 
-def _weights(model):
-    """The final norm and unembedding from the checkpoint, on the GPU in fp32, loaded once."""
-    if not model.weights:
+def _stored_weights(model):
+    """The checkpoint's final norm and unembedding in host memory as stored, read once."""
+    if "host" not in model.weights:
         from huggingface_hub import snapshot_download
         from safetensors import safe_open
 
@@ -88,17 +88,34 @@ def _weights(model):
                 index = {name: "model.safetensors" for name in f.keys()}
         names = {"norm": "model.norm.weight",
                  "unembed": "lm_head.weight" if "lm_head.weight" in index else "model.embed_tokens.weight"}
+        weights = {}
         for key, name in names.items():
-            with safe_open(os.path.join(root, index[name]), framework="pt", device="cuda") as f:
-                model.weights[key] = f.get_tensor(name).float()
-    return model.weights
+            with safe_open(os.path.join(root, index[name]), framework="pt") as f:
+                weights[key] = f.get_tensor(name)
+        model.weights["host"] = weights
+    return model.weights["host"]
 
 
-def _project(model, rows):
-    """Final RMSNorm, then the unembedding, on the GPU in fp32. rows: [n, d_model] -> [n, vocab]."""
-    w = _weights(model)
+def _weights(model, dtype, keep):
+    """The final norm and unembedding on the GPU in `dtype`: kept for later calls when `keep` (the
+    readout a timed call runs), else for this call only, so the GPU holds no weights that only check
+    calls use."""
+    if dtype in model.weights:
+        return model.weights[dtype]
+    weights = {key: w.to("cuda", dtype) for key, w in _stored_weights(model).items()}
+    if keep:
+        model.weights[dtype] = weights
+    return weights
+
+
+def _project(model, rows, dtype, keep):
+    """Final RMSNorm in fp32, cast back to `dtype` as vLLM-Hook's analyzers replay it
+    (`ScienceHallucinationAnalyzer._apply_rmsnorm`), then the unembedding in `dtype`, on the GPU;
+    the result on the host. rows: [n, d_model] -> [n, vocab]. `keep` as `_weights`."""
+    w = _weights(model, dtype, keep)
     x = rows.to("cuda", torch.float32)
-    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + model.config.rms_norm_eps) * w["norm"]
+    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + model.config.rms_norm_eps)
+    x = (x * w["norm"].float()).to(dtype)
     return (x @ w["unembed"].T).cpu()
 
 
@@ -137,7 +154,7 @@ def _capture(model, prompts, layers, mode, new_tokens=1):
         outs = llm.generate(list(prompts), params, save_to_disk=model.save_to_disk, use_tqdm=False)
         if model.save_to_disk:
             stats = llm.analyze(analyzer_spec={"reduce": "none"})   # reads this call's run_id
-            shutil.rmtree(os.path.join(llm._hook_dir, llm._last_run_id), ignore_errors=True)
+            model.finished_runs.append(os.path.join(llm._hook_dir, llm._last_run_id))
         else:
             stats = llm.analyze(analyzer_spec={"reduce": "none"}, probes=outs[0].probes)
     finally:
@@ -147,7 +164,8 @@ def _capture(model, prompts, layers, mode, new_tokens=1):
 
 def _capture_mia(model, prompts, layers, mode, new_tokens):
     """`_capture` on MIA: every request carries its layers (numbered from 1), mode and passes in
-    its own `extra_args`, and a disk run is named by this call, read back and removed. `probes` is
+    its own `extra_args`, and a disk run is named by this call, read back and left for `between_calls` to remove.
+    `probes` is
     read inside the call: MIA delivers an output's capture on first access (examples/README.md,
     "Where the captured data goes")."""
     from vllm import SamplingParams
@@ -165,16 +183,16 @@ def _capture_mia(model, prompts, layers, mode, new_tokens):
     run_id = uuid.uuid4().hex
     outs = llm.generate(list(prompts), params, save_to_disk=True, run_id=run_id, use_tqdm=False)
     stats = llm.analyze(analyzer_spec={"reduce": "none"}, run_id=run_id)
-    shutil.rmtree(os.path.join(model.hook_dir, run_id), ignore_errors=True)
+    model.finished_runs.append(os.path.join(model.hook_dir, run_id))
     return outs, stats["hidden_states"]
 
 
 def _last_rows(model, prompts, layers):
     """Each listed layer's (0-based) last-token stream of every prompt: [len(layers), B, d_model]."""
     _, by_layer = _capture(model, prompts, layers, "last_token")
-    return torch.stack([torch.stack([row.reshape(-1) for row in
-                                     _requests(by_layer[f"model.layers.{i}"], len(prompts))])
-                        for i in layers])
+    rows = [row.reshape(-1) for i in layers
+            for row in _requests(by_layer[f"model.layers.{i}"], len(prompts))]
+    return torch.stack(rows).reshape(len(layers), len(prompts), -1)
 
 
 def _token_rows(model, prompts, layers):
@@ -195,23 +213,49 @@ def _token_rows(model, prompts, layers):
 
 
 def _final_logits(model, prompts):
-    return _project(model, _last_rows(model, prompts, [model.n_layers - 1])[0])   # [B, vocab]
+    """The check form of a next token: the stream after the last layer projected in fp32,
+    `[B, vocab]`."""
+    return _project(model, _last_rows(model, prompts, [model.n_layers - 1])[0], torch.float32,
+                    keep=False)
+
+
+def _plain_tokens(model, prompts):
+    """Each prompt's greedy next token among the non-stop tokens (`min_tokens=1`), `[B, 1]` int64,
+    from the plain request: `generate` with `use_hook=False`, which clears the requests'
+    extra_args so the worker captures nothing (`vllm_hook_plugins/hook_llm.py` and `mia/llm.py`,
+    `generate`), or on AsyncLLM one request per prompt with no extra_args (`AsyncHook.decode`).
+    vLLM's request outputs come back in prompt order."""
+    from vllm import SamplingParams
+
+    if isinstance(model.llm, AsyncHook):
+        outs = model.llm.decode(list(prompts), 1)
+    else:
+        outs = model.llm.generate(list(prompts), SamplingParams(
+            max_tokens=1, min_tokens=1, temperature=0.0, top_p=1.0), use_hook=False, use_tqdm=False)
+    return torch.tensor([list(out.outputs[0].token_ids) for out in outs])
 
 
 @cell("logit_lens", family="llama", backend="vllm_hook")
-def logit_lens(be, model, units, *, layers="all"):
+def logit_lens(be, model, units, *, layers="all", check=False):
+    """The final RMSNorm and unembedding applied to the stream after each read layer at each
+    prompt's last token, `[n_layers, B, vocab]` on the host. A timed call projects in the stream's
+    dtype, a check call in fp32 (`_project`)."""
     n = model.n_layers
     idx = list(range(n)) if layers == "all" else [i % n for i in layers]
     rows = _last_rows(model, units, idx)                                       # [n_layers, B, d]
-    logits = _project(model, rows.reshape(-1, rows.shape[-1]))
+    logits = _project(model, rows.reshape(-1, rows.shape[-1]),
+                      torch.float32 if check else rows.dtype, keep=not check)
     return logits.reshape(len(idx), len(units), -1)                            # [n_layers, B, vocab]
 
 
 @cell("steering", family="llama", backend="vllm_hook")
 def steering(be, model, units, *, layer=8, layers=None, target=" Rome", alpha=6.0,
-             scale_by="mean_norm"):
+             scale_by="mean_norm", check=False):
+    """At `alpha=0` nothing is written: a timed call is the plain request and returns each unit's
+    greedy token, `[B, 1]` (`_plain_tokens`); a check call projects the stream captured after the
+    last layer, `[B, vocab]` (`_final_logits`). Any other strength is unsupported in both calls."""
     if alpha == 0:
-        return _final_logits(model, units)
+        return _final_logits(model, units) if check else _plain_tokens(model, units)
     if MIA:
         raise Unsupported(MIA_STEER)
     raise Unsupported(f"{LAST_ROW_STEER}; a strength from the stream's norm also needs a read, and "
@@ -265,9 +309,13 @@ def gen_capture(be, model, units, *, layer, new_tokens, export=True):
 
 
 @cell("activation_patching", family="llama", backend="vllm_hook")
-def activation_patching(be, model, units, *, layer=6, patch=True, positions="all"):
+def activation_patching(be, model, units, *, layer=6, patch=True, positions="all", check=False):
+    """`patch=False` runs each pair's corrupt prompt unpatched: a timed call is the plain request
+    and returns its greedy token, `[B, 1]` (`_plain_tokens`); a check call projects the stream
+    captured after the last layer, `[B, vocab]` (`_final_logits`). A patch is unsupported."""
     if not patch:
-        return _final_logits(model, [unit[1] for unit in units])   # the corrupt runs, unpatched
+        corrupt = [unit[1] for unit in units]
+        return _final_logits(model, corrupt) if check else _plain_tokens(model, corrupt)
     if MIA:
         raise Unsupported("a patch writes a value read from another run: the steer worker adds one "
                           "vector from a file to the positions it steers (steering.vector_path), "
@@ -280,17 +328,20 @@ def activation_patching(be, model, units, *, layer=6, patch=True, positions="all
 
 
 @cell("ablation", family="llama", backend="vllm_hook")
-def ablation(be, model, units, *, layer=6, target="mlp"):
+def ablation(be, model, units, *, layer=6, target="mlp", check=False):
+    """At `target="none"` nothing is zeroed: a timed call is the plain request and returns each
+    unit's greedy token, `[B, 1]` (`_plain_tokens`); a check call projects the stream captured
+    after the last layer, `[B, vocab]` (`_final_logits`). Any other target is unsupported."""
     if target == "none":
-        return _final_logits(model, units)
+        return _final_logits(model, units) if check else _plain_tokens(model, units)
     raise Unsupported("the built-in workers hook decoder layers and attention modules for reads and "
                       "steer the residual by a fixed vector; none zeroes a submodule's output")
 
 
 def _transport(model, transport, layers, dtype):
     """The J-lens transport for the read `layers` on the GPU in the stream's `dtype`: None (the
-    identity), one `[d, d]` map shared by every layer (an int seed, `_orthogonal`, or a tensor), or
-    an `[n_layers, d, d]` stack of per-layer maps (a fitted lens, `_load_fitted`, or a mapping).
+    identity), one `[d, d]` map shared by every layer (an int seed, `orthogonal`, or a tensor), or
+    an `[n_layers, d, d]` stack of per-layer maps (a fitted lens, `load_fitted`, or a mapping).
     A seed or a fitted spec is built once per model and kept."""
     if transport is None:
         return None
@@ -298,11 +349,11 @@ def _transport(model, transport, layers, dtype):
     if key in model.transports:
         return model.transports[key]
     if isinstance(transport, int):
-        maps = _orthogonal(model.config.hidden_size, transport)
+        maps = orthogonal(model.config.hidden_size, transport)
     elif isinstance(transport, torch.Tensor):
         maps = transport
     else:
-        per_layer = _load_fitted(transport) if isinstance(transport, str) else transport
+        per_layer = load_fitted(transport) if isinstance(transport, str) else transport
         maps = torch.stack([per_layer[i] for i in layers])
     maps = maps.to("cuda", dtype)
     if key is not None:
@@ -311,12 +362,12 @@ def _transport(model, transport, layers, dtype):
 
 
 @cell("jacobian_lens", family="llama", backend="vllm_hook")
-def jacobian_lens(be, model, units, *, layers="all", position="last", transport=None):
-    """The J-lens readout from the plugin's hidden states: the stream after each read layer at
+def jacobian_lens(be, model, units, *, layers="all", position="last", transport=None, check=False):
+    """The J-lens readout `[n_layers, B, vocab]` on the host: the stream after each read layer at
     each prompt's readout position (`last_token` capture for the last token, `all_tokens` for any
-    other), then user code on the client GPU, as for the logit lens: `J_l @ h` in the stream's
-    dtype, the checkpoint's final RMSNorm and the unembedding (`_project`, fp32). The plugin has
-    no unembedding, so the projection cannot run in the worker. Output `[n_layers, B, vocab]`."""
+    other), `J_l @ h` in the stream's dtype, then the checkpoint's final RMSNorm and unembedding on
+    the client GPU, since the plugin has no unembedding. A timed call projects in the stream's
+    dtype, a check call in fp32 (`_project`)."""
     n = model.n_layers
     idx = list(range(n)) if layers == "all" else [i % n for i in layers]
     positions = [locate(model.tokenizer, unit, position) for unit in units]
@@ -329,7 +380,8 @@ def jacobian_lens(be, model, units, *, layers="all", position="last", transport=
     maps = _transport(model, transport, idx, x.dtype)
     if maps is not None:
         x = x @ maps.T if maps.dim() == 2 else x @ maps.transpose(1, 2)        # per layer: h @ J_l.T
-    logits = _project(model, x.reshape(-1, x.shape[-1]))
+    logits = _project(model, x.reshape(-1, x.shape[-1]), torch.float32 if check else x.dtype,
+                      keep=not check)
     return logits.reshape(len(idx), len(units), -1)                            # [n_layers, B, vocab]
 
 
@@ -349,8 +401,8 @@ def activation_harvest(be, model, units, *, layer=None, layers=None, export=True
         return torch.tensor([[out.outputs[0].token_ids[0]] for out in outs])      # [B, 1]
     n = model.n_layers
     read = [i % n for i in (layers if layers is not None else [layer])]
-    stacked = torch.stack([torch.cat(rows) for rows in _token_rows(model, units, read)])
-    return stacked if layers is not None else stacked[0]
+    rows = torch.cat([row for per_prompt in _token_rows(model, units, read) for row in per_prompt])
+    return rows.reshape(len(read), -1, rows.shape[-1]) if layers is not None else rows
 
 
 @cell("residual_readout", family="llama", backend="vllm_hook")
@@ -362,14 +414,13 @@ def residual_readout(be, model, units, *, layers):
 
 
 @cell("attention_pattern", family="llama", backend="vllm_hook")
-def attention_pattern(be, model, units, *, layers="all"):
-    """The last query's attention log-probabilities `[n_layers, B, n_heads, k_len]` from the Q/K
-    probe: per request, `output_qk` lists the read layers (the worker numbers attention modules
-    from 0), the worker records the post-RoPE query at the last token and the keys of the whole
-    prompt, and the `attn_tracker` analyzer's own reconstruction gives each head's probabilities
-    over the prompt (`compute_attention_from_qk`, GQA heads repeated); the log is user code, and a
-    probability that is zero in the analyzer's dtype is floored at that dtype's smallest normal
-    first, as in the HF cell, so the output stays finite."""
+def attention_pattern(be, model, units, *, layers="all", check=False):
+    """The last query's attention probabilities `[n_layers, B, n_heads, k_len]`: each request lists
+    the read layers in `output_qk` (attention modules numbered from 0), and the `attn_tracker`
+    analyzer rebuilds every head's probabilities over the prompt from the captured post-RoPE query
+    and keys (`compute_attention_from_qk`). A timed call returns them in the analyzer's dtype; a
+    check call returns their log, a probability that is zero in that dtype floored first at the
+    dtype's smallest normal, as in the HF cell."""
     from vllm import SamplingParams
 
     if model.worker != QK:
@@ -385,14 +436,15 @@ def attention_pattern(be, model, units, *, layers="all"):
     if model.save_to_disk:
         run_id = run_id or llm._last_run_id
         weights = llm.analyzer.compute_attention_from_qk(run_id=run_id)
-        shutil.rmtree(os.path.join(model.hook_dir, run_id), ignore_errors=True)
+        model.finished_runs.append(os.path.join(model.hook_dir, run_id))
     else:
         weights = llm.analyzer.compute_attention_from_qk(probes=outs[0].probes)
     if len(weights) != len(units):
         raise RuntimeError(f"reconstructed {len(weights)} requests' attention, expected {len(units)}")
-    probs = [[w[f"model.layers.{i}.self_attn.attn"]["attention"] for w in weights] for i in idx]
-    return torch.stack([torch.stack([torch.log(p.clamp_min(torch.finfo(p.dtype).tiny)) for p in layer])
-                        for layer in probs])
+    probs = [w[f"model.layers.{i}.self_attn.attn"]["attention"] for i in idx for w in weights]
+    if check:
+        probs = [torch.log(p.clamp_min(torch.finfo(p.dtype).tiny)) for p in probs]
+    return torch.stack(probs).reshape(len(idx), len(units), *probs[0].shape)
 
 
 # On the AsyncLLM backend (backend.py, VLLMHookAsyncBackend) the same cells read through

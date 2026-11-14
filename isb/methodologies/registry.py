@@ -17,6 +17,10 @@ has a ModelProfile, receiving the profile as its third argument:
 `fn(be, model, prompts, **params)` surface either way. An exact per-family registration
 always wins over the generic one: that is the override hatch for a family whose
 intervention code genuinely differs (the case worth keeping explicit).
+
+A cell returns the user's result. One whose correctness check compares something else takes a
+keyword `check=False`, and returns that check output when the executor passes `check=True` for its
+untimed check calls (isb/sweep/execute.py); `check` is the kind of call, never a case parameter.
 """
 from __future__ import annotations
 
@@ -29,9 +33,9 @@ from ..profiles import PROFILES
 CELLS = {}  # (methodology, family, backend) -> fn(be, model, prompts, **params)
 REALIZATIONS = {}  # same key -> alternative realization params, in declaration order
 
-# nnsight's own vLLM interfaces, which share the vllm_async cells. A foreign system on vLLM
+# nnsight's other vLLM interface, which shares the vllm_async cells. A foreign system on vLLM
 # (e.g. vllm_lens) never inherits nnsight intervention code.
-NNSIGHT_VLLM_VARIANTS = frozenset({"vllm_serve", "vllm_sync", "vllm_pp"})
+NNSIGHT_VLLM_VARIANTS = frozenset({"vllm_sync"})
 
 
 class Unsupported(Exception):
@@ -53,7 +57,11 @@ def cell(methodology: str, family: str, backend: str, realizations=()):
                              "only the methodology's realization params")
 
     def deco(fn):
-        CELLS[(methodology, family, backend)] = fn
+        key = (methodology, family, backend)
+        if key in CELLS:
+            raise ValueError(f"{key} is already registered by {CELLS[key].__module__}."
+                             f"{CELLS[key].__qualname__}")
+        CELLS[key] = fn
         REALIZATIONS[(methodology, family, backend)] = tuple(dict(a) for a in realizations)
         return fn
 
@@ -81,14 +89,8 @@ def get_cell(methodology: str, family: str, backend: str):
     def lookup(fam):
         fn = CELLS.get((methodology, fam, backend))
         if fn is None and backend in NNSIGHT_VLLM_VARIANTS:
-            # Every vLLM *variant* runs the SAME vLLM model via the SAME intervention code as the
-            # in-process async backend: the only difference is fully contained in the backend/model
-            # object passed as `be` (over-HTTP for `vllm_serve`, an in-process sync engine for
-            # `vllm_sync`, a pipeline/tensor-parallel engine for `vllm_pp`). So a variant cell is, by
-            # construction, the `vllm_async` cell; reuse it rather than duplicating every
-            # methodology×family. An explicit registration still takes precedence if a cell ever needs
-            # to differ, and any silent divergence would surface as an oracle/test failure, not a
-            # stale copy.
+            # The sync engine runs the same vLLM model through the same intervention code as the
+            # async one; only the `be` object differs. An explicit registration takes precedence.
             fn = CELLS.get((methodology, fam, "vllm_async"))
         return fn
 

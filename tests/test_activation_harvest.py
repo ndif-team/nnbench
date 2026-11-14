@@ -45,25 +45,27 @@ class _HF:
     def __init__(self, extra_pad=0):
         self.extra_pad = extra_pad
 
-    def run(self, model, prompts, build):
+    def run(self, model, prompts, build, *, keep_dtype=False):
         acts = [_acts(p) for p in prompts]
         width = max(len(a) for a in acts) + self.extra_pad
         pad = lambda a: torch.full((width - len(a), D), 1e4)    # noqa: E731
         left = model.tokenizer.padding_side == "left"
         batch = torch.stack([torch.cat([pad(a), a] if left else [a, pad(a)]) for a in acts])
         model.trunk.decoder_blocks[1].output = (batch, "attention weights")
-        return build(list(range(len(prompts)))).detach().float().cpu()
+        out = build(list(range(len(prompts)))).detach().cpu()
+        return out if keep_dtype else out.float()
 
 
 class _VLLM:
     """One request: `[tokens, d]` with no batch axis, a fused-residual layer's (hidden, residual)."""
     name = "vllm_async"
 
-    def run(self, model, prompts, build):
+    def run(self, model, prompts, build, *, keep_dtype=False):
         (prompt,) = prompts
         hidden = _acts(prompt)
         model.trunk.decoder_blocks[1].output = (hidden, 10 * hidden + 3)
-        return build([0]).detach().float().cpu()
+        out = build([0]).detach().cpu()
+        return out if keep_dtype else out.float()
 
 
 def test_hf_exports_every_valid_token_in_prompt_order():
@@ -93,3 +95,11 @@ def test_vllm_exports_the_summed_stream_on_a_fused_residual_family():
     assert torch.equal(out, hidden + (10 * hidden + 3))    # hidden + residual at every token
     naive = VLLM(_VLLM(), _Model(), PROFILE, ["the cat sat"], layer=1, residual="plain")
     assert torch.equal(naive, hidden)                      # an explicit plain read stays possible
+
+
+def test_vllm_baseline_returns_the_token_the_engine_sampled():
+    # the export=False baseline is the user's plain forward: vLLM's own sample, with no logits read
+    model = _Model()                                          # carries no `logits` to read
+    model.samples = torch.tensor([[5]], dtype=torch.int32)    # the sampler's output for the step
+    out = VLLM(_VLLM(), model, PROFILE, ["the cat sat"], export=False)
+    assert out.dtype == torch.int32 and out.tolist() == [[5]]

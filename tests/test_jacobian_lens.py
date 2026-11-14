@@ -13,7 +13,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import isb.methodologies  # noqa: F401,E402  (registers cells)
-from isb.methodologies.jacobian_lens import _orthogonal  # noqa: E402
+from isb.methodologies.jacobian_lens import orthogonal  # noqa: E402
 from isb.methodologies.registry import CELLS, get_cell  # noqa: E402
 from isb.suites import suite_cases  # noqa: E402
 from isb.workloads import case  # noqa: E402
@@ -22,9 +22,9 @@ HID = 6
 
 
 def test_orthogonal_map_is_deterministic_and_orthogonal():
-    q1, q2 = _orthogonal(HID, seed=0), _orthogonal(HID, seed=0)
+    q1, q2 = orthogonal(HID, seed=0), orthogonal(HID, seed=0)
     assert torch.equal(q1, q2)                                   # same seed -> byte-identical
-    assert not torch.equal(q1, _orthogonal(HID, seed=1))         # seed matters
+    assert not torch.equal(q1, orthogonal(HID, seed=1))         # seed matters
     assert torch.allclose(q1 @ q1.T, torch.eye(HID), atol=1e-5)  # full-rank, norm-preserving
 
 
@@ -56,9 +56,12 @@ class _GPT2ish:
 
 
 class _FakeBE:
+    def between_calls(self, model):
+        pass
+
     name = "hf"
 
-    def run(self, model, prompts, build):
+    def run(self, model, prompts, build, *, keep_dtype=False):
         return build(list(range(len(prompts))))
 
     def last(self, t):
@@ -77,6 +80,32 @@ def test_cell_reads_position_and_transport_changes_readout():
     assert not torch.allclose(moved, ident)                      # the J-matmul actually applied
     again = fn(_FakeBE(), model, ["p"], unembed="weight", transport=0)
     assert torch.equal(moved, again)                             # deterministic across calls
+
+
+def test_hf_cell_places_a_seeded_transport_once_per_loaded_engine(monkeypatch):
+    # a user places a constant map on the GPU once; a copy inside every timed call is harness work
+    model = _GPT2ish(n_layers=3)
+    for block in model.transformer.h:
+        block.output = block.output.double()           # a stream dtype the fp32 map must move to
+    model.lm_head.weight = model.lm_head.weight.double()
+    copies = []
+    to = torch.Tensor.to
+
+    def counting_to(self, *args, **kwargs):
+        out = to(self, *args, **kwargs)
+        if out is not self and self.shape == (HID, HID):
+            copies.append(out)
+        return out
+
+    monkeypatch.setattr(torch.Tensor, "to", counting_to)
+    fn = get_cell("jacobian_lens", "gpt2", "hf")
+    engine = _FakeBE()
+    first = fn(engine, model, ["p"], unembed="weight", transport=0)
+    for _ in range(2):
+        assert torch.equal(fn(engine, model, ["p"], unembed="weight", transport=0), first)
+    assert len(copies) == 1                            # three calls x three layers, one copy
+    fn(_FakeBE(), model, ["p"], unembed="weight", transport=0)
+    assert len(copies) == 2                            # another loaded engine places its own
 
 
 def test_per_layer_mapping_transport_applies_each_layers_own_map():

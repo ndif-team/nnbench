@@ -8,7 +8,8 @@ import tempfile
 import traceback
 from pathlib import Path
 
-from .contract import VERSION, check_experiment, expected_cells, file_digest, restore_spec, write_json
+from .contract import check_experiment, expected_cells, file_digest, restore_spec, write_json
+from .schema import WIRE_VERSION
 
 
 def merge_requirements(required, configured):
@@ -31,7 +32,7 @@ def main(create_backend, job=Path("/job"), output=Path("/output")):
 def _main(create_backend, job, output):
     job, output = Path(job), Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    identity = {"version": VERSION}
+    identity = {"version": WIRE_VERSION}
     if os.environ.get("ISB_BACKEND"):
         identity["backend"] = os.environ["ISB_BACKEND"]
     published = False
@@ -62,7 +63,7 @@ def _main(create_backend, job, output):
             partial = Path(staging)
             execute_run(spec, run, str(partial), "result", backend=backend,
                         interface=backend.name, provenance=provenance)
-            artifact = torch.load(partial / "result.pt", map_location="cpu", weights_only=False)
+            artifact = torch.load(partial / "result.pt", map_location="cpu", weights_only=True)
             outputs, provenance = artifact["outputs"], artifact["provenance"]
             metadata = outputs.get(("__meta__",), {})
             cells = []
@@ -76,12 +77,12 @@ def _main(create_backend, job, output):
                 if info.get("unsupported"):
                     state = "UNSUPPORTED"
                 else:
-                    if not error and outputs.get(key) is None:
+                    if not error and outputs.get(key) is None and not info.get("check_unsupported"):
                         error = "cell returned no output"
                     state = "ERROR" if error else "RAN"
                 info["error"] = error
                 metadata[key] = info
-                cells.append({"workload": key[0], "label": key[1], "state": state, **info})
+                cells.append({"regime": key[0], "label": key[1], "state": state, **info})
             auxiliary_calls = [{"key": list(key), "record": info}
                                for key, info in metadata.items()
                                if key not in requested and key not in alternatives]

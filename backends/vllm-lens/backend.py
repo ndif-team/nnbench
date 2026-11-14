@@ -26,6 +26,21 @@ class LensModel:
     dtype: object              # the engine's activation dtype (vLLM's resolved model_config.dtype)
     directions: dict = field(default_factory=dict)   # token id -> unit unembedding row, fetched once
     transports: dict = field(default_factory=dict)   # J-lens transport spec -> maps, built once
+    steers: dict = field(default_factory=dict)       # steering row -> the extra_args that steer it
+
+
+def _with_hooks(model):
+    """`model` after one untimed captured request. The plugin installs its decoder-layer hooks on
+    the first request that captures, steers or hooks and keeps them for every later forward
+    (`_activations_plugin.py`, `install_hooks`), so every timed call, a plain request included, runs
+    on the engine in that state whatever ran before it. 1.3.0's Q/K hooks are a second such state,
+    installed by the first `output_qk` request (`install_qk_hooks`): the attention case's first
+    warm-up call."""
+    from vllm import SamplingParams
+
+    model.llm.generate(["The"], SamplingParams(max_tokens=1, extra_args={"output_residual_stream": [0]}),
+                       use_tqdm=False)
+    return model
 
 
 class VLLMLensBackend(Backend):
@@ -46,11 +61,12 @@ class VLLMLensBackend(Backend):
             # jacobian-lens examples prefetch it once before generating.
             llm.prefetch_params(["lm_head.weight"])
         config = AutoConfig.from_pretrained(repo)
-        return LensModel(llm, llm.get_tokenizer(), config, config.num_hidden_layers,
-                         llm.llm_engine.model_config.dtype)
+        return _with_hooks(LensModel(llm, llm.get_tokenizer(), config, config.num_hidden_layers,
+                                     llm.llm_engine.model_config.dtype))
 
     def plain(self, model, units, *, new_tokens=1):
-        """A plain generate on the plugin's engine: no extra_args, so no capture, steering or hook."""
+        """A plain generate on the plugin's engine: no extra_args, so the layer hooks installed at
+        load find nothing to capture, steer or call."""
         from vllm import SamplingParams
 
         model.llm.generate(prompts_of(units),
@@ -160,9 +176,9 @@ class _AsyncLLMEngine:
             # `_llm_prefetch_params`); AsyncLLM has no such method.
             self._gather([engine.collective_rpc("prefetch_parameters", args=(["lm_head.weight"],))])
         config = AutoConfig.from_pretrained(repo)
-        return LensModel(AsyncRequests(engine, self._gather),
-                         SerialTokenizer(AutoTokenizer.from_pretrained(repo)), config,
-                         config.num_hidden_layers, engine.model_config.dtype)
+        return _with_hooks(LensModel(AsyncRequests(engine, self._gather),
+                                     SerialTokenizer(AutoTokenizer.from_pretrained(repo)), config,
+                                     config.num_hidden_layers, engine.model_config.dtype))
 
     def _gather(self, coros):
         """Run the coroutines together on the one persistent loop (a fresh loop per call would close

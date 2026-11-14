@@ -30,7 +30,7 @@ class _Generate:
     def last(self, t):
         return t[:, -1, :] if self.name == "hf" else t[-1:, :]
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded, keep_dtype=False):
         self.bounded.append(bounded)
         (prompt,) = prompts
         rows = []
@@ -57,3 +57,13 @@ def test_each_step_exports_the_newest_row_of_the_stream(backend, bound):
     assert out.shape == (4, 1, D)
     assert torch.equal(out[:, 0], torch.cat(be.expected))   # vLLM: hidden + residual, newest row
     assert be.bounded == [bound == "bounded"]
+
+
+def test_vllm_baseline_returns_each_step_the_engine_sampled():
+    # the export=False baseline is the user's plain decode: each step's sample, with no logits read
+    model = _Model()                                          # carries no `logits` to read
+    model.samples = torch.tensor([[9]], dtype=torch.int32)
+    out = CELLS[("gen_capture", "*", "vllm_async")](_Generate("vllm_async"), model, PROFILE,
+                                                    ["the cat sat"], layer=1, new_tokens=3,
+                                                    export=False)
+    assert out.dtype == torch.int32 and out.tolist() == [[[9]]] * 3

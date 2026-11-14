@@ -63,14 +63,14 @@ class HFBackend(Backend):
             saved = build(list(range(len(prompts)))).save()
         return saved.detach().cpu() if keep_dtype else saved.detach().float().cpu()
 
-    def patch(self, model, clean_prompts, corrupted_prompts, capture, patch):
+    def patch(self, model, clean_prompts, corrupted_prompts, capture, patch, *, keep_dtype=False):
         clean_prompts, corrupted_prompts = self.paired(clean_prompts, corrupted_prompts, "patch")
         with model.trace(clean_prompts):                 # trace 1: snapshot the clean activations
             ca = capture().save()
-        clean_act = ca.detach().float().cpu()
+        clean_act = ca.detach()                          # stays where the trace saved it
         with model.trace(corrupted_prompts):             # trace 2: inject them, observe the batch
             res = patch(clean_act).save()
-        return res.detach().float().cpu()
+        return res.detach().cpu() if keep_dtype else res.detach().float().cpu()
 
     def session(self, model, build):
         out = [None]                     # index-assign: the compiled session body shares the list
@@ -83,7 +83,7 @@ class HFBackend(Backend):
         rows = list(range(len(sources)))
         with model.trace(sources):           # trace 1: source activations, no grad
             s = capture().save()
-        src = s.detach().float().cpu()
+        src = s.detach()
         with model.trace(bases):             # trace 2: intervened forward + backward on the loss
             loss = step(src, rows)
             lv = loss.save()
@@ -134,7 +134,7 @@ class HFBackend(Backend):
                 for L in range(n)]))
         return torch.stack(scores)                                   # [B, n]
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False):
         prompts = self.many(prompts, "generate")
         it = slice(0, new_tokens) if bounded else slice(None)
         with model.generate(prompts, max_new_tokens=new_tokens, min_new_tokens=new_tokens,
@@ -142,40 +142,41 @@ class HFBackend(Backend):
             rows = list().save()
             for step in tracer.iter[it]:
                 rows.append(build_step(step))
-        return self._steps(rows, new_tokens, "generation")
+        return self._steps(rows, new_tokens, "generation", keep_dtype)
 
     def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
-                       *, new_tokens, bounded=True):
+                       *, new_tokens, bounded=True, keep_dtype=False):
         sources, bases = self.paired(source_prompts, base_prompts, "generate_patch")
         with model.trace(sources):                  # trace 1: snapshot the source activations
             ca = capture().save()
-        clean_act = ca.detach().float().cpu()
+        clean_act = ca.detach()                     # stays where the trace saved it
         it = slice(0, new_tokens) if bounded else slice(None)
         with model.generate(bases, max_new_tokens=new_tokens, min_new_tokens=new_tokens,
                             do_sample=False) as tracer:
             rows = list().save()
             for step in tracer.iter[it]:
                 rows.append(build_step(clean_act, step))
-        return self._steps(rows, new_tokens, "generate_patch")
+        return self._steps(rows, new_tokens, "generate_patch", keep_dtype)
 
-    def _steps(self, rows, new_tokens, what):
-        """Per-step `[B, ...]` rows -> `[new_tokens, B, ...]`."""
+    def _steps(self, rows, new_tokens, what, keep_dtype=False):
+        """Per-step `[B, ...]` rows -> `[new_tokens, B, ...]` on the host, fp32 unless `keep_dtype`."""
         import torch
 
         if len(rows) != new_tokens:
             raise RuntimeError(f"hf {what} collected {len(rows)} per-step rows, expected {new_tokens}")
-        return torch.stack([r.detach().float().cpu() for r in rows], dim=0)
+        return torch.stack([(r.detach() if keep_dtype else r.detach().float()).cpu() for r in rows],
+                           dim=0)
 
     def plain(self, model, units, *, new_tokens=1):
         """The wrapped transformers module called directly on one left-padded batch, no trace. Ends
-        where the cells end: the result copied to the host, so a timer sees the same boundary."""
+        with the user's result copied to the host: the greedy next token, or the generated ids."""
         import torch
 
         inputs = model.tokenizer(prompts_of(units), return_tensors="pt", padding=True)
         inputs = inputs.to(model._module.device)
         with torch.no_grad():
             if new_tokens == 1:
-                out = model._module(**inputs).logits[:, -1, :]
+                out = model._module(**inputs).logits[:, -1, :].argmax(-1, keepdim=True)
             else:
                 out = model._module.generate(**inputs, max_new_tokens=new_tokens,
                                              min_new_tokens=new_tokens, do_sample=False)

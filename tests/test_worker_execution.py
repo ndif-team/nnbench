@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from isb.jobs import contract, worker
+from isb.jobs import contract, schema, worker
 from isb.manager import Collection, dispatch, export_html
 from isb.methodologies import registry, requirements
 from isb.methodologies.observations import record_resolved
@@ -55,6 +55,9 @@ def test_real_worker_execution_preserves_calls_through_artifact_and_manager(
             return template
 
     class Backend:
+        def between_calls(self, model):
+            pass
+
         name = interface
 
         def load(self, repo):
@@ -155,7 +158,7 @@ def test_real_worker_execution_preserves_calls_through_artifact_and_manager(
         assert effect[side]["error"] is None
 
     contract.write_json(root / "plan.json", {
-        "version": contract.PLAN_VERSION, "experiments": ["exp"], "backends": [backend_name],
+        "version": schema.PLAN_VERSION, "experiments": ["exp"], "backends": [backend_name],
         "reference": None, "comparison": "correctness", "status": "completed"})
     contract.write_json(output / "execution.json", {
         "backend": backend_name, "experiment_id": experiment["id"], "status": "completed",
@@ -174,7 +177,7 @@ def test_real_worker_execution_preserves_calls_through_artifact_and_manager(
     assert viewed_provenance["submitted_coordinates"]["inputs_sha256"] == experiment["inputs_sha256"]
     assert all(cell.state == "RAN" for cell in collection.results[key])
     for row in result["cells"]:
-        viewed = viewed_outputs[("__meta__",)][(row["workload"], row["label"])]
+        viewed = viewed_outputs[("__meta__",)][(row["regime"], row["label"])]
         for field in ("params", "semantics", "realization", "resolved_params", "protocol", "protocol_scope", "protocol_coverage"):
             assert viewed[field] == row[field]
     page = dispatch(collection, f"/run/{key}")
@@ -205,6 +208,9 @@ def test_declared_unsupported_cell_is_recorded_with_its_reason(tmp_path, monkeyp
         return torch.ones(len(prompts), 3)
 
     class Backend:
+        def between_calls(self, model):
+            pass
+
         name = interface
 
         def load(self, repo):
@@ -293,8 +299,8 @@ def test_plain_request_is_timed_beside_the_cells(tmp_path, monkeypatch, has_plai
 
 
 def test_a_failure_after_the_timed_call_keeps_the_measurement(tmp_path, monkeypatch):
-    """The per-unit re-run that scores an aggregate regime comes after the clock: when a later unit
-    fails there, the case records that error beside the timing of the unit it measured, so the
+    """The per-unit check calls that score an aggregate regime come after the clock: when a later
+    unit fails there, the case records that error beside the timing of the unit it measured, so the
     measurement is retained as the validation policy asks."""
     import isb.runs
     from isb.backends.base import Backend as BaseBackend
@@ -331,8 +337,51 @@ def test_a_failure_after_the_timed_call_keeps_the_measurement(tmp_path, monkeypa
                 job=job, output=output)
     cell = contract.validate_result(output, experiment, backend_name)["cells"][0]
     assert cell["state"] == "ERROR" and "second unit" in cell["error"]
-    assert cell["error_stage"] == "aggregate"
+    assert cell["error_stage"] == "check"
     assert cell["median_latency_ms"] > 0 and cell["overhead_vs_baseline"] > 0
+
+
+def test_a_system_without_check_output_keeps_its_timed_row(tmp_path, monkeypatch):
+    """A cell whose system cannot produce what the check compares raises Unsupported from its check
+    calls only: the timed row stands, unchecked, with the reason recorded."""
+    import isb.runs
+    from isb.backends.base import Backend as BaseBackend
+    from isb.methodologies.registry import Unsupported
+
+    method, backend_name, interface = "write_only_fixture", "write-only-cpu", "write_only_sys"
+    monkeypatch.setenv("ISB_BACKEND", backend_name)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(timing, "force_gc", lambda: None)
+    monkeypatch.setattr(isb.runs, "resolve_provenance", lambda run: {
+        "engine": {"kind": run.engine.kind}, "client": {}, "host": {}, "deployment": {}})
+    monkeypatch.setattr(registry, "CELLS", dict(registry.CELLS))
+
+    @registry.cell(method, family="gpt2", backend=interface)
+    def write(be, model, units, *, depth=1, check=False):
+        if check:
+            raise Unsupported("this system writes and has no read")
+        return torch.zeros(len(units), 1, dtype=torch.long)
+
+    class Backend(BaseBackend):
+        name = interface
+
+        def load(self, repo):
+            return SimpleNamespace(config=SimpleNamespace(_commit_hash="rev"),
+                                   tokenizer=SimpleNamespace(get_vocab=lambda: {"x": 0}))
+
+    spec = CellConfig("write-only", method, "gpt2", "test/model",
+                      [ExecutionRegime("interactive", ["first prompt", "second prompt"])],
+                      [TaskSpec("write", {"depth": 2})], BaselineSpec({"depth": 1}), None,
+                      warmup=1, n_trials=2, protocol_absence_reason="CPU fixture")
+    job = tmp_path / "exp"
+    experiment = contract.prepare(spec, job)
+    output = job / backend_name
+    worker.main(lambda restored: (Backend(), RunConfig(engine=EngineConfig("vllm"))),
+                job=job, output=output)
+    cell = contract.validate_result(output, experiment, backend_name)["cells"][0]
+    assert cell["state"] == "RAN" and cell["error"] is None
+    assert cell["check_unsupported"] == "this system writes and has no read"
+    assert cell["median_latency_ms"] > 0
 
 
 @pytest.mark.parametrize("realizations", ["default", "all"])
@@ -367,6 +416,9 @@ def test_declared_alternative_realizations_run_and_score_against_the_row(tmp_pat
 
     def backend(interface):
         class Backend:
+            def between_calls(self, model):
+                pass
+
             name = interface
 
             def load(self, repo):
@@ -409,10 +461,10 @@ def test_declared_alternative_realizations_run_and_score_against_the_row(tmp_pat
     # the manager browses the alternative rows from the saved JSON
     backends = ["ref/default", "cand/default"]
     contract.write_json(run_dir / "plan.json", {
-        "version": contract.PLAN_VERSION, "experiments": ["exp"], "backends": backends,
+        "version": schema.PLAN_VERSION, "experiments": ["exp"], "backends": backends,
         "reference": "ref/default", "comparison": "correctness", "status": "completed"})
     contract.write_json(run_dir / "report.json", {
-        "version": contract.PLAN_VERSION, "run": run_dir.name, "experiments": [report]})
+        "version": schema.REPORT_VERSION, "run": run_dir.name, "experiments": [report]})
     collection = Collection(str(tmp_path))
     assert not [w for w in collection.warnings if "invalid" in w or "unavailable" in w], collection.warnings
     states = {cell.label: cell.state for cell in collection.results["attempt/exp/cand/default"]}
@@ -427,6 +479,9 @@ def test_a_model_with_a_different_layer_count_fails_the_job(tmp_path, monkeypatc
         "engine": {"kind": run.engine.kind}, "client": {}, "host": {}, "deployment": {}})
 
     class Backend:
+        def between_calls(self, model):
+            pass
+
         name = "hf"
 
         def load(self, repo):

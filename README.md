@@ -205,16 +205,16 @@ run on Delta step by step (2026-09-30).
   case and config. `--combine` then splits each profile against the default-mode plain-vLLM floor
   profiled into the same directory.
 - `scripts/audit_runs.py` checks a set of run directories before their numbers are used: every job
-  completed, one source commit, under 100 MiB in use on the job's first GPU before it started, no
-  row in a hard failure state, and, in a run that includes a `vllm-plain` config, a same-mode floor
-  (`overhead_vs_plain_vllm`) for every timed vLLM row. Rows of the `opt/taps` and `static` configs
-  have no same-mode floor, so the audit lists them as errors in such a run.
+  completed, one source commit, the reserved GPUs checked before each job, no row in a hard
+  failure state, and, in a run that includes a `vllm-plain` config, a same-mode floor
+  (`overhead_vs_plain_vllm`) for every timed vLLM row that is not `saturated`. Rows of the
+  `opt/taps` and `static` configs have no same-mode floor, so the audit lists them as errors in
+  such a run.
 - The perf microbenchmark (`scripts/perf.py`) times single operations (read, steer, Q/K) per
   system against plain vLLM. Each cell runs in its own process; `ISB_PY_<system>` selects the
   interpreter for a system's cells, for example an `apptainer exec` wrapper around its backend
   image.
-- The construct probes (`scripts/micro.py`) and the standalone executor and scorer
-  (`scripts/execute.py`, `scripts/score.py`) keep their own entrypoints and environment
+- The construct probes (`scripts/constructs.py`) keep their own entrypoint and environment
   requirements.
 
 ## Results and scoring
@@ -226,10 +226,10 @@ the saved artifacts. Select the reference explicitly with `--reference`, normall
 
 | State | Meaning |
 |---|---|
-| `RAN` | Produced an output; no comparison verdict was assigned, including reference rows |
+| `RAN` | Ran without a comparison verdict: a reference row, a run without a reference, or a timed row whose system has no check output (`check_unsupported`) |
 | `SUPPORTED` / `NUMERICAL_MISMATCH` | Meets / exceeds the selected numerical thresholds; neither establishes general correctness |
 | `UNSUPPORTED` | The system's interface cannot express the row (the cell records the reason from the system's source), or no cell is registered for the combination |
-| `INVALID_OUTPUT` | Output structure or finiteness check failed; timing is diagnostic only |
+| `INVALID_OUTPUT` | Output structure or finiteness check failed, or the timed result disagrees with the check output of the same units; timing is diagnostic only |
 | `EQUIVALENT` / `DIVERGENT` | Matches / differs under `--comparison equivalence` |
 | `ERROR` | The cell failed |
 | `NO_REFERENCE` / `INVALID_REFERENCE` | Reference output is unavailable / unsuitable for judgment |
@@ -238,8 +238,7 @@ the saved artifacts. Select the reference explicitly with `--reference`, normall
 
 The numerical oracle uses top-1 agreement and softmax total-variation distance. Batched
 correctness is checked against per-prompt reference outputs. The main runner uses the requested
-comparison policy; legacy precision-control scoring can additionally classify
-`SUPPORTED_DEGRADED`.
+comparison policy.
 
 Warm timing uses warmup plus repeated trials, CUDA synchronization, median and standard deviation.
 Reports include regime-specific throughput, overhead against a no-intervention call on the same
@@ -259,7 +258,7 @@ python scripts/manager.py --dir runs --export results.html
 
 Open `http://127.0.0.1:6688` or share the self-contained HTML export. The site reads saved JSON
 reports; it leaves tensor artifacts and scoring untouched. See
-[the result-site guide](docs/result-site.md) for legacy imports and collection management.
+[the result-site guide](docs/result-site.md) for run-file imports and collection management.
 
 ## Case descriptions and CausaLab alignment
 
@@ -291,9 +290,9 @@ isolates nested execution parameters and provenance snapshots, preparing trial c
 outside the timed interval. Cells report automatically resolved choices separately in
 `resolved_params`, preserving the original bound arguments.
 
-Readers accept job wire version 2 and coordinate schema 3; older formats must be rerun.
+Jobs are written at wire version 3 and coordinate version 4 (`isb/jobs/schema.py`); readers also accept wire version 2, report version 1 and coordinate version 3, the October and November 2026 runs. Older artifacts must be rerun.
 Correctness comparisons require matching input content, case/regime settings, baseline/effect
-configuration, and model-load options. Timing-only differences are allowed and stay recorded.
+configuration, and model-load options.
 The [current design and acceptance plan](docs/design.md#1213-current-execution-and-artifact-contract)
 defines these boundaries and the extension points for methods and independent backend workers.
 
@@ -328,20 +327,17 @@ isb/
   workloads/               a methodology's rows, data, regimes and effect check; two layer-count sweeps
   models.py                registered checkpoints: architecture, layer count, load options
   suites.py                run recipes: workloads x models, backends, reference, load patterns
-  sweep/                   spec types and shared cell execution; legacy scoring
+  sweep/                   spec types and the shared executor
   jobs/                    frozen experiments, container lifecycle and artifact scoring
   oracle/                  numerical comparison
   perf/                    timing, load patterns, the phase profiler and microbenchmarks
-  micro/                   construct probes for individual nnsight primitives
-  report/                  applicability map and performance table
+  constructs/              construct probes for individual nnsight primitives
   manager/                 saved-report browser and HTML export
 backends/                  <system>/{Dockerfile,compose.yml,configs.yml,backend.py,cells.py}; configs.yml lists the images and
                            configs; the nnsight systems have no cells.py (their cells are in isb/methodologies/)
 slurm/                     batch scripts for the Apptainer path on Slurm clusters
 scripts/                   benchmark CLI, alignment checker, manager and standalone tools
 docs/                      results, design, guides and dated records
-docker/                    the preceding shared-Compose runner; `bench.py` does not use it
-configs/                   workload files of the June 2026 prototype; no code reads them
 ```
 
 ## Documentation
@@ -370,7 +366,5 @@ was then, so names of backends, files and flags in them may no longer exist.
 | [docs/inference-benchmark-survey.md](docs/inference-benchmark-survey.md) | 2026-10-20 | Survey of how LLM serving benchmarks issue requests, used to design the load patterns |
 | [docs/benchmark-contract-validation.md](docs/benchmark-contract-validation.md) | 2026-09-10 | Validation of the execution and artifact contract |
 | [docs/runner-validation.md](docs/runner-validation.md) | 2026-09-08 | Validation of the independent backend runner |
-| [docs/docker-validation.md](docs/docker-validation.md) | 2026-09-08 | Validation of the preceding shared-Compose runner |
-| [docker/README.md](docker/README.md) | 2026-06-12, last changed 2026-10-13 | How to use the preceding shared-Compose runner |
-| [docs/agents-and-the-primitive-model.md](docs/agents-and-the-primitive-model.md), [docs/drafts/](docs/drafts/) | 2026-06-11, 2026-06-12 | Design explorations folded into the design document |
+| [docs/drafts/](docs/drafts/) | 2026-06-12 | Design drafts folded into the design document; Part 1 of the revision is evidence the design cites |
 | [docs/finding-batched-position-ids.md](docs/finding-batched-position-ids.md) | 2026-06-08 | nnsight batched traces on padded prompts of absolute-position models |

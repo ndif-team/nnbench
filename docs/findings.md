@@ -199,9 +199,9 @@ that vLLM cannot do. → `isb/methodologies/attribution_patching.py`, `isb/backe
 
 ## Micro tier — Level 0/1 primitive probes, GPT-2, HF vs vLLM-async (2026-06-11)
 
-One minimal probe per previously-UNTESTED inventory row (design.md §3.7; `isb/micro/`,
-`scripts/micro.py`), each with a self-contained denotation check. Full maps in
-`results/micro_{hf,vllm_async}.txt`. **Refined 2026-06-11** after the per-construct root-cause
+One minimal probe per previously-UNTESTED inventory row (design.md §3.7; `isb/constructs/`,
+`scripts/constructs.py`), each with a self-contained denotation check. The statuses are the construct rows
+of `docs/interp-methods-catalog.md`. **Refined 2026-06-11** after the per-construct root-cause
 diagnosis (nnsight `docs/developing/vllm-construct-gaps.md`; all construct failures verified
 identical on vllm 0.19.1 and 0.15.1): iteration split by realization (bounded/unbounded) and
 session split by flow (saved/un-saved). **HF: 13/13 SUPPORTED** (all checks exact or ≤1e-3
@@ -229,7 +229,7 @@ Boundary `.input`, engine `logits`/`samples`, derived head/neuron views, and non
 is plain Python, so `.source` rewriting works there; reading attention weights stays the only
 absent internal site. Gotcha: the client-side envoy is the META model — a reconstruction that
 touches `.weight` must run INSIDE the trace (in the worker), else `Cannot copy out of meta tensor`.
-→ `isb/micro/probes.py` (`derived_head_vllm`).
+→ `isb/constructs/probes.py` (`derived_head_vllm`).
 
 ### Unbounded `tracer.iter[:]` drops all saves on vLLM; bounded slices work
 The documented multi-token idiom (`for step in tracer.iter[:]: rows.append(model.logits)` —
@@ -241,7 +241,7 @@ Root cause (diagnosed upstream, nnsight `docs/developing/vllm-construct-gaps.md`
 path never sets a stop bound, so the loop overruns the last step, blocks, and is unwound by
 `Cancelation` before the body's single final `push()` — the only thing that publishes saves.
 Blocks the generation-time workload class on vLLM until fixed; the bounded realization is the
-working recipe meanwhile. → `isb/micro/probes.py` (`_iter_vllm`).
+working recipe meanwhile. → `isb/constructs/probes.py` (`_iter_vllm`).
 
 ### Barrier on vLLM: loud on async, SILENT on the sync engine
 The cross-invoke barrier patch (HF: matches the two-trace patch exactly) fails on vLLM with a
@@ -353,7 +353,7 @@ in-frame (HF's access pattern), so the backend mirrors `hf.py` with vLLM module 
 (`model.logits`/`.samples`, `_untuple`, RowParallelLinear, greedy sampling kwargs) — no async drain.
 The full micro tier (13 probes, parity with async) and all 7 method cells run on it; the micro tier
 gains an `EXPECTED` baseline map + a SURPRISE column (the regression detector,
-`isb/micro/{probes,run}.py`).
+`isb/constructs/{probes,run}.py`).
 
 The maps below were measured on the nnsight `vllm-construct-bugs` fix branch (vLLM 0.19.1), where the
 sync-engine construct-gaps (barrier, session, unbounded-iter — the iteration / barrier / session
@@ -390,7 +390,7 @@ goes ERROR→SUPPORTED. `session_unsaved` surfaces the real `NameError` naming t
 instead of the pre-fix misleading `UnboundLocalError`. These are sync-side fixes — on async the same
 probes stay ERROR (barrier and session are fixed only on sync; re-confirmed — only unbounded-iter
 flips on async).
-→ `isb/backends/vllm_sync.py`, `isb/micro/probes.py` (sync probes + `EXPECTED`), `isb/micro/run.py`.
+→ `isb/backends/vllm_sync.py`, `isb/constructs/probes.py` (sync probes + `EXPECTED`), `isb/constructs/run.py`.
 
 ### The write × unbounded-iteration composition holds on sync once iter is fixed; other cells are engine-mode-independent
 gen_steering's unbounded `iter[:]` realization (per-step steering write inside the unbounded decode
@@ -403,7 +403,7 @@ confirming those mechanisms are engine-WIDE, not engine-MODE-specific. The dtype
 fresh fp32 **sync** engine (`_fp32_rerun` is backend-aware), so the SUPPORTED_DEGRADED verdicts are
 validated on the same mode. Caveat: run **one spec per process** for vLLM (repeated EngineCore
 `spawn`s leak semaphores within a single process — the project's standing convention, see the
-`scripts/micro.py` header); `--spec all` in one process is not the supported path for vLLM.
+`scripts/constructs.py` header); `--spec all` in one process is not the supported path for vLLM.
 → `isb/methodologies/*` (vllm_sync cells), `isb/sweep/driver.py`, `isb/specs/*` (sync `expected`).
 
 ### Sync batched (per-prompt multi-invoke): SUPPORTED where HF's padded batch is SILENTLY_WRONG
@@ -526,10 +526,10 @@ write `(hs, *out[1:])` hands the next module a tuple
 
 Two micro probes carried the tuple assumption and mis-scored this client (scan compared against a
 hardcoded batched shape; barrier indexed and wrote through [0]): fixed by normalizing through
-`_hidden`/`_with_hidden` in `isb/micro/probes.py`, after which all 13 hf probes pass (scan
+`_hidden`/`_with_hidden` in `isb/constructs/probes.py`, after which all 13 hf probes pass (scan
 matches the traced shape; barrier patch equals the two-trace patch, top1=1.00 tv=0.000). The
 method cells were unaffected: their reads already normalize the wrapper.
-→ `scripts/repro_output_wrapper.py` (repro), `isb/micro/probes.py` (probe fix).
+→ `scripts/repro_output_wrapper.py` (repro), `isb/constructs/probes.py` (probe fix).
 
 ## Method tier — the gradient class: DAS training and jacobian collection, GPT-2, HF vs vLLM-async (2026-08-20)
 

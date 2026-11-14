@@ -2,15 +2,19 @@
 Family-generic; the profile `m` says where the blocks, norm and head live. `unembed` selects the
 projection: the model's head module (HF), vLLM's `logits_processor` (whole under tensor
 parallelism) or a matmul with the head weight (this rank's slice under TP). `residual` selects the
-stream read on vLLM's fused-residual families (`fused` = hidden + residual)."""
+stream read on vLLM's fused-residual families (`fused` = hidden + residual). A timed call returns
+the lens logits in the dtype the model computes them, a check call in fp32."""
 from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
 
+from ..oracle.checks import read_matches, timed_check_of
 from ..profiles import _resid
 from .observations import record_resolved
 from .registry import cell
+
+timed_check_of("logit_lens")(read_matches)
 
 
 def _lens_proxy(blocks, norm, head, *, layers, unembed, last_fn, residual="plain", processor=None):
@@ -32,19 +36,21 @@ def _lens_proxy(blocks, norm, head, *, layers, unembed, last_fn, residual="plain
 
 
 @cell("logit_lens", family="*", backend="hf", realizations=[{"unembed": "weight"}])
-def logit_lens_hf(be, model, m, units, *, layers="all", unembed="module", residual="plain"):
+def logit_lens_hf(be, model, m, units, *, layers="all", unembed="module", residual="plain",
+                  check=False):
     def build(rows):
         return _lens_proxy(m.blocks(model), m.norm(model), m.head(model), layers=layers,
                            unembed=unembed, last_fn=be.last, residual=residual)
 
-    return be.run(model, units, build)
+    return be.run(model, units, build, keep_dtype=not check)
 
 
 # alternatives: the weight-matmul unembed (a rank slice under TP) and the plain-residual read, the
 # naive port that drops the accumulated residual on fused-residual families
 @cell("logit_lens", family="*", backend="vllm_async",
       realizations=[{"unembed": "weight"}, {"residual": "plain"}])
-def logit_lens_vllm(be, model, m, units, *, layers="all", unembed="logits_processor", residual=None):
+def logit_lens_vllm(be, model, m, units, *, layers="all", unembed="logits_processor", residual=None,
+                    check=False):
     residual = residual if residual is not None else m.default_residual(be.name)
     record_resolved(residual=residual)
 
@@ -53,4 +59,4 @@ def logit_lens_vllm(be, model, m, units, *, layers="all", unembed="logits_proces
                            unembed=unembed, last_fn=be.last, residual=residual,
                            processor=m.logits_processor(model))
 
-    return be.run(model, units, build)
+    return be.run(model, units, build, keep_dtype=not check)

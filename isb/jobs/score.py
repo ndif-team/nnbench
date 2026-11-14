@@ -6,8 +6,9 @@ import math
 import re
 from pathlib import Path
 
-from .contract import PLAN_VERSION, read_experiment, unpack, validate_result, write_json
-from isb.sweep.spec import reference_key
+from .contract import read_experiment, unpack, validate_result, write_json
+from .schema import REPORT_VERSION, latency_ratio
+from isb.sweep.spec import reference_key, regime_kind
 from isb.validation import POLICY_VERSION, performance_eligible
 
 
@@ -18,7 +19,7 @@ def _load(directory, experiment, backend):
     if execution["status"] != "completed":
         raise ValueError("job did not complete successfully")
     result = validate_result(directory, experiment, backend)
-    artifact = torch.load(directory / "result.pt", map_location="cpu", weights_only=False)
+    artifact = torch.load(directory / "result.pt", map_location="cpu", weights_only=True)
     if artifact["provenance"].get("job", {}).get("experiment_id") != experiment["id"]:
         raise ValueError("tensor artifact has a different experiment identity")
     return result, artifact, execution
@@ -74,52 +75,52 @@ def engine_run(log):
             "tensor_parallel_size": tp}
 
 
-def _floor_key(run, workload):
+def _floor_key(run, regime):
     return (run["vllm"], run["torch_compile"], run["cuda_graphs"], run["tensor_parallel_size"],
-            workload)
+            regime)
 
 
 def attach_plain_vllm(rows, results):
     """Whole-system overhead: each timed row on a vLLM engine is divided by the no-intervention
     request of a plain-vLLM job whose engine ran the same vLLM version, torch.compile on or off,
-    CUDA graphs on or off and tensor-parallel size, on the same workload. A plain job is one whose
-    provenance declares engine mode "plain"; its `__vanilla__` record is the latency. The mode is
+    CUDA graphs on or off and tensor-parallel size, in the same regime. A plain job is one whose
+    provenance declares engine mode "plain"; its `__vanilla__` record is the floor. The mode is
     what each engine ran (`engine_run`, from the job's own log), so an eager system's ratio does not
     absorb the CUDA-graph gap, and a system running CUDA graphs without torch.compile, which no
     plain vLLM config runs, gets no `overhead_vs_plain_vllm`. Every row whose mode is not vLLM's
     default (torch.compile and CUDA graphs) also gets `overhead_vs_plain_vllm_default`, against the
     default engine at the same version and tensor-parallel size: the cost a user pays relative to
-    plain vLLM as shipped. `results` maps backend -> {"provenance", "auxiliary_calls",
-    "engine_run"}; a job without an engine run (an HF job, an older log) matches nothing."""
+    plain vLLM as shipped. A ratio is None where either record is saturated (isb/jobs/schema.py).
+    `results` maps backend -> {"provenance", "auxiliary_calls", "engine_run"}; a job without an
+    engine run (an HF job, an older log) matches nothing."""
     plain = {}
     for backend, result in results.items():
         run = result["engine_run"]
         if result["provenance"].get("engine", {}).get("mode") != "plain" or run is None:
             continue
         for call in result.get("auxiliary_calls", []):
-            role, workload = call["key"]
-            latency = call["record"].get("median_latency_ms")
-            if role == "__vanilla__" and latency:
-                key = _floor_key(run, workload)
+            role, regime = call["key"]
+            if role == "__vanilla__" and call["record"].get("median_latency_ms"):
+                key = _floor_key(run, regime)
                 if key in plain:
                     raise ValueError(f"plain-vLLM jobs {plain[key][0]} and {backend} ran the same "
                                      f"engine mode {key}; keep one floor per mode")
-                plain[key] = (backend, latency)
+                plain[key] = (backend, call["record"])
     for row in rows:
         result = results.get(row["backend"])
         if result is None or result["engine_run"] is None or row.get("median_latency_ms") is None:
             continue
         run = result["engine_run"]
         row["engine_run"] = run
-        match = plain.get(_floor_key(run, row.get("workload")))
+        match = plain.get(_floor_key(run, row.get("regime")))
         if match:
-            row.update(plain_vllm=match[0], plain_vllm_ms=match[1],
-                       overhead_vs_plain_vllm=row["median_latency_ms"] / match[1])
+            row.update(plain_vllm=match[0], plain_vllm_ms=match[1]["median_latency_ms"],
+                       overhead_vs_plain_vllm=latency_ratio(row, match[1]))
         shipped = {**run, "torch_compile": True, "cuda_graphs": True}
-        default = plain.get(_floor_key(shipped, row.get("workload")))
+        default = plain.get(_floor_key(shipped, row.get("regime")))
         if run != shipped and default:
-            row.update(plain_vllm_default=default[0], plain_vllm_default_ms=default[1],
-                       overhead_vs_plain_vllm_default=row["median_latency_ms"] / default[1])
+            row.update(plain_vllm_default=default[0], plain_vllm_default_ms=default[1]["median_latency_ms"],
+                       overhead_vs_plain_vllm_default=latency_ratio(row, default[1]))
 
 
 def attach_worker_memory(rows, results):
@@ -134,7 +135,7 @@ def attach_worker_memory(rows, results):
             if role == "__vanilla__" and peak is not None:
                 vanilla[(backend, regime)] = peak
     for row in rows:
-        base = vanilla.get((row["backend"], row.get("workload")))
+        base = vanilla.get((row["backend"], row.get("regime")))
         if base is not None and row.get("worker_peak_mem_mb_max") is not None:
             row.update(worker_peak_mem_mb_vanilla=base,
                        worker_peak_mem_delta_mb=round(row["worker_peak_mem_mb_max"] - base, 1))
@@ -142,7 +143,7 @@ def attach_worker_memory(rows, results):
 
 def score_experiment(directory, backends, reference=None, comparison="correctness"):
     import torch
-    from isb.oracle.equivalence import compare, is_equivalent
+    from isb.oracle.checks import check_for
 
     if comparison not in {"correctness", "equivalence"}:
         raise ValueError("unknown comparison policy")
@@ -170,14 +171,20 @@ def score_experiment(directory, backends, reference=None, comparison="correctnes
         spec = unpack(experiment["spec"])
         for cell in result["cells"]:
             row = {"backend": backend, **cell}
-            key = (cell["workload"], cell["label"])
-            if cell["state"] != "RAN":
+            key = (cell["regime"], cell["label"])
+            # a timed row whose system has no check output keeps its timing, unchecked
+            if cell["state"] != "RAN" or cell.get("check_unsupported"):
                 rows.append(row)
                 continue
             actual = artifact["outputs"].get(key)
             if (not isinstance(actual, torch.Tensor) or not actual.numel()
                     or not torch.isfinite(actual).all()):
                 row.update(state="INVALID_OUTPUT", error="missing, empty or nonfinite tensor output")
+                rows.append(row)
+                continue
+            if not cell.get("timed_check", {"passed": True})["passed"]:
+                row.update(state="INVALID_OUTPUT",
+                           error="the timed result disagrees with the check output of the same units")
                 rows.append(row)
                 continue
             if reference is None or backend == reference:
@@ -196,7 +203,7 @@ def score_experiment(directory, backends, reference=None, comparison="correctnes
                 effect = ref[1]["outputs"].get(("__meta__",), {}).get(("__effect__", key[0]))
                 if expected is None:
                     row["state"] = "NO_REFERENCE"
-                elif (spec["effect"] and key[0] in {"interactive", "generation"}
+                elif (spec["effect"] and regime_kind(key[0]).effect
                       and (not effect or not effect.get("strong"))):
                     row.update(state="INVALID_REFERENCE", error="missing or weak intervention effect")
                 elif not isinstance(expected, torch.Tensor):
@@ -215,10 +222,12 @@ def score_experiment(directory, backends, reference=None, comparison="correctnes
                         row.update(state="INVALID_OUTPUT",
                                    error="shape mismatch or empty/nonfinite output")
                     else:
-                        metrics = compare(expected, actual)
+                        case = {"regime": key[0], "label": row_label,
+                                "reference": ref[1]["outputs"], "candidate": artifact["outputs"]}
+                        passed, metrics = check_for(spec["methodology"])(expected, actual, case)
                         good, bad = (("SUPPORTED", "NUMERICAL_MISMATCH") if comparison == "correctness"
                                      else ("EQUIVALENT", "DIVERGENT"))
-                        row.update(state=good if is_equivalent(metrics) else bad, metrics=metrics)
+                        row.update(state=good if passed else bad, metrics=metrics)
             rows.append(row)
     calls = {backend: {"provenance": artifact["provenance"],
                        "auxiliary_calls": result.get("auxiliary_calls", []),
@@ -244,12 +253,12 @@ def score_run(directory):
     reports = [score_experiment(directory / "experiments" / name, plan["backends"],
                                 plan["reference"], plan["comparison"])
                for name in plan["experiments"]]
-    report = {"version": PLAN_VERSION, "run": directory.name, "experiments": reports,
+    report = {"version": REPORT_VERSION, "run": directory.name, "experiments": reports,
               "not_applicable": plan.get("not_applicable", [])}
     write_json(directory / "report.json", report)
     for experiment in reports:
         for row in experiment["cells"]:
-            print(f"{experiment['spec']} | {row['backend']} | {row.get('workload', '-')} | "
+            print(f"{experiment['spec']} | {row['backend']} | {row.get('regime', '-')} | "
                   f"{row.get('label', '-')} | {row['state']}")
     for row in report["not_applicable"]:
         print(f"{row['case']} | - | - | {row['label']} | NOT_APPLICABLE ({row['reason']})")

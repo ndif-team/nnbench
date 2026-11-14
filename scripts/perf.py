@@ -10,10 +10,10 @@ Two modes:
                            vllm-hook / nnsight never share an interpreter; vLLM EngineCore uses
                            spawn).
 
-Each cell runs in its own conda env (per-system, see _SYSTEM_ENV). The sweep launcher can be any
-python that imports isb.perf.core; each cell subprocess is launched with its system's env python.
-Example:
-  CUDA_VISIBLE_DEVICES=5 /disk/u/zikai/anaconda3/envs/nnsight-vllm/bin/python scripts/perf.py sweep \
+Each cell subprocess runs under ISB_PY_<system> (for example a wrapper around `apptainer exec` on
+the system's backend image), else under the launcher's own interpreter. The auto-registering
+plugins (vLLM-Lens, vLLM-Hook) must not share an interpreter with the other systems. Example:
+  CUDA_VISIBLE_DEVICES=5 ISB_PY_vllm_lens=/path/to/lens-python python scripts/perf.py sweep \
       --plan plans/read_footprint_qwen.json --name perf-read-qwen
 """
 from __future__ import annotations
@@ -34,27 +34,10 @@ from isb.perf.core import Config, ROW_CFG_FIELDS, attach_overhead, row_from  # n
 
 _PREFIX = "RESULT_JSON "
 
-# Per-system env python + extra env vars (machine defaults; override via ISB_PY_<system>=/path).
-# The auto-registering plugins (vllm-lens / vllm-hook) must run in isolated envs; nnsight / pure /
-# native share nnsight-vllm (nnsight is opt-in import, no auto-registration). The worker puts isb on
-# sys.path itself, so the env python does not need interp-serve-bench installed.
-# nnsight_vllm carries NO PYTHONPATH override: it measures the env's own editable nnsight, the
-# same stack every vllm run in the correctness corpus records in its provenance.
-_ENVS = "/disk/u/zikai/anaconda3/envs"
-_SYSTEM_ENV: dict[str, tuple[str, dict]] = {
-    "nnsight_vllm": (f"{_ENVS}/nnsight-vllm/bin/python", {}),
-    "pure_vllm":    (f"{_ENVS}/nnsight-vllm/bin/python", {}),
-    "native_eagle": (f"{_ENVS}/nnsight-vllm/bin/python", {}),
-    "vllm_lens":    (f"{_ENVS}/bench-vllm-lens/bin/python", {}),
-    "vllm_hook":    (f"{_ENVS}/bench-vllm-hook/bin/python", {}),
-}
-
-
-def _env_for(system: str) -> tuple[str, dict]:
-    """(python, extra_env) for a system. ISB_PY_<system> overrides the python; unmapped systems
-    (e.g. the _echo test stub) fall back to the current interpreter so tests run without the envs."""
-    py, extra = _SYSTEM_ENV.get(system, (sys.executable, {}))
-    return os.environ.get(f"ISB_PY_{system}", py), extra
+def _python_for(system: str) -> str:
+    """The interpreter a system's cells run under: ISB_PY_<system>, else this one. The worker puts
+    isb on sys.path itself, so that interpreter does not need this repository installed."""
+    return os.environ.get(f"ISB_PY_{system}", sys.executable)
 
 
 def _error_row(cfg: Config, msg: str) -> dict:
@@ -76,21 +59,16 @@ def worker(cfg: Config) -> None:
 
 
 def _run_cell(cfg: Config) -> dict:
-    py, extra = _env_for(cfg.system)
+    py = _python_for(cfg.system)
     if not os.path.exists(py):
         return _error_row(cfg, f"env python not found for {cfg.system!r}: {py} "
                                f"(set ISB_PY_{cfg.system}=/path/to/python)")
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         f.write(cfg.to_json())
         cfgfile = f.name
-    env = os.environ.copy()
-    for k, v in extra.items():
-        # prepend so dev nnsight (PYTHONPATH) shadows the env's editable install
-        env[k] = v + os.pathsep + env[k] if (k == "PYTHONPATH" and env.get(k)) else v
     cmd = [py, str(Path(__file__).resolve()), "worker", "--config-file", cfgfile]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=cfg.timeout_s, env=env)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg.timeout_s)
     except subprocess.TimeoutExpired:
         # HANG: the stuck process cannot be trusted; one-process-per-cell means its exit reclaims GPU.
         return _error_row(cfg, f"HANG > {cfg.timeout_s:.0f}s")
@@ -120,7 +98,7 @@ def _write_run_file(plan: list[Config], rows: list[dict], run_dir: str, name: st
         spec=name, methodology="perf_micro", family="-",
         repo=", ".join(sorted({c.repo for c in plan})), interface="perf",
         cases=[{"label": r["cell"]} for r in rows])
-    prov["perf_envs"] = {s: _env_for(s)[0] for s in sorted({c.system for c in plan})}
+    prov["perf_envs"] = {s: _python_for(s) for s in sorted({c.system for c in plan})}
     return save_run(run_dir, name, {("perf_rows",): rows, ("__meta__",): {}}, prov)
 
 

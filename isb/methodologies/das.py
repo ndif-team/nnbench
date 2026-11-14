@@ -3,9 +3,11 @@ rotated subspace at (layer, last position). `train=0` applies a seeded orthogona
 same matrix on every backend); `train=N` fits the rotation with N AdamW steps over `batch` pairs
 each (`be.train_patch`, whose backward crosses the frozen model: HF runs it, vLLM's inference-mode
 activations refuse it). The cell consumes the whole labeled-unit list as one job inside one
-`be.session`: it trains on all but the last `heldout` units and returns their patched final logits
-`[heldout, vocab]`, evaluated in one patch call over the held-out units. In train mode the fitted
-rotation's held-out interchange accuracy must beat the seeded rotation's, else the cell raises."""
+`be.session`: it trains on all but the last `heldout` units and returns their patched greedy next
+tokens `[heldout, 1]`, evaluated in one patch call over the held-out units; a check call returns
+their patched final logits `[heldout, vocab]` instead. In train mode a check call also measures the
+seeded rotation's held-out interchange accuracy before training, and the fitted rotation's must
+beat it, else the cell raises."""
 from __future__ import annotations
 
 import functools
@@ -13,10 +15,14 @@ import functools
 import torch
 import torch.nn.functional as F
 
+from ..oracle.checks import timed_check_of, tokens_match
 from ..profiles import _resid
+from .jacobian_lens import orthogonal
 from .observations import record_resolved
-from .readout import final_logits
+from .readout import engine_copies, final_logits, moved, next_token
 from .registry import cell
+
+timed_check_of("das")(tokens_match)
 
 
 def _d_model(model):
@@ -24,11 +30,6 @@ def _d_model(model):
         if hasattr(model.config, name):
             return getattr(model.config, name)
     raise ValueError(f"cannot resolve d_model from config {type(model.config).__name__}")
-
-
-def _seeded_orthogonal(d: int, seed: int) -> torch.Tensor:
-    g = torch.Generator().manual_seed(seed)
-    return torch.linalg.qr(torch.randn(d, d, generator=g))[0].contiguous()
 
 
 def _rows(h):
@@ -43,16 +44,26 @@ def _capture_last(blocks, layer, residual):
         return _rows(h)[:, -1, :].clone()
 
 
-def _interchange_read(blocks, model, head, *, layer, src, R, k, residual, grad, site):
-    """Rotated interchange at (layer, last position) of every row, then the patched run's final
-    logits `[B, vocab]`. `grad=True` keeps the graph alive for a loss on the logits."""
+@functools.lru_cache(maxsize=4)
+def _rotation(d, seed):
+    """The seeded rotation in row-major layout, as DAS multiplies it, built once per (d, seed).
+    Callers must not modify it."""
+    return orthogonal(d, seed).contiguous()
+
+
+def _interchange_read(blocks, model, head, *, layer, src, R, k, residual, grad, site,
+                      read=final_logits, copies=None):
+    """Rotated interchange at (layer, last position) of every row, then the patched run's
+    `read(model, head, site)`: its final logits `[B, vocab]` or its next tokens `[B, 1]`.
+    `grad=True` keeps the graph alive for a loss on the logits. `R` moves onto the stream's device
+    once per call, or once per loaded engine with `copies` (`engine_copies`)."""
     ctx = torch.enable_grad() if grad else torch.no_grad()
     with ctx:
         out = blocks[layer].output
         is_tuple = isinstance(out, tuple)
         stream = _resid(out, residual)
         rows = _rows(stream)
-        Rd = R.to(device=rows.device, dtype=rows.dtype)
+        Rd = moved(R, rows, {} if copies is None else copies)
         rot = rows[:, -1, :] @ Rd
         rot_src = src.to(device=rows.device, dtype=rows.dtype).reshape(-1, Rd.shape[0]) @ Rd
         mixed = torch.cat([rot_src[:, :k], rot[:, k:]], dim=-1)
@@ -63,17 +74,22 @@ def _interchange_read(blocks, model, head, *, layer, src, R, k, residual, grad, 
             blocks[layer].output = (new - out[1], *out[1:])
         else:
             blocks[layer].output = (new, *out[1:]) if is_tuple else new
-        return final_logits(model, head, site)
+        return read(model, head, site)
 
 
-def _das_cell(be, model, m, units, *, layer, k, train, batch, heldout, lr, seed, residual, site):
+def _das_cell(be, model, m, units, *, layer, k, train, batch, heldout, lr, seed, residual, site,
+              check):
     if len(units) <= heldout:
         raise ValueError(f"need more than heldout={heldout} units, got {len(units)}")
     if batch < 1:
         raise ValueError(f"batch must be >= 1, got {batch}")
     train_units, eval_units = units[:-heldout], units[-heldout:]
     blocks, head = m.blocks(model), m.head(model)
-    R = torch.nn.Parameter(_seeded_orthogonal(_d_model(model), seed))
+    R = _rotation(_d_model(model), seed)
+    if train:
+        R = torch.nn.Parameter(R.clone())          # the fit trains its own copy
+    # the constant rotation goes to the GPU once on HF, whose trace runs in this process
+    copies = engine_copies(be) if site == "head" and not train else None
 
     def answer_id(unit):
         """First token of the corrupted prompt's answer, with no special prefix (Llama-3's BOS)."""
@@ -82,19 +98,23 @@ def _das_cell(be, model, m, units, *, layer, k, train, batch, heldout, lr, seed,
     def capture():
         return _capture_last(blocks, layer, residual)
 
+    read = final_logits if check else next_token
+
     def apply_fn(src):
         """The interchange read with the current rotation, no graph."""
-        return _interchange_read(blocks, model, head, layer=layer, src=src, R=R.detach(), k=k,
-                                 residual=residual, grad=False, site=site)
+        return _interchange_read(blocks, model, head, layer=layer, src=src,
+                                 R=R.detach() if train else R, k=k, residual=residual,
+                                 grad=False, site=site, read=read, copies=copies)
 
     def evaluate():
-        """The held-out units' patched final logits `[heldout, vocab]`, corrupted runs as sources."""
+        """The held-out units' patched next tokens `[heldout, 1]` (final logits `[heldout, vocab]`
+        in a check call), corrupted runs as sources."""
         return be.patch(model, [u[1] for u in eval_units], [u[0] for u in eval_units],
-                        capture=capture, patch=apply_fn)
+                        capture=capture, patch=apply_fn, keep_dtype=not check)
 
     def iia():
         """Interchange accuracy on the held-out units (patched top-1 == counterfactual answer), and
-        the logits it was measured on."""
+        the logits it was measured on. Check calls only."""
         logits = evaluate()
         answers = torch.tensor([answer_id(u) for u in eval_units])
         return (logits.argmax(-1) == answers).float().mean().item(), logits
@@ -108,7 +128,8 @@ def _das_cell(be, model, m, units, *, layer, k, train, batch, heldout, lr, seed,
 
     def fit():
         if train:
-            iia_seeded, _ = iia()
+            if check:
+                iia_seeded, _ = iia()
             opt = torch.optim.AdamW([R], lr=lr)
             for i in range(train):
                 step_units = [train_units[(i * batch + j) % len(train_units)] for j in range(batch)]
@@ -118,6 +139,8 @@ def _das_cell(be, model, m, units, *, layer, k, train, batch, heldout, lr, seed,
                                step=functools.partial(step, targets=targets, count=len(step_units)))
                 opt.step()
                 opt.zero_grad()
+            if not check:
+                return evaluate()
             iia_trained, logits = iia()
             if iia_trained <= iia_seeded:
                 raise RuntimeError(
@@ -131,15 +154,17 @@ def _das_cell(be, model, m, units, *, layer, k, train, batch, heldout, lr, seed,
 
 @cell("das", family="*", backend="hf")
 def das_hf(be, model, m, units, *, layer=6, k=64, train=0, batch=16, heldout=8,
-           lr=1e-3, seed=0, residual="plain"):
+           lr=1e-3, seed=0, residual="plain", check=False):
     return _das_cell(be, model, m, units, layer=layer, k=k, train=train, batch=batch,
-                     heldout=heldout, lr=lr, seed=seed, residual=residual, site="head")
+                     heldout=heldout, lr=lr, seed=seed, residual=residual, site="head",
+                     check=check)
 
 
 @cell("das", family="*", backend="vllm_async", realizations=[{"residual": "plain"}])
 def das_vllm(be, model, m, units, *, layer=6, k=64, train=0, batch=16, heldout=8,
-             lr=1e-3, seed=0, residual=None):
+             lr=1e-3, seed=0, residual=None, check=False):
     residual = residual if residual is not None else m.default_residual(be.name)
     record_resolved(residual=residual)
     return _das_cell(be, model, m, units, layer=layer, k=k, train=train, batch=batch,
-                     heldout=heldout, lr=lr, seed=seed, residual=residual, site="engine")
+                     heldout=heldout, lr=lr, seed=seed, residual=residual, site="engine",
+                     check=check)

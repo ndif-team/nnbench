@@ -24,7 +24,6 @@ from isb.methodologies.gen_patching import (  # noqa: E402
     _inject_transplant,
 )
 from isb.methodologies.registry import CELLS, get_cell  # noqa: E402
-from isb.states import AppState  # noqa: E402
 from isb.sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime  # noqa: E402
 
 HID, VOCAB = 4, 8
@@ -35,12 +34,12 @@ class _Block:
         self.output = out
 
 
-def test_cells_registered_and_serve_falls_back():
+def test_cells_registered_and_sync_falls_back():
     # family-generic (§12.8): registered once under family="*", resolved per profiled family
     assert ("gen_patching", "*", "hf") in CELLS
     assert ("gen_patching", "*", "vllm_async") in CELLS
-    # serve reuses the in-process vLLM cell: same underlying generic fn behind the profile-bound wrapper
-    assert get_cell("gen_patching", "gpt2", "vllm_serve").__wrapped__ is CELLS[
+    # the sync engine reuses the async vLLM cell: same generic fn behind the profile-bound wrapper
+    assert get_cell("gen_patching", "gpt2", "vllm_sync").__wrapped__ is CELLS[
         ("gen_patching", "*", "vllm_async")]
 
 
@@ -107,28 +106,32 @@ class _PatchModel:
         self.lm_head = _Head()
         self.lm_head.output = torch.zeros(1, 4, VOCAB)
         self.logits = torch.zeros(4, VOCAB)
+        self.samples = torch.zeros(1, 1, dtype=torch.long)
 
 
 class _PatchBackend:
+    def between_calls(self, model):
+        pass
+
     """Fake generate_patch / generate: record args and drive the closures like the real loops."""
     name = "vllm_async"
 
     def __init__(self):
         self.calls = []
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False):
         self.calls.append({"kind": "generate", "prompts": prompts,
                            "new_tokens": new_tokens, "bounded": bounded})
         rows = [build_step(step) for step in range(new_tokens)]
-        return torch.stack([r.detach().float().cpu() for r in rows], dim=0)
+        return torch.stack([r.detach() if keep_dtype else r.detach().float() for r in rows], dim=0)
 
     def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
-                       *, new_tokens, bounded=True):
+                       *, new_tokens, bounded=True, keep_dtype=False):
         self.calls.append({"kind": "generate_patch", "sources": source_prompts,
                            "bases": base_prompts, "new_tokens": new_tokens, "bounded": bounded})
         clean = capture()                                # one capture, like trace 1
         rows = [build_step(clean, step) for step in range(new_tokens)]
-        return torch.stack([r.detach().float().cpu() for r in rows], dim=0)
+        return torch.stack([r.detach() if keep_dtype else r.detach().float() for r in rows], dim=0)
 
 
 def test_patched_cell_captures_then_injects():
@@ -140,7 +143,7 @@ def test_patched_cell_captures_then_injects():
     assert c["kind"] == "generate_patch"
     assert c["sources"] == ["clean prompt"] and c["bases"] == ["corrupt prompt"]
     assert c["new_tokens"] == 4 and c["bounded"] is False       # bound="unbounded" -> bounded=False
-    assert out.shape == (4, 1, VOCAB)
+    assert out.shape == (4, 1, 1) and out.dtype == torch.long   # timed: each step's greedy token
     # the capture (layer-0 residual) was injected at the fake prefill (whole-tuple replace)
     assert torch.equal(model.transformer.h[0].output[0], torch.zeros(3, HID))
 
@@ -168,14 +171,18 @@ def test_baseline_cell_uses_generate_with_no_capture():
     out = fn(be, model, [("clean", "corrupt")], layer=0, bound="bounded", new_tokens=3, patch=False)
     assert be.calls[0]["kind"] == "generate"                    # baseline path, no transplant
     assert be.calls[0]["prompts"] == ["corrupt"]                # the corrupted run alone
-    assert out.shape == (3, 1, VOCAB)
+    assert out.shape == (3, 1, 1)
 
 
-def test_vllm_cell_reads_engine_logits_site():
+def test_vllm_cell_reads_engine_samples_timed_and_engine_logits_checked():
     be, model = _PatchBackend(), _PatchModel(prompt_len=3)
     fn = get_cell("gen_patching", "gpt2", "vllm_async")
+    model.samples = torch.tensor([[5]])
     out = fn(be, model, [("clean", "corrupt")], layer=0, bound="bounded", new_tokens=2, patch=True)
     assert be.calls[0]["kind"] == "generate_patch"
+    assert torch.equal(out, torch.tensor([[[5]], [[5]]]))         # model.samples per step
+    out = fn(be, model, [("clean", "corrupt")], layer=0, bound="bounded", new_tokens=2, patch=True,
+             check=True)
     assert out.shape == (2, 1, VOCAB)                            # reads model.logits[-1:, :]
 
 
@@ -198,6 +205,9 @@ def _fake_get_cell(methodology, family, backend):
 
 
 class _FakeBackend:
+    def between_calls(self, model):
+        pass
+
     def load(self, repo):
         return "model"
 
@@ -205,13 +215,12 @@ class _FakeBackend:
         pass
 
 
-def test_generation_pair_sweep_oracle_and_effect():
+def test_generation_pair_sweep_records_throughput_and_effect():
     import tempfile
 
     from isb.runfile import load_run
     from isb.runs import EngineConfig, RunConfig
     from isb.sweep.execute import execute_run
-    from isb.sweep.score import score_runs
 
     spec = CellConfig(
         name="fake_gp", methodology="m", family="fam", repo="repo://x",
@@ -241,14 +250,11 @@ def test_generation_pair_sweep_oracle_and_effect():
             execute_mod.get_cell, execute_mod.make_backend, execute_mod.resolve_provenance = orig
 
     with tempfile.TemporaryDirectory() as d:
-        execute_fake(d, "hf", "transformers")
         execute_fake(d, "vllm", "vllm")
-        cells = score_runs(spec, d, "vllm", "hf", quiet=True)
-        meta = load_run(d, "vllm")[0][("__meta__",)]
+        out = load_run(d, "vllm")[0]
+        meta = out[("__meta__",)]
 
-    by = {c.label: c for c in cells}
-    assert by["bound=iter[0:N]"].state == AppState.SUPPORTED   # same fake output both engines
-    assert by["bound=iter[0:N]"].workload == "generation"
+    assert {("generation", "bound=iter[0:N]"), ("generation", "bound=iter[:]")} <= set(out)
     m = meta[("generation", "bound=iter[0:N]")]
     assert m["throughput"] is not None                         # tokens/s populated for generation
     assert meta[("__effect__", "generation")]["strong"]        # the patch moves the fake control

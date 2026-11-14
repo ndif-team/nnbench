@@ -11,7 +11,34 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch  # noqa: E402
 
+from isb.oracle.checks import (  # noqa: E402
+    generated_tokens_match, probabilities_match, read_matches,
+)
 from isb.oracle.equivalence import compare, is_equivalent  # noqa: E402
+
+
+def test_generated_tokens_are_compared_up_to_the_first_flip():
+    """Each step's timed token must be the check's argmax until the first step where it is not;
+    that step's token must be a near tie, and later steps continue a different prefix."""
+    logits = torch.tensor([[1.0, 50.0, 0.0, 0.0],      # step 0: token 1, far ahead
+                           [0.0, 0.0, 10.0, 9.9],      # step 1: tokens 2 and 3 a near tie
+                           [7.0, 0.0, 0.0, 0.0]])[:, None, :]       # [steps, B, vocab]
+    passed, metrics = generated_tokens_match(torch.tensor([1, 3, 2])[:, None, None], logits)
+    assert passed and abs(metrics["steps_matched"] - 1 / 3) < 1e-6   # flipped at step 1
+    assert generated_tokens_match(torch.tensor([1, 2, 0])[:, None, None], logits)[0]
+    assert not generated_tokens_match(torch.tensor([1, 0, 0])[:, None, None], logits)[0]
+    assert not generated_tokens_match(torch.tensor([0, 2, 0])[:, None, None], logits)[0]
+
+
+def test_a_timed_read_and_attention_probabilities_match_their_check_forms():
+    """A read returned in the model's dtype matches its fp32 check copy; timed attention
+    probabilities match the check call's log-probabilities; a different read fails either way."""
+    lens = torch.randn(3, 2, 50)
+    assert read_matches(lens.bfloat16(), lens.bfloat16().float())[0]
+    assert not read_matches(lens.bfloat16(), torch.randn(3, 2, 50))[0]
+    probs = torch.softmax(torch.randn(2, 1, 4, 6), dim=-1)          # [layers, B, heads, keys]
+    assert probabilities_match(probs, torch.log(probs))[0]
+    assert not probabilities_match(probs, torch.log(probs.flip(-1)))[0]
 
 
 def test_identical_is_equivalent():

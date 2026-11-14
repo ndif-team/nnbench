@@ -32,7 +32,7 @@ if sys.argv[1] == "timeout":
 job = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("/job")
 output = Path(sys.argv[3]) if len(sys.argv) > 3 else Path("/output")
 experiment = json.loads((job / "experiment.json").read_text())
-supported = (1,) if sys.argv[1] == "v1-only" else (2,)
+supported = (1,) if sys.argv[1] == "v1-only" else (3,)
 if type(experiment.get("version")) is not int or experiment["version"] not in supported:
     raise SystemExit(f"unsupported experiment version {experiment.get('version')}; supported: {supported}")
 assert digest(canonical({k: v for k, v in experiment.items() if k != "id"})) == experiment["id"]
@@ -49,7 +49,7 @@ outputs = {key: torch.ones(1, 8) for key in sorted(expected)}
 output.mkdir(parents=True, exist_ok=True)
 torch.save({"outputs": outputs, "provenance": {"job": identity}}, output / "result.pt")
 result = {**identity, "status": "completed",
-    "cells": [{"workload": k[0], "label": k[1], "state": "RAN"} for k in outputs],
+    "cells": [{"regime": k[0], "label": k[1], "state": "RAN"} for k in outputs],
     "outputs_sha256": digest((output / "result.pt").read_bytes())}
 (output / "result.json.tmp").write_bytes(canonical(result) + b"\n")
 os.replace(output / "result.json.tmp", output / "result.json")

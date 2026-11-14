@@ -77,5 +77,5 @@ Validated inference backends: nnsight-HF and local async nnsight-vLLM. Other met
 suite; this GPU smoke is not a claim that every method/model/backend combination is supported.
 The result site now reads these job bundles and saved reports without loading tensors during
 browsing; see [the result-site guide](result-site.md). Multi-GPU scheduling, remote serving, and
-migration of the standalone micro/performance tools are outside this change.
+migration of the standalone construct-probe and performance tools are outside this change.
 See [the backend contract and commands](../backends/README.md).

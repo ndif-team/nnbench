@@ -9,15 +9,29 @@ def _run(version, compiled=True, graphs=True, tp=1):
 
 
 def _result(mode, run, vanilla_ms=None):
-    calls = ([{"key": ["__vanilla__", "interactive"], "record": {"median_latency_ms": vanilla_ms}}]
+    calls = ([{"key": ["__vanilla__", "interactive"],
+               "record": {"median_latency_ms": vanilla_ms, "latency_kind": "call"}}]
              if vanilla_ms else [])
     return {"provenance": {"engine": {"mode": mode}}, "auxiliary_calls": calls, "engine_run": run}
 
 
 def _rows(results, backends, ms=32.0):
-    rows = [{"backend": b, "workload": "interactive", "median_latency_ms": ms} for b in backends]
+    rows = [{"backend": b, "regime": "interactive", "median_latency_ms": ms, "latency_kind": "call"}
+            for b in backends]
     attach_plain_vllm(rows, results)
     return {r["backend"]: r for r in rows}
+
+
+def test_no_ratio_from_a_saturated_record_or_across_latency_kinds():
+    import pytest
+
+    results = {"plain": _result("plain", _run("0.28.0"), 10.0), "engine": _result("async", _run("0.28.0"))}
+    row = {"backend": "engine", "regime": "interactive", "median_latency_ms": 900.0,
+           "latency_kind": "call", "saturated": True}
+    attach_plain_vllm([row], results)
+    assert row["plain_vllm"] == "plain" and row["overhead_vs_plain_vllm"] is None
+    with pytest.raises(ValueError, match="pass latency over a call latency"):
+        attach_plain_vllm([{**row, "saturated": False, "latency_kind": "pass"}], results)
 
 
 def test_rows_divide_by_plain_vllm_at_the_same_engine_version():
@@ -26,11 +40,12 @@ def test_rows_divide_by_plain_vllm_at_the_same_engine_version():
                "lens-on-old": _result("hooks", _run("0.19.1")),
                "engine-on-new": _result("async", _run("0.28.0")),
                "hf-reference": _result("async", None)}
-    rows = [{"backend": b, "workload": "interactive", "median_latency_ms": 40.0}
+    rows = [{"backend": b, "regime": "interactive", "median_latency_ms": 40.0, "latency_kind": "call"}
             for b in ("lens-on-old", "engine-on-new", "hf-reference")]
-    rows.append({"backend": "engine-on-new", "workload": "generation", "median_latency_ms": 40.0})
+    rows.append({"backend": "engine-on-new", "regime": "generation", "median_latency_ms": 40.0,
+                 "latency_kind": "call"})
     attach_plain_vllm(rows, results)
-    by = {(r["backend"], r["workload"]): r for r in rows}
+    by = {(r["backend"], r["regime"]): r for r in rows}
     assert by[("lens-on-old", "interactive")]["plain_vllm"] == "plain-old"
     assert by[("lens-on-old", "interactive")]["overhead_vs_plain_vllm"] == 2.0
     assert by[("engine-on-new", "interactive")]["overhead_vs_plain_vllm"] == 4.0

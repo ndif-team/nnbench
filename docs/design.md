@@ -588,8 +588,8 @@ than numerical thresholds. Numerical differences alone, including persistent dif
 matched precision, cannot establish an incorrect intervention. This policy supersedes older
 oracle-as-correctness claims elsewhere in this document and historical findings.
 
-Output comparison is low priority until it is refactored as a whole (2026-10-21): the scorers
-(`isb/jobs/score.py`, `isb/sweep/score.py`, `scripts/score.py`), the oracle metrics
+Output comparison is low priority until it is refactored as a whole (2026-10-21): the scorer
+(`isb/jobs/score.py`), the oracle metrics
 (`isb/oracle/`) and `scripts/row_diff.py`. Inference forward passes are not deterministic, so the
 same code scores differently between runs, and deterministic forward passes are deferred. Until
 the refactor these tools are diagnostics: reviews raise no findings about them and other changes
@@ -605,10 +605,10 @@ For each (workload × backend × config), a multi-valued state — the user guid
 | State | Meaning | Detected by |
 |---|---|---|
 | `SUPPORTED` | runs, matches HF reference within tolerance | oracle pass |
-| `SUPPORTED_DEGRADED` | correct, but forced a de-opt (disables CUDA graphs / prefix cache) | runs + perf delta |
+| `SUPPORTED_DEGRADED` | in older reports, which the manager still renders: the numerical check passed at control precision | never assigned by the scorer |
 | `ERROR` | raises a clear, catchable error (user gets a signal) | exception captured |
 | `NUMERICAL_MISMATCH` | runs; correctness unresolved; performance remains eligible | numerical thresholds exceeded |
-| `INVALID_OUTPUT` | diagnostic timing only | output shape, emptiness or finiteness violation |
+| `INVALID_OUTPUT` | diagnostic timing only | output shape, emptiness or finiteness violation, or a failed timed check (§12.13) |
 | `HANG` | deadlocks | timeout |
 | `UNSUPPORTED_BY_CONSTRUCTION` | value can't exist (flash-attn attention patterns) | declared + confirmed |
 
@@ -938,9 +938,9 @@ tuple iterator are retired together. Historical file formats are unsupported; ex
 be rerun to produce current artifacts.
 
 Docker integration: the host freezes resolved specs and inputs through `isb/jobs/contract.py`.
-Its version-2 file contract stores `regimes`, `{label, params}` tasks, the protocol template, and
-explicit absence reason. Readers accept version 2 and retain its saved template and coverage
-reason. Restoration uses the frozen descriptor, independent of today's protocol table.
+Its file contract (version 3, `isb/jobs/schema.py`) stores `regimes`, `{label, params}` tasks, the
+protocol template, and explicit absence reason. Readers also accept version 2 and retain its saved
+template and coverage reason. Restoration uses the frozen descriptor, independent of today's protocol table.
 The shared executor accepts a backend, interface, and provenance supplied by the container's
 entrypoint; lazy sweep exports keep host spec loading independent of torch/nnsight imports.
 - **Reuse emerges bottom-up:** when two cells are structurally identical except module names,
@@ -968,8 +968,8 @@ not an abstraction in the code.
 axis from the HF-vs-vLLM correctness above is **parallelism-equivalence**: a run with
 `--comparison equivalence` scores a multi-GPU backend config (`nnsight-vllm/0-8-1/tp2`,
 `nnsight-vllm/0-8-1/tp4`) against the single-GPU config named by `--reference`
-(`nnsight-vllm/0-8-1`). The `parallel` suite holds the cases and the comparison axis, and both the
-single-GPU and multi-GPU configs are passed with `--backends`; until 2026-09-09 the flags were
+(`nnsight-vllm/0-8-1`). The `parallel` suite holds the cases, the comparison axis and both the
+single-GPU and multi-GPU configs (§12.16); until 2026-09-09 the flags were
 `bench.py --pp/--tp`. This is the GT2 oracle, emitting `EQUIVALENT` /
 `DIVERGENT`, a *different question* from correctness (so it does not reuse `SUPPORTED`/`SILENTLY_WRONG`;
 the cell's vs-HF correctness is carried as a separate dimension). The default assumption is that TP/PP
@@ -1021,14 +1021,13 @@ Updated 2026-11-11 to the tree after §12.13 to §12.18.
 ```
 isb/
   protocol.py           # CausaLab-aligned, non-executable intervention semantics
-  states.py             # AppState
   methodologies/
     registry.py         # @cell(methodology, family, backend, realizations=...) -> fn ; lookup
     logit_lens.py ...   # the nnsight cells, one module per methodology
     requirements.py     # case-requirement description hooks
   backends/
     base.py             # the `be` primitive contract: unit lists, FormError
-    hf.py vllm_sync.py vllm_async.py vllm_serve.py   # `be` infra per engine form
+    hf.py vllm_sync.py vllm_async.py   # `be` infra per engine form
   workloads/            # a methodology's rows, data, regimes, effect check; two layer-count sweeps (§12.16)
   models.py suites.py   # registered checkpoints; run recipes (§12.16)
   sweep/spec.py         # CellConfig = InterventionSpec × TaskSpec × ExecutionRegime; instantiate
@@ -1036,9 +1035,7 @@ isb/
   perf/                 # timing.py, load.py (§12.17), phase_profiler.py (§12.18), microbenchmarks
   jobs/                 # cli, frozen experiments, container launchers, worker, artifact scoring (§12.13)
   oracle/equivalence.py # per-family reference comparison
-  runner/run.py         # evaluate and precision disambiguation for the standalone scorer
-  micro/                # construct probes
-  report/applicability.py
+  constructs/           # construct probes
   manager/              # saved-report browser and HTML export (§12.12)
 backends/<system>/      # Dockerfile, compose.yml, configs.yml, backend.py, and cells.py except in the nnsight systems (§12.15)
 scripts/bench.py        # list | build | run | score
@@ -1069,10 +1066,10 @@ scripts/bench.py        # list | build | run | score
   (a) explains method-level statuses, (b) carries the version stamp (provenance attaches to
   ~a dozen primitive rows, not to every cell), and (c) flips first when an upstream fix lands —
   one cause, reported once, with every dependent method cell flipping alongside it.
-  **Built 2026-06-11**: `isb/micro/probes.py` (one probe per row, self-contained denotation
-  checks, watchdog HANG detection, vLLM probes ordered safest-first), `scripts/micro.py`;
-  measured maps in `results/micro_{hf,vllm_async}.txt` — the micro-tier construct findings
-  (portable Level-1 sites, and the iteration, barrier, session, and edit/scan construct results).
+  **Built 2026-06-11**: `isb/constructs/probes.py` (one probe per row, self-contained
+  checks, watchdog HANG detection, vLLM probes ordered safest-first), `scripts/constructs.py`;
+  the measured statuses are the construct rows of `docs/interp-methods-catalog.md` (portable
+  Level-1 sites, and the iteration, barrier, session, and edit/scan construct results).
 - Model-side law failures (§3.6; formerly "regime effects") are the non-decomposable residue —
   an explicit attributed category in the findings record rather than entries indistinguishable
   from derivable consequences.
@@ -1174,16 +1171,14 @@ explicit cell, preserving §12.1's explicitness exactly where it carries informa
 is an index of module locations, never a construction layer (§11's Resolver lesson holds:
 nothing generates intervention code). Adding a model = a spec (+ one profile row if it is a new
 architecture); zero methodology edits. Converted so far: logit_lens (six per-family cells → one
-hf + one vllm_async generic pair); steering/ablation keep their explicit nemotron cells (the
+hf + one vllm_async generic pair); ablation keeps its explicit nemotron cells (the
 single-mixer target is genuinely nemotron-specific code, i.e. the override case).
 
-**Tasks** (`isb/tasks/`) are the corpus-growth form that needs no framework: one function
-`task(be, model, m, items, **knobs)` plus its dataset verbatim (no trace schema; a task's items
-are whatever JSON it consumes). Portability comes only from `be` (backend interface) and `m`
-(profile). First external reproduction: the Jacobian-lens `lens-eval-*` sets
-(`isb/tasks/lens_eval.py`, data in `data/jlens/`, upstream Apache-2.0): all six datasets are one
-function whose only per-dataset knob is the readout-position rule; `transport=None` is the plain
-logit lens, `transport=[J_l]` the J-lens (one extra matmul before the final norm).
+**Tasks** (`isb/tasks/`), free functions `task(be, model, m, items, **knobs)` over a verbatim
+dataset, were removed on 2026-11-14 with the standalone path. Their one instance, the Jacobian-lens
+`lens-eval-*` sets (data in `data/jlens/`, upstream Apache-2.0), are data sources in `isb/data.py`
+(`jlens/<set>`), each with its only per-dataset knob, the readout-position rule (`locate`); the
+`jacobian_lens` workload reads the multihop set.
 
 ### 12.9 Split-run is the canonical method-tier mode (2026-07-23)
 
@@ -1234,24 +1229,15 @@ commit from pip's `direct_url.json` inside the container.
 
 ### 12.10 Runs, data bindings, execute/score, provenance (2026-07-24)
 
-These execution routines remain shared by the current worker. Standalone CLI and release-mode
-details below describe the legacy entrypoints; the main launcher follows §12.13.
+The job worker runs these execution routines; the launcher and the scorer follow §12.13.
 
 A result's identity is (spec × data × run config), each axis independent:
 
 - **RunConfig** (`isb/runs.py`): engine (transformers|vllm, mode, params — the §6 config axes,
-  incl. serving features like prefix caching) × deployment (local | serve | ndif, each with its
-  own host/commit/env — NDIF is a deployment, not an engine; transformers or vllm runs inside it)
+  incl. serving features like prefix caching) × deployment (local | ndif, each with its own
+  host/commit/env; NDIF is a deployment, not an engine, and transformers or vllm runs inside it)
   × client (interpreter -> env -> nnsight checkout). Backends are thin executors picked by
   (engine, mode, deployment); `vllm_pp` is gone as a concept (topology is engine params).
-- **Release vs debug runs** (`isb/debugtrace.py`): a run file is the RELEASE artifact — lean
-  cells, the regime perf is measured in, the only source of verdicts. `--debug` (bench or
-  execute) additionally writes `debug/<name>-debug.pt`: an instrumented forward over the first
-  workload prompts saving token ids, the per-layer residual at the readout position, and the
-  final logits. The companion never feeds a verdict (extra saves change what the engine
-  executes; certifying the instrumented run would certify a different program) — it exists to
-  localize a divergence the release file already shows. `scripts/debug_compare.py` diffs two
-  companions per layer and reports where the engines start to drift.
 - **Data** (`isb/data.py`): named, swappable sources (the six upstream lens-evals with their
   readout rules as knobs; the MIB IOI and CounterFact snapshots, `data/mib/` and
   `data/counterfact/`; the generated sets, `isb/tracegen.py`). Specs bind a default by
@@ -1262,21 +1248,26 @@ A result's identity is (spec × data × run config), each axis independent:
   logit lens, steering, generation steering, and the family probes. The single-trace
   frontier markers (attention pattern, attribution patching) keep their fixed inputs
   (`isb/workloads/attention_pattern.py`), and the template banks remain as `--data` alternatives.
-- **execute** (`isb/sweep/execute.py`, `scripts/execute.py`): one run, one process, ALWAYS writes
-  ONE self-contained run file `<name>.pt` (`isb/runfile.py`): cell outputs (per-prompt stacks for
-  batched-reference duty; per-cell perf + the effect guard) together with the four-layer
-  provenance (client incl. nnsight commit+dirty+remote, deployment, engine, host hardware), the
-  run's coordinates, and release-check findings when certified. Fresh runs land in the inbox
-  (`runs/inbox`); archiving a run into a collection directory is a file move. Provenance is
-  DESCRIPTIVE: declared values recorded next to resolved ones, drift visible, nothing refuses.
-- **score** (`isb/sweep/score.py`, `scripts/score.py`): a pure CPU step over any two output
-  files. Axis derived from provenance (cross-engine -> correctness; same engine -> equivalence);
-  batched candidates score against the reference's per-prompt stack; `--ctl` disambiguates
-  precision from a control-dtype RUN (data, not a live rerun); the header names both stacks —
-  the visibility whose absence turned the nnsight branch skew (§12.9) into a two-day hunt.
-- **--release** (`isb/preflight.py`): serious-measurement mode only — verifies the visible GPUs
-  are free of other work and disk has headroom, REFUSES on contamination naming the offenders,
-  never waits (scheduling is cluster tooling, not benchmark logic). Casual runs see none of it.
+- **execute** (`isb/sweep/execute.py`): one experiment, one process, writes ONE self-contained
+  run file (`isb/runfile.py`; the job's `result.pt`): cell outputs (per-unit stacks for
+  batched-reference duty; per-cell perf and the effect guard) together with the four-layer
+  provenance (client incl. nnsight commit+dirty+remote, deployment, engine, host hardware) and the
+  run's coordinates. Provenance is DESCRIPTIVE: declared values recorded next to resolved ones,
+  drift visible, nothing refuses.
+- **score** (`isb/jobs/score.py`): a pure CPU step over a run directory's job artifacts, with the
+  reference and the comparison axis named in the run plan (§12.13).
+- **Host check** (`isb/jobs/local.py`): before each job the launcher reads every GPU the config
+  reserves, waits up to two minutes for a previous job's memory to drain, and fails the job
+  without launching it when a reserved GPU still holds another process's memory or a compute
+  process, naming them; `execution.json` records the reading (`gpus_before`) and each reserved
+  GPU's clocks, enforced power limit, power draw, temperature and active clock event reasons at
+  the job's start and end (`gpus_before.clocks`, `gpus_after.clocks`). Under torchrun every rank
+  waits at a barrier before each timer starts, so rank 0's timer does not count another rank's lag.
+
+**2026-11-14: standalone path removed.** The standalone executor and scorer (`scripts/execute.py`,
+`scripts/score.py`, `isb/sweep/score.py`, `isb/runner/`, `isb/report/`), the release preflight,
+the debug companion, the tasks package (`isb/tasks/`) and the client/server experiment (`docker/`,
+the `vllm_serve` backend) are deleted. The launcher's per-job host check replaces the preflight.
 
 ### 12.11 Verdict baselines are stored runs, not spec fields (2026-07-24)
 
@@ -1300,26 +1291,25 @@ The replacement is the run layer, which already holds every axis the old field l
 
 ### 12.12 The run manager (2026-07-28; templated package 2026-07-31)
 
-A collection contains saved job bundles and explicitly imported legacy run summaries. The manager
-renders the selected directory using JSON metadata and saved comparison reports. Docker scoring
-is an explicit artifact-only operation with a reference selected in the run plan. Legacy import
-uses `score_runs` only when complete saved procedure identity matches the reference and scoring
-spec. Browsing performs no scoring and starts no models. Archive and discard preserve their
+A collection contains saved job bundles and explicitly imported summaries of the construct-probe
+and performance run files. The manager renders the selected directory using JSON metadata and
+saved comparison reports. Scoring is an explicit artifact-only operation with a reference selected
+in the run plan. Browsing performs no scoring and starts no models. Archive and discard preserve their
 existing recoverable file-move behavior.
 
 The code is shaped like the site: a fixed template stamped over uniform data (`isb/manager/`):
-- `model.py` — collections, comparison eligibility, rollup, perf points, archive/discard.
-- `records.py` — JSON-only job bundle loading, frozen identity, saved worker metadata and reports.
-- `htmlkit.py` — every tag, class, and format rule (one table builder, one chip builder, one
+- `model.py`: collections, run-file import, rollup, perf points, archive/discard.
+- `records.py`: JSON-only job bundle loading, frozen identity, saved worker metadata and reports.
+- `htmlkit.py`: every tag, class, and format rule (one table builder, one chip builder, one
   latency format); pages pass text, the kit escapes.
-- `figure.py` — the operating-point scatter.
-- `pages.py` — composition only, plus ROUTES: the single registry the server
+- `figure.py`: the operating-point scatter.
+- `pages.py`: composition only, plus ROUTES: the single registry the server
   (`scripts/manager.py`), the one-file static export (`--export`), and the tests share, so a
   routed page is exported and crawlable by construction.
 
 The server binds 127.0.0.1 only and rejects archive/discard names that are not inbox members.
-Current browsing reads saved JSON reports. Unpickling and scoring legacy artifacts require the
-explicit trusted `--import-legacy` operation.
+Current browsing reads saved JSON reports. Unpickling run files requires the explicit trusted
+`--import-run-files` operation.
 
 ### 12.13 Current execution and artifact contract
 
@@ -1356,11 +1346,76 @@ refusal is what those rows record. Outputs carry the unit axis at dim -2 (`[B, v
 `[L, B, vocab]`, `[T, B, vocab]` over decode steps). A generation call holds every unit to
 `new_tokens` decode steps (HF `min_new_tokens`, vLLM `min_tokens`), so a unit that would stop at EOS
 early produces the same number of rows at every B instead of a row-count error at B=1 and pad-fed
-rows inside a batch (2026-10-24). `be.plain(model, units,
+rows inside a batch (2026-10-24). interp-engine's generation requests take no minimum length, so a
+unit there that stops at EOS early raises. `be.plain(model, units,
 new_tokens=1)` is the engine's own request over the same list with nothing attached, timed in every
 regime, including the batched and load regimes, as the intervention-overhead denominator. An engine
 error recorded for a cell is therefore the engine's answer to its documented form;
 `scripts/row_diff.py` compares two runs row by row (`docs/writing-workloads.md` §8).
+
+**Timed calls and check calls (2026-11-14).** A timed call is what a user of the system runs: the
+request, the intervention and the user's result in the system's own form, with nothing the
+benchmark adds (a readout for the scorer, a conversion for the comparison, a guard, setup a user
+does once). A cell whose correctness check compares something other than that result declares
+`check=False`; the executor passes `check=True` to its untimed check calls, and `check` is never a
+case parameter. Check calls produce everything scoring reads: the per-unit reference stacks, both
+sides of the effect check, and each case's scored output. A case's check calls run after every
+timed call of the regime (the baseline, the plain request and every case), in the regime's form
+(per unit in an aggregate regime; one call over the timed units in a batched regime;
+for a load pattern the calls of one pass that cover the scored units, in the pass's chunks offline
+and as overlapping requests concurrently or open loop). A cell without `check` returns one value for
+both kinds of call. Each row records `timed_output`: `"result"` when its cell declares `check`,
+`"check"` when the cell returns one value for both. A run with `n_trials=0` (`bench.py run --check`,
+a check run) makes the check calls only. A check call that raises `Unsupported` after the case was
+timed (the system cannot produce what the check compares) leaves a RAN row with its timing and
+`check_unsupported`; any other check-call error is an execution failure on the checked units and
+records ERROR beside the timing.
+The job scorer compares check outputs through `isb/oracle/checks.py`: a methodology registers its own
+check with `check_of(methodology)` (`check(expected, actual, case)`, where `case` carries the regime,
+the label and both sides' outputs for checks that need other rows), and every other methodology uses
+the equivalence oracle's gate. For a cell that declares `check`, the executor relates the last timed
+output to the check output of the same units with the methodology's timed check (registered with
+`timed_check_of(methodology)`, looked up with `timed_check_for`) and records `timed_check`
+(`passed` and the check's metrics) on the row; the scorer makes a row whose timed check failed
+`INVALID_OUTPUT`, an output-contract failure that leaves the row out of performance comparison. A
+cell that declares `check` in a methodology without a timed check fails its row with a
+`LookupError`. Both lookups import the methodology modules first, so a check registered beside its
+cells is always found. The timed results, check outputs and timed checks, on every system:
+
+| methodology | timed result | check output | timed check |
+|---|---|---|---|
+| steering, ablation, activation patching, DAS | greedy next token `[B, 1]` | next-token logits `[B, vocab]` | `tokens_match` |
+| generation-time steering and patching | each step's token `[T, B, 1]` | per-step logits `[T, B, vocab]` | `generated_tokens_match` |
+| logit lens, Jacobian lens, activation harvest, per-step capture | the read as the system returns it | the read in fp32: cast, or projected in fp32 where the timed call projects in the engine's dtype | `read_matches` |
+| attention pattern | probabilities | log-probabilities | `probabilities_match` |
+
+The next token is the engine's own sample (`model.samples` on nnsight's vLLM, the generated id of a
+plain request with an installed edit or of the system's own request), or the argmax of the logits
+the system's documented call returns where it returns no token (HF's head, the TransformerLens
+bridge's default realization).
+A cell declares `check` only where its check call differs from its timed call. The reads the
+TransformerLens bridge returns in fp32, interp-engine's Jacobian lens, activation harvest and
+per-step capture, and the activation harvest and per-step capture of the opt realization, vLLM-Hook
+and vLLM-Lens return one value for both and record `timed_output: "check"`. vLLM-Lens's Jacobian
+lens and per-step capture declare `check` for a guard alone (each request's captured row count, an
+early stop) and return the engine's dtype from both calls; the every-layer activation harvest also
+returns the engine's dtype from both, since an fp32 copy would double the largest read the suite
+makes. Requests that hold every unit to its token count with `min_tokens` (nnsight's vLLM
+generations, vLLM-Lens, vLLM-Hook) sample with the stop tokens masked, while the
+check logits are read before the sampler, so a step whose top logit is a stop token fails the timed
+check unless the best other token is within its margin. No saved run has such a step.
+`tokens_match` passes when each timed token is the check logits' argmax or its logit is below the
+top logit by at most 2% of the top logit's magnitude; `generated_tokens_match` applies that per unit
+up to the first step whose token is not the argmax (after it the two calls continue different
+prefixes); `read_matches` and `probabilities_match` apply the equivalence gate, the latter to the
+log of the timed probabilities floored at their dtype's smallest normal. DAS measures the seeded
+rotation's held-out accuracy, the guard that training beat it, in check calls only. Residual
+readout (already in the engine's dtype), attribution patching (a host-side score per pair and
+layer) and Jacobian collection (the fitted maps; its forward-only baseline returns the read in the
+model's dtype) return one value for both. The backend primitives take `keep_dtype` for a timed
+result; a snapshot passed between two traces stays in the dtype it was saved in, on the GPU on HF
+and on the host on vLLM, whose saves arrive by pickle. HF's plain request ends with the next token
+or the generated ids on the host.
 
 **What gets saved.** Successful effective-call records contain bound parameters, their semantic and
 realization split when available, and a case-level protocol description or explicit template-level
@@ -1379,22 +1434,18 @@ records alongside the task-cell list. The manager retains these records and rend
 incomplete effect checks safely. Effect checks use the measured case's full aggregation regime;
 missing, empty, nonfinite, or incompatible outputs produce an isolated effect error.
 
-**One coordinate format.** `isb/runs.py` owns the schema-3 coordinate builder and boundary
-validation used by method, micro, perf, and manager paths. Snapshot values are detached from mutable
-specs and reader inputs. The manager preserves the worker's executed description and call records;
-the frozen job supplies submitted identity, including for failed or pending jobs. Other schema
-versions are rejected with a rerun instruction. Builders emit explicit fields.
+**One coordinate format.** `isb/runs.py` owns the coordinate builder (version 4) and boundary
+validation used by method, construct-probe, perf, and manager paths. Snapshot values are detached
+from mutable specs and reader inputs. The manager preserves the worker's executed description and
+call records; the frozen job supplies submitted identity, including for failed or pending jobs.
+Readers accept coordinate versions 3 and 4; other versions are rejected with a rerun instruction.
+Builders emit explicit fields.
 
 **Safe comparisons.** Docker comparisons retain the experiment/input identity checks and resolved
-source/model/tokenizer checks. Standalone comparison requires complete matching procedure identity:
-model and method, actual input content, declared case parameters, every regime setting, and
-baseline/effect configuration and model-load options. Warmup count, trial count, and the standalone
-precision-recheck setting (`dtype_control`) remain recorded but are excluded from correctness
-identity. Model-load options are conservatively matched because they can change the model being
-compared. Interface differences are an intended comparison axis. Current micro/perf artifacts can
-have incomplete procedure identity; these remain browsable without automatic equivalence claims.
-Labels and dataset names alone do not establish identity. Docker job identity still covers the
-entire submitted recipe, including timing settings.
+source/model/tokenizer checks. Interface differences are an intended comparison axis. Current
+construct-probe and perf artifacts can have incomplete procedure identity; these remain browsable
+without automatic equivalence claims. Labels and dataset names alone do not establish identity.
+Docker job identity still covers the entire submitted recipe, including timing settings.
 
 **Timing and ownership.** The saved recipe, effective-call metadata, and invocation parameters have
 separate ownership. Each warmup, measured trial, and reference/effect invocation receives a fresh
@@ -1404,13 +1455,14 @@ is inspected once when binding the case. The timed unit is the cell call, includ
 choice reporting, plus the established synchronization boundary. Tests pin this
 definition; changing it requires an explicit measurement-contract change.
 
-**File versions and failure reporting.** Version 2 writes one canonical task representation.
-Readers accept version 2; historical version-1 jobs must be rerun. Saved descriptions take
+**File versions and failure reporting.** Version 3 writes one canonical task representation and
+names each row's regime `regime` (version 2 called it `workload`). Readers accept versions 2 and 3
+through `isb/jobs/schema.py`; historical version-1 jobs must be rerun. Saved descriptions take
 precedence over current templates. New authored built-ins still require descriptors.
 Malformed jobs and restoration failures produce an atomic structured failure result; identity is
 included when it can be safely recovered. Independent backend executables remain supported through
-the documented file contract. A pinned v1-only worker must reject v2 clearly; bundled entrypoints
-use mounted repository code, while dependency changes require image rebuilds.
+the documented file contract. A pinned v1-only worker must reject version 3 clearly; bundled
+entrypoints use mounted repository code, while dependency changes require image rebuilds.
 
 Acceptance checks:
 
@@ -1420,7 +1472,7 @@ Acceptance checks:
 | Concrete requirements | Branch-behavior tests for no-write and no-gradient cases, plus a custom description hook |
 | Unit form | Every primitive raises `FormError` on a bare unit, an empty list or unequal sides in every backend and the test spy; closures take `rows`; a generation output stacks `[T, B, ...]` |
 | Ownership and timing | Nested mutation across warmups/trials/reference calls cannot alter snapshots; preparation occurs before the clock |
-| Comparison | Parameter, input, decode-length, aggregation, effect, and model-load changes reject comparison; timing-only changes compare; incomplete identity stays unverified |
+| Comparison | Parameter, input, decode-length, aggregation, effect, and model-load changes reject comparison; incomplete identity stays unverified |
 | File boundaries | Current jobs round-trip with saved coverage; historical and future versions fail clearly; malformed current artifacts fail validation |
 | Resolved choices | Automatic selectors retain their bound values and record the cell's resolved choice; inconsistent choices fail locally |
 | Independent workers | JSON-only worker contract tests and CPU Docker end-to-end jobs; source/model identity guards remain active |
@@ -1470,7 +1522,7 @@ that lacks the capability. `UNSUPPORTED` cells are excluded from performance com
   model runner follows them the same way: vLLM 0.30.0 and later run the V2 runner by default, and
   the eager 0.30.0 floors select V1 (`v2_model_runner: false`), which vllm-lens 1.3.0 imposes. The scorer
   divides each vLLM-engine row by the plain job's `__vanilla__` latency at
-  the same vLLM version and workload (`overhead_vs_plain_vllm`). Plain jobs are identified by the
+  the same vLLM version and regime (`overhead_vs_plain_vllm`). Plain jobs are identified by the
   engine mode they declare, never by name.
 
 Engine version and eager or CUDA-graph mode are recorded with each result, because an eager
@@ -1495,8 +1547,7 @@ explicitly. `bench.py build` builds each distinct (system, image) once; `bench.p
 ephemeral container from the config's image with its options as `ISB_ENGINE_OPTIONS` and its GPUs
 reserved (`--gpu N` plus the next `gpus - 1` indices). Nothing is loaded from outside the system
 directory (`isb/jobs/layout.py`). The nnsight systems keep their 0.7+ cells in
-`isb/methodologies/` (the `hf` / `vllm_async` registrations shared with the tests and the micro
-tier).
+`isb/methodologies/` (the `hf` / `vllm_async` registrations shared with the tests).
 
 Job directories mirror the name (`experiments/<id>/<system>/<config>/`). Saved runs were renamed to
 the new names by a one-time migration (`scripts/migrate_backend_names.py`, in the history up to
@@ -1516,7 +1567,7 @@ the older specs carry nnsight spellings (§12.14). This section separates the fo
 | Layer | Says | Never says | Lives in | Named by |
 |---|---|---|---|---|
 | Workload | what intervention, on what data, in which regimes, how its effect is checked | a model, a system, a realization | `isb/workloads/<methodology>.py` | its methodology (`steering`) |
-| Model | which checkpoint, its architecture, size, load options, control precision, fitted assets | a workload | `isb/models.py` | the checkpoint (`qwen2.5-7b`) |
+| Model | which checkpoint, its architecture, size, load options, fitted assets | a workload | `isb/models.py` | the checkpoint (`qwen2.5-7b`) |
 | Realization | how one system spells a row (in-place vs replacement write, naive port vs documented form) | a model or data | the system's cell registrations | its parameters (`mode=inplace`) |
 | Suite | workloads × models, backends, reference, data size, regimes, realizations, timing | intervention semantics | `isb/suites.py` | its purpose (`cross-system`) |
 
@@ -1535,7 +1586,7 @@ it asks a different question, not when it runs on a different model.
 **Models.** `isb/models.py` is torch-free and holds two tables. `FAMILIES` is the architecture
 index that `isb/profiles.py` holds today (§12.8): module paths, residual denotation per engine, and
 the block components (`attn`, `mlp`, or a single `mixer`). `MODELS` is one row per checkpoint:
-repo, family, layer count, control precision, HF and vLLM load options, and fitted assets (the
+repo, family, layer count, HF and vLLM load options, and fitted assets (the
 Qwen3.5-4B Jacobian lens, with the layer band it covers). The worker checks the layer count against
 the loaded model and fails loudly on a mismatch. `isb/profiles.py` keeps only the torch helpers
 (`_resid`, `_untuple`) and reads `FAMILIES`.
@@ -1557,7 +1608,7 @@ them, once per declared alternative. The scorer compares every realization of a 
 reference's default realization of the same row; baseline and effect use the default. The matched
 pairs of the corpus (naive port and documented form) are declared alternatives, so frontier markers
 stay measured. An alternative is its own result row, labelled `<row> [k=v]`, carrying `row` and
-`alternative` (its declared params) fields; the job file format stays version 2, since a result without such rows holds
+`alternative` (its declared params) fields, an additive field: a result without such rows holds
 the default realizations only.
 
 **Suites are run recipes.** A suite names entries of workloads × models, the backends, the
@@ -1570,7 +1621,7 @@ keep only those of its cases. Initial suites:
 | Suite | Entries | Backends | Realizations |
 |---|---|---|---|
 | `smoke` | every workload × `gpt2`, `logit_lens` × `smollm2-135m` | `nnsight-hf/default`, `nnsight-vllm/default` | all |
-| `parallel` | `logit_lens`, `steering`, `ablation`, `activation_patching`, `gen_steering` × `qwen2.5-14b` | `nnsight-vllm/default` as the reference; the TP/PP config is added with `--backends` (GT2, §12.2; multi-GPU settings belong in a backend config) | all |
+| `parallel` | `logit_lens`, `steering`, `ablation`, `activation_patching`, `gen_steering` × `qwen2.5-14b` | `nnsight-vllm/0-8-2` as the reference; `0-8-2/tp2` and `0-8-2/tp4` scored against it under the `equivalence` comparison (GT2, §12.2); the opt configs, which run other cells, take their own run against `0-8-2/opt` | all |
 | `nemotron` | `logit_lens`, `steering`, `ablation` × `nemotron3-nano-4b` (the 30B needs a multi-GPU config) | nnsight HF and vLLM | all |
 | `cross-system` | `logit_lens`, `steering`, `gen_steering`, `activation_patching`, `ablation`, `activation_harvest`, `gen_capture` × `qwen2.5-7b` | every system (§12.14) | default |
 | `fitted-jlens` | `jacobian_lens` × `qwen3.5-4b` | nnsight HF and vLLM | default |
@@ -1600,14 +1651,12 @@ Some measured cases move: GPT-2 steering ran at layer 8 (depth 2/3) and now runs
 
 **Existing runs are not renamed.** Rows and layers change, so a saved run is a record of the spec
 it ran, under that spec's name, and claiming it is an instance of the new workload would be false.
-The manager displays saved coordinates without consulting live definitions; legacy import already
-refuses an automatic comparison when the current definition differs. `docs/findings.md` keeps
+The manager displays saved coordinates without consulting live definitions. `docs/findings.md` keeps
 citing the old names with their run directories.
 
 **Layout.** `isb/workloads/<methodology>.py`, `isb/models.py`, `isb/suites.py`; `Depth`, `Row`,
 `Workload` and `instantiate` beside `CellConfig` in `isb/sweep/spec.py`; `isb/specs/` is removed.
-Out of scope here: the micro tier, `scripts/perf.py` and `isb/tasks/`, which keep their own entry
-points.
+Out of scope here: the construct probes and `scripts/perf.py`, which keep their own entry points.
 
 ### 12.17 Load patterns: how requests are issued (2026-10-20; open loop and per-workload patterns 2026-10-21)
 
@@ -1627,8 +1676,16 @@ section adds them as the two standard patterns.
 | `concurrent/c<C>` | closed-loop serving: `vllm bench serve --max-concurrency`, SGLang `bench_serving`, AIPerf's concurrency sweep | `units` single-unit calls from `C` clients, each issuing its next as soon as its previous returns | units/s; request latency p50 (`median_latency_ms`), p90, p99, mean |
 | `open/r<R>` | open-loop serving: MLPerf Server, `vllm bench serve --request-rate` | `units` single-unit calls arriving at `R` per second (seeded Poisson), each issued on arrival whatever the system is doing | achieved units/s; request latency from scheduled arrival, p50 (`median_latency_ms`), p90, p99, mean; offered rate; most requests in flight |
 
-Gamma (bursty) arrivals and a request deadline are not implemented: a pass issues a finite number
-of requests, so an overloaded system drains after the last arrival. The survey of how these tools
+Each timed record carries `latency_kind`, what its `median_latency_ms` is the median of (`call`,
+`pass` or `request`, from the regime-kinds table `REGIME_KINDS` in `isb/sweep/spec.py`), and a ratio
+divides only records of one kind. Gamma (bursty) arrivals and a request deadline are not
+implemented: a pass issues a finite number of requests, so an overloaded system drains after the
+last arrival. Such a system's request latency grows with the pass length, so an open-loop record
+whose median pass lasts more than 1.1 times the arrival span plus one request's service time (the
+fastest request's latency, which the last request takes with nothing queued; a record from before
+request latencies were kept is judged on the span alone) is `saturated` (`isb/perf/load.py`
+`kept_up`) and gives no overhead ratio; the seeded schedule's own span is the
+yardstick, since 128 arrivals at seed 0 span 147/R seconds rather than 127/R. The survey of how these tools
 issue requests is `docs/inference-benchmark-survey.md`; the background, what each pattern tests and
 which workloads take which pattern is `docs/request-patterns.md`.
 
@@ -1682,11 +1739,12 @@ carried the whole wait; measured 2026-10-24, two clients on the sync engine, pla
 the service time and p90 at the pass time). The open loop uses the same session or gate. The
 executor never interleaves calls a backend has not declared safe.
 
-**Correctness.** The outputs of the first `score_units` (16) units of the last pass are kept and
-scored; the rest are timed only, since a sweep's full outputs can exceed host memory (an all-layer
-logit lens over 256 prompts is 17 GB). For correctness, an offline cell is scored against the
-reference's per-unit outputs (`offline_perprompt`, recorded once per run like `batched_perprompt`,
-before the cases). An offline call can cover more units than are scored, so the executor keeps the
+**Correctness.** After the timed passes, check calls cover the first `score_units` (16) units in the
+pattern's form, and their outputs are scored; the other units are timed only, since a sweep's full
+outputs can exceed host memory (an all-layer logit lens over 256 prompts is 17 GB). For correctness,
+an offline cell is scored against the reference's per-unit outputs (`offline_perprompt`, recorded once
+per run after the first offline regime's timed passes, as a batched regime records `batched_perprompt`
+after its own). An offline call can cover more units than are scored, so the executor keeps the
 leading rows the per-unit outputs fill, since one unit may fill several rows (decode steps, a
 harvest's tokens). Concurrent and open-loop calls are single-unit, so they are scored against the
 reference's same regime.
@@ -1719,13 +1777,12 @@ profile into four segments: the compiled base engine, the eager or graph-break c
 hook dispatch and edit, and readout with host transfer. The module docstring holds the contract.
 
 **Run audit** (`scripts/audit_runs.py`): a set of run directories passes when all of these hold.
-Every job completed with an image id. Each job started with under 100 MiB in use on its first GPU;
-the launcher records the `--gpu` index only, so the other GPUs of a multi-GPU config are not
-checked. Every run came from one source commit (or the commits named by `--allow-commits`, each
+Every job completed with an image id and a recorded check of its reserved GPUs (the launcher
+fails a job whose reserved GPU is in use, so a completed job started on idle GPUs). Every run came from one source commit (or the commits named by `--allow-commits`, each
 with one source hash). The backends of an experiment loaded one model identity. No row is in a
 hard failure state (`JOB_FAILED`, `NO_REFERENCE`, `INCOMPATIBLE`, `INVALID_OUTPUT`). In a run that
-includes a `vllm-plain` config, every timed vLLM row has `overhead_vs_plain_vllm`, the floor of
-its own engine mode; rows of the `opt/taps` and `static` configs run a mode no `vllm-plain` config
-runs and fail this check. Warnings: GPU memory more than 1,024 MiB above the baseline after a job,
-an `INVALID_REFERENCE` row, an `UNSUPPORTED` row without a reason, a latency coefficient of
-variation above 0.20, and a timed vLLM row without `overhead_vs_vanilla`.
+includes a `vllm-plain` config, every timed vLLM row that is not `saturated` has
+`overhead_vs_plain_vllm`, the floor of its own engine mode; rows of the `opt/taps` and `static`
+configs run a mode no `vllm-plain` config runs and fail this check. Warnings: an
+`INVALID_REFERENCE` row, an `UNSUPPORTED` row without a reason, a latency coefficient of variation
+above 0.20, and a timed vLLM row that is not `saturated` without `overhead_vs_vanilla`.

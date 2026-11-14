@@ -166,8 +166,8 @@ python scripts/report/optlarge.py runs/large-opt large-opt-report.html
   intervention), `validation_state` (`NUMERICAL_CHECK_PASSED`, `UNRESOLVED`, `EXECUTION_FAILED`),
   `metrics.top1_agree`, `metrics.tv`. The reference column's own state is `RAN`.
 - The plain-engine numbers are not cells: read `auxiliary_calls` in each backend's `result.json`
-  for the entry with key `["__vanilla__", <regime>]`. Patching is two forwards, so compare a
-  patching cell with twice the plain forward.
+  for the entry with key `["__vanilla__", <regime>]`. The plain request runs every prompt of the
+  regime's units, both prompts of a patching pair, so a patching cell compares with it directly.
 - What the 72B run showed, as the pattern to expect: vLLM's general cell at 0.6 to 0.75 of HF
   device_map on single forwards and generation and 1.2 on the logit lens; taps at 0.45 to 0.65 of
   HF and within 1.2 of plain vLLM except the lens, where taps were slower than the general cell;
@@ -181,7 +181,7 @@ python scripts/report/optlarge.py runs/large-opt large-opt-report.html
 
 ## 7. Changing the model
 
-1. Add it to `isb/models.py`: `Model(name, repo, family, n_layers, dtype_control="bfloat16")`.
+1. Add it to `isb/models.py`: `Model(name, repo, family, n_layers)`.
    The family picks the cells (`llama` covers Qwen2.5, Qwen3, Llama, Mistral; others exist for
    GPT-2, Gemma, BERT...). Layers are addressed by depth fraction, so nothing else changes.
    Use the exact repo id the cache holds; `HF_HUB_OFFLINE=1` refuses a different spelling.

@@ -9,7 +9,7 @@ from isb.backends.hf import HFBackend
 
 
 class NNsight05HFBackend(HFBackend):
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False):
         prompts = self.many(prompts, "generate")
         it = slice(0, new_tokens) if bounded else slice(None)
         with model.generate(prompts, max_new_tokens=new_tokens, min_new_tokens=new_tokens,
@@ -17,18 +17,18 @@ class NNsight05HFBackend(HFBackend):
             rows = list().save()
             with tracer.iter[it] as step:
                 rows.append(build_step(step))
-        return self._steps(rows, new_tokens, "generation")
+        return self._steps(rows, new_tokens, "generation", keep_dtype)
 
     def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
-                       *, new_tokens, bounded=True):
+                       *, new_tokens, bounded=True, keep_dtype=False):
         sources, bases = self.paired(source_prompts, base_prompts, "generate_patch")
         with model.trace(sources):
             ca = capture().save()
-        clean_act = ca.detach().float().cpu()
+        clean_act = ca.detach()                     # stays where the trace saved it
         it = slice(0, new_tokens) if bounded else slice(None)
         with model.generate(bases, max_new_tokens=new_tokens, min_new_tokens=new_tokens,
                             do_sample=False) as tracer:
             rows = list().save()
             with tracer.iter[it] as step:
                 rows.append(build_step(clean_act, step))
-        return self._steps(rows, new_tokens, "generate_patch")
+        return self._steps(rows, new_tokens, "generate_patch", keep_dtype)
