@@ -1397,10 +1397,10 @@ The next token is the engine's own sample (`model.samples` on nnsight's vLLM, th
 plain request with an installed edit or of the system's own request), or the argmax of the logits
 the system's documented call returns where it returns no token (HF's head, the TransformerLens
 bridge's default realization). A generation returns the tokens the decode produced: on HF the ids
-`generate` returns, read in a second, empty invoke (`tracer.result`; `model.generator.output` on
-nnsight 0.4), and on nnsight's vLLM the token sampled at each step. HF decodes greedily
-without the checkpoint's repetition penalty (`repetition_penalty=1.0`; Qwen2.5-Instruct's generation
-config sets 1.05), the rule vLLM's explicit sampling parameters decode by.
+`generate` returns, read in a second, empty invoke (`tracer.result`), and on nnsight's vLLM the
+token sampled at each step. HF decodes greedily without the checkpoint's repetition penalty
+(`repetition_penalty=1.0`; Qwen2.5-Instruct's generation config sets 1.05), the rule vLLM's
+explicit sampling parameters decode by.
 A cell declares `check` only where its check call differs from its timed call. The reads the
 TransformerLens bridge returns in fp32, vLLM-Hook's logit lens and Jacobian lens (projected in fp32
 in both calls, as vLLM-Hook's analyzers replay the final norm on fp32 features), interp-engine's
@@ -1546,8 +1546,7 @@ engine's absolute latency depends on host CPU load.
 engine (`nnsight-vllm`, `interp-engine-vllm`, `vllm-plain`) and holds exactly one `Dockerfile`
 (versions as `ARG`s), one `compose.yml` (the runner service, parameterized by `ISB_IMAGE`,
 `ISB_ENGINE_OPTIONS`, `ISB_GPUS` and `ISB_RANKS`), one `configs.yml`, `backend.py` and `cells.py`,
-plus the modules they import (`cells_opt.py` for installed edits; `nnsight04.py` and
-`cells_nnsight04.py` for the legacy nnsight 0.4 release). `configs.yml` lists the system's
+plus the modules they import (`cells_opt.py` for installed edits). `configs.yml` lists the system's
 `images` (Dockerfile build arguments keyed by image name; the tag is `isb-<system>-<image>:local`)
 and its `configs`, each naming its image, its engine `options`, and the `gpus` and `ranks` it
 reserves. The backend name is `<system>/<config>`, configs are named
@@ -1637,7 +1636,7 @@ keep only those of its cases. Initial suites:
 | `nemotron` | `logit_lens`, `steering`, `ablation` × `nemotron3-nano-4b` (the 30B needs a multi-GPU config) | nnsight HF and vLLM | all |
 | `cross-system` | `logit_lens`, `steering`, `gen_steering`, `activation_patching`, `ablation`, `activation_harvest`, `gen_capture` × `qwen2.5-7b` | every system (§12.14) | default |
 | `fitted-jlens` | `jacobian_lens` × `qwen3.5-4b` | nnsight HF and vLLM | default |
-| `nnsight-versions` | `logit_lens`, `steering`, `ablation`, `gen_steering`, `activation_patching` × `qwen2.5-7b`, `qwen3-32b` | nnsight 0.8.1 and 0.7 on HF sdpa and the vLLM sync engine; 0.4.6 on HF | default |
+| `nnsight-versions` | `logit_lens`, `steering`, `ablation`, `gen_steering`, `activation_patching` × `qwen2.5-7b`, `qwen3-32b` | nnsight 0.8.1 and 0.7 on HF sdpa and the vLLM sync engine | default |
 | `nnsight-load-offline`, `nnsight-load-concurrent`, `nnsight-load-open` | load patterns only (§12.17) × `qwen2.5-7b`, `qwen3-32b` | nnsight 0.8.1 on HF and vLLM (sync; async for concurrent and open) | default |
 
 `slurm/delta-compare.slurm` calls suites; it does not list cases.

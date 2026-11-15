@@ -26,8 +26,7 @@ options and the GPUs and ranks it reserves. A backend name is `<system>/<config>
 directory holds exactly one `Dockerfile`, `compose.yml` (the runner service, parameterized by
 `ISB_IMAGE`, `ISB_ENGINE_OPTIONS`, `ISB_GPUS`, `ISB_RANKS`), `configs.yml`, `backend.py` and
 `cells.py` (the nnsight systems' cells are the `hf` / `vllm_async` registrations in
-`isb/methodologies/`, so they have none), plus the modules they import (`cells_opt.py`,
-`nnsight04.py`); a realization that needs
+`isb/methodologies/`, so they have none), plus the modules they import (`cells_opt.py`); a realization that needs
 different code is an option `backend.py` dispatches on (`mode`), never a subdirectory
 (`isb/jobs/layout.py`). The host runner in `isb/jobs/` is backend-agnostic: do not add engine
 switches, backend registries, Conda paths, or shared-Compose override selection. See

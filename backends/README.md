@@ -14,8 +14,7 @@ backends/<system>/
   backend.py      create_backend(spec) -> the backend object; a `mode` option selects a realization
   cells.py        the system's workload implementation; the nnsight systems register theirs in
                   isb/methodologies/ and have none
-  *.py            modules the two import: cells_opt.py (installed edits), nnsight04.py,
-                  cells_nnsight04.py (the adapter for the legacy nnsight 0.4 release)
+  *.py            modules the two import: cells_opt.py (installed edits)
 ```
 
 ## The catalog

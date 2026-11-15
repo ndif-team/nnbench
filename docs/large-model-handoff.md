@@ -70,7 +70,8 @@ or merge the two. The list below names the files as that branch laid them out; t
 refactor moved configs into `backends/<system>/configs.yml` (`nnsight-hf/0-8-1/gpu2`,
 `nnsight-hf/0-8-1/tp2`, `nnsight-vllm/0-8-1/opt/tp2`, `nnsight-vllm/0-8-1/opt/taps/tp2`,
 `vllm-plain/0-28-0/tp2`), the opt cells to `backends/nnsight-vllm/{backend_opt,cells_opt}.py`,
-and removed the byref prototype. What the branch added over `main`:
+and removed the byref prototype; the nnsight 0.4.6 backend, its `gpu2` config included, was
+removed on 2026-11-14. What the branch added over `main`:
 
 - `backends/nnsight-hf/sdpa/0-8-1/{gpu2,tp2}` and `backends/nnsight-hf/sdpa/0-4-6/gpu2`: the
   two-GPU HF configs. `tp2` needs the HF image built with `TRANSFORMERS_VERSION=5.19.0`,

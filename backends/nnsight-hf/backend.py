@@ -1,8 +1,4 @@
-"""nnsight on HF transformers. The installed nnsight release selects the adapter: 0.4 builds an
-intervention graph (nnsight04.py, with its own cells in cells_nnsight04.py), later releases run the
-shared HFBackend."""
-from importlib.metadata import version
-
+"""nnsight on HF transformers: the shared HFBackend."""
 from isb.backends.hf import HFBackend
 from isb.jobs.worker import merge_requirements, options
 from isb.runs import EngineConfig, RunConfig
@@ -10,13 +6,4 @@ from isb.runs import EngineConfig, RunConfig
 
 def create_backend(spec):
     params = merge_requirements(spec.hf_kwargs, options())
-    release = version("nnsight")
-    if release.startswith("0.4."):
-        from . import cells_nnsight04  # noqa: F401  (registers 0.4's cells)
-        from .nnsight04 import NNsight04Backend as cls
-
-        if params.pop("force_text_causal", False):
-            raise ValueError("the nnsight 0.4 backend does not load multimodal-wrapper checkpoints")
-    else:
-        cls = HFBackend
-    return cls(**params), RunConfig(EngineConfig("transformers", params=params))
+    return HFBackend(**params), RunConfig(EngineConfig("transformers", params=params))

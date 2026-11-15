@@ -89,9 +89,9 @@ SUITES = {s.name: s for s in (
                     "vllm-plain/0-19-1", "vllm-plain/0-20-2", "vllm-plain/0-28-0"),
           reference="nnsight-hf/default", timeout=3600),
     # nnsight releases on HF and on vLLM, same rows, batch sizes and precision on both sides: 0.7.0
-    # and 0.8.1 each on HF against vLLM, and 0.4.6 (2025-04-24) against 0.8.1 on HF. HF runs sdpa
-    # attention in bf16; vLLM runs nnsight's documented default, the sync engine, eager. Timings
-    # cover the request only: every engine loads once per job, before warm-up.
+    # and 0.8.1 each on HF against vLLM. HF runs sdpa attention in bf16; vLLM runs nnsight's
+    # documented default, the sync engine, eager. Timings cover the request only: every engine
+    # loads once per job, before warm-up.
     # Standard request patterns on nnsight 0.8.1, HF against vLLM, each on the workloads that
     # declare it. Offline is `vllm bench throughput` / MLPerf Offline: 256 units as one sweep, B per
     # call, B=all handing vLLM every unit at once (HF pads them into one batch, which may not fit: a
@@ -135,8 +135,7 @@ SUITES = {s.name: s for s in (
                    Entry(("gen_steering", "activation_patching"), ("qwen2.5-7b", "qwen3-32b"),
                          size=16)),
           backends=("nnsight-hf/0-8-1", "nnsight-vllm/0-8-1",
-                    "nnsight-hf/0-7", "nnsight-vllm/0-7",
-                    "nnsight-hf/0-4-6", "nnsight-hf/0-4-6/era"),
+                    "nnsight-hf/0-7", "nnsight-vllm/0-7"),
           reference="nnsight-hf/0-8-1", timeout=3600),
     # The same three studies on Qwen2.5-72B-Instruct in bf16, which needs two GPUs: HF splits its
     # layers across them (device_map="auto", the */gpu2 configs), vLLM shards each layer (tensor
@@ -145,22 +144,19 @@ SUITES = {s.name: s for s in (
     Suite("nnsight-large-versions",
           entries=(Entry(("logit_lens", "steering", "ablation"), ("qwen2.5-72b",), size=32),
                    Entry(("gen_steering", "activation_patching"), ("qwen2.5-72b",), size=16)),
-          backends=("nnsight-hf/0-8-1/gpu2", "nnsight-vllm/0-8-1/tp2",
-                    "nnsight-hf/0-4-6/gpu2"),
+          backends=("nnsight-hf/0-8-1/gpu2", "nnsight-vllm/0-8-1/tp2"),
           reference="nnsight-hf/0-8-1/gpu2", timeout=7200),
     Suite("nnsight-large-offline",
           entries=(Entry(("steering", "ablation"), ("qwen2.5-72b",), regimes=("offline",),
                          loads=(Offline(256, (1, 16, 64, None)),)),
                    Entry(("logit_lens",), ("qwen2.5-72b",), regimes=("offline",),
                          loads=(Offline(256, (1, 16, 64)),))),
-          backends=("nnsight-hf/0-8-1/gpu2", "nnsight-vllm/0-8-1/tp2",
-                    "nnsight-hf/0-4-6/gpu2"),
+          backends=("nnsight-hf/0-8-1/gpu2", "nnsight-vllm/0-8-1/tp2"),
           reference="nnsight-hf/0-8-1/gpu2", timeout=7200),
     Suite("nnsight-large-concurrent",
           entries=(Entry(("steering", "activation_patching", "gen_steering"), ("qwen2.5-72b",),
                          regimes=("concurrent",), loads=(Concurrent(128, (1, 4, 16, 64)),)),),
-          backends=("nnsight-hf/0-8-1/gpu2", "nnsight-vllm/0-8-1/async/tp2",
-                    "nnsight-hf/0-4-6/gpu2"),
+          backends=("nnsight-hf/0-8-1/gpu2", "nnsight-vllm/0-8-1/async/tp2"),
           reference="nnsight-hf/0-8-1/gpu2", timeout=10800),
     # Llama-3.3-70B-Instruct in bf16 on four 80 GB A100s: HF splits its layers across them
     # (device_map="auto", the */gpu4 configs), vLLM shards each layer (tensor parallel, */tp4).
