@@ -191,23 +191,20 @@ SUITES = {s.name: s for s in (
           backends=("nnsight-hf/0-8-1/gpu4", "nnsight-hf/0-7/gpu4",
                     "nnsight-vllm/0-8-1/async/tp4", "nnsight-vllm/0-7/async/tp4"),
           reference="nnsight-hf/0-8-1/gpu4", timeout=10800),
-    # Coverage: every load pattern the five workloads declare, 16 units each, on nnsight 0.8.1, 0.7
-    # and 0.5.15 (2026-01-13). 0.5 has only the sync vLLM engine, so it also serves the serving
-    # patterns, one request at a time like HF.
+    # Coverage: every load pattern the five workloads declare, 16 units each, on nnsight 0.8.1 and
+    # 0.7.
     Suite("llama70b-coverage-offline",
           entries=(Entry(("logit_lens", "steering", "ablation", "activation_patching", "gen_steering"),
                          ("llama3.3-70b",), regimes=("offline",), loads=(Offline(16, (1, 16)),)),),
-          backends=("nnsight-hf/0-8-1/gpu4", "nnsight-hf/0-7/gpu4",
-                    "nnsight-hf/0-5-15/gpu4", "nnsight-vllm/0-8-1/tp4",
-                    "nnsight-vllm/0-7/tp4", "nnsight-vllm/0-5-15/tp4"),
+          backends=("nnsight-hf/0-8-1/gpu4", "nnsight-hf/0-7/gpu4", "nnsight-vllm/0-8-1/tp4",
+                    "nnsight-vllm/0-7/tp4"),
           reference="nnsight-hf/0-8-1/gpu4", timeout=7200),
     Suite("llama70b-coverage-serving",
           entries=(Entry(("logit_lens", "steering", "gen_steering"), ("llama3.3-70b",),
                          regimes=("concurrent", "open"),
                          loads=(Concurrent(16, (4,)), Open(16, (4.0,)))),),
           backends=("nnsight-hf/0-8-1/gpu4", "nnsight-hf/0-7/gpu4",
-                    "nnsight-hf/0-5-15/gpu4", "nnsight-vllm/0-8-1/async/tp4",
-                    "nnsight-vllm/0-7/async/tp4", "nnsight-vllm/0-5-15/tp4"),
+                    "nnsight-vllm/0-8-1/async/tp4", "nnsight-vllm/0-7/async/tp4"),
           reference="nnsight-hf/0-8-1/gpu4", timeout=7200),
     # The fastest form each engine offers on nnsight 0.8.1, one prompt per call
     # (docs/large-model-handoff.md on four GPUs): HF splitting the layers (gpu4) or sharding them with

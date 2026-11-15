@@ -32,13 +32,9 @@ _ENGINE_COPIES = weakref.WeakKeyDictionary()
 
 
 def engine_logits(model):
-    """vLLM's logits for this step at the engine site. Runs INSIDE a trace. nnsight 0.7 and later
-    expose them as the `model.logits` property; 0.5 as the output of the `model.logits` wrapper
-    module (its README at v0.5.15: `model.logits.output`)."""
-    from nnsight.intervention.envoy import Envoy
-
-    logits = model.logits
-    return logits.output if isinstance(logits, Envoy) else logits
+    """vLLM's logits for this step at the engine site, the `model.logits` property. Runs INSIDE a
+    trace."""
+    return model.logits
 
 
 def final_logits(model, head, site):
@@ -53,13 +49,9 @@ def final_logits(model, head, site):
 
 
 def engine_samples(model):
-    """The token ids vLLM's sampler drew this step at the engine site, `[1, 1]`. Runs INSIDE a
-    trace. nnsight 0.7 and later expose them as the `model.samples` property; 0.5 as the output of
-    the `model.samples` wrapper module."""
-    from nnsight.intervention.envoy import Envoy
-
-    samples = model.samples
-    return samples.output if isinstance(samples, Envoy) else samples
+    """The token ids vLLM's sampler drew this step at the engine site, `[1, 1]`, the
+    `model.samples` property. Runs INSIDE a trace."""
+    return model.samples
 
 
 def next_token(model, head, site):

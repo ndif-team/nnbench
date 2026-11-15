@@ -1331,7 +1331,7 @@ cell takes `units: list[Unit]`, a unit being a prompt, a (clean, corrupted) pair
 triple, and hands a primitive the whole list of one call; B=1 is a one-element list. The backend
 runs the list as its engine documents: HF pads the units into one left-padded batch, the sync vLLM
 engine runs one `tracer.invoke` per unit inside one trace, the async engine one request per unit
-gathered together, nnsight 0.5 on vLLM one unit per trace (several units are `Unsupported`). `run`
+gathered together. `run`
 and `generate` take a nonempty list (`Backend.many()`); `patch`, `generate_patch`, `attribute`,
 `train_patch` and `vjp_batch` take one list per side of equal length (`Backend.paired()`); every
 backend and the test spy raise `FormError` on a bare prompt, an empty list or unequal sides, so a
@@ -1398,7 +1398,7 @@ plain request with an installed edit or of the system's own request), or the arg
 the system's documented call returns where it returns no token (HF's head, the TransformerLens
 bridge's default realization). A generation returns the tokens the decode produced: on HF the ids
 `generate` returns, read in a second, empty invoke (`tracer.result`; `model.generator.output` on
-nnsight 0.5 and 0.4), and on nnsight's vLLM the token sampled at each step. HF decodes greedily
+nnsight 0.4), and on nnsight's vLLM the token sampled at each step. HF decodes greedily
 without the checkpoint's repetition penalty (`repetition_penalty=1.0`; Qwen2.5-Instruct's generation
 config sets 1.05), the rule vLLM's explicit sampling parameters decode by.
 A cell declares `check` only where its check call differs from its timed call. The reads the
@@ -1546,8 +1546,8 @@ engine's absolute latency depends on host CPU load.
 engine (`nnsight-vllm`, `interp-engine-vllm`, `vllm-plain`) and holds exactly one `Dockerfile`
 (versions as `ARG`s), one `compose.yml` (the runner service, parameterized by `ISB_IMAGE`,
 `ISB_ENGINE_OPTIONS`, `ISB_GPUS` and `ISB_RANKS`), one `configs.yml`, `backend.py` and `cells.py`,
-plus the modules they import (`cells_opt.py` for installed edits; `nnsight04.py`, `nnsight05.py`
-and `cells_nnsight04.py` for the legacy nnsight releases). `configs.yml` lists the system's
+plus the modules they import (`cells_opt.py` for installed edits; `nnsight04.py` and
+`cells_nnsight04.py` for the legacy nnsight 0.4 release). `configs.yml` lists the system's
 `images` (Dockerfile build arguments keyed by image name; the tag is `isb-<system>-<image>:local`)
 and its `configs`, each naming its image, its engine `options`, and the `gpus` and `ranks` it
 reserves. The backend name is `<system>/<config>`, configs are named
