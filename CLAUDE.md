@@ -15,7 +15,7 @@ Output comparison (the scorers, the oracle metrics, `scripts/row_diff.py`) is lo
 it is refactored as a whole (design §8.1): reviews raise no findings about it and other changes do
 not extend it. Review effort goes to what workloads, cells and engines compute.
 
-nnbench: a **systems performance + coverage benchmark** for interpretability workloads on serving backends: nnsight on HuggingFace and on vLLM, and the other interpretability systems on vLLM (vLLM-Lens, vLLM-Hook, interp-engine, the TransformerLens bridge), beside plain vLLM. It measures whether a workload **runs**, **runs correctly** (numerical equivalence vs an HF reference), and **runs fast** — it is *not* a faithfulness benchmark. The headline deliverable is the applicability map, and the dangerous state it exists to catch is `SILENTLY_WRONG`: runs with no error but produces wrong numbers (e.g. the portable logit-lens on vLLM-Llama drops half the dual residual stream).
+nnbench: a **systems performance + coverage benchmark** for interpretability workloads on serving backends: nnsight on HuggingFace and on vLLM, and the other interpretability systems on vLLM (vLLM-Lens, vLLM-Hook, interp-engine, the TransformerLens bridge), beside plain vLLM. It measures whether a workload **runs** and **how fast**, and compares each row's output with a reference run under the validation policy above; it is *not* a faithfulness benchmark. The headline deliverable is the applicability map with its performance table.
 
 ## Environment & commands
 
@@ -26,8 +26,7 @@ options and the GPUs and ranks it reserves. A backend name is `<system>/<config>
 directory holds exactly one `Dockerfile`, `compose.yml` (the runner service, parameterized by
 `ISB_IMAGE`, `ISB_ENGINE_OPTIONS`, `ISB_GPUS`, `ISB_RANKS`), `configs.yml`, `backend.py` and
 `cells.py` (the nnsight systems' cells are the `hf` / `vllm_async` registrations in
-`isb/methodologies/`, so they have none), plus the modules they import (`cells_opt.py`,
-`nnsight04.py`); a realization that needs
+`isb/methodologies/`, so they have none), plus the modules they import (`cells_opt.py`); a realization that needs
 different code is an option `backend.py` dispatches on (`mode`), never a subdirectory
 (`isb/jobs/layout.py`). The host runner in `isb/jobs/` is backend-agnostic: do not add engine
 switches, backend registries, Conda paths, or shared-Compose override selection. See
@@ -44,14 +43,10 @@ python scripts/bench.py run --workload steering --model gpt2 --backends nnsight-
 python scripts/bench.py run --suite smoke --gpu 0
 # Workloads in isb/workloads/ (one per methodology), models in isb/models.py, suites (run recipes)
 # in isb/suites.py; `bench.py list workloads|models|suites`. A case is named <workload>/<model>.
-
-# Client/server (vllm_serve) split: the legacy standalone tool (after stocking HF and control run
-# files); it writes .pt run files that scripts/score.py scores, outside the main runner
-GPU=0 docker/run_vm.sh
 ```
 
-The standalone micro/perf entrypoints have not yet been moved to the Compose launcher; that is a
-separate follow-up to this main benchmark conversion.
+The construct probes (`scripts/constructs.py`) and the perf tool (`scripts/perf.py`) are not on
+the Compose launcher; they run in the current environment and write `.pt` run files.
 
 vLLM EngineCore uses spawn: every entrypoint must run under an `if __name__ == "__main__"` guard.
 
@@ -64,24 +59,24 @@ semantic values and realization selectors. The worker binds effective params to 
 cell signature, records case requirements through `methodologies/requirements.py`, and gives
 each invocation fresh nested values prepared outside the timer. Protocol metadata indexes cells
 and provenance. Protocol metadata must never construct intervention programs. Backend selection
-belongs to the independent Compose launcher. A `vllm_*` variant falls back to the `vllm_async`
-cell when no exact registration exists. Current contracts
+belongs to the independent Compose launcher. The `vllm_sync` interface falls back to the
+`vllm_async` cell when no exact registration exists. Current contracts
 and acceptance checks live in `docs/design.md` §12.13.
 
 Main data flow: `scripts/bench.py` → frozen experiment/inputs → `isb.jobs.entry` (the system's
 `backend.py`/`cells.py`) in its own Compose project → validated artifacts →
-`isb/jobs/score.py`. The shared nnsight worker reuses the scientific execution routines below. Standalone execute/score tools retain their `.pt`
-interface. The manager reads saved job reports; standalone `.pt` browsing requires explicit
-`--import-legacy` summaries. Readers accept job wire version 2 and coordinate schema 3;
-older artifacts must be rerun.
+`isb/jobs/score.py`. The worker runs the executor (`isb/sweep/execute.py`) inside the container.
+The manager reads saved job reports; the construct-probe and performance `.pt` run files of the
+standalone tools are browsed after an explicit `scripts/manager.py --import-run-files`.
+Jobs are written at wire version 3 and coordinate version 4 (`isb/jobs/schema.py`); readers also accept wire version 2, report version 1 and coordinate version 3, the October and November 2026 runs. Older artifacts must be rerun.
 
 1. **Workload × model** (`isb/workloads/`, `isb/models.py`, design §12.16): a workload is a methodology's semantic rows, data, regimes and effect check, naming no model and no system; layers are `Depth` fractions. `instantiate` resolves it on a model into the frozen `CellConfig` (`InterventionSpec × TaskSpec × ExecutionRegime`). Realizations (nnsight's in-place vs replacement write, the naive plain-residual port) are declared on the cell registration, never written in a workload. Suites (`isb/suites.py`) are run recipes. Batching is a *coverage axis* — each case is oracle-checked in its own regime, not just timed.
-2. **Backend** (`isb/backends/`): `be` objects — `hf` (the per-family control), `vllm_sync` (nnsight's documented LLM path, the default vLLM realization), `vllm_async` (AsyncLLM, one request per unit), `vllm_serve` (over-HTTP). One model load per backend, amortized across all tasks; an intervention error is isolated (engine survives, later tasks still run).
-3. **Oracle** (`isb/oracle/equivalence.py`): compares outputs via top-1 agreement and softmax TV. The main runner takes an explicit reference and comparison axis, with no implicit precision-control jobs. The standalone `scripts/score.py --ctl` can disambiguate precision using current schema-3 artifacts.
-4. **Perf** (`isb/perf/`): warm timing (warmup + N trials, CUDA-synced, median±std, peak mem) — correctness is verified in the same warm/batched regime perf is measured in.
-5. **Report** (`isb/report/`): applicability map (`AppState` in `isb/states.py`) + performance table.
+2. **Backend** (`isb/backends/`): `be` objects: `hf`, `vllm_sync` (nnsight's documented LLM path, the default vLLM realization) and `vllm_async` (AsyncLLM, one request per unit); the other systems' backends live in `backends/<system>/backend.py`. One model load per backend, amortized across all tasks; an intervention error is isolated (engine survives, later tasks still run).
+3. **Oracle** (`isb/oracle/equivalence.py`): compares outputs via top-1 agreement and softmax TV. The main runner takes an explicit reference and comparison axis, with no implicit precision-control jobs.
+4. **Perf** (`isb/perf/`): warm timing (warmup + N trials, CUDA-synced, median±std, peak mem). A cell that declares `check` returns the user's result from its timed calls (a write's generated tokens, a read as the system returns it) and what the scorer compares from untimed check calls in the same regime and call form (logits, mostly a read in fp32); a cell whose two forms coincide declares no `check` and returns one value for both (residual readout, attribution patching and Jacobian collection everywhere, and the per-system reads design §12.13 lists).
+5. **Report** (`isb/jobs/score.py`): `report.json` holds each row's state, its validation state (`isb/validation.py`) and its timing; the manager (`isb/manager/`) renders it.
 
-The **micro tier** (`isb/micro/`) probes individual nnsight primitives per backend. A probe that times out is recorded `HANG` and **aborts that backend's remaining probes** — the stuck thread still owns the engine loop, so anything after it would measure a poisoned engine. Probe registration order is safest-first for this reason.
+The **construct probes** (`isb/constructs/`, `scripts/constructs.py`) probe individual nnsight primitives per backend. A probe that times out is recorded `HANG` and **aborts that backend's remaining probes**: the stuck thread still owns the engine loop, so anything after it would measure a poisoned engine. Probe registration order is safest-first for this reason.
 
 ## Conventions & constraints
 
@@ -95,4 +90,3 @@ The **micro tier** (`isb/micro/`) probes individual nnsight primitives per backe
 - The corpus deliberately includes non-portable workloads as frontier markers — an `ERROR` cell on vLLM is a *result*, not a gap to "fix" by deleting the cell. Methodologies often come as matched pairs: the naive port (frontier marker) and the documented-correct form for the backend.
 - **A TP/PP divergence is a finding to classify and document, NOT a cell bug to patch.** By default tensor/pipeline parallelism is assumed to share the *same behavior and same interface* as single-GPU — identical intervention code runs identically on 1 and N GPUs. When an equivalence run of a multi-GPU config (`--backends nnsight-vllm/0-8-1 nnsight-vllm/0-8-1/tp2 --reference nnsight-vllm/0-8-1 --comparison equivalence`) finds a cell that is correct on single-GPU but `DIVERGENT` (the GT2 oracle scores parallel-vs-single vLLM, not vs HF — see design §12.2), that is the benchmark *working*. Classify the divergence as either an interface change users must be made aware of, or — the **default for parallelism** — a translation gap **nnsight** should fix, because an interp user must not have to handle the underlying sharding/distribution. Do NOT rewrite the cell to work around it (that hides the finding and pushes distribution onto users). Check the cell against the system's pinned docs first: a cell off the documented form is a cell bug. E.g. nnsight 0.8.1 documents a vLLM parameter as this rank's slice under TP, so `head.weight[token_id]` or a weight-matmul unembed is off-form; the cells read `model.logits` and build vectors before the trace (`isb/methodologies/readout.py`). (Distinct from a cell using a *known-wrong* pattern like reading the plain residual on a fused-residual family, which IS a suite bug to fix in the cell.)
 - Tests are no-GPU by design: cell logic, oracle, execute/score invariants run against fake backends. GPU behavior is exercised by `scripts/bench.py`, not the test suite.
-- `serve.cli --host 0.0.0.0` executes pickled Python from the network — only safe on the trusted docker compose bridge; never expose port 6677.

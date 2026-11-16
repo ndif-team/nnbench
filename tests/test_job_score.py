@@ -4,7 +4,7 @@ import json
 import pytest
 import torch
 
-from isb.jobs import contract
+from isb.jobs import contract, schema
 from isb.jobs.score import score_experiment
 from isb.sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
 
@@ -19,7 +19,7 @@ def artifacts(tmp_path, *, batched=False):
     for backend in ("reference-name", "candidate-name"):
         output = directory / backend
         output.mkdir()
-        identity = {"version": contract.VERSION, "backend": backend, "experiment_id": experiment["id"],
+        identity = {"version": schema.WIRE_VERSION, "backend": backend, "experiment_id": experiment["id"],
                     "inputs_sha256": experiment["inputs_sha256"]}
         provenance = {"job": identity, "model_identity": {
             "repo": "test/model", "revision": "abc", "vocab_sha256": "def", "vocab_size": 8}}
@@ -27,7 +27,7 @@ def artifacts(tmp_path, *, batched=False):
         torch.save({"outputs": {key: value, ("batched_perprompt", "task"): value},
                     "provenance": provenance}, output / "result.pt")
         contract.write_json(output / "result.json", {**identity, "status": "completed",
-            "cells": [{"workload": key[0], "label": "task", "state": "RAN"}],
+            "cells": [{"regime": key[0], "label": "task", "state": "RAN"}],
             "outputs_sha256": contract.file_digest(output / "result.pt")})
         contract.write_json(output / "execution.json", {"status": "completed", "source": {"commit": "abc"}})
     return directory, key
@@ -52,6 +52,47 @@ def test_policy_does_not_depend_on_backend_names(tmp_path):
     directory, _ = artifacts(tmp_path)
     assert candidate(directory)["state"] == "SUPPORTED"
     assert candidate(directory, comparison="equivalence")["state"] == "EQUIVALENT"
+
+
+def test_a_methodology_check_decides_the_verdict(tmp_path, monkeypatch):
+    from isb.oracle import checks
+
+    directory, key = artifacts(tmp_path)
+    seen = []
+    monkeypatch.setattr(checks, "CHECKS", {})
+
+    @checks.check_of("logit_lens")
+    def never(expected, actual, case):
+        seen.append((case["regime"], case["label"]))
+        return False, {"compared": True}
+
+    row = candidate(directory)
+    assert row["state"] == "NUMERICAL_MISMATCH" and row["metrics"] == {"compared": True}
+    assert seen == [key]
+
+
+def test_a_row_without_check_output_keeps_its_timing_unchecked(tmp_path):
+    directory, key = artifacts(tmp_path)
+    change(directory, "candidate-name", lambda artifact: artifact["outputs"].pop(key))
+    path = directory / "candidate-name" / "result.json"
+    result = json.loads(path.read_text())
+    result["cells"][0].update(check_unsupported="no read on this system", median_latency_ms=5.0)
+    contract.write_json(path, result)
+    row = candidate(directory)
+    assert row["state"] == "RAN" and row["validation_state"] == "UNRESOLVED"
+    assert row["performance_eligible"] and row["median_latency_ms"] == 5.0
+
+
+def test_a_timed_result_that_disagrees_with_its_check_output_is_invalid(tmp_path):
+    directory, _ = artifacts(tmp_path)
+    path = directory / "candidate-name" / "result.json"
+    result = json.loads(path.read_text())
+    result["cells"][0].update(timed_check={"passed": False, "tokens_matched": 0.0},
+                              median_latency_ms=5.0)
+    contract.write_json(path, result)
+    row = candidate(directory)
+    assert row["state"] == "INVALID_OUTPUT" and not row["performance_eligible"]
+    assert row["validation_state"] == "OUTPUT_CONTRACT_FAILED" and row["median_latency_ms"] == 5.0
 
 
 def test_reference_failure_does_not_discard_candidate(tmp_path):

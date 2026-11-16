@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Forensic auditor for InterpServeBench evaluation runs (Gate 3).
+"""Audit the run directories of an evaluation before its numbers are used.
 
 Usage:
-    python3 scripts/audit_runs.py /disk/u/zikai/isb-runs/eval-v1/stage1c-cross-system
-    python3 scripts/audit_runs.py --allow-commits d0ed4b9,1a2b3c4 /disk/u/zikai/isb-runs/eval-v1
+    python3 scripts/audit_runs.py RUNS/cross-system
+    python3 scripts/audit_runs.py --allow-commits d0ed4b9,1a2b3c4 RUNS
 
 Every run dir must come from one (commit, source_sha256): score.py pairs a candidate with its reference
 only when both ran from the same source. Across run dirs one commit is required unless --allow-commits
@@ -15,6 +15,9 @@ import argparse
 import json
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from isb.jobs.schema import REPORT_VERSION, upgrade_rows  # noqa: E402
 
 
 def audit_run_dir(run_dir: Path) -> tuple[list[str], list[str], dict]:
@@ -50,13 +53,18 @@ def audit_run_dir(run_dir: Path) -> tuple[list[str], list[str], dict]:
         if not ex.get("image_id"):
             errors.append(f"{rel}: missing image_id")
 
-        gpu_rel = ex.get("gpu_release") or {}
-        base_mib = gpu_rel.get("baseline_mib")
-        after_mib = gpu_rel.get("after_mib")
-        if base_mib is None or base_mib >= 100:
-            errors.append(f"{rel}: dirty GPU pre-flight baseline_mib={base_mib} (must be < 100 MiB)")
-        if after_mib is not None and base_mib is not None and after_mib > base_mib + 1024:
-            warnings.append(f"{rel}: GPU memory did not fully drain (after_mib={after_mib})")
+        # The launcher refuses a job whose reserved GPU is busy; it can only skip the check when
+        # nvidia-smi cannot report. Jobs launched before that check record `gpu_release`.
+        before = ex.get("gpus_before")
+        if before is None:
+            release = ex.get("gpu_release") or {}
+            base_mib, after_mib = release.get("baseline_mib"), release.get("after_mib")
+            if base_mib is None or base_mib >= 100:
+                errors.append(f"{rel}: dirty GPU pre-flight baseline_mib={base_mib} (must be < 100 MiB)")
+            elif after_mib is not None and after_mib > base_mib + 1024:
+                warnings.append(f"{rel}: GPU memory did not fully drain (after_mib={after_mib})")
+        elif not before.get("state"):
+            errors.append(f"{rel}: the reserved GPUs were not checked before the job")
     if len(sources) > 1:
         errors.append(f"{run_dir.name}: SOURCE DRIFT within the run: {sorted(sources, key=str)}")
 
@@ -78,7 +86,7 @@ def audit_run_dir(run_dir: Path) -> tuple[list[str], list[str], dict]:
     high_cv_cells = 0
     for exp in report.get("experiments", []):
         spec_name = exp.get("spec")
-        for cell in exp.get("cells", []):
+        for cell in upgrade_rows(exp.get("cells", []), report.get("version", 1), REPORT_VERSION):
             st = cell.get("state", "UNKNOWN")
             backend = cell.get("backend", "")
             state_counts[st] = state_counts.get(st, 0) + 1
@@ -98,11 +106,13 @@ def audit_run_dir(run_dir: Path) -> tuple[list[str], list[str], dict]:
                     f"{loc} -> high latency variance CV={std/med:.2f} (median={med:.1f}ms, std={std:.1f}ms)"
                 )
 
-            # Gate 3 item 6: check overhead_vs_vanilla and overhead_vs_plain_vllm on timed vLLM rows
-            if med and not backend.startswith(("nnsight-hf/", "vllm-plain/")):
+            # Check overhead_vs_vanilla and overhead_vs_plain_vllm on timed vLLM rows; a
+            # saturated open-loop row has none by design
+            if med and not cell.get("saturated") and not backend.startswith(("nnsight-hf/", "vllm-plain/")):
                 if cell.get("overhead_vs_vanilla") is None:
                     warnings.append(f"{loc} -> timed vLLM row missing overhead_vs_vanilla")
-                if has_plain_vllm and cell.get("overhead_vs_plain_vllm") is None:
+                # no floor matched; a matched floor that saturated leaves the ratio None by design
+                if has_plain_vllm and cell.get("plain_vllm") is None:
                     errors.append(f"{loc} -> timed vLLM row missing overhead_vs_plain_vllm (check matching vllm-plain version/eager config)")
 
     summary = {
@@ -162,9 +172,9 @@ def main():
         print(f"  [FAIL] {e}")
 
     if all_errors:
-        print(f"\nGATE 3 AUDIT FAILED: {len(all_errors)} error(s), {len(all_warnings)} warning(s).")
+        print(f"\nAUDIT FAILED: {len(all_errors)} error(s), {len(all_warnings)} warning(s).")
         sys.exit(1)
-    print(f"\nGATE 3 AUDIT PASSED: {len(run_dirs)} run(s) verified with 0 errors ({len(all_warnings)} warnings).")
+    print(f"\nAUDIT PASSED: {len(run_dirs)} run(s) verified with 0 errors ({len(all_warnings)} warnings).")
 
 
 if __name__ == "__main__":

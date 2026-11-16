@@ -1,11 +1,12 @@
 """Metadata-only result browsing, safe routing, and complete-run archival."""
+import copy
 import json
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from isb.jobs.contract import VERSION, prepare, write_json
+from isb.jobs.contract import prepare, write_json
 from isb.manager import Collection, dispatch, export_html
 from isb.manager.model import archive, discard, _rename_exclusive
 from isb.sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
@@ -25,7 +26,9 @@ def bundle(parent, name="attempt", backends=("nnsight-hf/default", "custom-backe
         (directory / "result.pt").write_bytes(b"intentionally not a pickle: viewer must never load it")
         write_json(directory / "execution.json", {"status": "completed", "backend": backend,
             "experiment_id": experiment["id"], "image_id": "sha256:fixture"})
-        write_json(directory / "result.json", {"version": VERSION, "status": "completed", "backend": backend,
+        # result.json and report.json in their previous versions (wire 2, report 1): the
+        # manager reads them through isb/jobs/schema.py
+        write_json(directory / "result.json", {"version": 2, "status": "completed", "backend": backend,
             "experiment_id": experiment["id"], "inputs_sha256": experiment["inputs_sha256"],
             "cells": [{"workload": "interactive", "label": "task", "state": "RAN", "median_latency_ms": 1.}],
             "provenance": {"engine": {"kind": "transformers" if backend == backends[0] else "vllm"},
@@ -44,7 +47,7 @@ def test_new_results_use_saved_verdicts_without_torch_load_or_scoring(tmp_path):
     root = bundle(tmp_path)
     with patch("torch.load", side_effect=AssertionError("must not load tensors")), \
          patch("isb.jobs.score.score_run", side_effect=AssertionError("must not rescore")), \
-         patch("isb.sweep.score.score_runs", side_effect=AssertionError("must not rescore")):
+         patch("isb.jobs.score.score_experiment", side_effect=AssertionError("must not rescore")):
         col = Collection(str(root), str(tmp_path / "inbox"))
         assert len(col.entries) == 2
         assert col.results["attempt/exp/custom-backend/opt"][0].state == "SILENTLY_WRONG"
@@ -117,7 +120,7 @@ def test_manager_rejects_unknown_worker_coordinate_schema(tmp_path):
     result["provenance"]["coordinates"] = {"schema": 999}
     write_json(path, result)
     cell = Collection(str(root)).results["attempt/exp/custom-backend/opt"][0]
-    assert cell.state == "JOB_FAILED" and "schema" in cell.error
+    assert cell.state == "JOB_FAILED" and "coordinate version" in cell.error
 
 
 def test_manager_preserves_auxiliary_calls_without_adding_task_results(tmp_path):
@@ -139,7 +142,9 @@ def test_manager_preserves_auxiliary_calls_without_adding_task_results(tmp_path)
     col = Collection(str(root))
     name = "attempt/exp/custom-backend/opt"
     outputs, prov = col.entries[name]
-    assert prov["auxiliary_calls"] == supporting
+    upgraded = copy.deepcopy(supporting)
+    upgraded[0]["record"]["latency_kind"] = "call"       # a version-2 timed record gains its kind
+    assert prov["auxiliary_calls"] == upgraded
     assert outputs[("__meta__",)][("__effect__", "interactive")] == supporting[1]["record"]
     assert len(col.results[name]) == 1 and col.results[name][0].label == "task"
     assert not perf_points(col.entries, [name])
@@ -269,12 +274,12 @@ def test_inbox_links_and_details_use_namespaced_ids(tmp_path):
     assert "SILENTLY_WRONG" in dispatch(col, "/run/inbox/attempt/exp/custom-backend/opt")
 
 
-def test_legacy_files_are_not_loaded_implicitly(tmp_path):
+def test_run_files_are_not_loaded_implicitly(tmp_path):
     (tmp_path / "untrusted.pt").write_bytes(b"bad pickle")
     with patch("isb.manager.model.load_run", side_effect=AssertionError("no implicit import")):
         col = Collection(str(tmp_path))
         assert not col.entries
-        assert "--import-legacy" in col.warnings[0]
+        assert "--import-run-files" in col.warnings[0]
 
 
 def test_empty_collection_does_not_scan_working_directory(tmp_path, monkeypatch):

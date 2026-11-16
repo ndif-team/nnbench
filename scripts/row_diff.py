@@ -1,11 +1,11 @@
 """Compare two run files row by row: status, recorded error, median latency and output difference.
 
-    python scripts/row_diff.py runs/inbox das-before das-after
+    python scripts/row_diff.py BEFORE/experiments/EXP/nnsight-hf/default/result.pt \
+        AFTER/experiments/EXP/nnsight-hf/default/result.pt
 
 The check a cell change runs before it is pushed, on the backends whose code the change touches
 (docs/writing-workloads.md §8): a row whose recorded error text changed is a cell-form change
-until the commit message says why. Runs come from `scripts/execute.py` (one cell, one engine,
-one file) or from a job's exported run files.
+until the commit message says why. Each file is a job's `result.pt` from `bench.py run`.
 """
 import json
 import re
@@ -54,11 +54,11 @@ def diff_rows(a, b):
 
 
 def main(argv):
-    if len(argv) != 4:
+    if len(argv) != 3:
         raise SystemExit(__doc__)
-    out, name_a, name_b = argv[1:]
-    a, _ = load_run(out, name_a)
-    b, _ = load_run(out, name_b)
+    path_a, path_b = (Path(arg) for arg in argv[1:])
+    a, _ = load_run(str(path_a.parent), path_a.stem)
+    b, _ = load_run(str(path_b.parent), path_b.stem)
     changed = 0
     for row in diff_rows(a, b):
         same = row["status"][0] == row["status"][1] and row["error"][0] == row["error"][1]
@@ -67,7 +67,7 @@ def main(argv):
         shown = {**row, "error": tuple(e[:160] for e in row["error"])}
         print(mark, row["row"], json.dumps({k: v for k, v in shown.items() if k != "row"},
                                            default=str))
-    print(f"{changed} row(s) changed status or error text between {name_a} and {name_b}")
+    print(f"{changed} row(s) changed status or error text between {path_a} and {path_b}")
     return 1 if changed else 0
 
 

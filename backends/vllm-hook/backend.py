@@ -6,13 +6,21 @@ built-in worker and its analyzer (docs/configs.md, "Selecting a configuration fr
 for the attention cells. The plugin registers through vLLM's general_plugins entry point and
 forces enforce_eager on every engine (`_hook_plugin._patched_create_engine_config`). An engine
 carries one worker extension, so one engine reads hidden states or Q/K, and neither steers
-(`steer_hook_act` is a different worker).
+(`steer_hook_act` is a different worker). Each engine serves one untimed captured request at load
+(`_with_hooks`), so its worker's hooks are in place before any timed call.
 
 Storage is the documented per-request axis (docs/configs.md): "rpc" returns probes on the output
 (`HookLLM.generate` default); "disk-st-async" writes a safetensors artifact from a background
 thread, the variant the docs recommend as fastest. Both read back through `HookLLM.analyze`.
 `async_llm: true` runs the hidden-state cells on vLLM's serving engine, AsyncLLM, one request per
 prompt with its own extra_args (`VLLMHookAsyncBackend`, `AsyncHook`).
+
+From v1.0.0 the plugin is MIA (distribution `vllm-hook-mia`, module `mia`, on vLLM 0.32.0 and its
+V2 model runner), and the installed distribution selects it (`MIA`). Its offline entry point is
+`MiaLLM`, with the same `generate`/`analyze` calls; the workers are `capture_hs` and `capture_qk`,
+the storage axis is "rpc" or "disk" (`save_to_disk`), and an engine runs under CUDA graphs unless
+`enforce_eager` is set (README, "Supported Configurations"; docs/configs.md). Its served path is
+`vllm serve` with `MiaClient`, so `async_llm` is refused.
 """
 import contextlib
 import json
@@ -26,52 +34,103 @@ from isb.backends.base import Backend, prompts_of
 from isb.jobs.worker import merge_requirements, options
 from isb.runs import EngineConfig, RunConfig
 
-WORKERS = {  # docs/configs.md: worker_name -> its analyzer_name
-    "probe_hidden_states": "hidden_states",
-    "probe_hook_qk": "attn_tracker",
-}
-STORAGE_ENV = {  # docs/configs.md: set before HookLLM is built; the worker inherits them at spawn
-    "rpc": {},
-    "disk-st-async": {"VLLM_HOOK_USE_SAFETENSORS": "1", "VLLM_HOOK_ASYNC_SAVE": "1"},
-}
+
+def _installed(distribution):
+    try:
+        return metadata.version(distribution)
+    except metadata.PackageNotFoundError:
+        return None
+
+
+MIA = _installed("vllm-hook-mia") is not None     # the plugin from v1.0.0 (setup.py)
+DISTRIBUTION = "vllm-hook-mia" if MIA else "vllm-hook-plugins"
+# docs/configs.md: worker_name -> its analyzer_name; the hidden-state worker first, then Q/K
+WORKERS = ({"capture_hs": "hidden_states", "capture_qk": "attn_tracker"} if MIA else
+           {"probe_hidden_states": "hidden_states", "probe_hook_qk": "attn_tracker"})
+READ, QK = WORKERS
+# docs/configs.md: set before the engine is built; the worker inherits them at spawn
+STORAGE_ENV = ({"rpc": {}, "disk": {}} if MIA else
+               {"rpc": {}, "disk-st-async": {"VLLM_HOOK_USE_SAFETENSORS": "1",
+                                             "VLLM_HOOK_ASYNC_SAVE": "1"}})
 
 
 @dataclass
 class HookModel:
-    llm: object                # vllm_hook_plugins.HookLLM
+    llm: object                # vllm_hook_plugins.HookLLM, or mia.MiaLLM
     tokenizer: object
     config: object             # the checkpoint's HF config; model identity reads its revision
     n_layers: int
     repo: str
+    hook_dir: str              # the artifact root of disk runs
     save_to_disk: bool
     worker: str                # the engine's worker extension (WORKERS)
-    weights: dict = field(default_factory=dict)   # final norm + unembedding from the checkpoint
+    weights: dict = field(default_factory=dict)   # the final norm + unembedding: "host" as stored,
+                                                  # "gpu" the fp32 copy a timed readout keeps
     transports: dict = field(default_factory=dict)   # J-lens transport spec -> maps, built once
+    # disk runs a call has read back, removed between calls (`between_calls`), outside the timer
+    finished_runs: list = field(default_factory=list)
+
+
+def _with_hooks(model):
+    """`model` after one untimed captured request. The plugin installs its worker's forward hooks on
+    the first request that captures and keeps them for every later forward (v0.2.0
+    `_hook_plugin.py`, `_patched_llm_generate` and `_patched_generate`; MIA `core/_plugin.py`,
+    `_patched_llm_generate`, on an eager engine), so every timed call, a plain request included,
+    runs on the engine in that state whatever ran before it. A CUDA-graph MIA engine installs its
+    capture as the model loads (`core/hooks/install.py`, `patch_worker_load_model`)."""
+    from vllm import SamplingParams
+
+    if model.worker != READ:                      # the Q/K probe numbers attention modules from 0
+        extra = {"output_qk": [0]}
+    elif isinstance(model.llm, AsyncHook):        # AsyncLLM: the fields go on the request
+        model.llm.capture(["The"], [1], "last_token")
+        return model
+    else:                                         # the hidden-state worker numbers layers from 1
+        extra = {"output_hidden_states": [1], "hs_mode": "last_token"}
+    model.llm.generate(["The"], SamplingParams(max_tokens=1, extra_args=extra), use_tqdm=False)
+    return model
 
 
 class VLLMHookBackend(Backend):
     name = "vllm_hook"
 
-    def __init__(self, storage="rpc", worker="probe_hidden_states", **engine_options):
+    def __init__(self, storage="rpc", worker=READ, enforce_eager=False, **engine_options):
         if storage not in STORAGE_ENV:
             raise ValueError(f"unknown vLLM-Hook storage {storage!r}; one of {sorted(STORAGE_ENV)}")
         if worker not in WORKERS:
             raise ValueError(f"unknown vLLM-Hook worker {worker!r}; one of {sorted(WORKERS)}")
         self.storage = storage
         self.worker = worker
+        # v0.2.0 forces eager execution on every engine; MIA runs CUDA graphs unless asked not to.
+        self.enforce_eager = bool(enforce_eager) if MIA else True
         self.engine_options = engine_options
         self.hook_dir = None
 
     def load(self, repo: str):
         os.environ.update(STORAGE_ENV[self.storage])
         from transformers import AutoConfig
-        from vllm_hook_plugins import HookLLM
 
-        # /dev/shm is the plugin's default artifact root (_hook_plugin._DEFAULT_HOOK_DIR).
+        # /dev/shm is v0.2.0's default artifact root (_hook_plugin._DEFAULT_HOOK_DIR); MIA's
+        # default is under the home directory, which the container does not provide.
         self.hook_dir = tempfile.mkdtemp(prefix="isb_vllm_hook_", dir="/dev/shm")
+        if MIA:
+            import multiprocessing
+
+            from mia import MiaLLM as HookLLM
+
+            # the two lines MIA's offline skeleton sets before it builds an engine (README,
+            # "Quickstart"; examples/README.md, "Gotchas")
+            multiprocessing.set_start_method("spawn", force=True)
+            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+            # Under CUDA graphs the captured rows pass through files in the capture directory, by
+            # default one under the working directory, and MIA removes none of them
+            # (examples/README.md, "Where the captured data goes"); teardown removes this one.
+            os.environ["MIA_APERTURE_DIR"] = os.path.join(self.hook_dir, "aperture")
+        else:
+            from vllm_hook_plugins import HookLLM
         config = AutoConfig.from_pretrained(repo)
         config_file = None
-        if self.worker == "probe_hook_qk":
+        if self.worker == QK:
             # A model config in the form of model_configs/attention_tracker/*.json: every (layer,
             # head) pair as an important head, so the attn_tracker analyzer reconstructs every
             # head (attention_tracker_analyzer.compute_attention_from_qk), and the query captured
@@ -85,13 +144,16 @@ class VLLMHookBackend(Backend):
         # download_dir=None: vLLM resolves the model through HF_HOME (HookLLM's default is ~/.cache).
         llm = HookLLM(model=repo, worker_name=self.worker, analyzer_name=WORKERS[self.worker],
                       config_file=config_file, download_dir=None, hook_dir=self.hook_dir,
-                      enforce_eager=True, **self.engine_options)
-        llm._hs_mode = "last_token"     # what load_config sets from a config's hidden_states.mode
-        return HookModel(llm, llm.tokenizer, config, config.num_hidden_layers, repo,
-                         save_to_disk=self.storage != "rpc", worker=self.worker)
+                      enforce_eager=self.enforce_eager, **self.engine_options)
+        if not MIA:                     # on MIA each request names its own mode (cells.py)
+            llm._hs_mode = "last_token"     # load_config sets it from hidden_states.mode
+        return _with_hooks(HookModel(llm, llm.tokenizer, config, config.num_hidden_layers, repo,
+                                     self.hook_dir, save_to_disk=self.storage != "rpc",
+                                     worker=self.worker))
 
     def plain(self, model, units, *, new_tokens=1):
-        """A plain generate on the plugin's engine: use_hook=False clears extra_args."""
+        """A plain generate on the plugin's engine: use_hook=False clears extra_args, so the
+        worker's hooks, installed at load (`_with_hooks`), capture nothing."""
         from vllm import SamplingParams
 
         model.llm.generate(prompts_of(units),
@@ -103,6 +165,12 @@ class VLLMHookBackend(Backend):
         """Through `HookLLM.llm`, the `vllm.LLM` it wraps (hook_llm.py, `HookLLM.__init__`), whose
         `collective_rpc` is vLLM's own (vLLM 0.19.1 `entrypoints/llm.py`, `LLM.collective_rpc`)."""
         return model.llm.llm.collective_rpc(method, args=args)
+
+    def between_calls(self, model) -> None:
+        """Remove the disk runs the previous calls read back: a user keeps captured data, so the
+        removal is the benchmark's and stays out of the timed calls."""
+        while model.finished_runs:
+            shutil.rmtree(model.finished_runs.pop(), ignore_errors=True)
 
     def teardown(self, model) -> None:
         model.llm.llm_engine.engine_core.shutdown()
@@ -124,6 +192,7 @@ class AsyncHook:
     hook_dir: str
     save_to_disk: bool
     gather: object             # the backend's persistent-loop runner
+    finished_runs: list = field(default_factory=list)   # read-back disk runs, HookModel's list
 
     def capture(self, prompts, layers, mode, new_tokens=1):
         """One request per prompt, submitted together, capturing the stream after each listed
@@ -159,7 +228,7 @@ class AsyncHook:
         for out, request_id in zip(outs, ids):
             if self.save_to_disk:
                 stats = self.analyzer.analyze(analyzer_spec={"reduce": "none"}, run_id=request_id)
-                shutil.rmtree(os.path.join(self.hook_dir, request_id), ignore_errors=True)
+                self.finished_runs.append(os.path.join(self.hook_dir, request_id))
             else:
                 stats = self.analyzer.analyze(analyzer_spec={"reduce": "none"}, probes=out.probes)
             for module, rows in stats["hidden_states"].items():
@@ -202,7 +271,10 @@ class VLLMHookAsyncBackend(VLLMHookBackend):
         self._loop_thread = None         # set while a concurrent session runs the loop
 
     def load(self, repo: str):
-        if self.worker != "probe_hidden_states":
+        if MIA:
+            raise ValueError("MIA documents no in-process AsyncLLM entry: its served path is "
+                             "`vllm serve` with MiaClient (README; docs/configs.md, \"Serve\")")
+        if self.worker != READ:
             raise ValueError("the AsyncLLM backend reads hidden states only (AsyncHook.capture)")
         os.environ.update(STORAGE_ENV[self.storage])     # the engine-core process inherits them
         import vllm.plugins
@@ -225,9 +297,10 @@ class VLLMHookAsyncBackend(VLLMHookBackend):
         llm = AsyncHook(engine, analyzer, self.hook_dir, self.storage != "rpc", self._gather)
         # The clients' own tokenizer: the engine's renderer tokenizes with its instance, and a
         # fast tokenizer raises "Already borrowed" under concurrent calls.
-        return HookModel(llm, AutoTokenizer.from_pretrained(repo), config,
-                         config.num_hidden_layers, repo, save_to_disk=llm.save_to_disk,
-                         worker=self.worker)
+        return _with_hooks(HookModel(llm, AutoTokenizer.from_pretrained(repo), config,
+                                     config.num_hidden_layers, repo, self.hook_dir,
+                                     save_to_disk=llm.save_to_disk, worker=self.worker,
+                                     finished_runs=llm.finished_runs))
 
     def _gather(self, coros):
         """Run the coroutines together on the one persistent loop (a fresh loop per call would close
@@ -265,7 +338,8 @@ class VLLMHookAsyncBackend(VLLMHookBackend):
             self._loop_thread = None
 
     def plain(self, model, units, *, new_tokens=1):
-        """One request per prompt with no extra_args, so the patch installs and sends nothing."""
+        """One request per prompt with no extra_args: the patch sends no RPC for it, and the
+        worker's hooks, installed at load (`_with_hooks`), capture nothing."""
         import uuid
 
         from vllm import SamplingParams
@@ -306,13 +380,13 @@ class VLLMHookAsyncBackend(VLLMHookBackend):
 def create_backend(spec):
     params = merge_requirements(spec.vllm_kwargs, options())
     storage = params.pop("storage", "rpc")
-    worker = params.pop("worker", "probe_hidden_states")
+    worker = params.pop("worker", READ)
     # async_llm: the engine is vLLM's AsyncLLM, one request per prompt, instead of HookLLM.
     async_llm = params.pop("async_llm", False)
     backend = (VLLMHookAsyncBackend if async_llm else VLLMHookBackend)(
         storage=storage, worker=worker, **params)
     mode = f"vllm-hook-{storage}-async" if async_llm else f"vllm-hook-{storage}"
     run = RunConfig(EngineConfig("vllm", mode=mode, params={
-        **backend.engine_options, "enforce_eager": True, "storage": storage, "worker": worker,
-        "vllm_hook_plugins": metadata.version("vllm-hook-plugins")}))
+        **backend.engine_options, "enforce_eager": backend.enforce_eager, "storage": storage,
+        "worker": worker, DISTRIBUTION.replace("-", "_"): metadata.version(DISTRIBUTION)}))
     return backend, run

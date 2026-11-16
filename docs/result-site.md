@@ -41,7 +41,7 @@ Procedure snippets are from the current checkout; they are not historical source
 python scripts/manager.py --dir runs/corpus --inbox runs/inbox
 ```
 
-The inbox lists immediate child run bundles and imported legacy artifacts. Archive moves the
+The inbox lists immediate child run bundles and `.pt` run files. Archive moves the
 entire bundle, including logs, frozen inputs, reports, and tensor outputs. An existing destination
 is never overwritten; the action returns a conflict instead. Select a collection as the archive
 destination, not an existing run bundle.
@@ -55,21 +55,20 @@ or cross-filesystem moves fail without copying/deleting artifacts. POST actions 
 from the inbox page, and the server rejects unexpected hosts and cross-origin actions. Static
 exports contain no action forms.
 
-## Explicit standalone artifact import
+## Explicit run-file import
 
-Collections containing current schema-3 `.pt` files need a one-time import. The CLI retains the
-`--import-legacy` name for this standalone path. Older coordinate formats must be rerun:
+The construct probes (`scripts/constructs.py`) and the perf microbenchmark (`scripts/perf.py`) write
+`.pt` run files with version-4 coordinates, which need a one-time import. The import also reads
+version 3; older coordinate formats must be rerun:
 
 ```bash
-python scripts/manager.py --dir runs/legacy --import-legacy --export legacy.html
+python scripts/manager.py --dir runs/probes --import-run-files --export probes.html
 ```
 
-Only use this flag for artifacts you trust: the import unpickles files and can execute code.
-It saves small `NAME.summary.json` sidecars so subsequent browsing reads JSON only. Standalone
-scoring happens during this explicit import; it never guesses an fp32 control. Reference
-selection checks exact saved inputs, model and method, case/regime settings, baseline/effect
-configuration, and model-load options. Timing-only changes are allowed. Standalone imports lack
-the Docker runner's resolved source/model/tokenizer checks; the site labels that limitation.
+The import loads tensors and plain containers only (`torch.load(weights_only=True)`). It saves
+small `NAME.summary.json` sidecars so subsequent browsing reads JSON only. A run file holding
+neither probe results nor performance rows is skipped; method runs are job bundles of
+`bench.py run`.
 
 Changing a `.pt` file's size or modification time invalidates its summary; rerun the import.
 Archive and trash move its summary alongside the artifact. No tensor cache is kept by the site.

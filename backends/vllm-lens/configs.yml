@@ -1,7 +1,9 @@
-# vLLM-Lens on vLLM 0.19.1 (the Dockerfile's ARG values). `mode: opt` selects the fastest
-# documented realization (cells_opt.py).
+# vLLM-Lens: 1.2.1 on vLLM 0.19.1 in the configs without a version (the Dockerfile's ARG values)
+# and 1.3.0 on vLLM 0.30.0, the release it requires, in the `1-3-0` configs (the same config set).
+# `mode: opt` selects the fastest documented realization (cells_opt.py).
 images:
   default: {}
+  1-3-0: {VLLM_IMAGE: vllm/vllm-openai:v0.30.0, VLLM_LENS_VERSION: 1.3.0}
 configs:
   default:
     image: default
@@ -17,3 +19,11 @@ configs:
   tp4: {image: default, options: {<<: *base, tensor_parallel_size: 4}, gpus: 4}
   opt/tp2: {image: default, options: {<<: *base, mode: opt, tensor_parallel_size: 2}, gpus: 2}
   opt/tp4: {image: default, options: {<<: *base, mode: opt, tensor_parallel_size: 4}, gpus: 4}
+  1-3-0: {image: 1-3-0, options: *base}
+  1-3-0/opt: {image: 1-3-0, options: {<<: *base, mode: opt}}
+  1-3-0/async: {image: 1-3-0, options: {<<: *base, async_llm: true}}
+  1-3-0/opt/async: {image: 1-3-0, options: {<<: *base, mode: opt, async_llm: true}}
+  1-3-0/tp2: {image: 1-3-0, options: {<<: *base, tensor_parallel_size: 2}, gpus: 2}
+  1-3-0/tp4: {image: 1-3-0, options: {<<: *base, tensor_parallel_size: 4}, gpus: 4}
+  1-3-0/opt/tp2: {image: 1-3-0, options: {<<: *base, mode: opt, tensor_parallel_size: 2}, gpus: 2}
+  1-3-0/opt/tp4: {image: 1-3-0, options: {<<: *base, mode: opt, tensor_parallel_size: 4}, gpus: 4}

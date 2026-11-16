@@ -18,32 +18,54 @@ Denotation, from IBM/vLLM-Hook 0e34fdd source:
   plugin merges the requests' probes onto `outputs[0].probes` as a list in request order
   (`hook_llm.py`, `generate`); on the disk path `flush_disk` writes the batch's requests into one
   artifact in request order. The `hidden_states` analyzer returns those rows per layer.
-- The plugin returns hidden states only, with no unembedding. The next-token readout is user code:
-  the checkpoint's final RMSNorm and `lm_head` weights, applied to the last rows on the GPU.
+- The plugin returns hidden states only, with no unembedding. A readout over the vocabulary is user
+  code: the checkpoint's final RMSNorm and `lm_head` weights applied to captured rows on the GPU in
+  fp32, as vLLM-Hook's analyzers replay the norm on fp32 features (`ScienceHallucinationAnalyzer`).
 - `steer_hook_act`, the steering worker, adds a fixed vector (`add_vector`) or adjusts a projection
   (`adjust_rs`) at the LAST row of each forward of one layer: the last prompt token, and each decoded
   token when `apply_at_all_positions` is true (commit afdf36a). It is a separate worker extension,
   so an engine either reads or steers.
 Workloads outside those forms are declared unsupported with the reason. Outputs carry the unit
 axis at dim -2.
+
+MIA (v1.0.1, d748ccf, on vLLM 0.32.0) keeps those read denotations and the same calls on `MiaLLM`:
+- `capture_hs` records `hidden + residual` after each decoder block, in the CUDA graph
+  (`mia/core/hooks/ops.py`, the capture op) and in the eager hook
+  (`mia/workers/hs_capture_worker.py`, `hs_hook`: `output[0] + output[1]`), layers numbered from 1,
+  the same `last_token` / `all_tokens` modes and `hooks_on` passes. A request names its layers and
+  mode in its own `extra_args` (`output_hidden_states`, `hs_mode`; docs/configs.md, "Per-request
+  arguments"), which `MiaLLM.generate` keeps over the engine's defaults.
+- `capture_qk` records the same post-RoPE query and keys, and `attn_tracker` rebuilds the
+  probabilities (`compute_attention_from_qk`).
+- A batch's probes arrive merged on `outputs[0].probes`, one first pass per request
+  (`mia/llm.py`, `_merge_probes`); `save_to_disk` writes the run under the given `run_id`.
+- `steer` adds `coefficient * dir` at every token of the listed blocks, or the last one
+  (`steering.positions`), on the prefill and decode passes (`steering.phase`); it writes no
+  artifact and returns no activations (docs/configs.md).
 """
 import json
 import os
-import shutil
+import uuid
 
 import torch
 
-from isb.methodologies.jacobian_lens import _load_fitted, _orthogonal
+from isb.methodologies.jacobian_lens import load_fitted, orthogonal
 from isb.methodologies.registry import Unsupported, cell
-from isb.tasks.lens_eval import locate
+from isb.data import locate
 
-from .backend import AsyncHook
+from .backend import MIA, QK, READ, AsyncHook
 
 ONE_ENGINE = ("an engine carries one worker extension (HookLLM worker_name), so reading the stream "
               "(probe_hidden_states) and writing it (steer_hook_act) cannot share an engine")
 LAST_ROW_STEER = ("steer_hook_act writes only the last row of each forward "
                   "(steer_activation_worker._apply_steer: slice_view[-1:]), the last prompt token and "
                   "each decoded token; adding at every prompt position is not expressible")
+# MIA's steer worker reaches every token, and the engine that steers still returns nothing to read.
+MIA_STEER = ("the steer worker adds a fixed vector (steering.method add_vector: coefficient * dir "
+             "at the listed blocks) and returns no activations (docs/configs.md: steering writes "
+             "no artifact), and an engine carries one worker (MiaLLM worker_name), so the engine "
+             "that steers cannot read the stream: neither the norm the strength is relative to "
+             "nor the steered next-token distribution over the vocabulary")
 
 
 def _other_worker(model, needed, what):
@@ -51,9 +73,9 @@ def _other_worker(model, needed, what):
                        f"engine carries one worker extension (HookLLM worker_name)")
 
 
-def _weights(model):
-    """The final norm and unembedding from the checkpoint, on the GPU in fp32, loaded once."""
-    if not model.weights:
+def _stored_weights(model):
+    """The checkpoint's final norm and unembedding in host memory as stored, read once."""
+    if "host" not in model.weights:
         from huggingface_hub import snapshot_download
         from safetensors import safe_open
 
@@ -66,15 +88,30 @@ def _weights(model):
                 index = {name: "model.safetensors" for name in f.keys()}
         names = {"norm": "model.norm.weight",
                  "unembed": "lm_head.weight" if "lm_head.weight" in index else "model.embed_tokens.weight"}
+        weights = {}
         for key, name in names.items():
-            with safe_open(os.path.join(root, index[name]), framework="pt", device="cuda") as f:
-                model.weights[key] = f.get_tensor(name).float()
-    return model.weights
+            with safe_open(os.path.join(root, index[name]), framework="pt") as f:
+                weights[key] = f.get_tensor(name)
+        model.weights["host"] = weights
+    return model.weights["host"]
 
 
-def _project(model, rows):
-    """Final RMSNorm, then the unembedding, on the GPU in fp32. rows: [n, d_model] -> [n, vocab]."""
-    w = _weights(model)
+def _weights(model, keep):
+    """The final norm and unembedding on the GPU in fp32: kept for later calls when `keep` (the
+    readout a timed call runs), else for this call only, so the GPU holds no weights that only check
+    calls use."""
+    if "gpu" in model.weights:
+        return model.weights["gpu"]
+    weights = {key: w.to("cuda", torch.float32) for key, w in _stored_weights(model).items()}
+    if keep:
+        model.weights["gpu"] = weights
+    return weights
+
+
+def _project(model, rows, keep):
+    """Final RMSNorm, then the unembedding, on the GPU in fp32; the result on the host.
+    rows: [n, d_model] -> [n, vocab]. `keep` as `_weights`."""
+    w = _weights(model, keep)
     x = rows.to("cuda", torch.float32)
     x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + model.config.rms_norm_eps) * w["norm"]
     return (x @ w["unembed"].T).cpu()
@@ -99,10 +136,12 @@ def _capture(model, prompts, layers, mode, new_tokens=1):
     extra_args and adds its own defaults)."""
     from vllm import SamplingParams
 
-    if model.worker != "probe_hidden_states":
-        raise _other_worker(model, "probe_hidden_states", "hidden-state capture")
+    if model.worker != READ:
+        raise _other_worker(model, READ, "hidden-state capture")
     if isinstance(model.llm, AsyncHook):           # AsyncLLM: the fields go on each request
         return model.llm.capture(prompts, [i + 1 for i in layers], mode, new_tokens)
+    if MIA:
+        return _capture_mia(model, prompts, layers, mode, new_tokens)
     params = (SamplingParams(max_tokens=new_tokens, min_tokens=new_tokens, temperature=0.0, top_p=1.0,
                              extra_args={"hooks_on": "both"}) if new_tokens > 1
               else SamplingParams(max_tokens=1, temperature=0.0, top_p=1.0))
@@ -113,7 +152,7 @@ def _capture(model, prompts, layers, mode, new_tokens=1):
         outs = llm.generate(list(prompts), params, save_to_disk=model.save_to_disk, use_tqdm=False)
         if model.save_to_disk:
             stats = llm.analyze(analyzer_spec={"reduce": "none"})   # reads this call's run_id
-            shutil.rmtree(os.path.join(llm._hook_dir, llm._last_run_id), ignore_errors=True)
+            model.finished_runs.append(os.path.join(llm._hook_dir, llm._last_run_id))
         else:
             stats = llm.analyze(analyzer_spec={"reduce": "none"}, probes=outs[0].probes)
     finally:
@@ -121,12 +160,37 @@ def _capture(model, prompts, layers, mode, new_tokens=1):
     return outs, stats["hidden_states"]
 
 
+def _capture_mia(model, prompts, layers, mode, new_tokens):
+    """`_capture` on MIA: every request carries its layers (numbered from 1), mode and passes in
+    its own `extra_args`, and a disk run is named by this call, read back and left for `between_calls` to remove.
+    `probes` is
+    read inside the call: MIA delivers an output's capture on first access (examples/README.md,
+    "Where the captured data goes")."""
+    from vllm import SamplingParams
+
+    extra = {"output_hidden_states": [i + 1 for i in layers], "hs_mode": mode}
+    if new_tokens > 1:
+        extra["hooks_on"] = "both"
+    params = SamplingParams(max_tokens=new_tokens, min_tokens=new_tokens, temperature=0.0,
+                            top_p=1.0, extra_args=extra)
+    llm = model.llm
+    if not model.save_to_disk:
+        outs = llm.generate(list(prompts), params, use_tqdm=False)
+        return outs, llm.analyze(analyzer_spec={"reduce": "none"},
+                                 probes=outs[0].probes)["hidden_states"]
+    run_id = uuid.uuid4().hex
+    outs = llm.generate(list(prompts), params, save_to_disk=True, run_id=run_id, use_tqdm=False)
+    stats = llm.analyze(analyzer_spec={"reduce": "none"}, run_id=run_id)
+    model.finished_runs.append(os.path.join(model.hook_dir, run_id))
+    return outs, stats["hidden_states"]
+
+
 def _last_rows(model, prompts, layers):
     """Each listed layer's (0-based) last-token stream of every prompt: [len(layers), B, d_model]."""
     _, by_layer = _capture(model, prompts, layers, "last_token")
-    return torch.stack([torch.stack([row.reshape(-1) for row in
-                                     _requests(by_layer[f"model.layers.{i}"], len(prompts))])
-                        for i in layers])
+    rows = [row.reshape(-1) for i in layers
+            for row in _requests(by_layer[f"model.layers.{i}"], len(prompts))]
+    return torch.stack(rows).reshape(len(layers), len(prompts), -1)
 
 
 def _token_rows(model, prompts, layers):
@@ -147,23 +211,48 @@ def _token_rows(model, prompts, layers):
 
 
 def _final_logits(model, prompts):
-    return _project(model, _last_rows(model, prompts, [model.n_layers - 1])[0])   # [B, vocab]
+    """The check form of a next token: the stream after the last layer projected in fp32,
+    `[B, vocab]`."""
+    return _project(model, _last_rows(model, prompts, [model.n_layers - 1])[0], keep=False)
+
+
+def _plain_tokens(model, prompts):
+    """Each prompt's greedy next token among the non-stop tokens (`min_tokens=1`), `[B, 1]` int64,
+    from the plain request: `generate` with `use_hook=False`, which clears the requests'
+    extra_args so the worker captures nothing (`vllm_hook_plugins/hook_llm.py` and `mia/llm.py`,
+    `generate`), or on AsyncLLM one request per prompt with no extra_args (`AsyncHook.decode`).
+    vLLM's request outputs come back in prompt order."""
+    from vllm import SamplingParams
+
+    if isinstance(model.llm, AsyncHook):
+        outs = model.llm.decode(list(prompts), 1)
+    else:
+        outs = model.llm.generate(list(prompts), SamplingParams(
+            max_tokens=1, min_tokens=1, temperature=0.0, top_p=1.0), use_hook=False, use_tqdm=False)
+    return torch.tensor([list(out.outputs[0].token_ids) for out in outs])
 
 
 @cell("logit_lens", family="llama", backend="vllm_hook")
 def logit_lens(be, model, units, *, layers="all"):
+    """The final RMSNorm and unembedding applied in fp32 to the stream after each read layer at
+    each prompt's last token, `[n_layers, B, vocab]` on the host (`_project`)."""
     n = model.n_layers
     idx = list(range(n)) if layers == "all" else [i % n for i in layers]
     rows = _last_rows(model, units, idx)                                       # [n_layers, B, d]
-    logits = _project(model, rows.reshape(-1, rows.shape[-1]))
+    logits = _project(model, rows.reshape(-1, rows.shape[-1]), keep=True)
     return logits.reshape(len(idx), len(units), -1)                            # [n_layers, B, vocab]
 
 
 @cell("steering", family="llama", backend="vllm_hook")
 def steering(be, model, units, *, layer=8, layers=None, target=" Rome", alpha=6.0,
-             scale_by="mean_norm"):
+             scale_by="mean_norm", check=False):
+    """At `alpha=0` nothing is written: a timed call is the plain request and returns each unit's
+    greedy token, `[B, 1]` (`_plain_tokens`); a check call projects the stream captured after the
+    last layer, `[B, vocab]` (`_final_logits`). Any other strength is unsupported in both calls."""
     if alpha == 0:
-        return _final_logits(model, units)
+        return _final_logits(model, units) if check else _plain_tokens(model, units)
+    if MIA:
+        raise Unsupported(MIA_STEER)
     raise Unsupported(f"{LAST_ROW_STEER}; a strength from the stream's norm also needs a read, and "
                       f"{ONE_ENGINE}")
 
@@ -171,6 +260,8 @@ def steering(be, model, units, *, layer=8, layers=None, target=" Rome", alpha=6.
 @cell("gen_steering", family="llama", backend="vllm_hook")
 def gen_steering(be, model, units, *, layer=8, target=" Rome", alpha=6.0, new_tokens=8,
                  scale_by="mean_norm"):
+    if MIA:
+        raise Unsupported(MIA_STEER)
     raise Unsupported(f"{LAST_ROW_STEER}; steering at every decode step steers the last prompt "
                       f"token, not every prompt position")
 
@@ -195,6 +286,10 @@ def gen_capture(be, model, units, *, layer, new_tokens, export=True):
         return torch.stack([torch.tensor(out.outputs[0].token_ids)[:, None] for out in outs],
                            dim=1)                                               # [new_tokens, B, 1]
     if not model.save_to_disk and not isinstance(model.llm, AsyncHook) and len(units) > 1:
+        if MIA:
+            raise Unsupported("MiaLLM.generate merges several requests' probes onto outputs[0], "
+                              "keeping each request's first pass (mia/llm.py, _merge_probes), so a "
+                              "batch's decode passes are not on it; disk storage keeps them")
         raise Unsupported("HookLLM.generate merges several requests' RPC probes onto outputs[0], "
                           "keeping each request's first pass (hook_llm.py, generate), so a batch's "
                           "decode passes are lost; disk storage and the AsyncLLM path keep them")
@@ -209,9 +304,18 @@ def gen_capture(be, model, units, *, layer, new_tokens, export=True):
 
 
 @cell("activation_patching", family="llama", backend="vllm_hook")
-def activation_patching(be, model, units, *, layer=6, patch=True, positions="all"):
+def activation_patching(be, model, units, *, layer=6, patch=True, positions="all", check=False):
+    """`patch=False` runs each pair's corrupt prompt unpatched: a timed call is the plain request
+    and returns its greedy token, `[B, 1]` (`_plain_tokens`); a check call projects the stream
+    captured after the last layer, `[B, vocab]` (`_final_logits`). A patch is unsupported."""
     if not patch:
-        return _final_logits(model, [unit[1] for unit in units])   # the corrupt runs, unpatched
+        corrupt = [unit[1] for unit in units]
+        return _final_logits(model, corrupt) if check else _plain_tokens(model, corrupt)
+    if MIA:
+        raise Unsupported("a patch writes a value read from another run: the steer worker adds one "
+                          "vector from a file to the positions it steers (steering.vector_path), "
+                          "and an engine carries one worker (MiaLLM worker_name), so the engine "
+                          "that steers reads neither the clean stream nor the patched output")
     if positions != "last":
         raise Unsupported(LAST_ROW_STEER)
     raise Unsupported("a last-token patch is an add_vector of clean minus corrupt at the last row, "
@@ -219,17 +323,20 @@ def activation_patching(be, model, units, *, layer=6, patch=True, positions="all
 
 
 @cell("ablation", family="llama", backend="vllm_hook")
-def ablation(be, model, units, *, layer=6, target="mlp"):
+def ablation(be, model, units, *, layer=6, target="mlp", check=False):
+    """At `target="none"` nothing is zeroed: a timed call is the plain request and returns each
+    unit's greedy token, `[B, 1]` (`_plain_tokens`); a check call projects the stream captured
+    after the last layer, `[B, vocab]` (`_final_logits`). Any other target is unsupported."""
     if target == "none":
-        return _final_logits(model, units)
+        return _final_logits(model, units) if check else _plain_tokens(model, units)
     raise Unsupported("the built-in workers hook decoder layers and attention modules for reads and "
                       "steer the residual by a fixed vector; none zeroes a submodule's output")
 
 
 def _transport(model, transport, layers, dtype):
     """The J-lens transport for the read `layers` on the GPU in the stream's `dtype`: None (the
-    identity), one `[d, d]` map shared by every layer (an int seed, `_orthogonal`, or a tensor), or
-    an `[n_layers, d, d]` stack of per-layer maps (a fitted lens, `_load_fitted`, or a mapping).
+    identity), one `[d, d]` map shared by every layer (an int seed, `orthogonal`, or a tensor), or
+    an `[n_layers, d, d]` stack of per-layer maps (a fitted lens, `load_fitted`, or a mapping).
     A seed or a fitted spec is built once per model and kept."""
     if transport is None:
         return None
@@ -237,11 +344,11 @@ def _transport(model, transport, layers, dtype):
     if key in model.transports:
         return model.transports[key]
     if isinstance(transport, int):
-        maps = _orthogonal(model.config.hidden_size, transport)
+        maps = orthogonal(model.config.hidden_size, transport)
     elif isinstance(transport, torch.Tensor):
         maps = transport
     else:
-        per_layer = _load_fitted(transport) if isinstance(transport, str) else transport
+        per_layer = load_fitted(transport) if isinstance(transport, str) else transport
         maps = torch.stack([per_layer[i] for i in layers])
     maps = maps.to("cuda", dtype)
     if key is not None:
@@ -251,11 +358,10 @@ def _transport(model, transport, layers, dtype):
 
 @cell("jacobian_lens", family="llama", backend="vllm_hook")
 def jacobian_lens(be, model, units, *, layers="all", position="last", transport=None):
-    """The J-lens readout from the plugin's hidden states: the stream after each read layer at
+    """The J-lens readout `[n_layers, B, vocab]` on the host: the stream after each read layer at
     each prompt's readout position (`last_token` capture for the last token, `all_tokens` for any
-    other), then user code on the client GPU, as for the logit lens: `J_l @ h` in the stream's
-    dtype, the checkpoint's final RMSNorm and the unembedding (`_project`, fp32). The plugin has
-    no unembedding, so the projection cannot run in the worker. Output `[n_layers, B, vocab]`."""
+    other), `J_l @ h` in the stream's dtype, then the checkpoint's final RMSNorm and unembedding in
+    fp32 on the client GPU (`_project`), since the plugin has no unembedding."""
     n = model.n_layers
     idx = list(range(n)) if layers == "all" else [i % n for i in layers]
     positions = [locate(model.tokenizer, unit, position) for unit in units]
@@ -268,7 +374,7 @@ def jacobian_lens(be, model, units, *, layers="all", position="last", transport=
     maps = _transport(model, transport, idx, x.dtype)
     if maps is not None:
         x = x @ maps.T if maps.dim() == 2 else x @ maps.transpose(1, 2)        # per layer: h @ J_l.T
-    logits = _project(model, x.reshape(-1, x.shape[-1]))
+    logits = _project(model, x.reshape(-1, x.shape[-1]), keep=True)
     return logits.reshape(len(idx), len(units), -1)                            # [n_layers, B, vocab]
 
 
@@ -288,8 +394,8 @@ def activation_harvest(be, model, units, *, layer=None, layers=None, export=True
         return torch.tensor([[out.outputs[0].token_ids[0]] for out in outs])      # [B, 1]
     n = model.n_layers
     read = [i % n for i in (layers if layers is not None else [layer])]
-    stacked = torch.stack([torch.cat(rows) for rows in _token_rows(model, units, read)])
-    return stacked if layers is not None else stacked[0]
+    rows = torch.cat([row for per_prompt in _token_rows(model, units, read) for row in per_prompt])
+    return rows.reshape(len(read), -1, rows.shape[-1]) if layers is not None else rows
 
 
 @cell("residual_readout", family="llama", backend="vllm_hook")
@@ -301,30 +407,37 @@ def residual_readout(be, model, units, *, layers):
 
 
 @cell("attention_pattern", family="llama", backend="vllm_hook")
-def attention_pattern(be, model, units, *, layers="all"):
-    """The last query's attention log-probabilities `[n_layers, B, n_heads, k_len]` from the Q/K
-    probe: per request, `output_qk` lists the read layers (the worker numbers attention modules
-    from 0), the worker records the post-RoPE query at the last token and the keys of the whole
-    prompt, and the `attn_tracker` analyzer's own reconstruction gives each head's probabilities
-    over the prompt (`compute_attention_from_qk`, GQA heads repeated); the log is user code."""
+def attention_pattern(be, model, units, *, layers="all", check=False):
+    """The last query's attention probabilities `[n_layers, B, n_heads, k_len]`: each request lists
+    the read layers in `output_qk` (attention modules numbered from 0), and the `attn_tracker`
+    analyzer rebuilds every head's probabilities over the prompt from the captured post-RoPE query
+    and keys (`compute_attention_from_qk`). A timed call returns them in the analyzer's dtype; a
+    check call returns their log, a probability that is zero in that dtype floored first at the
+    dtype's smallest normal, as in the HF cell."""
     from vllm import SamplingParams
 
-    if model.worker != "probe_hook_qk":
-        raise _other_worker(model, "probe_hook_qk", "Q/K capture")
+    if model.worker != QK:
+        raise _other_worker(model, QK, "Q/K capture")
     n = model.n_layers
     idx = list(range(n)) if layers == "all" else [i % n for i in layers]
     llm = model.llm
     params = SamplingParams(max_tokens=1, temperature=0.0, top_p=1.0, extra_args={"output_qk": idx})
-    outs = llm.generate(list(units), params, save_to_disk=model.save_to_disk, use_tqdm=False)
+    # MIA names a disk run by an argument; v0.2.0 keeps the last run's id on the engine object
+    run_id = uuid.uuid4().hex if MIA else None
+    outs = llm.generate(list(units), params, save_to_disk=model.save_to_disk, use_tqdm=False,
+                        **({"run_id": run_id} if MIA and model.save_to_disk else {}))
     if model.save_to_disk:
-        weights = llm.analyzer.compute_attention_from_qk(run_id=llm._last_run_id)
-        shutil.rmtree(os.path.join(llm._hook_dir, llm._last_run_id), ignore_errors=True)
+        run_id = run_id or llm._last_run_id
+        weights = llm.analyzer.compute_attention_from_qk(run_id=run_id)
+        model.finished_runs.append(os.path.join(model.hook_dir, run_id))
     else:
         weights = llm.analyzer.compute_attention_from_qk(probes=outs[0].probes)
     if len(weights) != len(units):
         raise RuntimeError(f"reconstructed {len(weights)} requests' attention, expected {len(units)}")
-    return torch.stack([torch.stack([torch.log(w[f"model.layers.{i}.self_attn.attn"]["attention"])
-                                     for w in weights]) for i in idx])
+    probs = [w[f"model.layers.{i}.self_attn.attn"]["attention"] for i in idx for w in weights]
+    if check:
+        probs = [torch.log(p.clamp_min(torch.finfo(p.dtype).tiny)) for p in probs]
+    return torch.stack(probs).reshape(len(idx), len(units), *probs[0].shape)
 
 
 # On the AsyncLLM backend (backend.py, VLLMHookAsyncBackend) the same cells read through

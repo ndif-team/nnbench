@@ -1,4 +1,4 @@
-"""Micro-tier runner: one backend per process, all its probes against one loaded
+"""Construct-probe runner: one backend per process, all its probes against one loaded
 GPT-2, each probe in a watchdog thread.
 
 HANG handling: a probe that exceeds its timeout is recorded HANG and the sweep for
@@ -13,8 +13,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from ..states import AppState
-from .probes import PROBES, names_for
+from .probes import PROBES, State, names_for
 
 PROBE_TIMEOUT_S = 180.0
 
@@ -59,14 +58,14 @@ def _run_one(fn, be, model, timeout_s: float):
     t.join(timeout_s)
     dt = time.perf_counter() - t0
     if t.is_alive():
-        return AppState.HANG, f"exceeded {timeout_s:.0f}s watchdog", dt, None
+        return State.HANG, f"exceeded {timeout_s:.0f}s watchdog", dt, None
     if "error" in box:
-        return AppState.ERROR, box["error"], dt, box.get("detail")
+        return State.ERROR, box["error"], dt, box.get("detail")
     state, note = box["result"]
     return state, note, dt, None
 
 
-def run_micro(backend_name: str, repo: str = "openai-community/gpt2",
+def run_constructs(backend_name: str, repo: str = "openai-community/gpt2",
               only: list | None = None, timeout_s: float = PROBE_TIMEOUT_S) -> list:
     from ..backends import IMPLS
 
@@ -80,7 +79,7 @@ def run_micro(backend_name: str, repo: str = "openai-community/gpt2",
             state, note, dt, detail = _run_one(PROBES[(name, backend_name)], be, model, timeout_s)
             results.append(ProbeResult(name, backend_name, state, note, dt, detail))
             print(f"  {name:<20}{state:<18}{dt:6.1f}s  {note}", flush=True)
-            if state == AppState.HANG:
+            if state == State.HANG:
                 print("  -- HANG poisons the engine; aborting this backend's remaining probes",
                       flush=True)
                 break
@@ -89,13 +88,11 @@ def run_micro(backend_name: str, repo: str = "openai-community/gpt2",
     return results
 
 
-def micro_run_file(backend_name: str, repo: str, results: list,
+def constructs_run_file(backend_name: str, repo: str, results: list,
                    out_dir: str, run_name: str) -> str:
     """Write a construct-probe run as a self-contained run file (isb/runfile.py). Probes
     self-check, so the file carries their states directly under ("probe", <name>) meta keys;
-    there is nothing for a baseline comparison to score. Coordinates say "constructs": in this
-    project's vocabulary "micro" is the perf op-cost benchmark, and these probes surface as
-    construct support on backend pages."""
+    there is nothing for a baseline comparison to score."""
     from ..runfile import save_run
     from ..runs import EngineConfig, RunConfig, resolve_provenance, run_coordinates
 
@@ -111,8 +108,8 @@ def micro_run_file(backend_name: str, repo: str, results: list,
     return save_run(out_dir, run_name, {("__meta__",): meta}, prov)
 
 
-def print_micro_map(backend_name: str, repo: str, results: list) -> None:
-    print("\n=== Micro tier — Level 0/1 primitive map ===")
+def print_constructs_map(backend_name: str, repo: str, results: list) -> None:
+    print("\n=== Construct probes: Level 0/1 primitive map ===")
     print(f"backend: {backend_name}    model: {repo}")
     print("-" * 100)
     print(f"{'probe':<21}{'state':<18}{'lat':<7}{'denotation check / note'}")
@@ -121,5 +118,5 @@ def print_micro_map(backend_name: str, repo: str, results: list) -> None:
         lat = f"{r.latency_s:.1f}s" if r.latency_s is not None else "-"
         print(f"{r.name:<21}{r.state:<18}{lat:<7}{r.note}")
     print("-" * 100)
-    n_ok = sum(1 for r in results if r.state == AppState.SUPPORTED)
+    n_ok = sum(1 for r in results if r.state == State.SUPPORTED)
     print(f"{n_ok}/{len(results)} SUPPORTED.")

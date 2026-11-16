@@ -3,15 +3,19 @@
 are the last n_i positions of row i and the pad positions are dropped; vLLM serves each request's
 own `[tokens, d]` with no padding. `export=False` is the baseline: the same forward, returning each
 prompt's greedy next token. `layers`, when given, replaces `layer`: the result is `[len(layers),
-tokens, d]`, each layer's rows in the single-layer order, in the engine's activation dtype."""
+tokens, d]`, each layer's rows in the single-layer order, in the engine's activation dtype. A timed
+call returns every read in the engine's dtype; a check call returns a single layer's in fp32."""
 from __future__ import annotations
 
 import torch
 
+from ..oracle.checks import read_matches, timed_check_of
 from ..profiles import _resid
 from .observations import record_resolved
-from .readout import engine_logits
+from .readout import next_token
 from .registry import cell
+
+timed_check_of("activation_harvest")(read_matches)
 
 
 def _layers(layer, layers, export):
@@ -25,7 +29,7 @@ def _layers(layer, layers, export):
 
 @cell("activation_harvest", family="*", backend="hf")
 def activation_harvest_hf(be, model, m, units, *, layer=None, export=True, residual="plain",
-                          layers=None):
+                          layers=None, check=False):
     counts = [len(model.tokenizer(p)["input_ids"]) for p in units]
     if len(units) > 1 and model.tokenizer.padding_side != "left":
         raise ValueError(f"the tokenizer pads on the {model.tokenizer.padding_side}; valid tokens are "
@@ -49,27 +53,23 @@ def activation_harvest_hf(be, model, m, units, *, layer=None, export=True, resid
                             for i in read])                                # [n_layers, tokens, d]
 
     with torch.no_grad():
-        if read is None:
-            return be.run(model, units, build)
-        return be.run(model, units, build, keep_dtype=True)
+        return be.run(model, units, build, keep_dtype=not check or read is not None)
 
 
 @cell("activation_harvest", family="*", backend="vllm_async")
 def activation_harvest_vllm(be, model, m, units, *, layer=None, export=True, residual=None,
-                            layers=None):
+                            layers=None, check=False):
     residual = residual if residual is not None else m.default_residual(be.name)
     record_resolved(residual=residual)
     read = _layers(layer, layers, export)
 
     def build(rows):
         if not export:
-            return engine_logits(model)[-1:, :].argmax(-1, keepdim=True).cpu()      # [1, 1]
+            return next_token(model, None, "engine")                               # [1, 1]
         if read is None:
             return _resid(m.blocks(model)[layer].output, residual).cpu()           # [tokens, d]
         blocks = m.blocks(model)
         return torch.stack([_resid(blocks[i].output, residual)
                             for i in read]).cpu()                          # [n_layers, tokens, d]
 
-    if read is None:
-        return be.run(model, units, build)
-    return be.run(model, units, build, keep_dtype=True)
+    return be.run(model, units, build, keep_dtype=not check or read is not None)

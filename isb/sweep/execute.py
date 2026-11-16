@@ -1,15 +1,23 @@
 """Execute one run: (spec × data × RunConfig) -> one run file, <out_dir>/<run_name>.pt
-(isb/runfile.py): `outputs` {(regime name, label): cpu tensor} holds every cell's warm output (an
+(isb/runfile.py): `outputs` {(regime name, label): cpu tensor} holds every cell's check output (an
 alternative realization under its own label, `<row> [k=v]`), the per-unit stacks a multi-unit call
 is scored against (("batched_perprompt" | "offline_perprompt", label)) and ("__meta__",), the
-per-cell perf (with `returned_bytes`, the tensor bytes one call hands the client), errors and
+per-cell perf (with `returned_bytes`, the tensor bytes one timed call hands the client), errors and
 effective params; `provenance` is the client/deployment/engine/host
 record with the run's coordinates (isb/runs.py `run_coordinates`).
 
-Every regime runs the same way: the baseline cell, the plain request (`be.plain`) and every case,
-each over the regime's units in the regime's call form and timing loop (warm trials for the
-execution regimes, the load pattern's passes for a load regime). Scoring is a separate step
-(score.py) over run files: execution never compares.
+A cell runs in two kinds of call. A timed call is what a user of the system runs and returns the
+user's result; it is never scored. A check call, untimed, returns what the correctness check
+compares (`check=True`, for a cell that declares the parameter; any other cell returns one value
+for both, and its row records `timed_output: "check"`). Every regime runs the same way: the
+baseline cell, the plain request (`be.plain`) and every case, each timed over the regime's units in
+the regime's call form and timing loop (warm trials for the execution regimes, the load pattern's
+passes for a load regime), then, after all of them, the per-unit reference stacks and each case's
+check calls in the same form. A case whose cell returns a separate result when timed has its last
+timed output related to the check output of the same units (`timed_check`, isb/oracle/checks.py).
+A check run (`n_trials=0`) makes the check calls only. The scorer (isb/jobs/score.py) compares the
+check outputs with the reference job's; within the job, execution compares only a timed result
+with its check output and the effect check's baseline and perturbed outputs.
 """
 from __future__ import annotations
 
@@ -18,17 +26,19 @@ import functools
 import inspect
 import traceback
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from ..methodologies.observations import capture_choices
 from ..methodologies.registry import Unsupported, get_cell, get_realizations
+from ..oracle.checks import stop_tokens, timed_check_for
 from ..perf.core import returned_bytes
 from ..perf.timing import time_cell
 from ..perf.worker_memory import WorkerMemory, allow_callable_rpc, requested as worker_memory_requested
+from ..jobs.schema import latency_ratio, measured
 from ..runfile import save_run
 from ..runs import RunConfig, cell_interface, make_backend, resolve_provenance, spec_coordinates
 from ..sweep.guards import compute_effect_size
-from ..sweep.spec import LOAD_KINDS
+from ..sweep.spec import LOAD_KINDS, REGIME_KINDS
 
 
 # ---- cell-call helpers (shared with tests) ----------------------------------------------------
@@ -49,7 +59,7 @@ def _effective_params(fn, params):
     bound.apply_defaults()
     effective = {}
     for name, value in bound.arguments.items():
-        if name in leading:
+        if name in leading or name == "check":       # the kind of call, set per invocation
             continue
         kind = signature.parameters[name].kind
         if kind is inspect.Parameter.VAR_KEYWORD:
@@ -66,16 +76,22 @@ class BoundCell:
     params: dict
     record: dict = field(default_factory=dict)
     positional_names: tuple = field(init=False)
+    checks: bool = field(init=False)      # the cell returns a separate check output
 
     def __post_init__(self):
         parameters = list(inspect.signature(self.fn).parameters.values())
         self.positional_names = tuple(p.name for p in parameters[3:]
                                       if p.kind is inspect.Parameter.POSITIONAL_ONLY)
+        self.checks = any(p.name == "check" for p in parameters)
 
-    def prepare(self, impl, model, units):
-        """A fresh zero-argument call of the cell over `units` (a list)."""
+    def prepare(self, impl, model, units, check=False):
+        """A fresh zero-argument call of the cell over `units` (a list): a timed call, or with
+        `check` a check call. Runs the backend's `between_calls` first, outside any timer."""
+        impl.between_calls(model)
         owned = deepcopy(self.params)
         positional = [owned.pop(name) for name in self.positional_names]
+        if self.checks:
+            owned["check"] = check
 
         def invoke():
             with capture_choices(self.params, self.record):
@@ -139,11 +155,11 @@ def _stack(mats):
 
 
 def _per_unit_stack(call, be, model, units):
-    """Run the cell on each unit alone (its own call, no padding) and stack the outputs along the
-    unit axis: the per-unit verdict of an aggregate regime, and the reference a multi-unit call is
-    scored against (a padded batch is not its own valid reference: left padding shifts the position
-    embeddings of an absolute-position model)."""
-    return _stack([call.prepare(be, model, [unit])() for unit in units])
+    """Make the cell's check call on each unit alone (its own call, no padding) and stack the
+    outputs along the unit axis: the per-unit verdict of an aggregate regime, and the reference a
+    multi-unit call is scored against (a padded batch is not its own valid reference: left padding
+    shifts the position embeddings of an absolute-position model)."""
+    return _stack([call.prepare(be, model, [unit], check=True)() for unit in units])
 
 
 def _first_rows(tensor, rows):
@@ -196,8 +212,8 @@ def _run_load(regime, prepare, be):
     """Drive `prepare(units)` (a fresh zero-argument call over a unit list) under `regime`'s load
     pattern: offline issues the units in chunks of `batch_size`, concurrent and open loop one unit
     per call. Returns (LoadResult, call outputs): the last pass's outputs, in call order, of the
-    calls that cover the first `score_units` units (offline: whole calls, so possibly more units);
-    the caller stacks them once the timing is recorded and cuts them to the reference's rows."""
+    calls that cover the first `score_units` units (offline: whole calls, so possibly more units),
+    which the caller stacks."""
     from ..perf.load import run_concurrent, run_offline, run_open
 
     keep = min(regime.score_units, len(regime.units))
@@ -221,12 +237,12 @@ def _run_load(regime, prepare, be):
 
 
 def _load_record(regime, result):
-    """A load-pattern record's timing: `median_latency_ms` is the median time of a whole offline
-    pass, or the median request latency under concurrency and open loop (from scheduled arrival);
-    `throughput` is units/s either way."""
+    """A load-pattern record's timing: `median_latency_ms` over whole offline passes, or over the
+    requests under concurrency and open loop (`latency_kind`); `throughput` is units/s either way."""
     latency = result.median_pass_ms if regime.kind == "offline" else result.percentile(50)
-    return {"median_latency_ms": latency, "std_latency_ms": None, "peak_mem_mb": result.peak_mem_mb,
-            "throughput": result.throughput, "load": result.summary()}
+    return measured({"median_latency_ms": latency, "std_latency_ms": None,
+                     "peak_mem_mb": result.peak_mem_mb, "throughput": result.throughput,
+                     "load": result.summary()}, regime.name)
 
 
 def _measure(spec, regime, be, model, prepare):
@@ -243,9 +259,47 @@ def _measure(spec, regime, be, model, prepare):
         return {**_load_record(regime, result), **worker.record(worker.peak_mb())}, out
     timing, out = time_cell(functools.partial(prepare, _timed_units(regime)),
                             warmup=spec.warmup, n_trials=spec.n_trials, worker_memory=worker)
-    return {"median_latency_ms": timing.median_ms, "std_latency_ms": timing.std_ms,
-            "peak_mem_mb": timing.peak_mem_mb, "throughput": _throughput(regime, timing),
-            **worker.record(timing.worker_peak_mem_mb)}, out
+    return measured({"median_latency_ms": timing.median_ms, "std_latency_ms": timing.std_ms,
+                     "trials_ms": timing.times_ms, "peak_mem_mb": timing.peak_mem_mb,
+                     "throughput": _throughput(regime, timing),
+                     **worker.record(timing.worker_peak_mem_mb)}, regime.name), out
+
+
+def _check_load(regime, check, be):
+    """A load pattern's check calls: the calls of one pass that cover the first `score_units`
+    units, in the pattern's form (offline: the timed pass's chunks; concurrent and open loop: those
+    units' requests, overlapping as in a timed pass). Their outputs, in call order."""
+    keep = min(regime.score_units, len(regime.units))
+    if regime.kind == "offline":
+        size = regime.batch_size or len(regime.units)
+        return [check(regime.units[i:i + size])() for i in range(0, keep, size)]
+    _, outs = _run_load(replace(regime, units=regime.units[:keep], passes=1), check, be)
+    return outs
+
+
+def _checked(regime, call, be, model):
+    """A case's scored output from its check calls in the regime's form: per unit in an aggregate
+    regime, one call over the timed units for a multi-unit call, a load pattern's check calls
+    stacked."""
+    check = functools.partial(call.prepare, be, model, check=True)
+    if regime.kind in LOAD_KINDS:
+        return _stack(_check_load(regime, check, be))
+    if regime.kind in ("interactive", "generation") and regime.aggregate:
+        return _per_unit_stack(call, be, model, regime.units)
+    return check(_timed_units(regime))()
+
+
+def _timed_check(methodology, regime, timed, checked, stops):
+    """The last timed output (a load pattern's kept calls, stacked) against the check output of
+    the same leading units: `{"passed", **metrics}` from the methodology's timed check, given
+    `stops()`, the engine's stop tokens, when it takes them."""
+    if regime.kind in LOAD_KINDS:
+        timed = _stack(timed)
+    rows = min(t.shape[-2] if t.dim() >= 2 else t.shape[0] for t in (timed, checked))
+    check = timed_check_for(methodology)
+    extra = {"stops": stops()} if "stops" in inspect.signature(check).parameters else {}
+    passed, metrics = check(_first_rows(timed, rows), _first_rows(checked, rows), **extra)
+    return {"passed": passed, **metrics}
 
 
 def _call_bytes(regime, out):
@@ -254,12 +308,6 @@ def _call_bytes(regime, out):
     if regime.kind in LOAD_KINDS:
         return returned_bytes(out[0]) if out else 0
     return returned_bytes(out)
-
-
-def _ratio(timing, denominator):
-    if not denominator or not denominator.get("median_latency_ms"):
-        return None
-    return timing["median_latency_ms"] / denominator["median_latency_ms"]
 
 
 def _plain(spec, regime, be, model, record):
@@ -285,14 +333,49 @@ def _plain(spec, regime, be, model, record):
 
 
 def _execute_regime(spec, regime, iface, be, model, meta, outputs):
-    """One regime: the per-unit reference stack a multi-unit call is scored against, then the
-    baseline cell, the plain request and every case, each measured under the regime, then the
-    effect check for the single-unit regimes. Every cell error is isolated and recorded."""
+    """One regime: the baseline cell, the plain request and every case, each timed under the
+    regime; then the untimed calls: the per-unit reference stack a multi-unit call is scored
+    against, each case's check calls and the effect check for the single-unit regimes. A check run
+    makes the untimed calls only. Every cell error is isolated and recorded beside any timing it follows; a timed case whose
+    system cannot produce the check output (`Unsupported` from a check call) stays a timed row."""
     name = regime.name
+    timed = spec.n_trials > 0
 
     def bound(params, record):
         call = _bind_case(spec, iface, _task_params(regime, params), record)
         return call, functools.partial(call.prepare, be, model)
+
+    base = plain = None
+    if timed:
+        baseline = meta[("__baseline__", name)] = {}
+        try:
+            _, prepare = bound(spec.baseline.params, baseline)
+            base = _measure(spec, regime, be, model, prepare)[0]
+            baseline.update(base)
+            _success(baseline)
+        except Exception as e:
+            _failure(baseline, e)
+        plain = _plain(spec, regime, be, model, meta.setdefault(("__vanilla__", name), {}))
+
+    timed_cases = []
+    for label, params, alternative in _cases(spec, iface):
+        key = (name, label)
+        case = meta[key] = dict(deepcopy(alternative) or {})
+        try:
+            call, prepare = bound(params, case)
+            case["timed_output"] = "result" if call.checks else "check"
+            out = None
+            if timed:
+                timing, out = _measure(spec, regime, be, model, prepare)
+                case.update(timing, overhead_vs_baseline=latency_ratio(timing, base),
+                            overhead_vs_vanilla=latency_ratio(timing, plain),
+                            returned_bytes=_call_bytes(regime, out))
+        except Exception as e:              # isolated: engine survives, later cells run
+            _failure(case, e)
+            continue
+        # a separate timed result is kept for its timed check; the others need nothing kept
+        timed_cases.append((key, case, call, alternative, out if call.checks else None))
+        out = None
 
     reference = None
     if regime.kind == "batched":
@@ -310,52 +393,39 @@ def _execute_regime(spec, regime, iface, be, model, meta, outputs):
             except Exception as e:
                 _failure(record, e)
 
-    base = None
-    baseline = meta[("__baseline__", name)] = {}
-    try:
-        _, prepare = bound(spec.baseline.params, baseline)
-        base, _ = _measure(spec, regime, be, model, prepare)
-        baseline.update(base)
-        _success(baseline)
-    except Exception as e:
-        _failure(baseline, e)
-    plain = _plain(spec, regime, be, model, meta.setdefault(("__vanilla__", name), {}))
-
-    for label, params, alternative in _cases(spec, iface):
-        key = (name, label)
-        case = meta[key] = dict(deepcopy(alternative) or {})
+    for (_, label), case, call, alternative, timed_out in timed_cases:   # after every timed call
+        case["error_stage"] = "check"
         try:
-            call, prepare = bound(params, case)
-            timing, out = _measure(spec, regime, be, model, prepare)
-            case.update(timing, overhead_vs_baseline=_ratio(timing, base),
-                        overhead_vs_vanilla=_ratio(timing, plain),   # kept if shaping fails below
-                        returned_bytes=_call_bytes(regime, out))
-            if regime.kind in LOAD_KINDS:
-                case["error_stage"] = "stack"
-                out = _stack(out)
-            if regime.kind in ("interactive", "generation") and regime.aggregate:
-                case["error_stage"] = "aggregate"
-                out = _per_unit_stack(call, be, model, regime.units)
-            elif regime.kind == "offline":
+            out = _checked(regime, call, be, model)
+            if regime.kind == "offline":
                 per_unit = outputs.get(("offline_perprompt", (alternative or {}).get("row", label)))
                 if per_unit is not None:        # else scoring reports the gap
                     out = _first_rows(out, per_unit.shape[-2 if per_unit.dim() >= 2 else 0])
-            outputs[key] = out
+            outputs[(name, label)] = out
+            if timed_out is not None:
+                case["timed_check"] = _timed_check(
+                    spec.methodology, regime, timed_out, out,
+                    lambda: stop_tokens(model.tokenizer, spec.repo))
             _success(case)
-        except Exception as e:              # isolated: engine survives, later cells run
+        except Unsupported as e:
+            if not timed:
+                _failure(case, e)
+            else:       # the system has no check output for the row; its timing stands
+                case.update(check_unsupported=str(e), error=None, error_stage=None)
+        except Exception as e:              # an execution failure on the checked units
             _failure(case, e)
 
     # the non-vacuity guard, recorded per run (score reads it off the reference side)
-    if spec.effect is not None and regime.kind in ("interactive", "generation"):
+    if spec.effect is not None and REGIME_KINDS[regime.kind].effect:
         effect = meta[("__effect__", name)] = {}
         values = {}
         for side, params in (("baseline", spec.effect.baseline_params),
                              ("perturbed", spec.effect.perturbed_params)):
             record = effect[side] = {}
             try:
-                call, prepare = bound(params, record)
+                call, _ = bound(params, record)
                 values[side] = (_per_unit_stack(call, be, model, regime.units) if regime.aggregate
-                                else prepare(regime.units)())
+                                else call.prepare(be, model, regime.units, check=True)())
                 _success(record)
             except Exception as e:
                 _failure(record, e)
@@ -422,7 +492,6 @@ def _layer_count(model):
 
 
 def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
-                release_findings: list | None = None, debug: bool = False,
                 backend=None, interface=None, provenance=None) -> str:
     """Run every (regime, task) cell of `spec` on `run`'s stack; write outputs + provenance.
     Returns the outputs path. Cell errors are isolated and recorded in meta, never fatal to the
@@ -431,8 +500,6 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
     be = make_backend(run, spec) if backend is None else backend
     iface = cell_interface(run) if interface is None else interface
     prov["coordinates"] = _run_coordinates(spec, iface)
-    if release_findings is not None:
-        prov["release_check"] = {"clean": not release_findings, "findings": release_findings}
 
     outputs, meta = {}, {}
     model = None
@@ -459,17 +526,6 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
             }
         for regime in spec.regimes:
             _execute_regime(spec, regime, iface, be, model, meta, outputs)
-
-        dbg_out = dbg_prov = None
-        if debug:       # the debug companion (isb/debugtrace.py) never feeds the verdict
-            from ..debugtrace import collect_debug, debug_prompts
-            from ..profiles import PROFILES
-            try:
-                mprof = PROFILES[spec.family]
-                dbg_out, dbg_prov = collect_debug(be, model, mprof, debug_prompts(spec),
-                                                  mprof.default_residual(be.name))
-            except Exception:
-                traceback.print_exc()
     finally:
         if model is not None:
             be.teardown(model)
@@ -478,9 +534,4 @@ def execute_run(spec, run: RunConfig, out_dir: str, run_name: str,
     path = save_run(out_dir, run_name, outputs, prov)
     print(f"[execute] {run_name}: {sum(1 for k in outputs if k[0] not in ('__meta__',))} outputs "
           f"+ provenance -> {path}")
-    if dbg_out:
-        import os as _os
-        dpath = save_run(_os.path.join(out_dir, "debug"), f"{run_name}-debug",
-                         dbg_out, {**prov, **dbg_prov})
-        print(f"[execute] {run_name}: debug companion -> {dpath}")
     return path

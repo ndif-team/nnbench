@@ -1,7 +1,7 @@
 """Shared engine-config base for the vLLM backends.
 
-The three vLLM backends — in-process async, in-process sync, and over-HTTP serve — differ only in
-HOW they run a trace (event loop / in-frame / wire). They share the same vLLM *engine config*: the
+The two vLLM backends, in-process async and in-process sync, differ only in how they run a trace
+(on an event loop or in the caller's frame). They share the same vLLM *engine config*: the
 precision `dtype`, and `trust_remote_code` (which permits vLLM to READ an auto_map repo's config,
 e.g. NemotronH — the native impl runs, no remote modeling is executed). The driver splats a case's
 `vllm_kwargs` into ANY of their constructors, so they must accept ONE signature for that config —
@@ -22,8 +22,7 @@ class VLLMBackend(Backend):
     def __init__(self, dtype: str | None = None, trust_remote_code: bool = False,
                  max_model_len: int | None = None, tokenizer: str | None = None,
                  enable_prefix_caching: bool | None = None):
-        # dtype: precision axis (None -> vLLM's default, bf16 for GPT-2; "float32" matches HF, which is
-        # how the oracle separates SUPPORTED_DEGRADED from a true SILENTLY_WRONG bug).
+        # dtype: None runs vLLM's default (bf16 for GPT-2); "float32" matches HF's precision.
         self.dtype = dtype
         # trust_remote_code: lets vLLM read a repo whose config declares custom code (auto_map). The
         # remote modeling is never executed (vLLM uses its native impl) — needed by NemotronH, arrives
@@ -31,8 +30,7 @@ class VLLMBackend(Backend):
         self.trust_remote_code = trust_remote_code
         # max_model_len: caps the KV reservation so big weights + KV fit; a per-model requirement
         # (the model row) or per-run choice (RunConfig), meaningful to every vLLM venue, so it lives here
-        # per this base's one-signature rule. The serve client carries it for provenance even
-        # though the server's engine was configured at deploy time.
+        # per this base's one-signature rule.
         self.max_model_len = max_model_len
         # tokenizer: an explicit path/repo for the tokenizer when it differs from the weights repo
         # (e.g. a shared weights cache whose tokenizer files are unwritable-by-us); forwarded to

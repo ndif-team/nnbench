@@ -51,14 +51,15 @@ class Backend:
     def run(self, model, prompts, build, *, keep_dtype=False):
         """One forward over `prompts`. `build(rows)` runs inside the trace with the indices (into
         `prompts`) of the units that trace holds and returns the proxy to save. Returns the saved
-        value as a CPU tensor with the units along dim -2: in fp32, or with `keep_dtype` in the
-        dtype the trace saved (an exported activation, whose volume is part of the measurement)."""
+        value as a CPU tensor with the units along dim -2: in fp32 (a check call's form), or with
+        `keep_dtype` in the dtype the trace saved (a timed call's result)."""
         raise NotImplementedError
 
-    def patch(self, model, clean_prompts, corrupted_prompts, capture, patch):
+    def patch(self, model, clean_prompts, corrupted_prompts, capture, patch, *, keep_dtype=False):
         """Two-trace activation patching over pairs: `capture()` runs in the clean trace and returns
-        the proxy to snapshot; `patch(clean)` runs in the corrupted trace with that snapshot as a CPU
-        tensor (the trace's own units) and returns the proxy to observe."""
+        the proxy to snapshot; `patch(clean)` runs in the corrupted trace with that snapshot (the
+        trace's own units) in the dtype it was saved in and returns the proxy to observe, returned
+        as `run` returns it."""
         raise NotImplementedError
 
     def session(self, model, build):
@@ -68,9 +69,9 @@ class Backend:
 
     def train_patch(self, model, source_prompts, base_prompts, capture, step):
         """One gradient step over the pairs `zip(source_prompts, base_prompts)`: trace 1 captures
-        the source activation (to CPU), trace 2 calls `step(src, rows)` for the loss over the pairs
-        `rows` the trace holds (summed over them) and runs its backward. Returns the loss summed
-        over all pairs as a CPU scalar."""
+        the source activation (in the dtype it was saved in), trace 2 calls `step(src, rows)` for the
+        loss over the pairs `rows` the trace holds (summed over them) and runs its backward. Returns
+        the loss summed over all pairs as a CPU scalar."""
         raise NotImplementedError
 
     def vjp_batch(self, model, prompts, acts_of, target_of, make_cotangent, n):
@@ -86,17 +87,25 @@ class Backend:
         `((act_clean - act_corrupt) * grad).sum()` per pair and layer. Needs autograd."""
         raise NotImplementedError
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False,
+                 tokens=False):
         """Greedy decode of `new_tokens` steps over `prompts`; `build_step(step)` runs once per
-        decode step and returns that step's proxy (`[B_trace, ...]`). Returns `[new_tokens, B, ...]`.
-        `bounded` selects `tracer.iter[0:N]` (True) or `tracer.iter[:]` (False)."""
+        decode step and returns that step's proxy (`[B_trace, ...]`). Returns `[new_tokens, B, ...]`
+        on the host, fp32 unless `keep_dtype` (as `run`). `bounded` selects `tracer.iter[0:N]`
+        (True) or `tracer.iter[:]` (False). With `tokens`, `build_step` returns nothing and the call
+        returns the tokens the decode produced, `[new_tokens, B, 1]`, read as the engine documents
+        them (HF: the ids `generate` returns; vLLM: the sampled token at each step).
+        `build_step=None` is a decode with no per-step work. An unbounded loop ends only when a
+        step asks for a forward the run does not make, so its `build_step` touches the model at
+        every step."""
         raise NotImplementedError
 
-    def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
-                       *, new_tokens, bounded=True):
-        """`patch` composed with `generate`: `capture()` runs in a forward over the sources,
-        `build_step(clean, step)` once per decode step of the bases with the snapshot as a CPU
-        tensor. Returns `[new_tokens, B, ...]`."""
+    def generate_patch(self, model, source_prompts, base_prompts, capture, inject, build_step,
+                       *, new_tokens, bounded=True, keep_dtype=False, tokens=False):
+        """`patch` composed with `generate`: `capture()` runs in a forward over the sources, then
+        `inject(clean)` on the first forward of the bases (the prefill) with the snapshot in the
+        dtype it was saved in, and `build_step(step)` once per decode step. Returns what
+        `generate` returns."""
         raise NotImplementedError
 
     def plain(self, model, units, *, new_tokens=1):
@@ -115,6 +124,11 @@ class Backend:
         it (isb/perf/worker_memory.py). A backend that does not override this records why."""
         raise NotImplementedError(f"{self.name} gives the harness no handle on engine worker "
                                   f"processes (no collective_rpc override)")
+
+    def between_calls(self, model) -> None:
+        """Untimed work run as each call is prepared: the benchmark's own housekeeping that no user
+        call does (vLLM-Hook removes the disk runs earlier calls read back). A load pass prepares all
+        its calls before it starts, so one pass's runs stay until the next pass is prepared."""
 
     def teardown(self, model) -> None:
         pass

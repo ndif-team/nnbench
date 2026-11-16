@@ -1,22 +1,19 @@
 """The vLLM backends share one engine-config signature (isb/backends/) — no GPU.
 
-The driver splats a spec's `vllm_kwargs` (e.g. trust_remote_code for the NemotronH auto_map repo) into
-ANY vLLM backend constructor, so all three must accept the same engine-config. The bug this guards:
-trust_remote_code reached only the async backend, so VLLMSyncBackend(**{"trust_remote_code": True})
-(in _fp32_rerun / vllm_sync / vllm_serve runs) raised TypeError and silently no-op'd disambiguation.
+A system's `create_backend` splats a spec's `vllm_kwargs` (e.g. trust_remote_code for the NemotronH
+auto_map repo) into either vLLM backend constructor, so both must accept the same engine config.
 """
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from isb.backends import VLLMAsyncBackend, VLLMServeBackend, VLLMSyncBackend  # noqa: E402
+from isb.backends import VLLMAsyncBackend, VLLMSyncBackend  # noqa: E402
 from isb.backends.vllm_base import VLLMBackend  # noqa: E402
 
 
 def _vllm_backends(**kw):
-    # exactly how the driver builds them: serve takes a positional host, all take the shared config.
-    return [VLLMAsyncBackend(**kw), VLLMSyncBackend(**kw), VLLMServeBackend("http://x", **kw)]
+    return [VLLMAsyncBackend(**kw), VLLMSyncBackend(**kw)]
 
 
 def test_all_vllm_backends_accept_the_shared_engine_config():
@@ -27,7 +24,7 @@ def test_all_vllm_backends_accept_the_shared_engine_config():
 
 
 def test_trust_remote_code_splat_does_not_raise_on_any_backend():
-    # the regression: driver does Backend(**spec.vllm_kwargs) with {"trust_remote_code": True}.
+    # the regression: create_backend does Backend(**spec.vllm_kwargs) with {"trust_remote_code": True}.
     for be in _vllm_backends(trust_remote_code=True):
         assert be.trust_remote_code is True
 

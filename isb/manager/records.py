@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
-from ..jobs.contract import PLAN_VERSION, VERSIONS, check_experiment, expected_cells, wire_spec
+from ..jobs.contract import check_experiment, expected_cells, wire_spec
+from ..jobs.schema import (PLAN_VERSION, REPORT_READ, REPORT_VERSION, WIRE_READ, WIRE_VERSION,
+                           drop_saturated_floors, upgrade_calls, upgrade_rows)
 from ..protocol import InterventionSpec
 from ..runs import coordinate_config, run_coordinates, read_coordinates
 
@@ -47,19 +49,24 @@ def cells(rows):
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get("state"), str):
             raise ValueError("cell must have a string state")
-        if not all(isinstance(row.get(k, "job"), str) for k in ("label", "workload")):
+        if not all(isinstance(row.get(k, "job"), str) for k in ("label", "regime")):
             raise ValueError("invalid cell identity")
         metrics = row.get("metrics") or {}
         if not isinstance(metrics, dict) or any(not isinstance(v, (int, float)) for v in metrics.values()):
             raise ValueError("invalid cell metrics")
         if any(row.get(k) is not None and not isinstance(row[k], (int, float))
-               for k in ("median_latency_ms", "overhead_vs_baseline", "throughput", "peak_mem_mb")):
+               for k in ("median_latency_ms", "overhead_vs_baseline", "overhead_vs_plain_vllm",
+                         "throughput", "peak_mem_mb")):
             raise ValueError("invalid performance measurement")
-    return [SimpleNamespace(label=r.get("label", "job"), workload=r.get("workload", "job"),
-                            state=r["state"], error=r.get("error") or r.get("unsupported"),
+    return [SimpleNamespace(label=r.get("label", "job"), regime=r.get("regime", "job"),
+                            state=r["state"], validation_state=r.get("validation_state"),
+                            error=r.get("error") or r.get("unsupported"),
                             metrics=r.get("metrics") or {},
                             latency_s=(r["median_latency_ms"] / 1000
-                                       if r.get("median_latency_ms") is not None else None))
+                                       if r.get("median_latency_ms") is not None else None),
+                            latency_kind=r.get("latency_kind"), saturated=bool(r.get("saturated")),
+                            throughput=r.get("throughput"),
+                            overhead_vs_plain_vllm=r.get("overhead_vs_plain_vllm"))
             for r in rows]
 
 
@@ -119,11 +126,12 @@ def load_bundle(directory, prefix):
     if (directory / "report.json").exists():
         try:
             saved = read_json(directory / "report.json")
-            if saved.get("version") != PLAN_VERSION or saved.get("run") != directory.name:
+            if saved.get("version") not in REPORT_READ or saved.get("run") != directory.name:
                 raise ValueError("report belongs to a different run/version")
             for item in saved["experiments"]:
                 if not isinstance(item, dict):
                     raise ValueError("invalid report experiment")
+                item["cells"] = upgrade_rows(item["cells"], saved["version"], REPORT_VERSION)
                 if item["experiment_id"] in report:
                     raise ValueError("duplicate experiment in report")
                 report[item["experiment_id"]] = item
@@ -149,7 +157,7 @@ def load_bundle(directory, prefix):
                     raise ValueError("report comparison differs from plan")
                 cells(scored["cells"])
                 for row in scored["cells"]:
-                    key = (row["backend"], row.get("workload", "job"), row.get("label", "job"))
+                    key = (row["backend"], row.get("regime", "job"), row.get("label", "job"))
                     known = (key[1:] in expected | {("job", "job")} if "row" not in row
                              else (key[1], row["row"]) in expected)    # an alternative realization
                     if row["backend"] not in names or key in scored_rows or not known:
@@ -181,7 +189,7 @@ def load_bundle(directory, prefix):
                     error = execution.get("error") or execution.get("cleanup_error")
                 if (jobdir / "result.json").exists():
                     result = read_json(jobdir / "result.json")
-                    if (type(result.get("version")) is not int or result["version"] not in VERSIONS or result.get("backend") != backend
+                    if (result.get("version") not in WIRE_READ or result.get("backend") != backend
                             or result.get("experiment_id") != experiment["id"]
                             or result.get("inputs_sha256") != experiment["inputs_sha256"]):
                         raise ValueError("result identity mismatch")
@@ -192,30 +200,32 @@ def load_bundle(directory, prefix):
                     worker_coordinates = prov.get("coordinates", {})
                     if worker_coordinates.get("schema") is not None or "spec" in worker_coordinates:
                         prov["coordinates"] = read_coordinates(worker_coordinates)
-                    auxiliary = auxiliary_calls(result.get("auxiliary_calls", []))
+                    auxiliary = upgrade_calls(auxiliary_calls(result.get("auxiliary_calls", [])),
+                                              result["version"])
                     if auxiliary:
                         prov["auxiliary_calls"] = copy.deepcopy(auxiliary)
                     if state == "COMPLETED":
                         if result.get("status") != "completed" or not child(jobdir, "result.pt").is_file():
                             raise ValueError("completed job has no complete artifact")
-                        raw = result["cells"]
+                        raw = upgrade_rows(result["cells"], result["version"], WIRE_VERSION)
                         cells(raw)
-                        raw_keys = [(r["workload"], r["label"]) for r in raw if "row" not in r]
+                        raw_keys = [(r["regime"], r["label"]) for r in raw if "row" not in r]
                         if set(raw_keys) != expected or len(raw_keys) != len(expected):
                             raise ValueError("result does not cover requested cells")
-                        alternatives = [(r["workload"], r["label"]) for r in raw if "row" in r]
+                        alternatives = [(r["regime"], r["label"]) for r in raw if "row" in r]
                         if (len(set(alternatives)) != len(alternatives) or set(alternatives) & expected
-                                or any((r["workload"], r["row"]) not in expected for r in raw if "row" in r)):
+                                or any((r["regime"], r["row"]) not in expected for r in raw if "row" in r)):
                             raise ValueError("an alternative realization must name a requested row")
                         rows = []
                         for item in raw:
-                            saved = scored_rows.get((backend, item["workload"], item["label"]))
+                            saved = scored_rows.get((backend, item["regime"], item["label"]))
                             # Never turn an execution error into a passing verdict.
                             row = saved if saved and (item["state"] == "RAN" or saved["state"] == item["state"]) else item
                             rows.append({**item, **row})
+                        drop_saturated_floors(rows, auxiliary)
                         job_failure = scored_rows.get((backend, "job", "job"))
                         if job_failure is not None:
-                            rows = [{"workload": w, "label": label, "state": job_failure["state"],
+                            rows = [{"regime": w, "label": label, "state": job_failure["state"],
                                      "error": job_failure.get("error")} for w, label in sorted(expected)]
                         if not scored_rows:
                             warnings.append(f"{key}: no saved comparison; displaying execution states only")
@@ -224,7 +234,7 @@ def load_bundle(directory, prefix):
             except (OSError, ValueError, KeyError, TypeError) as caught:
                 state, error, rows, prov, auxiliary = "JOB_FAILED", str(caught), [], {}, []
             if not rows:
-                rows = [{"workload": w, "label": label, "state": state, "error": error}
+                rows = [{"regime": w, "label": label, "state": state, "error": error}
                         for w, label in sorted(expected)]
             prov.setdefault("client", {})
             prov.setdefault("engine", {"kind": "unknown", "params": {}})
@@ -254,7 +264,7 @@ def load_bundle(directory, prefix):
                 "path": str(jobdir), "saved_report": bool(scored_rows)}
             prov.setdefault("executed", directory.name)
             meta = {tuple(call["key"]): call["record"] for call in auxiliary}
-            meta.update({(r["workload"], r["label"]): r for r in rows})
+            meta.update({(r["regime"], r["label"]): r for r in rows})
             entries[key] = ({("__meta__",): meta}, prov)
             results[key] = cells(rows)
         if reference:

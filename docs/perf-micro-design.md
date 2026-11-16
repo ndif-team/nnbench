@@ -1,6 +1,6 @@
 # Performance microbenchmark (design)
 
-A second benchmark, separate from the functionality micro tier and the method tier. It
+A second benchmark, separate from the construct probes and the method tier. It
 measures the cost of each primitive intervention op in isolation, as overhead over an
 unmodified engine, head-to-head across systems. It adopts the vllm-lens layout (one op,
 many systems) and vllm-hook's sweep depth and storage metrics.
@@ -104,16 +104,14 @@ every truncation; never silently cap coverage.
 `scripts/perf.py`: two modes. `worker --config-file F` runs one cell in its own process and
 prints `RESULT_JSON {...}`. `sweep --plan P --out O` launches one subprocess per cell with a
 timeout, collects results, runs teardown, attaches overhead, writes the results file. Mirrors
-the existing `scripts/micro.py` one-backend-per-process pattern.
+the existing `scripts/constructs.py` one-backend-per-process pattern.
 
 Environment (updated 2026-11-11): each system's cells run in an interpreter selected for that
 system, because the auto-registering plugins (vLLM-Lens, vLLM-Hook) must not share an environment.
 `scripts/perf.py` launches each cell's subprocess with `ISB_PY_<system>=/path/to/python`, for
 example a wrapper around `apptainer exec` on the system's backend image (`make_wrappers` in
-`slurm/delta-compare.slurm` writes one per image). Without that variable the script falls back to
-its `_SYSTEM_ENV` table of conda environments on the development host. In that table, nnsight,
-plain vLLM and the Eagle scaffold share one environment, and the vLLM-Lens and vLLM-Hook entries
-name environments that no longer exist, so those two systems need the variable. The systems of one
+`slurm/delta-compare.slurm` writes one per image). Without that variable a cell runs under the
+launcher's own interpreter, so a sweep over vLLM-Lens or vLLM-Hook sets it. The systems of one
 sweep run the same vLLM build: each Delta plan under `plans/` holds one vLLM version (five plans
 over 0.15.1 and 0.19.1). nnsight is measured as installed in its interpreter, with no
 `PYTHONPATH` override. Call the interpreter directly, and wrap every run in a timeout with an

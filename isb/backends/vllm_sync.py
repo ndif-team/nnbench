@@ -28,16 +28,14 @@ class VLLMSyncBackend(VLLMBackend):
         self.gpu_memory_utilization = gpu_memory_utilization
         self.tensor_parallel_size = tensor_parallel_size
 
-    def load(self, repo: str, gpu_memory_utilization: float | None = None):
+    def load(self, repo: str):
         from nnsight.modeling.vllm import VLLM
 
-        if gpu_memory_utilization is None:
-            gpu_memory_utilization = self.gpu_memory_utilization
         kw = self._engine_kwargs()
         if self.tensor_parallel_size > 1:
             kw["tensor_parallel_size"] = self.tensor_parallel_size
         return VLLM(repo, mode="sync", dispatch=True,
-                    gpu_memory_utilization=gpu_memory_utilization, **kw)
+                    gpu_memory_utilization=self.gpu_memory_utilization, **kw)
 
     def _collect(self, rows, n, what, keep_dtype=False):
         """Per-invoke outputs -> one tensor with the units along dim -2 (fp32 unless `keep_dtype`)."""
@@ -58,7 +56,7 @@ class VLLMSyncBackend(VLLMBackend):
                     rows[i] = build([i])
         return self._collect(rows, len(prompts), "run", keep_dtype)
 
-    def patch(self, model, clean_prompts, corrupted_prompts, capture, patch):
+    def patch(self, model, clean_prompts, corrupted_prompts, capture, patch, *, keep_dtype=False):
         clean_prompts, corrupted_prompts = self.paired(clean_prompts, corrupted_prompts, "patch")
         n = len(clean_prompts)
         with model.trace(**SAMPLING) as tracer:     # trace 1: one invoke per clean prompt
@@ -67,14 +65,14 @@ class VLLMSyncBackend(VLLMBackend):
             for i, p in enumerate(clean_prompts):
                 with tracer.invoke(p):
                     clean[i] = capture()
-        clean_acts = [c.detach().float().cpu() for c in clean]
+        clean_acts = [c.detach().cpu() for c in clean]
         with model.trace(**SAMPLING) as tracer:     # trace 2: inject each into its corrupted run
             rows = [None] * n
             rows = rows.save()
             for i, p in enumerate(corrupted_prompts):
                 with tracer.invoke(p):
                     rows[i] = patch(clean_acts[i])
-        return self._collect(rows, n, "patch")
+        return self._collect(rows, n, "patch", keep_dtype)
 
     def train_patch(self, model, source_prompts, base_prompts, capture, step):
         """Two traces of one invoke per pair: the source captures, then each pair's loss and its
@@ -90,7 +88,7 @@ class VLLMSyncBackend(VLLMBackend):
             for i, p in enumerate(sources):
                 with tracer.invoke(p):
                     srcs[i] = capture()
-        srcs = [s.detach().float().cpu() for s in srcs]
+        srcs = [s.detach().cpu() for s in srcs]
         with model.trace(**SAMPLING) as tracer:
             losses = [None] * n
             losses = losses.save()
@@ -154,8 +152,8 @@ class VLLMSyncBackend(VLLMBackend):
                 for L in range(n)]))
         return torch.stack(scores)
 
-    def _step_rows(self, per_unit, new_tokens, what):
-        """One per-step list per unit -> `[new_tokens, B, ...]`."""
+    def _step_rows(self, per_unit, new_tokens, what, keep_dtype=False):
+        """One per-step list per unit -> `[new_tokens, B, ...]`, fp32 unless `keep_dtype`."""
         import torch
 
         filled = [steps for steps in per_unit if steps is not None]
@@ -163,14 +161,17 @@ class VLLMSyncBackend(VLLMBackend):
             raise RuntimeError(f"vllm_sync {what} collected {len(filled)}/{len(per_unit)} units")
         stacks = []
         for steps in per_unit:
-            mats = [r.detach().float().cpu() for r in steps if r is not None]
+            mats = [(r.detach() if keep_dtype else r.detach().float()).cpu()
+                    for r in steps if r is not None]
             if len(mats) != new_tokens:
                 raise RuntimeError(f"vllm_sync {what} collected {len(mats)} per-step rows, "
                                    f"expected {new_tokens}")
             stacks.append(torch.stack(mats, dim=0))                 # [new_tokens, 1, ...]
         return torch.cat(stacks, dim=1)
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False,
+                 tokens=False):
+        """With `tokens`, each step's sampled token (`model.samples`, docs/models/vllm.md)."""
         prompts = self.many(prompts, "generate")
         with model.trace(temperature=0.0, top_p=1, max_tokens=new_tokens,
                          min_tokens=new_tokens) as tracer:
@@ -182,11 +183,12 @@ class VLLMSyncBackend(VLLMBackend):
                     rows[i] = per_step               # placed before the loop and filled in place
                     steps = tracer.iter[0:new_tokens] if bounded else tracer.iter[:]
                     for step in steps:
-                        per_step.append(build_step(step))
-        return self._step_rows(rows, new_tokens, "generation")
+                        row = None if build_step is None else build_step(step)
+                        per_step.append(model.samples if tokens else row)
+        return self._step_rows(rows, new_tokens, "generation", keep_dtype or tokens)
 
-    def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
-                       *, new_tokens, bounded=True):
+    def generate_patch(self, model, source_prompts, base_prompts, capture, inject, build_step,
+                       *, new_tokens, bounded=True, keep_dtype=False, tokens=False):
         sources, bases = self.paired(source_prompts, base_prompts, "generate_patch")
         n = len(sources)
         with model.trace(**SAMPLING) as tracer:
@@ -195,7 +197,7 @@ class VLLMSyncBackend(VLLMBackend):
             for i, p in enumerate(sources):
                 with tracer.invoke(p):
                     clean[i] = capture()
-        clean_acts = [c.detach().float().cpu() for c in clean]
+        clean_acts = [c.detach().cpu() for c in clean]
         with model.trace(temperature=0.0, top_p=1, max_tokens=new_tokens,
                          min_tokens=new_tokens) as tracer:
             rows = [None] * n
@@ -204,10 +206,12 @@ class VLLMSyncBackend(VLLMBackend):
                 with tracer.invoke(p):
                     per_step = []
                     rows[i] = per_step
+                    inject(clean_acts[i])            # outside the loop: the first forward
                     steps = tracer.iter[0:new_tokens] if bounded else tracer.iter[:]
                     for step in steps:
-                        per_step.append(build_step(clean_acts[i], step))
-        return self._step_rows(rows, new_tokens, "generate_patch")
+                        row = None if build_step is None else build_step(step)
+                        per_step.append(model.samples if tokens else row)
+        return self._step_rows(rows, new_tokens, "generate_patch", keep_dtype or tokens)
 
     def plain(self, model, units, *, new_tokens=1):
         """One `generate` call to nnsight's `vllm.LLM` entrypoint with no trace, which the engine

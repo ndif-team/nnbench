@@ -15,7 +15,7 @@ All run one untimed warm-up (a full pass offline; one request per client concurr
 open loop), then `passes` timed sweeps. A pass is timed between CUDA syncs; a request from issue to
 return, or open loop from its scheduled arrival, so a late issue counts against the system. Call
 preparation (the fresh parameter copy) happens outside both. The outputs of the first `keep` units
-of the last pass are returned for scoring.
+of the last pass are returned for the executor's timed check.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, Callable
 
-from .timing import force_gc, peak_mem_mb, reset_peak_mem, sync_cuda
+from .timing import force_gc, peak_mem_mb, reset_peak_mem, sync_cuda, sync_ranks
 
 
 class _FifoGate:
@@ -92,6 +92,7 @@ class LoadResult:
                 "request_p50_ms": self.percentile(50), "request_p90_ms": self.percentile(90),
                 "request_p99_ms": self.percentile(99),
                 "request_mean_ms": statistics.fmean(self.request_ms),
+                "request_ms": list(self.request_ms),
                 **({"offered_rate": self.offered_rate, "max_in_flight": self.max_in_flight}
                    if self.offered_rate is not None else {})}
 
@@ -115,6 +116,7 @@ def run_offline(prepare: Callable[[list], Callable[[], Any]], chunks: list, *, p
             force_gc()
             reset_peak_mem()
         calls = [prepare(chunk) for chunk in chunks]
+        sync_ranks()
         sync_cuda()
         start = perf_counter()
         for index, call in enumerate(calls):
@@ -171,6 +173,7 @@ def run_concurrent(prepare: Callable[[Any], Callable[[], Any]], units: list, *, 
 
         threads = [threading.Thread(target=client, name=f"isb-client-{i}", daemon=True)
                    for i in range(min(concurrency, len(indices)))]
+        sync_ranks()
         sync_cuda()
         start = perf_counter()
         for thread in threads:
@@ -204,6 +207,19 @@ def arrival_offsets(count: int, rate: float, seed: int = 0) -> list:
         offsets.append(t)
         t += rng.expovariate(rate)
     return offsets
+
+
+def kept_up(summary: dict) -> bool:
+    """Whether an open-loop run kept up with its arrivals (`summary` is `LoadResult.summary()`): its
+    median pass lasted at most 1.1 times the arrival span plus one request's service time, the
+    fastest request's latency, which the last request takes even with nothing queued. The
+    schedule's own span is the yardstick, since a seeded schedule's realized rate differs from the
+    offered one (128 arrivals at seed 0 span 147/rate seconds). A system that falls behind queues
+    the requests, so their latency grows with the pass length and measures it."""
+    span_ms = arrival_offsets(summary["units"], summary["offered_rate"])[-1] * 1000.0
+    # a wire version 2 record holds no request latencies; it is judged on the span alone
+    service_ms = min(summary["request_ms"]) if "request_ms" in summary else 0.0
+    return summary["median_pass_ms"] <= 1.1 * (span_ms + service_ms)
 
 
 def run_open(prepare: Callable[[Any], Callable[[], Any]], units: list, *, rate: float, passes: int,
@@ -243,6 +259,7 @@ def run_open(prepare: Callable[[Any], Callable[[], Any]], units: list, *, rate: 
         # ponytail: one thread per request, so a pass holds at most len(units) threads; a worker
         # pool would be needed only for sweeps far larger than the suites' 128 units
         threads = []
+        sync_ranks()
         sync_cuda()
         start = perf_counter()
         for index, offset in enumerate(offsets):

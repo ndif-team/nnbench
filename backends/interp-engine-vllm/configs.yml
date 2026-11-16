@@ -1,8 +1,11 @@
-# interp-engine on vLLM 0.28.0 (the Dockerfile's ARG values). `static` runs its CUDA-graph
-# (vllm-static) backend. `num_gpus` is load_model's tensor-parallel size (load.py; it sets the
-# engine's own `tensor_parallel_size`, so the static buffer fit divides the weights over the ranks).
+# interp-engine on vLLM 0.28.0: 1.12.0 in the configs without a version (the Dockerfile's ARG
+# values) and 1.14.3 in the `1-14-3` configs (its [vllm] extra pins the same vllm==0.28.0). `static`
+# runs its CUDA-graph (vllm-static) backend. `num_gpus` is load_model's tensor-parallel size
+# (load.py; it sets the engine's own `tensor_parallel_size`, so the static buffer fit divides the
+# weights over the ranks).
 images:
   default: {}
+  1-14-3: {INTERP_ENGINE_VERSION: 1.14.3}
 configs:
   default:
     image: default
@@ -15,3 +18,9 @@ configs:
   tp4: {image: default, options: {<<: *base, num_gpus: 4}, gpus: 4}
   static/tp2: {image: default, options: {<<: *base, backend: vllm-static, num_gpus: 2}, gpus: 2}
   static/tp4: {image: default, options: {<<: *base, backend: vllm-static, num_gpus: 4}, gpus: 4}
+  1-14-3: {image: 1-14-3, options: *base}
+  1-14-3/static: {image: 1-14-3, options: {<<: *base, backend: vllm-static}}
+  1-14-3/tp2: {image: 1-14-3, options: {<<: *base, num_gpus: 2}, gpus: 2}
+  1-14-3/tp4: {image: 1-14-3, options: {<<: *base, num_gpus: 4}, gpus: 4}
+  1-14-3/static/tp2: {image: 1-14-3, options: {<<: *base, backend: vllm-static, num_gpus: 2}, gpus: 2}
+  1-14-3/static/tp4: {image: 1-14-3, options: {<<: *base, backend: vllm-static, num_gpus: 4}, gpus: 4}

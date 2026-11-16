@@ -14,8 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import isb.methodologies  # noqa: F401,E402  (registers cells)
 from isb.methodologies.registry import CELLS, get_cell  # noqa: E402
-from isb.methodologies.readout import head_direction  # noqa: E402
-from isb.methodologies.steering import _resolve_token, _steer_and_read  # noqa: E402
+from isb.methodologies.readout import head_direction, next_token  # noqa: E402
+from isb.methodologies.steering import resolve_token, _steer_and_read  # noqa: E402
 
 VOCAB, HID = 11, 4
 
@@ -112,6 +112,41 @@ def test_readout_is_the_documented_site_last_token():
     assert out[0, 0].item() == 9.0
 
 
+def test_the_user_result_is_the_greedy_next_token_at_the_documented_site():
+    """A timed call returns the next token: the argmax of the head's last position on HF, the
+    engine's own sample on vLLM (`model.samples`, `[1, 1]` per step)."""
+    blocks = _blocks((torch.zeros(2, HID), "kv"), torch.ones(2, HID))
+    logits = torch.zeros(1, 2, VOCAB)
+    logits[0, -1, 3] = 9.0
+    out = _steer(blocks, _Head(logits), layer=0, token_id=1, alpha=1.0, mode="replace",
+                 read=next_token)
+    assert out.tolist() == [[3]]
+    model = _Model()
+    model.samples = torch.tensor([[7]])
+    out = _steer_and_read(blocks, model, _Head(), layer=0, direction=None, alpha=0.0,
+                          mode="replace", site="engine", read=next_token)
+    assert out.tolist() == [[7]]
+
+
+def test_a_timed_token_matches_the_check_argmax_up_to_a_near_tie():
+    """The steering timed check: each unit's timed token is its check logits' argmax, or within 2%
+    of the top logit's magnitude; a token further down, or outside the vocabulary, fails."""
+    from isb.oracle.checks import timed_check_for
+
+    check = timed_check_for("steering")
+    logits = torch.tensor([[1.0, 50.0, 49.5, 0.0], [-80.0, -30.0, -30.4, -90.0]])
+    assert check(torch.tensor([[1], [1]]), logits)[0]
+    assert check(torch.tensor([[2], [2]]), logits)[0]            # 0.5 and 0.4 below the top
+    assert not check(torch.tensor([[1], [0]]), logits)[0]        # 50 below the top
+    assert not check(torch.tensor([[1], [9]]), logits)[0]
+    # a nonfinite check output fails with no gap, which the job's JSON could not hold
+    for bad in (float("nan"), float("inf")):
+        nonfinite = logits.clone()
+        nonfinite[1, 3] = bad
+        passed, metrics = check(torch.tensor([[1], [1]]), nonfinite)
+        assert not passed and metrics["max_gap"] is None
+
+
 def test_scale_is_relative_to_residual_norm():
     """alpha is dimensionless: doubling the residual norm doubles the applied vec (self-calibration)."""
     head = _Head()
@@ -150,7 +185,7 @@ def test_resolve_token_takes_last_piece():
         def __call__(self, s, add_special_tokens=False):
             return {"input_ids": [10, 20, 30]}
 
-    assert _resolve_token(_Tok(), "anything") == 30
+    assert resolve_token(_Tok(), "anything") == 30
 
 
 def _run_all():
@@ -196,3 +231,31 @@ def test_token_norm_scales_each_position_by_its_own_stream_norm():
     direction = torch.nn.functional.normalize(_Head().weight[1], dim=0)
     expected = 2.0 * (sub_block + residual).norm(dim=-1, keepdim=True) * direction
     assert torch.allclose(added, expected)               # row 0 scaled by 1.0, row 1 by 4.0
+
+
+def test_a_backend_that_loads_another_model_builds_its_steering_direction_from_that_model():
+    """The kept direction belongs to the model it was read from: after the same backend loads a
+    model with another unembedding, the direction comes from the new head."""
+    from types import SimpleNamespace
+
+    from isb.methodologies.steering import cached_head_direction
+
+    class Tokenizer:
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [2]}
+
+    class Model:
+        def __init__(self, row):
+            self.tokenizer = Tokenizer()
+            self.lm = torch.nn.Linear(3, 4, bias=False)
+            with torch.no_grad():
+                self.lm.weight[2] = torch.tensor(row)
+
+    class Backend:
+        pass
+
+    profile = SimpleNamespace(head=lambda model: model.lm)
+    be, first, second = Backend(), Model([3.0, 0.0, 0.0]), Model([0.0, 0.0, 5.0])
+    assert cached_head_direction(be, first, profile, " x").tolist() == [1.0, 0.0, 0.0]
+    assert cached_head_direction(be, second, profile, " x").tolist() == [0.0, 0.0, 1.0]
+    assert cached_head_direction(be, first, profile, " x").tolist() == [1.0, 0.0, 0.0]

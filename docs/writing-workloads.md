@@ -30,7 +30,8 @@ settle it, read the code at the pinned version:
   after the layer is their sum, because the next layer's norm performs the add.
 - **The interpretability system's dispatch**, for what it hands user code and how a returned value
   is written back. vLLM-Lens 1.2.1 post-hooks receive the summed stream, and a returned tensor is
-  applied as a delta onto the first element (`_worker_ext.py`, `_apply_hook_delta`).
+  applied as a delta onto the first element (`_worker_ext.py`, `_apply_hook_delta`); 1.3.0 stores
+  it in the first element and zeroes the second (`_helpers/_hook_output.py`).
 
 Record the denotation in the cell's docstring with the file and version it came from.
 
@@ -98,13 +99,36 @@ of the engine's limit. The DAS train step on PR #17 (2026-10-21) did this: 16-pr
 per invoke are not supported" in place of the inference-mode gradient refusal the row exists to
 record.
 
+## 5b. Return the user's result; the check output only on a check call
+
+A timed call holds what a user of the system runs: the request, the intervention and the result in
+the system's own form. Nothing the benchmark needs goes in it: no readout for the scorer, no cast or
+transform for the comparison, no guard, no setup a user does once (build vectors and directions
+before the trace, as `readout.py` does). When the correctness check compares something other than
+that result, the cell declares `check=False` and returns the check output only when the executor
+passes `check=True` (design.md §12.13 "Timed calls and check calls"); `check` is never a case
+parameter. The executor makes each case's check calls untimed, after every timed call of the regime
+(the baseline, the plain request and every case). A cell that declares `check` needs its
+methodology's timed check, registered beside the cells with `timed_check_of`
+(`isb/oracle/checks.py` holds the shared forms: `tokens_match`, `generated_tokens_match`,
+`read_matches`, `probabilities_match`): the executor relates the last timed result to the check
+output of the same units, a failed timed check makes the row `INVALID_OUTPUT`, and a methodology
+without a timed check fails the row with a `LookupError`.
+Steering is the example: the timed call returns the greedy next token (`next_token`: the
+head's argmax on HF, the engine's own sample `model.samples` on vLLM, nnsight 0.8.2
+docs/models/vllm.md) with `keep_dtype=True`, so no cast runs; the check call returns the next-token
+logits at the documented read site (`final_logits`). A read returns its value as the system
+returns it when timed and, where that is not fp32, in fp32 when checked; a timed generation returns
+the tokens the decode produced (`tokens=True`: HF's `generate` ids, vLLM's sample at each step) and
+passes a per-step closure only when the case does work at every step. A cell whose two forms would be the same tensor declares no `check`. A system
+that cannot produce the check output raises `Unsupported` from its check calls only, and its timed
+rows still record.
+
 ## 6. Run the new cell before writing anything
 
-Run the new cell on each backend that registers it or falls back to it (a `vllm_*` variant uses
-the `vllm_async` cell), on gpt2 or the smallest registered model of its family, against
-`nnsight-hf/default`, before any sentence about what it shows. `scripts/execute.py` runs a case on
-an in-tree backend (`--engine transformers|vllm`) without Docker; a system under `backends/` runs
-through `scripts/bench.py run`. On a mismatch, repeat steps 1 to 3 before writing it up. For
+Run the new cell on each backend that registers it or falls back to it (`vllm_sync` uses the
+`vllm_async` cell), on gpt2 or the smallest registered model of its family, against
+`nnsight-hf/default`, before any sentence about what it shows, through `scripts/bench.py run`. On a mismatch, repeat steps 1 to 3 before writing it up. For
 cross-system rows, a second system on the same engine locates the difference: bitwise-identical
 outputs mean the gap belongs to the engine, not to either interpretability layer.
 
@@ -133,7 +157,8 @@ Before pushing, run only what the diff changed, before and after the change:
 3. Make the change; run the no-GPU suite (it catches a one-unit primitive handed several units,
    nothing more about form).
 4. Run the same pairs again and compare each with its run before the change
-   (`scripts/row_diff.py` prints each row's recorded error text and output difference).
+   (`scripts/row_diff.py BEFORE.pt AFTER.pt`, given the two jobs' `result.pt`, prints each
+   row's recorded error text and output difference).
 5. A row whose output changed needs the reason in the commit message (a new default, a
    batching change). A row whose recorded error text changed is a cell-form change until the
    commit message says otherwise: the engine's message usually names the form it takes.

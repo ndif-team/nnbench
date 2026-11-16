@@ -25,13 +25,15 @@ class _Generate:
     `[1, seq, d]` with the stream in `[0]`, vLLM as `[tokens, d]` (hidden, residual) pairs."""
 
     def __init__(self, name):
-        self.name, self.bounded, self.expected = name, [], []
+        self.name, self.bounded, self.expected, self.per_step = name, [], [], []
 
     def last(self, t):
         return t[:, -1, :] if self.name == "hf" else t[-1:, :]
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded, keep_dtype=False,
+                 tokens=False):
         self.bounded.append(bounded)
+        self.per_step.append(build_step is not None)
         (prompt,) = prompts
         rows = []
         for step in range(new_tokens):
@@ -44,8 +46,9 @@ class _Generate:
                 residual = 2 * hidden - 5
                 model.trunk.decoder_blocks[1].output = (hidden, residual)
                 self.expected.append((hidden + residual)[-1:])
-            rows.append(build_step(step))
-        return torch.stack(rows)                      # [new_tokens, 1, d]
+            row = None if build_step is None else build_step(step)
+            rows.append(model.samples if tokens else row)
+        return torch.stack(rows)                      # [new_tokens, 1, d] or [new_tokens, 1, 1]
 
 
 @pytest.mark.parametrize("backend", ["hf", "vllm_async"])
@@ -57,3 +60,15 @@ def test_each_step_exports_the_newest_row_of_the_stream(backend, bound):
     assert out.shape == (4, 1, D)
     assert torch.equal(out[:, 0], torch.cat(be.expected))   # vLLM: hidden + residual, newest row
     assert be.bounded == [bound == "bounded"]
+
+
+@pytest.mark.parametrize("backend", ["hf", "vllm_async"])
+def test_baseline_is_a_decode_with_no_per_step_work_returning_its_tokens(backend):
+    # the export=False baseline is the user's plain decode: no per-step read, the tokens it produced
+    model = _Model()                                          # carries no `logits` to read
+    model.samples = torch.tensor([[9]], dtype=torch.int32)
+    be = _Generate(backend)
+    out = CELLS[("gen_capture", "*", backend)](be, model, PROFILE, ["the cat sat"], layer=1,
+                                               new_tokens=3, export=False)
+    assert be.per_step == [False]
+    assert out.dtype == torch.int32 and out.tolist() == [[[9]]] * 3

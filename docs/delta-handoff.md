@@ -75,9 +75,8 @@ Notes:
   a multi-unit call goes to that engine as several invokes (sync) or gathered requests (async).
 - The vLLM 0.28.0 image ships CUDA 13.0 torch; driver 595 supports it natively.
 - Inside an allocation the GPU is index 0: pass `--gpu 0`.
-- Run on a GPU no one else uses for the duration. Every job records the GPU's used memory before
-  and after (`execution.json`, field `gpu_release`); a nonzero `baseline_mib` means something else
-  was on the GPU.
+- Run on a GPU no one else uses for the duration. The launcher refuses a job whose reserved GPU
+  holds another process's memory and records the check (`execution.json`, field `gpus_before`).
 
 ## Step 1: no-GPU tests
 
@@ -183,7 +182,7 @@ tar czf comparison-delta.tgz runs/comparison-delta        # runs/ is git-ignored
 
 Per cell in `report.json`: `state`, `metrics` (top1_agree, tv, max_abs), `median_latency_ms`,
 `overhead_vs_vanilla`, `overhead_vs_plain_vllm`, and `unsupported` for declared gaps. Per job in
-`execution.json`: `status`, `image_id`, `source`, `gpu_release`. Send back the tarball and the
+`execution.json`: `status`, `image_id`, `source`, `gpus_before`. Send back the tarball and the
 HTML export.
 
 ## Known issues

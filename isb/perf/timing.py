@@ -1,12 +1,7 @@
-"""Self-contained timing helper for the perf path (design.md §8.2).
-
-Mirrors the nnsight timing methodology (`tests/performance/profile/profiler_utils.py`): load once →
-warm up → N trials → center±spread, CUDA-synced around every timed region. We copy ~40 lines so the
-benchmark has no dependency on nnsight's `tests/` tree, and make two deliberate choices: report the
-**median** (robust to a stray cold/GC trial) and **GPU peak memory** via `max_memory_allocated`.
-
-`time_cell` returns BOTH a `TimingResult` and the last warm output, so the oracle can check
-correctness on the very run the perf numbers came from — never on an unverified regime.
+"""Warm timing of one call: `warmup` untimed calls, then `n_trials` timed calls, each timed between
+CUDA syncs after a rank barrier under torchrun, the call's preparation outside the timer. Reports
+the median, standard deviation and every trial's time, and the peak GPU memory over the timed
+trials. `time_cell` returns the timing and the last timed call's output.
 """
 from __future__ import annotations
 
@@ -26,6 +21,15 @@ def sync_cuda() -> None:
             torch.cuda.synchronize()
     except Exception:
         pass
+
+
+def sync_ranks() -> None:
+    """Block until every rank of a multi-process job (torchrun) reaches this point, so a timer that
+    starts next does not count another rank's lag; a no-op in a single process."""
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dist.barrier()
 
 
 def force_gc() -> None:
@@ -67,7 +71,7 @@ class TimingResult:
     worker_peak_mem_mb: list | None = None    # per engine-worker rank, over the timed trials
 
 
-def time_cell(prepare_call: Callable[[], Callable[[], Any]], *, warmup: int = 3, n_trials: int = 7,
+def time_cell(prepare_call: Callable[[], Callable[[], Any]], *, warmup: int = 3, n_trials: int = 3,
               worker_memory=None):
     """Prepare each invocation, warm up, then measure the remaining cell calls.
 
@@ -91,6 +95,7 @@ def time_cell(prepare_call: Callable[[], Callable[[], Any]], *, warmup: int = 3,
     times, out = [], None
     for _ in range(n_trials):
         call = prepare_call()
+        sync_ranks()
         sync_cuda()
         t0 = perf_counter()
         out = call()

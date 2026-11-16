@@ -6,9 +6,9 @@ host memory inside the decode loop, as an online monitor of a generation does. P
 stacked [new_tokens, d_model] and checked row per step. The iteration bound is a realization the
 nnsight cells declare, as for gen_steering.
 
-Read methodology -> no effect-size guard. Baseline = export=False: the same decode loop returning
-only each step's greedy token, so overhead-vs-baseline is the per-step capture's cost inside the
-generation regime.
+Read methodology -> no effect-size guard. Baseline = export=False: the same decode with no per-step
+work, returning the tokens it produced, so overhead-vs-baseline is the per-step capture's cost inside
+the generation regime.
 """
 from ..data import DataRef
 from ..sweep.spec import Depth, Regime, Row, Workload

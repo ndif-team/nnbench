@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -92,22 +91,14 @@ def test_runner_sweep_with_echo(tmp_path: Path):
     assert "_echo" in prov["perf_envs"]
 
 
-def test_env_for_mapping():
+def test_each_system_runs_under_its_own_interpreter_variable(monkeypatch):
     spec = importlib.util.spec_from_file_location("_perf_runner", ROOT / "scripts" / "perf.py")
     perf = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(perf)
-    # unmapped (e.g. the _echo stub) -> current interpreter, no extra env
-    py, extra = perf._env_for("_echo")
-    assert py == sys.executable and extra == {}
-    # nnsight measures the env's own editable checkout (the corpus stack): no PYTHONPATH override
-    py, extra = perf._env_for("nnsight_vllm")
-    assert "nnsight-vllm" in py and extra == {}
-    # ISB_PY_<system> overrides the python
-    os.environ["ISB_PY_vllm_hook"] = "/custom/python"
-    try:
-        assert perf._env_for("vllm_hook")[0] == "/custom/python"
-    finally:
-        del os.environ["ISB_PY_vllm_hook"]
+    assert perf._python_for("_echo") == sys.executable
+    monkeypatch.setenv("ISB_PY_vllm_hook", "/custom/python")
+    assert perf._python_for("vllm_hook") == "/custom/python"
+    assert perf._python_for("vllm_lens") == sys.executable
 
 
 if __name__ == "__main__":

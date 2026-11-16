@@ -70,7 +70,8 @@ or merge the two. The list below names the files as that branch laid them out; t
 refactor moved configs into `backends/<system>/configs.yml` (`nnsight-hf/0-8-1/gpu2`,
 `nnsight-hf/0-8-1/tp2`, `nnsight-vllm/0-8-1/opt/tp2`, `nnsight-vllm/0-8-1/opt/taps/tp2`,
 `vllm-plain/0-28-0/tp2`), the opt cells to `backends/nnsight-vllm/{backend_opt,cells_opt}.py`,
-and removed the byref prototype. What the branch added over `main`:
+and removed the byref prototype; the nnsight 0.4.6 backend, its `gpu2` config included, was
+removed on 2026-11-14. What the branch added over `main`:
 
 - `backends/nnsight-hf/sdpa/0-8-1/{gpu2,tp2}` and `backends/nnsight-hf/sdpa/0-4-6/gpu2`: the
   two-GPU HF configs. `tp2` needs the HF image built with `TRANSFORMERS_VERSION=5.19.0`,
@@ -166,8 +167,8 @@ python scripts/report/optlarge.py runs/large-opt large-opt-report.html
   intervention), `validation_state` (`NUMERICAL_CHECK_PASSED`, `UNRESOLVED`, `EXECUTION_FAILED`),
   `metrics.top1_agree`, `metrics.tv`. The reference column's own state is `RAN`.
 - The plain-engine numbers are not cells: read `auxiliary_calls` in each backend's `result.json`
-  for the entry with key `["__vanilla__", <regime>]`. Patching is two forwards, so compare a
-  patching cell with twice the plain forward.
+  for the entry with key `["__vanilla__", <regime>]`. The plain request runs every prompt of the
+  regime's units, both prompts of a patching pair, so a patching cell compares with it directly.
 - What the 72B run showed, as the pattern to expect: vLLM's general cell at 0.6 to 0.75 of HF
   device_map on single forwards and generation and 1.2 on the logit lens; taps at 0.45 to 0.65 of
   HF and within 1.2 of plain vLLM except the lens, where taps were slower than the general cell;
@@ -181,7 +182,7 @@ python scripts/report/optlarge.py runs/large-opt large-opt-report.html
 
 ## 7. Changing the model
 
-1. Add it to `isb/models.py`: `Model(name, repo, family, n_layers, dtype_control="bfloat16")`.
+1. Add it to `isb/models.py`: `Model(name, repo, family, n_layers)`.
    The family picks the cells (`llama` covers Qwen2.5, Qwen3, Llama, Mistral; others exist for
    GPT-2, Gemma, BERT...). Layers are addressed by depth fraction, so nothing else changes.
    Use the exact repo id the cache holds; `HF_HUB_OFFLINE=1` refuses a different spelling.

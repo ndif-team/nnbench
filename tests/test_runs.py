@@ -8,7 +8,7 @@ import json
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from isb.backends import HFBackend, VLLMAsyncBackend, VLLMServeBackend, VLLMSyncBackend  # noqa: E402
+from isb.backends import HFBackend, VLLMAsyncBackend, VLLMSyncBackend  # noqa: E402
 from isb.runs import (  # noqa: E402
     DeploymentConfig,
     EngineConfig,
@@ -30,8 +30,6 @@ def test_executor_mapping_covers_the_grid():
     assert isinstance(make_backend(_run("transformers"), SPEC), HFBackend)
     assert isinstance(make_backend(_run("vllm"), SPEC), VLLMAsyncBackend)
     assert isinstance(make_backend(_run("vllm", mode="sync"), SPEC), VLLMSyncBackend)
-    serve = make_backend(_run("vllm", dep_kind="serve", host="http://s:6677"), SPEC)
-    assert isinstance(serve, VLLMServeBackend)
 
 
 def test_ndif_is_a_reserved_deployment_not_an_engine():
@@ -62,23 +60,17 @@ def test_cell_interface_is_engine_level_only():
     assert cell_interface(_run("transformers")) == "hf"
     assert cell_interface(_run("vllm")) == "vllm_async"
     assert cell_interface(_run("vllm", mode="sync")) == "vllm_sync"
-    assert cell_interface(_run("vllm", dep_kind="serve", host="h")) == "vllm_serve"
     # topology params do NOT change the interface (tp2 runs the same cells)
     assert cell_interface(_run("vllm", params={"tensor_parallel_size": 2})) == "vllm_async"
 
 
-def test_provenance_records_declared_next_to_resolved():
-    # provenance is descriptive: a declared value that does not match reality is RECORDED (visible
-    # drift), never a refusal — the record must exist precisely when things drift
-    prov = resolve_provenance(_run("transformers", nnsight="0000000dead", gpu_model="X9000"))
-    assert set(prov) == {"executed", "declared", "client", "deployment", "engine", "host"}
-    assert prov["declared"]["nnsight"] == "0000000dead"           # kept verbatim
-    assert prov["declared"]["gpu_model"] == "X9000"
+def test_provenance_records_the_resolved_stack():
+    prov = resolve_provenance(_run("transformers"))
+    assert set(prov) == {"executed", "client", "deployment", "engine", "host"}
     from importlib.util import find_spec
     # A lightweight host need not install any inference stack. Absence is provenance too.
     installed = find_spec("nnsight")
     assert bool(prov["client"]["nnsight"]["path"]) == bool(installed)
-    assert prov["client"]["nnsight"].get("commit") != "0000000dead"
     assert prov["host"]["hostname"]
 
 

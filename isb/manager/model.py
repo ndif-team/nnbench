@@ -1,13 +1,13 @@
-"""Metadata-only collections of saved reports; trusted legacy import is an explicit operation."""
+"""Metadata-only collections of saved reports; importing a trusted run file is an explicit
+operation."""
 from __future__ import annotations
 
 import os
-import time
 import uuid
 from pathlib import Path
 
 from ..runfile import INBOX, load_run
-from ..runs import procedure, spec_coordinates, read_coordinates
+from ..runs import read_coordinates
 
 _PASS = {"SUPPORTED", "SUPPORTED_DEGRADED", "EQUIVALENT", "EQUIVALENT_DEGRADED"}
 
@@ -21,25 +21,20 @@ def list_runs(dir_path: str) -> list[str]:
                         or p.is_dir() and (p / "plan.json").is_file())})
 
 
-def _load_cached(dir_path: str, name: str):
-    # Historical name retained for callers; only a small JSON summary is read, never cached tensors.
+def _load_summary(dir_path: str, name: str):
+    """(metadata, provenance) of an imported run file, read from its JSON summary, never the
+    tensors."""
     from .records import child, read_json
     path = child(Path(dir_path), name + ".summary.json")
     summary = read_json(path)
     artifact = child(Path(dir_path), name + ".pt").stat()
     if summary.get("artifact_stat") != [artifact.st_size, artifact.st_mtime_ns]:
-        raise ValueError("legacy artifact changed after import")
+        raise ValueError("run file changed after import")
     meta = {tuple(key): value for key, value in summary["metadata"]}
     provenance = summary["provenance"]
     if "coordinates" in provenance:
         provenance["coordinates"] = read_coordinates(provenance["coordinates"])
     return {("__meta__",): meta, ("perf_rows",): summary.get("perf_rows", [])}, provenance
-
-
-def load_dir(dir_path: str) -> dict[str, tuple[dict, dict]]:
-    """{run_name: (outputs, provenance)} for every run file in the directory."""
-    return {name: _load_cached(dir_path, name) for name in list_runs(dir_path)
-            if (Path(dir_path) / f"{name}.summary.json").is_file()}
 
 
 def spec_of(prov: dict) -> str:
@@ -53,80 +48,27 @@ def probe_results(outputs: dict) -> dict[str, dict]:
             if isinstance(k, tuple) and len(k) == 2 and k[0] == "probe"}
 
 
-def baselines_of(dir_path: str, entries: dict) -> dict[str, str]:
-    """{spec_name: baseline run}. One baseline per spec: a run can only reference runs of its
-    own spec and data, so a directory holding the whole corpus carries one baseline per method;
-    the N-runs-vs-one-baseline structure holds within each spec. The BASELINE file lists one run
-    name per line; without it, a spec whose only transformers run is unambiguous uses that run.
-    Probe runs never qualify: they self-check, so they cannot reference anything."""
-    marker = os.path.join(dir_path, "BASELINE")
-    if os.path.exists(marker):
-        named = [ln.strip() for ln in open(marker).read().splitlines() if ln.strip()]
-        return {spec_of(entries[n][1]): n for n in named if n in entries}
-    per_spec: dict[str, list[str]] = {}
-    for n, (out, prov) in entries.items():
-        if prov["engine"]["kind"] == "transformers" and not probe_results(out):
-            per_spec.setdefault(spec_of(prov), []).append(n)
-    return {spec: names[0] for spec, names in per_spec.items() if len(names) == 1}
-
-
-def comparable(prov: dict, base_prov: dict) -> bool:
-    """Both records must establish complete matching procedure identity."""
-    candidate = procedure(prov["coordinates"])
-    return candidate is not None and candidate == procedure(base_prov["coordinates"])
-
-
-def dir_results(dir_path: str, entries: dict, baselines: dict[str, str]):
-    """Read explicit legacy-import snapshots. No scoring occurs during browsing."""
-    from .records import cells, read_json
-    return {name: cells(saved) if saved is not None else None for name in entries
-            for saved in [read_json(Path(dir_path) / f"{name}.summary.json").get("cells")]}
-
-
-def import_legacy(dir_path: str):
-    """Explicit, trusted .pt import. Keep only metadata; never guess precision controls."""
+def import_run_files(dir_path: str):
+    """Explicit, trusted import of the directory's .pt run files (construct probes, performance
+    rows): write a JSON summary of each file's metadata beside it, which browsing reads instead of
+    the tensors. A run file of any other kind is skipped with a message: method runs are job
+    bundles of `bench.py run`."""
     from ..jobs.contract import write_json
-    from ..workloads import case
-    from ..sweep.score import score_runs
 
-    entries = {}
     for name in list_runs(dir_path):
-        if not (Path(dir_path) / f"{name}.pt").is_file():
+        path = Path(dir_path) / f"{name}.pt"
+        if not path.is_file():
             continue
         outputs, prov = load_run(dir_path, name)
-        entries[name] = ({("__meta__",): outputs.get(("__meta__",), {}),
-                          ("perf_rows",): outputs.get(("perf_rows",), [])}, prov)
+        meta, rows = outputs.get(("__meta__",), {}), outputs.get(("perf_rows",), [])
         del outputs
-    baselines = baselines_of(dir_path, entries)
-    for name, (out, prov) in entries.items():
-        base = baselines.get(spec_of(prov))
-        # The current definition of a saved case name; historical spec names have none.
-        spec = case(prov["coordinates"]["spec"])
-        rows, comparison_error = None, None
-        recorded = procedure(prov["coordinates"])
-        current = procedure(spec_coordinates(spec, "unknown")) if spec is not None else None
-        if probe_results(out) or out.get(("perf_rows",)):
-            pass  # Primitive self-checks and performance rows already carry their measured states.
-        elif recorded is None:
-            comparison_error = "Recorded procedure identity is incomplete; no automatic comparison was made."
-        elif current != recorded:
-            comparison_error = "The current spec does not match the saved procedure; no automatic comparison was made."
-        elif base and not comparable(prov, entries[base][1]):
-            comparison_error = "The reference procedure is incomplete or different; no automatic comparison was made."
-        elif base:
-            scored = score_runs(spec, dir_path, name, None if name == base else base, quiet=True)
-            rows = [{"label": c.label, "workload": c.workload, "state": c.state,
-                     "error": c.error, "metrics": c.metrics,
-                     "median_latency_ms": c.latency_s * 1000 if c.latency_s is not None else None}
-                    for c in scored]
+        if not (probe_results({("__meta__",): meta}) or rows):
+            print(f"[manager] {name}: not a construct-probe or performance run file; skipped")
+            continue
         write_json(Path(dir_path) / f"{name}.summary.json", {
-            "version": 1, "provenance": prov, "reference": base, "cells": rows,
-            "comparison_error": comparison_error,
-            "metadata": [[list(k), v] for k, v in out[("__meta__",)].items()],
-            "perf_rows": out[("perf_rows",)], "legacy": True,
-            "artifact_stat": [(Path(dir_path) / f"{name}.pt").stat().st_size,
-                              (Path(dir_path) / f"{name}.pt").stat().st_mtime_ns],
-        })
+            "version": 1, "provenance": prov,
+            "metadata": [[list(k), v] for k, v in meta.items()], "perf_rows": rows,
+            "artifact_stat": [path.stat().st_size, path.stat().st_mtime_ns]})
 
 
 def rollup(states: list[str]) -> str:
@@ -155,12 +97,6 @@ def backend_label(prov: dict) -> tuple[str, str]:
     mode = e.get("mode") or "async"
     place = "served" if d.get("kind") == "serve" else "in-process"
     return f"{e['kind']}-nnsight · {mode} · {place}", f"nnsight on the {e['kind']} {mode} engine, {place}"
-
-
-def executed(prov: dict, path: str) -> str:
-    """The run's own timestamp; file mtime for run files written before it was recorded."""
-    return prov.get("executed") or \
-        time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(path)))
 
 
 def _delegation_target(src: str) -> str | None:
@@ -248,7 +184,7 @@ def _rename_exclusive(source, destination):
 
 
 def archive(run_name: str, dest_dir: str, inbox: str = INBOX) -> str:
-    """Move a whole bundle (or legacy artifact + summary), never replace a destination."""
+    """Move a whole bundle (or a run file and its summary), never replace a destination."""
     import fcntl
     from .records import child
 
@@ -302,25 +238,15 @@ class Collection:
         self.entries, self.results, self.baselines, self.warnings = {}, {}, {}, []
         self._inbox_collection = None
         self.csrf_token = ""
-        from .records import bundle_paths, cells, load_bundle, read_json
+        from .records import bundle_paths, load_bundle
         root = Path(dir_path)
         for name in list_runs(dir_path):
             if not (root / f"{name}.pt").is_file():
                 continue
             try:
-                entry = _load_cached(dir_path, name)
-                summary = read_json(root / f"{name}.summary.json")
-                result = cells(summary["cells"]) if summary.get("cells") is not None else None
-                self.entries[name], self.results[name] = entry, result
-                if summary.get("comparison_error"):
-                    self.warnings.append(f"{name}: {summary['comparison_error']}")
-                if summary.get("reference") == name:
-                    self.baselines[spec_of(self.entries[name][1])] = name
+                self.entries[name], self.results[name] = _load_summary(dir_path, name), None
             except (OSError, ValueError, KeyError, TypeError) as error:
-                self.warnings.append(f"{name}: legacy summary unavailable; run --import-legacy ({error})")
-        if self.entries:
-            self.warnings.append("Standalone import snapshots: comparisons lack the Docker runner's resolved "
-                                 "source/model/tokenizer checks.")
+                self.warnings.append(f"{name}: no summary of this run file; run --import-run-files ({error})")
         for directory in bundle_paths(root) if dir_path else ():
             relative = directory.relative_to(root).as_posix()
             prefix = directory.name if relative == "." else relative

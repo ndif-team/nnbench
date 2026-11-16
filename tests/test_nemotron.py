@@ -70,8 +70,11 @@ class _NemoModel:
 
 
 class _FakeBE:
+    def between_calls(self, model):
+        pass
+
     """Runs the cell's build() closure with no trace/GPU — the no-GPU cell harness."""
-    def run(self, model, prompts, build):
+    def run(self, model, prompts, build, *, keep_dtype=False):
         return build(list(range(len(prompts))))
 
     def last(self, t):
@@ -89,9 +92,9 @@ def test_cells_registered_for_both_backends():
         for backend in ("hf", "vllm_async"):
             assert (methodology, "nemotron", backend) not in CELLS
             assert get_cell(methodology, "nemotron", backend) is not None
-    # every vllm_* variant falls back to the vllm_async cell (generalized routing); for the generic
+    # the sync variant falls back to the vllm_async cell; for the generic
     # cell each lookup returns a fresh profile-bound wrapper, so pin the shared underlying fn
-    assert (get_cell("logit_lens", "nemotron", "vllm_pp").__wrapped__
+    assert (get_cell("logit_lens", "nemotron", "vllm_sync").__wrapped__
             is get_cell("logit_lens", "nemotron", "vllm_async").__wrapped__)
 
 

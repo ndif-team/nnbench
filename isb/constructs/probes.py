@@ -1,20 +1,15 @@
-"""Micro tier — Level 0/1 primitive probes (design.md §3.7, §12.6).
+"""Construct probes: Level 0/1 primitive probes, shown as construct support on backend pages.
 
 One minimal probe per row of the primitive inventory
-(`docs/interp-methods-catalog.md`), per backend. A probe measures ONE primitive —
+(`docs/interp-methods-catalog.md`), per backend. A probe measures ONE primitive,
 a control op or its cross-edge data movement (iteration loop-carried saves /
 barrier fork-join sharing / session cross-region flow / edit staging replay /
 scan region mode) or a Level-1 site (boundary `.input`, engine `logits`/`samples`,
-derived head/neuron, non-attention `.source`) — with a self-contained denotation
-check, so its verdict uses the same applicability states as method cells:
-
-  SUPPORTED       ran AND the denotation check passed
-  SILENTLY_WRONG  ran, no error, denotation check failed (the dangerous cell)
-  ERROR           raised a clean exception (runner catches; last line recorded)
-  HANG            exceeded the per-probe timeout (runner-level)
+derived head/neuron, non-attention `.source`), with a self-contained check and one of the
+`State` verdicts below.
 
 Probes are explicit per (name, backend) like method cells — same §12 idiom, no
-abstraction. Family: GPT-2 only for now (the micro tier needs ONE family; per-family
+abstraction. Family: GPT-2 only for now (the probes need ONE family; per-family
 denotation differences like the fused residual stay in the method tier where the
 family axis lives). vLLM probes own their async drain in the probe body because the
 trace body must share a frame with `with model.trace(...)` (isb/backends/base.py).
@@ -31,9 +26,19 @@ import torch
 import torch.nn.functional as F
 
 from ..oracle.equivalence import compare, is_equivalent
-from ..states import AppState
 
 PROMPT = "The Eiffel Tower is in"
+
+
+class State:
+    """A probe's verdict. A numerical check outside its tolerance is NUMERICAL_MISMATCH,
+    correctness unresolved; SILENTLY_WRONG is a direct check's finding: the construct ran without
+    error and demonstrably did not happen (a missing read, an edit with no effect, a wrong shape)."""
+    SUPPORTED = "SUPPORTED"
+    NUMERICAL_MISMATCH = "NUMERICAL_MISMATCH"
+    SILENTLY_WRONG = "SILENTLY_WRONG"
+    ERROR = "ERROR"
+    HANG = "HANG"
 
 
 def _nnsight_at_least(major: int, minor: int) -> bool:
@@ -100,20 +105,20 @@ def _rel_dev(got, want) -> float:
 
 
 def _verdict_close(rel: float, tol: float, what: str):
-    state = AppState.SUPPORTED if rel <= tol else AppState.SILENTLY_WRONG
+    state = State.SUPPORTED if rel <= tol else State.NUMERICAL_MISMATCH
     return state, f"{what}: rel-dev={rel:.2e} (tol {tol:.0e})"
 
 
 def _verdict_compare(ref, got, what: str):
     m = compare(ref, got)
-    state = AppState.SUPPORTED if is_equivalent(m) else AppState.SILENTLY_WRONG
+    state = State.SUPPORTED if is_equivalent(m) else State.NUMERICAL_MISMATCH
     return state, f"{what}: top1={m['top1_agree']:.2f} tv={m['tv']:.3f}"
 
 
 def _vllm_saves(out) -> dict:
     """Unwrap a finished async output's nested `.saves`, surfacing a worker
     exception payload as a clean error (mirrors VLLMAsyncBackend._extract, but
-    returns the whole dict — micro probes save lists/scalars, not one tensor)."""
+    returns the whole dict: the probes save lists/scalars, not one tensor)."""
     if not hasattr(out, "saves"):
         raise RuntimeError("finished output carried no saves")
     saves = out.saves
@@ -161,7 +166,7 @@ def engine_samples_hf(be, model):
         lm = model.lm_head.output[:, -1, :].save()
         seq = model.generator.output.save()
     tok, arg = int(seq[0, -1].item()), int(_cpu(lm).argmax(-1).item())
-    state = AppState.SUPPORTED if tok == arg else AppState.SILENTLY_WRONG
+    state = State.SUPPORTED if tok == arg else State.SILENTLY_WRONG
     return state, f"generated id {tok} vs greedy argmax {arg}"
 
 
@@ -219,7 +224,7 @@ def _iter_hf(be, model, iter_slice):
         for step in tracer.iter[iter_slice]:
             rows.append(model.lm_head.output[:, -1, :])
     if len(rows) != 3:
-        return AppState.SILENTLY_WRONG, f"expected 3 per-step reads, got {len(rows)}"
+        return State.SILENTLY_WRONG, f"expected 3 per-step reads, got {len(rows)}"
     state, note = _verdict_compare(_cpu(ref), _cpu(rows[0]), "step0 vs plain trace")
     return state, f"3 steps; {note}"
 
@@ -253,7 +258,7 @@ def scan_hf(be, model):
     with model.scan(PROMPT):
         shp = nnsight.save(tuple(_hidden(model.transformer.h[0].output).shape))
     ok = tuple(shp) == tuple(real) and tuple(shp)[-2:] == (n_tok, hidden)
-    state = AppState.SUPPORTED if ok else AppState.SILENTLY_WRONG
+    state = State.SUPPORTED if ok else State.SILENTLY_WRONG
     return state, f"scanned shape {tuple(shp)} vs traced {tuple(real)}"
 
 
@@ -285,9 +290,9 @@ def edit_hf(be, model):
         base_after = model.lm_head.output[:, -1, :].save()
 
     if is_equivalent(compare(_cpu(base), _cpu(ed))):
-        return AppState.SILENTLY_WRONG, "edit had no effect (edited == unedited baseline)"
+        return State.SILENTLY_WRONG, "edit had no effect (edited == unedited baseline)"
     if not is_equivalent(compare(_cpu(base), _cpu(base_after))):
-        return AppState.SILENTLY_WRONG, "non-inplace edit leaked into the original model"
+        return State.SILENTLY_WRONG, "non-inplace edit leaked into the original model"
     return _verdict_compare(_cpu(ref_abl), _cpu(ed), "edited trace vs in-trace ablation")
 
 
@@ -314,7 +319,7 @@ def session_unsaved_hf(be, model):
         with model.trace(PROMPT):
             diff = (model.transformer.ln_f.output[:, -1, :] - v).abs().max().save()
     rel = float(diff.detach())
-    state = AppState.SUPPORTED if rel < 1e-5 else AppState.SILENTLY_WRONG
+    state = State.SUPPORTED if rel < 1e-5 else State.NUMERICAL_MISMATCH
     return state, f"cross-trace value reuse, |Δ|={rel:.2e}"
 
 
@@ -409,7 +414,7 @@ def engine_samples_vllm(be, model):
     s = _vllm_trace_saves(be, model, body)
     tok = int(_cpu(s["smp"]).flatten()[-1].item())
     arg = int(_cpu(s["lg"]).argmax(-1).flatten()[-1].item())
-    state = AppState.SUPPORTED if tok == arg else AppState.SILENTLY_WRONG
+    state = State.SUPPORTED if tok == arg else State.SILENTLY_WRONG
     return state, f"sampled id {tok} vs greedy logits argmax {arg}"
 
 
@@ -505,7 +510,7 @@ def _iter_vllm(be, model, bounded: bool):
             ) from e
         raise
     if len(rows) != 3:
-        return AppState.SILENTLY_WRONG, f"{form}: expected 3 per-step reads, got {len(rows)}"
+        return State.SILENTLY_WRONG, f"{form}: expected 3 per-step reads, got {len(rows)}"
     state, note = _verdict_compare(_cpu(ref), _cpu(rows[0]), "step0 vs single-step trace")
     return state, f"{form}: 3 steps; {note}"
 
@@ -528,9 +533,9 @@ def scan_vllm(be, model):
     n_tok = len(model.tokenizer(PROMPT)["input_ids"])
     with model.scan(PROMPT):
         shp = nnsight.save(tuple(_untuple(model.transformer.h[0].output).shape))
-    state = (AppState.SUPPORTED
+    state = (State.SUPPORTED
              if len(shp) >= 2 and shp[-2] == n_tok or shp[0] == n_tok
-             else AppState.SILENTLY_WRONG)
+             else State.SILENTLY_WRONG)
     return state, f"scanned shape {tuple(shp)} (prompt tokens={n_tok})"
 
 
@@ -564,17 +569,17 @@ def edit_vllm(be, model):
 
     ed = be._run_coro(_go())["ed"]
     if is_equivalent(compare(_cpu(base), _cpu(ed))):
-        return AppState.SILENTLY_WRONG, "edit silently dropped (edited == unedited baseline)"
-    return AppState.SUPPORTED, "edit applied (edited logits diverge from baseline)"
+        return State.SILENTLY_WRONG, "edit silently dropped (edited == unedited baseline)"
+    return State.SUPPORTED, "edit applied (edited logits diverge from baseline)"
 
 
 def _edit_verdict(base, ref, ed, after):
     """0.8 registration contract (docs/models/vllm-editing.md): the edited request equals the
     same ablation written in a trace, the edit is non-vacuous, and clear() restores the engine."""
     if is_equivalent(compare(_cpu(base), _cpu(ed))):
-        return AppState.SILENTLY_WRONG, "edit silently dropped (edited == unedited baseline)"
+        return State.SILENTLY_WRONG, "edit silently dropped (edited == unedited baseline)"
     if not is_equivalent(compare(_cpu(base), _cpu(after))):
-        return AppState.SILENTLY_WRONG, "edit still applied after clear()"
+        return State.SILENTLY_WRONG, "edit still applied after clear()"
     state, note = _verdict_compare(_cpu(ref), _cpu(ed), "registered edit vs in-trace ablation")
     return state, f"{note}; cleared engine matches baseline"
 
@@ -650,7 +655,7 @@ def barrier_vllm(be, model):
         raise
     if not (isinstance(s, dict) and "patched" in s):
         raise RuntimeError(f"post-barrier save dropped (saves: {s!r:.120})")
-    return AppState.SUPPORTED, "barrier patch produced a value (compare in method tier)"
+    return State.SUPPORTED, "barrier patch produced a value (compare in method tier)"
 
 
 @probe("session_saved", "vllm_async")
@@ -689,7 +694,7 @@ def session_unsaved_vllm(be, model):
             "back from the worker), so trace 2 dies and its saved var never binds — "
             "vllm-construct-gaps.md §3"
         ) from e
-    state = AppState.SUPPORTED if val < 1e-3 else AppState.SILENTLY_WRONG
+    state = State.SUPPORTED if val < 1e-3 else State.NUMERICAL_MISMATCH
     return state, f"cross-trace value reuse, |Δ|={val:.2e}"
 
 
@@ -735,7 +740,7 @@ def engine_samples_vllm_sync(be, model):
         smp = model.samples.save()
     tok = int(_cpu(smp).flatten()[-1].item())
     arg = int(_cpu(lg).argmax(-1).flatten()[-1].item())
-    state = AppState.SUPPORTED if tok == arg else AppState.SILENTLY_WRONG
+    state = State.SUPPORTED if tok == arg else State.SILENTLY_WRONG
     return state, f"sampled id {tok} vs greedy logits argmax {arg}"
 
 
@@ -799,7 +804,7 @@ def _iter_sync(be, model, bounded: bool):
         raise RuntimeError(f"per-step saves dropped under {form}: the saved list never bound; "
                            "see nnsight docs/developing/vllm-construct-gaps.md §1") from e
     if n_rows != 3:
-        return AppState.SILENTLY_WRONG, f"{form}: expected 3 per-step reads, got {n_rows}"
+        return State.SILENTLY_WRONG, f"{form}: expected 3 per-step reads, got {n_rows}"
     state, note = _verdict_compare(_cpu(ref), _cpu(rows[0]), "step0 vs single-step trace")
     return state, f"{form}: 3 steps; {note}"
 
@@ -823,9 +828,9 @@ def scan_vllm_sync(be, model):
     n_tok = len(model.tokenizer(PROMPT)["input_ids"])
     with model.scan(PROMPT):
         shp = nnsight.save(tuple(_untuple(model.transformer.h[0].output).shape))
-    state = (AppState.SUPPORTED
+    state = (State.SUPPORTED
              if (len(shp) >= 2 and shp[-2] == n_tok) or shp[0] == n_tok
-             else AppState.SILENTLY_WRONG)
+             else State.SILENTLY_WRONG)
     return state, f"scanned shape {tuple(shp)} (prompt tokens={n_tok})"
 
 
@@ -862,8 +867,8 @@ def edit_vllm_sync(be, model):
     with edited.trace(PROMPT, **_S):
         ed = edited.logits.save()
     if is_equivalent(compare(_cpu(base), _cpu(ed))):
-        return AppState.SILENTLY_WRONG, "edit silently dropped (edited == unedited baseline)"
-    return AppState.SUPPORTED, "edit applied (edited logits diverge from baseline)"
+        return State.SILENTLY_WRONG, "edit silently dropped (edited == unedited baseline)"
+    return State.SUPPORTED, "edit applied (edited logits diverge from baseline)"
 
 
 @probe("barrier", "vllm_sync")
@@ -905,7 +910,7 @@ def barrier_vllm_sync(be, model):
             res["patched"] = model.logits
     if not (isinstance(res, dict) and "patched" in res):
         keys = sorted(res) if isinstance(res, dict) else repr(res)
-        return AppState.SILENTLY_WRONG, f"post-barrier save dropped, no error (keys={keys})"
+        return State.SILENTLY_WRONG, f"post-barrier save dropped, no error (keys={keys})"
     return _verdict_compare(_cpu(ref), _cpu(res["patched"]), "barrier patch vs two-trace patch")
 
 
@@ -940,7 +945,7 @@ def session_unsaved_vllm_sync(be, model):
             "the worker); on sync the fix surfaces the real NameError naming the upstream var — "
             "vllm-construct-gaps.md §3"
         ) from e
-    state = AppState.SUPPORTED if val < 1e-3 else AppState.SILENTLY_WRONG
+    state = State.SUPPORTED if val < 1e-3 else State.NUMERICAL_MISMATCH
     return state, f"cross-trace value reuse, |Δ|={val:.2e}"
 
 

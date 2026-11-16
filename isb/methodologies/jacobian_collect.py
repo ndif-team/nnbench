@@ -6,7 +6,7 @@ backward over dim_batch copies), since the primitive takes one cotangent. Copy b
 one-hot cotangent on one output dimension at every valid target position (positions skip_first ..
 len-2). The cell consumes the whole prompt list as one job and returns `[n_sources, d, d]`; HF runs
 the sweep, vLLM's inference-mode activations refuse the backward. `grad=False` is the baseline: the
-same forward over the units, reading the target residual's last row, `[B, d]`.
+same forward over the units, reading the target residual's last row, `[B, d]` in the model's dtype.
 
 `dim_batch` changes how many rows one backward computes, never the rows: the default sizes it by
 model. The replicated batch's activations grow with copies x layers x width, so the default holds
@@ -61,7 +61,7 @@ def _collect_cell(be, model, m, units, *, dim_batch, skip_first, grad, residual)
             return be.last(_resid(blocks[target].output, residual)).clone()
 
     if not grad:
-        return be.run(model, units, read_target)
+        return be.run(model, units, read_target, keep_dtype=True)
 
     def acts_of(mdl):
         return [_resid(blocks[l].output, residual) for l in sources]

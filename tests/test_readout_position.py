@@ -1,18 +1,11 @@
-"""lens_eval task tests (isb/tasks/lens_eval.py) — no GPU; torch only.
-
-Pins the two pieces of task logic that fail silently if broken: the readout-position rules
-(input-space, per item) and the upstream pass@k metric (min-over-layers rank of each
-intermediate's token). The trace-side read path is the shared _resid + profile machinery,
-covered elsewhere.
-"""
+"""Readout-position rules of the lens datasets (isb/data.py), no GPU: the rule each shipped set
+uses and the token index each rule picks (input-space, per item)."""
 import sys
 from pathlib import Path
 
-import torch
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from isb.tasks.lens_eval import POSITION_RULES, first_token_id, locate, pass_at_k  # noqa: E402
+from isb.data import POSITION_RULES, locate  # noqa: E402
 
 
 class _FakeTok:
@@ -52,29 +45,6 @@ def test_locate_rejects_unknown_rule():
         raise AssertionError("expected ValueError on an unknown rule")
     except ValueError:
         pass
-
-
-class _IdTok:
-    """first_token_id fake: maps ' word' to a fixed id table."""
-    def __init__(self, table):
-        self.table = table
-
-    def encode(self, text, add_special_tokens=True):
-        return [self.table[text]]
-
-
-def test_pass_at_k_min_over_layers():
-    # 2 layers, vocab 6. intermediate "hit" (id 3): rank 0 at layer 1 -> min rank 0 -> pass@1.
-    # intermediate "miss" (id 5): worst logit in both layers -> min rank 5 -> fails even @4.
-    tok = _IdTok({" hit": 3, " miss": 5})
-    l0 = torch.tensor([5.0, 4.0, 3.0, 2.0, 1.0, 0.0])     # id 3 rank 3, id 5 rank 5
-    l1 = torch.tensor([1.0, 2.0, 3.0, 9.0, 4.0, 0.0])     # id 3 rank 0, id 5 rank 5
-    out = torch.stack([l0, l1])                            # [L=2, vocab] (vllm-shaped, no batch dim)
-    items = [{"intermediates": ["hit", "miss"]}]
-    assert pass_at_k([out], items, tok, k=1) == 0.5        # hit passes, miss fails
-    assert pass_at_k([out], items, tok, k=6) == 1.0        # everything passes at vocab size
-    # hf-shaped [L, 1, vocab] must score identically (the reshape normalizes the batch dim)
-    assert pass_at_k([out.unsqueeze(1)], items, tok, k=1) == 0.5
 
 
 def test_position_rules_cover_all_six_shipped_datasets():

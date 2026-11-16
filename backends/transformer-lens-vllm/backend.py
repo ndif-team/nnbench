@@ -20,7 +20,8 @@ class BridgeModel:
     tokenizer: object          # the checkpoint's HF tokenizer, used exactly as the nnsight cells do
     config: object             # the checkpoint's HF config; model identity reads its revision
     n_layers: int
-    weights: dict = field(default_factory=dict)   # unembedding, final norm, J-lens maps: built once
+    weights: dict = field(default_factory=dict)   # unembedding, final norm, steering directions,
+                                                  # J-lens maps: built once per loaded model
     device: str = "cuda:0"     # where a GPU-side readout projects (the engine shares this process)
 
 
@@ -72,6 +73,17 @@ class TransformerLensBackend(Backend):
 
 class TransformerLensOptBackend(TransformerLensBackend):
     name = "transformer_lens_opt"
+
+    def plain(self, model, units, *, new_tokens=1):
+        """The opt cells' own request with no intervention: the driver's forward with
+        `return_logits=False`, ending with the token vLLM generated for each prompt, `[B, 1]`
+        (cells_opt.py, `_next_tokens`); no logits are rebuilt on the host."""
+        from .cells_opt import _next_tokens
+
+        if new_tokens != 1:
+            raise NotImplementedError("the vLLM driver runs one forward per call "
+                                      "(max_new_tokens=1)")
+        return _next_tokens(self, model, prompts_of(units))
 
 
 def create_backend(spec):

@@ -1,6 +1,5 @@
-"""Micro-tier registry invariants (no GPU)."""
-from isb.micro.probes import PROBES, names_for
-from isb.states import AppState
+"""Construct-probe registry invariants (no GPU)."""
+from isb.constructs.probes import State, names_for
 
 # every inventory row gets exactly one probe per backend; iteration and session are
 # split by realization (bounded/unbounded, saved/un-saved flow) — the Level-1.5 splits
@@ -35,20 +34,20 @@ def test_vllm_order_is_safest_first():
 
 
 def test_probe_watchdog_marks_hang_and_error():
-    from isb.micro.run import _run_one
+    from isb.constructs.run import _run_one
 
     def hangs(be, model):
         import time
         time.sleep(5)
-        return AppState.SUPPORTED, ""
+        return State.SUPPORTED, ""
 
     def raises(be, model):
         raise RuntimeError("boom\nlast line wins")
 
     state, note, _, _ = _run_one(hangs, None, None, timeout_s=0.2)
-    assert state == AppState.HANG
+    assert state == State.HANG
     state, note, _, detail = _run_one(raises, None, None, timeout_s=5)
-    assert state == AppState.ERROR and note == "RuntimeError: last line wins"
+    assert state == State.ERROR and note == "RuntimeError: last line wins"
     assert detail == "boom\nlast line wins"
 
     def raises_from_worker(be, model):     # a vLLM worker error: remote traceback, caret last

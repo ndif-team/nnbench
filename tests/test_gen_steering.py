@@ -22,9 +22,7 @@ from isb.methodologies.readout import head_direction  # noqa: E402
 from isb.methodologies.registry import CELLS, get_cell  # noqa: E402
 from isb.runfile import load_run  # noqa: E402
 from isb.runs import EngineConfig, RunConfig  # noqa: E402
-from isb.states import AppState  # noqa: E402
 from isb.sweep.execute import _task_params, _throughput, execute_run  # noqa: E402
-from isb.sweep.score import score_runs  # noqa: E402
 from isb.sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime  # noqa: E402
 
 VOCAB, HID = 11, 4
@@ -40,13 +38,12 @@ class _Head:
         self.weight = torch.eye(VOCAB, HID)  # row i is the unit direction e_i
 
 
-def test_cells_registered_and_serve_falls_back():
+def test_cells_registered_and_sync_falls_back():
     # family-generic (§12.8): registered once under family="*", resolved per profiled family
     assert ("gen_steering", "*", "hf") in CELLS
     assert ("gen_steering", "*", "vllm_async") in CELLS
-    # the serve backend reuses the in-process vLLM cell by construction
-    # serve reuses the in-process vLLM cell: same underlying generic fn behind the profile-bound wrapper
-    assert get_cell("gen_steering", "gpt2", "vllm_serve").__wrapped__ is CELLS[
+    # the sync engine reuses the async vLLM cell: same generic fn behind the profile-bound wrapper
+    assert get_cell("gen_steering", "gpt2", "vllm_sync").__wrapped__ is CELLS[
         ("gen_steering", "*", "vllm_async")]
 
 
@@ -128,15 +125,22 @@ class _GenModel:
 
 
 class _GenBackend:
+    def between_calls(self, model):
+        pass
+
     """Fake be.generate: records the plumbing args and drives build_step like the real loop."""
 
     def __init__(self):
         self.calls = []
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
-        self.calls.append({"prompts": prompts, "new_tokens": new_tokens, "bounded": bounded})
-        rows = [build_step(step) for step in range(new_tokens)]
-        return torch.stack([r.detach().float().cpu() for r in rows], dim=0)
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False,
+                 tokens=False):
+        self.calls.append({"prompts": prompts, "new_tokens": new_tokens, "bounded": bounded,
+                           "per_step": build_step is not None, "tokens": tokens})
+        rows = [None if build_step is None else build_step(step) for step in range(new_tokens)]
+        if tokens:                       # the tokens the decode produced, as the backends return
+            return torch.zeros(new_tokens, len(prompts), 1, dtype=torch.long)
+        return torch.stack([r.detach() if keep_dtype else r.detach().float() for r in rows], dim=0)
 
 
 def test_hf_cell_plumbs_bound_and_new_tokens_and_steers():
@@ -145,7 +149,8 @@ def test_hf_cell_plumbs_bound_and_new_tokens_and_steers():
     out = fn(be, model, ["p"], layer=0, target="x", alpha=2.0, bound="unbounded", new_tokens=4)
     assert be.calls[0]["new_tokens"] == 4
     assert be.calls[0]["bounded"] is False                # bound="unbounded" -> bounded=False
-    assert out.shape == (4, 1, VOCAB)                     # per-step rows stacked over the unit
+    assert be.calls[0]["tokens"] and be.calls[0]["per_step"]   # timed: steer per step, tokens back
+    assert out.shape == (4, 1, 1) and out.dtype == torch.long
     assert isinstance(model.transformer.h[0].output, tuple) or not torch.equal(
         model.transformer.h[0].output, torch.ones(1, 2, HID))   # the write landed
 
@@ -154,9 +159,18 @@ def test_hf_cell_alpha_zero_is_pure_readout():
     be, model = _GenBackend(), _GenModel()
     before = model.transformer.h[0].output.clone()
     fn = get_cell("gen_steering", "gpt2", "hf")
-    out = fn(be, model, ["p"], layer=0, target="x", alpha=0.0, bound="bounded", new_tokens=3)
+    out = fn(be, model, ["p"], layer=0, target="x", alpha=0.0, bound="bounded", new_tokens=3,
+             check=True)
     assert torch.equal(model.transformer.h[0].output, before)   # no write at all
-    assert out.shape == (3, 1, VOCAB)
+    assert out.shape == (3, 1, VOCAB)                     # checked: per-step logits
+
+
+def test_hf_cell_alpha_zero_timed_is_a_decode_with_no_per_step_work():
+    be, model = _GenBackend(), _GenModel()
+    out = get_cell("gen_steering", "gpt2", "hf")(be, model, ["p"], layer=0, target="x", alpha=0.0,
+                                                 bound="unbounded", new_tokens=3)
+    assert be.calls[0]["tokens"] and not be.calls[0]["per_step"]
+    assert out.shape == (3, 1, 1)
 
 
 # ---- fake-backend sweep over a generation workload -------------------------------------------
@@ -180,6 +194,9 @@ def _fake_get_cell(methodology, family, backend):
 
 
 class _FakeBackend:
+    def between_calls(self, model):
+        pass
+
     def load(self, repo):
         return "model"
 
@@ -203,7 +220,7 @@ def _execute_fake(spec, out_dir, name, engine_kind):
         execute_mod.get_cell, execute_mod.make_backend, execute_mod.resolve_provenance = orig
 
 
-def test_generation_sweep_oracle_throughput_and_effect():
+def test_generation_sweep_records_throughput_and_effect():
     import tempfile
 
     spec = CellConfig(
@@ -218,15 +235,11 @@ def test_generation_sweep_oracle_throughput_and_effect():
         warmup=0, n_trials=1,
     )
     with tempfile.TemporaryDirectory() as d:
-        _execute_fake(spec, d, "hf", "transformers")
         _execute_fake(spec, d, "vllm", "vllm")
-        cells = score_runs(spec, d, "vllm", "hf", quiet=True)
-        meta = load_run(d, "vllm")[0][("__meta__",)]
+        out = load_run(d, "vllm")[0]
+        meta = out[("__meta__",)]
 
-    by = {c.label: c for c in cells}
-    for label in ("bound=iter[0:N]", "bound=iter[:]"):     # same fake output both engines
-        assert by[label].state == AppState.SUPPORTED
-    assert by["bound=iter[0:N]"].workload == "generation"
+    assert {("generation", "bound=iter[0:N]"), ("generation", "bound=iter[:]")} <= set(out)
     m = meta[("generation", "bound=iter[0:N]")]
     assert m["throughput"] is not None                     # tokens/s populated for generation
     assert meta[("__effect__", "generation")]["strong"]    # steering moves the fake control

@@ -18,11 +18,11 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import isb.sweep.execute as execute_mod  # noqa: E402
-from isb.perf.load import arrival_offsets, run_concurrent, run_offline, run_open  # noqa: E402
+from isb.jobs.schema import drop_saturated_floors, upgrade_calls, upgrade_rows  # noqa: E402
+from isb.perf.load import arrival_offsets, kept_up, run_concurrent, run_offline, run_open  # noqa: E402
 from isb.runs import EngineConfig, RunConfig  # noqa: E402
 from isb.suites import Entry, cases, parse_load  # noqa: E402
 from isb.sweep.execute import execute_run  # noqa: E402
-from isb.sweep.score import score_runs  # noqa: E402
 from isb.sweep.spec import (BaselineSpec, CellConfig, Concurrent, ExecutionRegime,  # noqa: E402
                             Offline, Open, instantiate, is_load_regime, reference_key)
 from isb.workloads import WORKLOADS  # noqa: E402
@@ -282,6 +282,37 @@ def test_open_loop_below_capacity_keeps_latency_near_the_service_time():
     assert result.percentile(99) < 100.0
 
 
+def test_an_open_loop_record_is_saturated_when_its_pass_outlasts_the_arrivals():
+    # 128 arrivals at 64/s, seed 0, span 147/64 s, not 127/64: the schedule's span is the yardstick
+    span_ms = arrival_offsets(128, 64.0)[-1] * 1000.0
+    assert span_ms > 2200.0
+    summary = {"units": 128, "offered_rate": 64.0}
+    assert kept_up({**summary, "median_pass_ms": span_ms + 60.0})        # drained one request later
+    assert not kept_up({**summary, "median_pass_ms": 1.5 * span_ms})     # queued behind the arrivals
+    # a request slower than a tenth of the span: the pass ends one request after the last arrival
+    assert kept_up({**summary, "request_ms": [300.0, 340.0], "median_pass_ms": span_ms + 330.0})
+    # requests that all took ~2 s against a 0.2 s one: the queue, not the service, set the drain
+    assert not kept_up({**summary, "request_ms": [200.0, 2100.0], "median_pass_ms": span_ms + 1850.0})
+    assert kept_up({"units": 1, "offered_rate": 4.0, "request_ms": [9.0], "median_pass_ms": 9.5})
+    # a report row written before the field existed gains it and loses the ratios it took part in
+    row = {"backend": "b", "workload": "open/r64", "label": "x", "state": "RAN",
+           "median_latency_ms": 1190.7, "overhead_vs_plain_vllm": 92.0, "overhead_vs_vanilla": 3.0,
+           "load": {**summary, "median_pass_ms": 1.49 * span_ms}}
+    upgraded, = upgrade_rows([row], 1, 2)
+    assert upgraded["regime"] == "open/r64" and upgraded["latency_kind"] == "request"
+    assert upgraded["saturated"] and "overhead_vs_plain_vllm" not in upgraded
+    assert "overhead_vs_vanilla" not in upgraded
+    # a row that kept up loses its ratio over a floor of its regime that did not
+    floors = upgrade_calls([
+        {"key": ["__baseline__", "open/r64"], "record": {"median_latency_ms": 1800.0,
+                                                         "load": row["load"]}},
+        {"key": ["__vanilla__", "open/r64"], "record": {"median_latency_ms": 40.0,
+                                                        "load": {**summary, "median_pass_ms": span_ms}}}], 2)
+    kept = {"regime": "open/r64", "overhead_vs_baseline": 0.64, "overhead_vs_vanilla": 1.5}
+    drop_saturated_floors([kept], floors)
+    assert "overhead_vs_baseline" not in kept and kept["overhead_vs_vanilla"] == 1.5
+
+
 def test_an_open_loop_error_is_raised():
     def prepare(unit):
         def invoke():
@@ -302,6 +333,9 @@ def _onehot(i, vocab=8):
 
 
 class _Backend:
+    def between_calls(self, model):
+        pass
+
     name = "hf"
 
     def __init__(self, concurrent=False):
@@ -395,10 +429,43 @@ def test_executor_records_load_patterns(tmp_path):
     assert loads[0]["batch_size"] == 4 and loads[1]["concurrency"] == 3
 
 
+def test_load_pattern_check_calls_take_the_timed_form(tmp_path, monkeypatch):
+    """A load pattern's scored outputs come from untimed check calls in the pattern's form: offline
+    the timed pass's chunk that holds the scored units, concurrently those units' own requests.
+    The kept timed outputs, stacked, meet the check outputs of the same units."""
+    from isb.oracle import checks as checks_mod
+
+    checks, met = [], []
+
+    def meets(timed, checked):
+        met.append(torch.equal(timed, checked))
+        return met[-1], {}
+
+    monkeypatch.setattr(checks_mod, "TIMED", {"m": meets})
+
+    def fake(methodology, family, backend):
+        def fn(impl, model, units, *, check=False):
+            if check:
+                checks.append(list(units))
+            return torch.cat([_onehot(int(u[1])) for u in units], dim=0)
+        return fn
+
+    monkeypatch.setattr(execute_mod, "get_cell", fake)
+    monkeypatch.setattr(execute_mod, "make_backend", lambda run, spec: _Backend(concurrent=True))
+    monkeypatch.setattr(execute_mod, "resolve_provenance", lambda run: {
+        "client": {}, "deployment": {"kind": "local"},
+        "engine": {"kind": run.engine.kind, "mode": run.engine.mode, "params": {}},
+        "host": {"hostname": "testbox", "gpus": []}})
+    execute_run(_spec(), RunConfig(engine=EngineConfig("vllm")), str(tmp_path), "run")
+    assert ["p0", "p1", "p2", "p3"] in checks          # offline/b4, three scored units
+    assert ["p3"] in checks                             # concurrent/c3, four scored units
+    assert met == [True, True]
+
+
 def test_a_concurrent_backend_opens_its_session_and_overlaps_requests(tmp_path):
     backend = _Backend(concurrent=True)
     _execute(tmp_path, "cand", "vllm", backend)
-    assert backend.sessions == 3                       # baseline, plain system, one case
+    assert backend.sessions == 4       # baseline, plain system, one case timed, then checked
     assert backend.in_flight.peak > 1
 
 
@@ -426,7 +493,7 @@ def test_executor_runs_single_unit_offline_and_the_open_loop(tmp_path):
     opened = meta[("open/r1000", "t")]
     assert opened["error"] is None and opened["load"]["offered_rate"] == 1000.0
     assert out[("open/r1000", "t")].shape == (3, 8)
-    assert backend.sessions == 3                       # the open loop runs in a concurrent session
+    assert backend.sessions == 4       # the open loop runs in a concurrent session, checks too
 
 
 def test_offline_keeps_the_rows_its_scored_units_fill(tmp_path):
@@ -438,16 +505,6 @@ def test_offline_keeps_the_rows_its_scored_units_fill(tmp_path):
     out, _ = load_run(str(tmp_path), "ref")
     assert out[("offline_perprompt", "t")].shape == (6, 8)
     assert torch.equal(out[("offline/b4", "t")], out[("offline_perprompt", "t")])
-
-
-def test_offline_candidate_scored_against_reference_per_unit_outputs(tmp_path):
-    _execute(tmp_path, "ref", "transformers", _Backend())
-    _execute(tmp_path, "cand", "vllm", _Backend(concurrent=True), wrong_on="p1")
-    by = {(c.workload, c.label): c for c in score_runs(_spec(), str(tmp_path), "cand", "ref",
-                                                        quiet=True)}
-    assert set(by) == {("offline/b4", "t"), ("concurrent/c3", "t")}
-    assert by[("offline/b4", "t")].state == "NUMERICAL_MISMATCH"     # p1 is among the scored units
-    assert by[("concurrent/c3", "t")].state == "NUMERICAL_MISMATCH"
 
 
 def test_coordinates_rebuilt_from_a_frozen_record_keep_load_regimes_apart(tmp_path):

@@ -17,8 +17,5 @@ RUN python3 -m pip install --break-system-packages --no-cache-dir \
       "transformers==${TRANSFORMERS_VERSION}" \
     && mkdir -p /models /outputs \
     && chmod 0777 /models /outputs
-# nnsight 0.4.x opens nnsight.log inside its package directory at import; images run read-only, so
-# point that file at /tmp. Releases without the file are untouched.
-RUN python3 -c "import importlib.util as u, os; p = os.path.join(os.path.dirname(u.find_spec('nnsight').origin), 'nnsight.log'); os.path.exists(p) and (os.remove(p), os.symlink('/tmp/nnsight.log', p))"
 RUN if [ "${REMOVE_PACKAGES}" != none ]; then python3 -m pip uninstall --break-system-packages -y ${REMOVE_PACKAGES}; fi
 RUN python3 -m pip check

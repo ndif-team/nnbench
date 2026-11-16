@@ -31,6 +31,21 @@ POSITION_RULES = {
 }
 
 
+def locate(tokenizer, prompt: str, rule: str) -> int:
+    """Readout token index into the prompt for a position rule. Indices are computed on
+    `tokenizer.encode(prompt)` WITH special tokens, matching the sequence the model actually
+    runs (e.g. a llama BOS shifts absolute indices; `last` is unaffected, `last_newline` is)."""
+    if rule == "last":
+        return -1
+    if rule == "last_newline":
+        ids = tokenizer.encode(prompt)
+        nl = [i for i, tid in enumerate(ids) if "\n" in tokenizer.decode([tid])]
+        if not nl:
+            raise ValueError("last_newline readout on a prompt with no newline token")
+        return nl[-1]
+    raise ValueError(f"unknown position rule {rule!r}")
+
+
 @dataclass(frozen=True)
 class DataRef:
     """A named binding to a data source: `name` picks the source, `n` optionally sizes it

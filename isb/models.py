@@ -3,8 +3,8 @@ the host can instantiate workloads without loading an inference stack.
 
 `FAMILIES` is the architecture index (§12.8): where a family's blocks, final norm and unembed head
 live in the module tree, the family's residual denotation per engine, and the block components a
-workload row can name. `MODELS` is one row per checkpoint: repo, family, layer count, control
-precision, load options and fitted assets. `isb/profiles.py` wraps `FAMILIES` with the torch helpers.
+workload row can name. `MODELS` is one row per checkpoint: repo, family, layer count, load
+options and fitted assets. `isb/profiles.py` wraps `FAMILIES` with the torch helpers.
 
 Nemotron 3 Nano (design.md §12.7) loads differently per backend (measured 2026-06-19):
   - HF: transformers' BUILT-IN NemotronH, trust_remote_code=False. The repo's remote modeling
@@ -95,13 +95,11 @@ FAMILIES = {
 @dataclass(frozen=True)
 class Model:
     """One checkpoint. `n_layers` resolves workload depths and is checked against the loaded model.
-    `dtype_control` is the precision of the standalone SILENTLY_WRONG-vs-DEGRADED re-check.
     `assets` are fitted artifacts bound to this checkpoint, referenced from rows by `Asset`."""
     key: str
     repo: str
     family: str
     n_layers: int
-    dtype_control: str = "float32"
     hf_kwargs: dict = field(default_factory=dict)
     vllm_kwargs: dict = field(default_factory=dict)
     assets: dict = field(default_factory=dict)
@@ -130,22 +128,21 @@ MODELS = {m.key: m for m in (
     Model("gpt2", "openai-community/gpt2", "gpt2", 12),
     # a LlamaForCausalLM; meta-llama is gated and uncached
     Model("smollm2-135m", "HuggingFaceTB/SmolLM2-135M-Instruct", "llama", 30),
-    # Llama-shaped decoders (family "llama"). The 14B's control runs in bf16 so it fits on ONE 40GB
-    # A100 (fp32 14B is ~56GB).
+    # Llama-shaped decoders (family "llama").
     Model("qwen2.5-7b", "Qwen/Qwen2.5-7B-Instruct", "llama", 28),
-    Model("qwen2.5-14b", "Qwen/Qwen2.5-14B-Instruct", "llama", 48, dtype_control="bfloat16"),
+    Model("qwen2.5-14b", "Qwen/Qwen2.5-14B-Instruct", "llama", 48),
     # Qwen3 keeps the Llama tree (q/k norms sit inside self_attn). The 32B is the largest cached
     # checkpoint with full-precision weights (~65 GB in bf16: one 141 GB H200, or an 80 GB card).
-    Model("qwen3-32b", "Qwen/Qwen3-32B", "llama", 64, dtype_control="bfloat16"),
+    Model("qwen3-32b", "Qwen/Qwen3-32B", "llama", 64),
     # 4-bit AWQ (GEMM, group 128); the only 72B weights in the personal cache. Loading it on HF needs an AWQ kernel package.
     # Full-precision 72B (145 GB in bf16) lives in the group's shared cache; it needs two H200s:
     # the */gpu2 and */tp2 configs, with ISB_MODEL_CACHE naming a volume linked to that cache.
-    Model("qwen2.5-72b", "Qwen/Qwen2.5-72B-Instruct", "llama", 80, dtype_control="bfloat16"),
-    Model("qwen2.5-72b-awq", "Qwen/Qwen2.5-72B-Instruct-AWQ", "llama", 80, dtype_control="bfloat16"),
+    Model("qwen2.5-72b", "Qwen/Qwen2.5-72B-Instruct", "llama", 80),
+    Model("qwen2.5-72b-awq", "Qwen/Qwen2.5-72B-Instruct-AWQ", "llama", 80),
     # Llama-3.3-70B-Instruct in bf16 (132 GiB) from the group's shared cache: four 80 GB A100s,
     # the */gpu4 and */tp4 configs. Qwen3-8B (same family, one GPU) checks a config before it.
-    Model("llama3.3-70b", "meta-llama/Llama-3.3-70B-Instruct", "llama", 80, dtype_control="bfloat16"),
-    Model("qwen3-8b", "Qwen/Qwen3-8B", "llama", 36, dtype_control="bfloat16"),
+    Model("llama3.3-70b", "meta-llama/Llama-3.3-70B-Instruct", "llama", 80),
+    Model("qwen3-8b", "Qwen/Qwen3-8B", "llama", 36),
     # Text-only checkpoint of a multimodal-wrapper arch: transformers auto-routes it to the text-only
     # ForCausalLM, but nnsight's LanguageModel refuses the repo by model_type (the guard exempts
     # explicit automodels; see HFBackend).
@@ -153,7 +150,7 @@ MODELS = {m.key: m for m in (
           hf_kwargs={"force_text_causal": True}, vllm_kwargs={"max_model_len": 1024},
           assets={"jlens": _QWEN35_JLENS}),
     Model("nemotron3-nano-4b", "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16", "nemotron", 42,
-          dtype_control="bfloat16", vllm_kwargs=_NEMOTRON_VLLM),
+          vllm_kwargs=_NEMOTRON_VLLM),
     Model("nemotron3-nano-30b", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "nemotron", 52,
-          dtype_control="bfloat16", vllm_kwargs=_NEMOTRON_VLLM),
+          vllm_kwargs=_NEMOTRON_VLLM),
 )}

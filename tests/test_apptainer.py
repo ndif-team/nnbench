@@ -141,7 +141,8 @@ def test_job_lifecycle_through_apptainer(tmp_path, monkeypatch):
     image.parent.mkdir(parents=True)
     image.write_bytes(b"sif image bytes")
     experiment = contract.prepare(specimen(), tmp_path / "job")
-    monkeypatch.setattr(local, "gpu_used_mib", lambda gpu: None)
+    monkeypatch.setattr(local, "gpu_state", lambda gpus: None)
+    monkeypatch.setattr(local, "gpu_clocks", lambda gpus: None)
     launched = []
 
     def fake_run(argv, extra_env, log, timeout):

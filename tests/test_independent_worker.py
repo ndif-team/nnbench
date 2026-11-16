@@ -23,17 +23,17 @@ def _worker(tmp_path, mode):
                           text=True, capture_output=True, timeout=45)
 
 
-def test_independent_v2_worker_is_accepted(tmp_path):
+def test_independent_worker_of_the_current_version_is_accepted(tmp_path):
     experiment = _job(tmp_path)
     process = _worker(tmp_path, "success")
     assert process.returncode == 0, process.stderr
     result = validate_result(tmp_path / "output", experiment, "third-party")
-    assert result["cells"] == [{"workload": "interactive", "label": "case", "state": "RAN"}]
+    assert result["cells"] == [{"regime": "interactive", "label": "case", "state": "RAN"}]
 
 
-def test_pinned_v1_worker_rejects_v2_clearly(tmp_path):
+def test_worker_pinned_to_an_older_version_rejects_the_current_one_clearly(tmp_path):
     _job(tmp_path)
     process = _worker(tmp_path, "v1-only")
     assert process.returncode != 0
-    assert "unsupported experiment version 2; supported: (1,)" in process.stderr
+    assert "unsupported experiment version 3; supported: (1,)" in process.stderr
     assert not (tmp_path / "output/result.json").exists()

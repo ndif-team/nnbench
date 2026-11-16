@@ -1,16 +1,20 @@
 """Generation-time steering: the steering write applied at every decode step of a greedy
-generation, reading each step's next-token logits (`[new_tokens, B, vocab]`). The write is a
-whole-tuple replacement; `bound` selects the iteration form, `tracer.iter[0:N]` (bounded) or
-`tracer.iter[:]` (unbounded). `alpha=0` writes nothing."""
+generation, returning the tokens the decode produced (`[new_tokens, B, 1]`); a check call returns
+each step's next-token logits instead (`[new_tokens, B, vocab]`). The write is a whole-tuple
+replacement; `bound` selects the iteration form, `tracer.iter[0:N]` (bounded) or `tracer.iter[:]`
+(unbounded). `alpha=0` writes nothing, so its timed call is a decode with no per-step work."""
 from __future__ import annotations
 
 import torch
 
+from ..oracle.checks import generated_tokens_match, timed_check_of
 from ..profiles import _resid
 from .observations import record_resolved
-from .readout import checkpoint_direction, checkpoint_of, engine_logits, head_direction
+from .readout import checkpoint_direction, checkpoint_of, final_logits
 from .registry import cell
-from .steering import _attention_mask, _resolve_token, _strength_scale
+from .steering import _attention_mask, _strength_scale, cached_head_direction, resolve_token
+
+timed_check_of("gen_steering")(generated_tokens_match)
 
 
 def _steer_step(blocks, model, *, layer, direction, alpha, residual="plain", scale_by="mean_norm",
@@ -36,33 +40,39 @@ def _check_bound(bound):
 
 @cell("gen_steering", family="*", backend="hf", realizations=[{"bound": "unbounded"}])
 def gen_steering_hf(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0,
-                    bound="bounded", new_tokens=8, scale_by="mean_norm"):
+                    bound="bounded", new_tokens=8, scale_by="mean_norm", check=False):
     _check_bound(bound)
-    direction = (head_direction(model, m.head(model), _resolve_token(model.tokenizer, target))
-                 if alpha != 0 else None)
+    direction = cached_head_direction(be, model, m, target) if alpha != 0 else None
 
     def step(index):
         if alpha != 0:
             _steer_step(m.blocks(model), model, layer=layer, direction=direction, alpha=alpha,
                         scale_by=scale_by, masked=True)
-        return m.head(model).output[:, -1, :]            # this step's next-token logits [B, vocab]
+        if check:
+            return final_logits(model, m.head(model), "head")
 
-    return be.generate(model, units, step, new_tokens=new_tokens, bounded=(bound == "bounded"))
+    return be.generate(model, units, step if alpha != 0 or check else None,
+                       new_tokens=new_tokens, bounded=(bound == "bounded"), keep_dtype=not check,
+                       tokens=not check)
 
 
 @cell("gen_steering", family="*", backend="vllm_async", realizations=[{"bound": "unbounded"}])
 def gen_steering_vllm(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0,
-                      bound="bounded", new_tokens=8, residual=None, scale_by="mean_norm"):
+                      bound="bounded", new_tokens=8, residual=None, scale_by="mean_norm",
+                      check=False):
     _check_bound(bound)
     residual = residual if residual is not None else m.default_residual(be.name)
     record_resolved(residual=residual)
-    direction = (checkpoint_direction(checkpoint_of(model), _resolve_token(model.tokenizer, target))
+    direction = (checkpoint_direction(checkpoint_of(model), resolve_token(model.tokenizer, target))
                  if alpha != 0 else None)
 
     def step(index):
         if alpha != 0:
             _steer_step(m.blocks(model), model, layer=layer, direction=direction, alpha=alpha,
                         residual=residual, scale_by=scale_by)
-        return engine_logits(model)[-1:, :]              # the step's last row, [1, vocab]
+        if check:
+            return final_logits(model, None, "engine")
 
-    return be.generate(model, units, step, new_tokens=new_tokens, bounded=(bound == "bounded"))
+    return be.generate(model, units, step if alpha != 0 or check else None,
+                       new_tokens=new_tokens, bounded=(bound == "bounded"), keep_dtype=not check,
+                       tokens=not check)

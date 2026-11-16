@@ -68,7 +68,7 @@ def test_generic_cell_binds_a_new_profile_row():
         assert (fam, first_block, prompts) == ("weird", "block0", ["p"])
         # vllm variant routing composes with the generic fallback
         CELLS[("probe_meth", "*", "vllm_async")] = probe
-        assert get_cell("probe_meth", "weird", "vllm_serve") is not None
+        assert get_cell("probe_meth", "weird", "vllm_sync") is not None
     finally:
         del CELLS[("probe_meth", "*", "hf")]
         CELLS.pop(("probe_meth", "*", "vllm_async"), None)
@@ -88,7 +88,7 @@ def test_for_backend_prefixes_every_path_on_vllm_only():
         "text_side.score_fn")
     wrapper = SimpleNamespace(text_side=SimpleNamespace(score_fn="the-processor"))
     assert v.logits_processor(wrapper) == "the-processor"
-    assert v.for_backend("vllm_serve") is v                      # idempotent (prefix consumed)
+    assert v.for_backend("vllm_sync") is v                      # idempotent (prefix consumed)
     # no prefix declared -> identity on every backend
     assert WEIRD.for_backend("vllm_async") is WEIRD
 

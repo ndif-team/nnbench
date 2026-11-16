@@ -16,7 +16,7 @@ def test_real_cells_report_residual_choice_at_resolution_site(method, family, ex
     # Stop at the backend boundary: the actual cell and family profile resolve the selector.
     monkeypatch.setattr("isb.methodologies.steering.checkpoint_direction",
                         lambda repo, token_id: "direction")      # no checkpoint here
-    backend = SimpleNamespace(name="vllm_async", run=lambda model, prompts, build: "trace reached")
+    backend = SimpleNamespace(name="vllm_async", between_calls=lambda model: None, run=lambda model, prompts, build, keep_dtype=False: "trace reached")
     model = SimpleNamespace(tokenizer=lambda *args, **kwargs: {"input_ids": [1]}, repo_id="repo")
     spec = CellConfig("choice", method, family, "repo",
                       [ExecutionRegime("interactive", ["prompt"])],
@@ -41,9 +41,10 @@ def test_patching_defaults_to_the_family_vllm_residual(method, prompts, family, 
     block = SimpleNamespace(mlp="mlp", attn="attn", self_attn="attn")
     stack = SimpleNamespace(layers=[block] * 8, norm="norm", h=[block] * 8, ln_f="norm")
     model = SimpleNamespace(model=stack, transformer=stack, lm_head="head")
-    backend = SimpleNamespace(name="vllm_async",
-                              run=lambda model, prompts, build: "trace reached",
-                              patch=lambda model, clean, corrupt, capture, patch: "trace reached")
+    backend = SimpleNamespace(name="vllm_async", between_calls=lambda model: None,
+                              run=lambda model, prompts, build, keep_dtype=False: "trace reached",
+                              patch=lambda model, clean, corrupt, capture, patch, keep_dtype=False:
+                              "trace reached")
     spec = CellConfig("choice", method, family, "repo",
                       [ExecutionRegime("interactive", ["prompt"])],
                       [TaskSpec("auto", {"layer": 1})], BaselineSpec({}))

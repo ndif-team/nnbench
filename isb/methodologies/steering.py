@@ -1,6 +1,7 @@
 """Steering (activation addition): add a steering vector into a block's residual-stream output and
-read the model's next-token logits. The direction is the target token's unit unembedding row, built
-before the trace; `alpha` is relative to the stream's own per-token norm; `alpha=0` writes nothing.
+return the model's greedy next token; a check call returns the next-token logits instead. The
+direction is the target token's unit unembedding row, built before the trace; `alpha` is relative
+to the stream's own per-token norm; `alpha=0` writes nothing.
 `mode` selects the write form, in place into the live buffer or whole-tuple replacement. `layers`,
 when given, steers each listed block in one forward and replaces `layer`; `alpha` is then the total
 strength, split evenly, so each block gets `alpha / len(layers)` (a single `layer` gets `alpha`).
@@ -22,14 +23,20 @@ import weakref
 
 import torch
 
+from ..oracle.checks import timed_check_of, tokens_match
 from ..profiles import _resid
 from .observations import record_resolved
-from .readout import checkpoint_direction, checkpoint_of, final_logits, head_direction
+from .readout import (checkpoint_direction, checkpoint_of, final_logits, head_direction,
+                      next_token, per_model)
 from .registry import cell
 
+timed_check_of("steering")(tokens_match)
 
-def _resolve_token(tokenizer, target: str) -> int:
-    """Token id whose unembed row gives the steering direction."""
+
+@functools.lru_cache(maxsize=None)
+def resolve_token(tokenizer, target: str) -> int:
+    """Token id whose unembed row gives the steering direction, tokenized once per (tokenizer,
+    target)."""
     ids = tokenizer(target, add_special_tokens=False)["input_ids"]
     if not ids:
         raise ValueError(f"steering target {target!r} tokenized to nothing")
@@ -46,24 +53,36 @@ def _attention_mask(model):
 
 
 CALIBRATED = "calibrated_mean_norm"
-_CALIBRATED_NORMS = weakref.WeakKeyDictionary()      # backend -> {layer: unsteered mean norm}
+# backend -> (its loaded model, {layer: unsteered mean norm}), kept by `per_model`
+_CALIBRATED_NORMS = weakref.WeakKeyDictionary()
+# backend -> (its loaded model, {target: unit unembedding row}), kept by `per_model`
+_HEAD_DIRECTIONS = weakref.WeakKeyDictionary()
 
 
-def calibrated_strengths(be, layers, alpha, units, measure):
+def cached_head_direction(be, model, m, target):
+    """The target token's unit unembedding row from the loaded head (HF): built on the first call,
+    the warm-up, and reused by the timed calls of the loaded engine."""
+    known = per_model(_HEAD_DIRECTIONS, be, model)
+    if target not in known:
+        known[target] = head_direction(model, m.head(model), resolve_token(model.tokenizer, target))
+    return known[target]
+
+
+def calibrated_strengths(be, model, layers, alpha, units, measure):
     """The strength of each of `layers` under `scale_by="calibrated_mean_norm"`, the same for all:
     `alpha / len(layers)` times the unsteered stream's mean per-token norm at the first of them.
     `measure(prompts, layers)` returns such norms from one plain forward of the system's own read;
     it runs on the first prompt of the first call that needs a layer's norm, and the value is kept
-    for the loaded engine, so every later call (the harness's timed ones among them) adds fixed
-    vectors and reads nothing."""
+    for the engine `be` has loaded, `model`, so every later call (the harness's timed ones among
+    them) adds fixed vectors and reads nothing."""
     first = min(layers)
-    known = _CALIBRATED_NORMS.setdefault(be, {})
+    known = per_model(_CALIBRATED_NORMS, be, model)
     if first not in known:
         (known[first],) = measure(units[:1], [first])
     return [alpha / len(layers) * known[first]] * len(layers)
 
 
-def _mean_norms(be, model, blocks, prompts, layers, *, residual, masked):
+def mean_norms(be, model, blocks, prompts, layers, *, residual, masked):
     """The unsteered stream's mean per-token norm at each of `layers`, averaged over `prompts`: one
     read-only forward through `be.run`, `[len(layers)]` floats."""
     def build(rows):
@@ -95,9 +114,10 @@ def _strength_scale(stream, scale_by, mask=None):
 
 def _steer_and_read(blocks, model, head, *, layer=None, direction, alpha, mode, site,
                     residual="plain", scale_by="mean_norm", masked=False, layers=None,
-                    strengths=None):
-    """Steer blocks[layer], or each of blocks[layers] in forward order, along `direction` and read
-    the next-token logits at `site`. Runs inside a trace. `strengths` (one float per steered block,
+                    strengths=None, read=final_logits):
+    """Steer blocks[layer], or each of blocks[layers] in forward order, along `direction` and
+    return `read(model, head, site)`: the next-token logits (`final_logits`) or the next token
+    (`next_token`). Runs inside a trace. `strengths` (one float per steered block,
     from `calibrated_strengths`) adds those fixed multiples of the direction; without it each block
     gets `alpha / len(layers)` times the live norm `scale_by` names. `masked` reads the padded
     batch's attention mask for that per-unit mean norm (HF). The direction moves onto a block's
@@ -133,50 +153,49 @@ def _steer_and_read(blocks, model, head, *, layer=None, direction, alpha, mode, 
                     blocks[layer].output = (new_hidden, *out[1:]) if is_tuple else new_hidden
                 else:
                     raise ValueError(f"unknown steering mode {mode!r}")
-        return final_logits(model, head, site)
+        return read(model, head, site)
 
 
 @cell("steering", family="*", backend="hf", realizations=[{"mode": "inplace"}])
 def steering_hf(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0, mode="replace",
-                scale_by="mean_norm", layers=None):
-    direction = (head_direction(model, m.head(model), _resolve_token(model.tokenizer, target))
-                 if alpha != 0 else None)
+                scale_by="mean_norm", layers=None, check=False):
+    direction = cached_head_direction(be, model, m, target) if alpha != 0 else None
     strengths = None
     if scale_by == CALIBRATED and alpha != 0:
-        measure = functools.partial(_mean_norms, be, model, m.blocks(model), residual="plain",
+        measure = functools.partial(mean_norms, be, model, m.blocks(model), residual="plain",
                                     masked=True)
-        strengths = calibrated_strengths(be, [layer] if layers is None else list(layers), alpha,
-                                         units, measure)
+        strengths = calibrated_strengths(be, model, [layer] if layers is None else list(layers),
+                                         alpha, units, measure)
 
     def build(rows):
         return _steer_and_read(
             m.blocks(model), model, m.head(model), layer=layer, layers=layers, direction=direction,
             alpha=alpha, mode=mode, site="head", scale_by=scale_by, masked=True,
-            strengths=strengths)
+            strengths=strengths, read=final_logits if check else next_token)
 
-    return be.run(model, units, build)
+    return be.run(model, units, build, keep_dtype=not check)
 
 
 @cell("steering", family="*", backend="vllm_async", realizations=[{"mode": "inplace"}])
 def steering_vllm(be, model, m, units, *, layer=8, target=" Rome", alpha=6.0, mode="replace",
-                  residual=None, scale_by="mean_norm", layers=None):
+                  residual=None, scale_by="mean_norm", layers=None, check=False):
     # the stream the strength is relative to follows the family's vLLM denotation (fused on the
     # RMSNorm families, plain on GPT-2) unless the row says otherwise
     residual = residual if residual is not None else m.default_residual(be.name)
     record_resolved(residual=residual)
-    direction = (checkpoint_direction(checkpoint_of(model), _resolve_token(model.tokenizer, target))
+    direction = (checkpoint_direction(checkpoint_of(model), resolve_token(model.tokenizer, target))
                  if alpha != 0 else None)
     strengths = None
     if scale_by == CALIBRATED and alpha != 0:
-        measure = functools.partial(_mean_norms, be, model, m.blocks(model), residual=residual,
+        measure = functools.partial(mean_norms, be, model, m.blocks(model), residual=residual,
                                     masked=False)
-        strengths = calibrated_strengths(be, [layer] if layers is None else list(layers), alpha,
-                                         units, measure)
+        strengths = calibrated_strengths(be, model, [layer] if layers is None else list(layers),
+                                         alpha, units, measure)
 
     def build(rows):
         return _steer_and_read(
             m.blocks(model), model, m.head(model), layer=layer, layers=layers, direction=direction,
             alpha=alpha, mode=mode, site="engine", residual=residual, scale_by=scale_by,
-            strengths=strengths)
+            strengths=strengths, read=final_logits if check else next_token)
 
-    return be.run(model, units, build)
+    return be.run(model, units, build, keep_dtype=not check)

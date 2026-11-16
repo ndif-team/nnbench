@@ -20,16 +20,18 @@ class EngineModel:
     config: object             # the checkpoint's HF config; model identity reads its revision
     n_layers: int
     maps: dict = field(default_factory=dict)      # J-lens transport maps, built once per model
+    directions: dict = field(default_factory=dict)  # unit unembedding rows by token id, read once
 
 
 class InterpEngineBackend(Backend):
     name = "interp_engine"
 
     # The sync facade submits every call to one event loop on its own thread
-    # (`interp_engine/_loop.py`, LoopRunner.run: run_coroutine_threadsafe per call, from any
-    # thread), and `capture` and the per-request lens ops are documented as safe to call
-    # concurrently with other requests (`vllm_backend.py`), so client threads calling the cells at
-    # once overlap on the engine's scheduler (design.md §12.17); nothing to open.
+    # (`interp_engine/_loop.py`, LoopRunner.run: one submission per call, from any thread; from
+    # 1.13 it carries the caller's context, so an open `steer()` block reaches the request), and
+    # `capture` and the per-request lens ops are documented as safe to call concurrently with
+    # other requests (`vllm_backend.py`), so client threads calling the cells at once overlap on
+    # the engine's scheduler (design.md §12.17); nothing to open.
     concurrent_requests = True
 
     @contextlib.contextmanager
@@ -50,8 +52,15 @@ class InterpEngineBackend(Backend):
         engine = sync_model(load_model(repo, backend=self.backend, **self.engine_options))
         engine.warmup()
         config = AutoConfig.from_pretrained(repo)
-        return EngineModel(engine, AutoTokenizer.from_pretrained(repo), config,
-                           config.num_hidden_layers)
+        model = EngineModel(engine, AutoTokenizer.from_pretrained(repo), config,
+                            config.num_hidden_layers)
+        # The engine wraps its runner's input preparation on the first capture, steer or attention
+        # registration and keeps the wrapper (vllm_capture/_demux.py, `_ensure_patched`); one
+        # untimed captured request puts every timed call, a plain one included, on the engine in
+        # that state.
+        engine.runner.run(engine.model.capture(model.tokenizer("The")["input_ids"],
+                                               ["resid_post.0"]))
+        return model
 
     def plain(self, model, units, *, new_tokens=1):
         """`generate_text` with no capture points and no steering spec, one request per prompt,
@@ -72,8 +81,8 @@ class InterpEngineBackend(Backend):
         facade's `model` property gives the VLLMModel, whose `engine` attribute holds the AsyncLLM
         once `warmup` (in `load`) has built it (vllm_backend.py, `_ensure_engine`); the call runs on
         the facade's loop, the one that engine is bound to. `engine` is backend surface outside
-        the sync protocol, as `unembed_rows` is; the same attribute serves `default` and
-        `vllm-static`."""
+        the sync protocol (as `unembed_rows` is on 1.12.0); the same attribute serves `default`
+        and `vllm-static`."""
         return model.engine.runner.run(model.engine.model.engine.collective_rpc(method, args=args))
 
     def teardown(self, model) -> None:

@@ -11,7 +11,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from build import E, SERIES, chip, figure, fnum, mounts, page_head, provenance, table  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from isb.jobs.schema import REPORT_VERSION, upgrade_rows  # noqa: E402
+from build import E, SERIES, figure, fnum, mounts, page_head, provenance, table  # noqa: E402
 
 HF, HF_TP = "nnsight-hf/0-8-1/gpu2", "nnsight-hf/0-8-1/tp2"
 GEN, OPT, TAPS = ("nnsight-vllm/0-8-1/tp2", "nnsight-vllm/0-8-1/opt/tp2",
@@ -55,7 +57,7 @@ class Run:
             self.ids.append(d["run"])
             for x in d["experiments"]:
                 spec = x["spec"].split("/")[0]
-                for c in x["cells"]:
+                for c in upgrade_rows(x["cells"], d["version"], REPORT_VERSION):
                     self.cells[(spec, c["label"], c["backend"])] = c
                     if (spec, c["label"]) not in self.order:
                         self.order.append((spec, c["label"]))
@@ -79,12 +81,11 @@ class Run:
         return c.get("median_latency_ms") if c and c.get("performance_eligible", True) else None
 
     def regime(self, spec, label):
-        return self.get(spec, label, HF)["workload"]
+        return self.get(spec, label, HF)["regime"]
 
     def plain(self, spec, label, b):
         """The engine with nothing attached: each HF column's own no-trace call, plain compiled vLLM for a vLLM cell."""
-        v = self.vanilla.get((spec, PLAIN_OF[b], self.regime(spec, label)))
-        return v * 2 if v and spec == "activation_patching" else v   # patching is two forwards
+        return self.vanilla.get((spec, PLAIN_OF[b], self.regime(spec, label)))
 
     def vstate(self, spec, label, b):
         if b == HF:
@@ -104,6 +105,11 @@ class Run:
 
     def layers(self):
         return self.prov[HF]["experiment"]["spec"]["n_layers"]
+
+    def calls(self):
+        """The caption's timing protocol, from the runs' own spec."""
+        spec = self.prov[HF]["experiment"]["spec"]
+        return f"Median of {spec['n_trials']} timed calls after {spec['warmup']} warm-ups"
 
     def correctness(self, cols):
         """One sentence counting the scored cells of `cols` by validation outcome."""
@@ -215,7 +221,7 @@ def page(run_dir):
     tvp = S["taps_vs_plain"]
     rng = lambda d, ks: f"{fnum(min(d[k] for k in ks), 2)}–{fnum(max(d[k] for k in ks), 2)}"  # noqa: E731
     model, gpus, layers = S["model"], ", ".join(sorted(R.gpus)), R.layers()
-    fwd = [k for k in one if k[0] != "activation_patching"]   # one prompt per call, like the plain request
+    fwd = [k for k in one if k[0] != "activation_patching"]   # the steering and ablation rows the text names
     specs, parts = [], []
 
     sections = [("best", "Best per engine"), ("table", "All rows"), ("changes", "What each realization is"),
@@ -259,14 +265,14 @@ rows. The lens breaks the graph at each of its {layers} read sites and runs at {
 {fnum(r_tp[k_gs], 2)}× on generation; its plain forward is {fnum(S["tp_plain1"])} ms against {fnum(S["hf_plain1"])} ms with
 device_map. vLLM's TP forward is {fnum(S["vl_plain1"])} ms on the same GPU model.</li>
 <li><b>nnsight on HF.</b> The device_map column is {fnum(S["hf_vs_plain"][k_st], 2)}× plain on steering,
-{fnum(S["hf_vs_plain"][k_gs], 2)}× on generation, {fnum(S["hf_vs_plain"][k_pa], 2)}× on patching (two forwards) and
+{fnum(S["hf_vs_plain"][k_gs], 2)}× on generation, {fnum(S["hf_vs_plain"][k_pa], 2)}× on patching and
 {fnum(S["hf_vs_plain"][k_ll], 2)}× on the lens, which reads and projects all {layers} layers.</li>
 <li><b>Correctness.</b> {E(R.correctness((HF_TP, GEN, OPT, TAPS)))}</li>
 </ul>''')
     figs = []
     for fid, spec, label, title in HEADLINE:
         specs.append(headline_spec(R, fid, spec, label))
-        figs.append(figure(fid, title, "Median of 7 timed calls after 3 warm-ups. Per engine: the plain engine with nothing attached, "
+        figs.append(figure(fid, title, f"{R.calls()}. Per engine: the plain engine with nothing attached, "
                            "nnsight's general cell, and the fastest documented realization (named under the engine)."))
     parts.append(f'''<section id="best"><h2>Best per engine</h2>
 <div class="prose"><p>For each workload, the engine alone, nnsight's general cell on it, and the fastest form nnsight documents for that
@@ -275,8 +281,8 @@ engine. HF has one form on either multi-GPU path; a missing bar says so.</p></di
 </section>''')
     parts.append(f'''<section id="table"><h2>All rows</h2>
 <div class="prose"><p>Every row of the five workloads: the plain engines, each nnsight column's median, and its ratio to its own engine
-with nothing attached (each HF column's own no-trace call, plain compiled vLLM for the vLLM columns; two plain forwards for patching,
-which runs a clean and a corrupted pass).</p></div>
+with nothing attached (each HF column's own no-trace call, plain compiled vLLM for the vLLM columns), run over the same prompts:
+both prompts of each patching pair.</p></div>
 {full_table(R)}</section>''')
     parts.append(f'''<section id="changes"><h2>What each realization is</h2>
 <div class="audit">

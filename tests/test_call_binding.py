@@ -5,6 +5,7 @@ import inspect
 import pytest
 
 from isb.methodologies.registry import CELLS, get_cell
+from isb.backends.base import Backend
 from isb.sweep.execute import BoundCell, _bind_case, _effective_params, _task_params
 from isb.sweep.spec import BaselineSpec, CellConfig, ExecutionRegime
 from isb.suites import SUITES, suite_cases
@@ -37,7 +38,7 @@ def test_optional_positional_only_defaults_replay_positionally():
 
     params = _effective_params(cell, {"alpha": 3})
     assert params == {"option": 2, "alpha": 3}
-    assert BoundCell(cell, params).prepare(None, None, [])() == (2, 3)
+    assert BoundCell(cell, params).prepare(Backend(), None, [])() == (2, 3)
     with pytest.raises(TypeError, match="option"):
         _effective_params(cell, {"option": 4})
 
@@ -49,7 +50,7 @@ def test_generic_cell_preserves_optional_positional_only_arguments(monkeypatch):
     monkeypatch.setitem(CELLS, ("binding_test", "*", "hf"), generic)
     fn = get_cell("binding_test", "gpt2", "hf")
     params = _effective_params(fn, {"alpha": 3})
-    assert BoundCell(fn, params).prepare(None, None, ["hello"])() == (["hello"], 2, 3)
+    assert BoundCell(fn, params).prepare(Backend(), None, ["hello"])() == (["hello"], 2, 3)
 
 
 def test_partial_binding_and_mutable_defaults_are_owned():
@@ -63,7 +64,7 @@ def test_partial_binding_and_mutable_defaults_are_owned():
     params = _effective_params(fn, {})
     call = BoundCell(fn, params)
     for _ in range(2):
-        assert call.prepare(None, None, [])() == ([1, 99], 2)
+        assert call.prepare(Backend(), None, [])() == ([1, 99], 2)
     assert defaults == [1] and params == {"layers": [1], "alpha": 2}
 
 
@@ -96,7 +97,7 @@ def test_trial_preparation_reuses_the_bound_parameter_layout(monkeypatch):
 
     monkeypatch.setattr(inspect, "signature", forbidden)
     for _ in range(3):
-        assert call.prepare(None, None, [])() == 2
+        assert call.prepare(Backend(), None, [])() == 2
 
 
 def test_dataset_task_and_generation_precedence():

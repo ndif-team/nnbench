@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from isb.jobs.contract import prepare  # noqa: E402
 from isb.jobs.local import (canonical, compose, config, configuration,  # noqa: E402
-                             environment, gpu_used_mib, wait_for_release)
+                             environment, refuse_busy, wait_idle)
 from isb.perf.phase_profiler import ATTRIBUTIONS, split_with_floors  # noqa: E402
 from isb.suites import Entry, cases  # noqa: E402
 
@@ -38,7 +38,7 @@ def run(name, job, output, gpu, timeout, rows, marks=True):
     env = {**environment(name, job, output, gpu), "ISB_PHASE_ROWS": json.dumps(rows),
            "ISB_PHASE_MARKS": "1" if marks else "0"}
     configuration(name, env=env)
-    baseline = gpu_used_mib(gpu)
+    refuse_busy(wait_idle(env["ISB_GPUS"].split(","))[0])
     with (output / "execution.log").open("w") as log:
         try:
             code = subprocess.run(command + ["run", "--rm", "--no-TTY", "-e", "ISB_PHASE_PROFILE=1",
@@ -52,7 +52,6 @@ def run(name, job, output, gpu, timeout, rows, marks=True):
         finally:
             subprocess.run(command + ["down", "--remove-orphans", "--timeout", "10"], env=env,
                            stdout=log, stderr=subprocess.STDOUT, timeout=60)
-    wait_for_release(gpu, baseline)
     return code
 
 

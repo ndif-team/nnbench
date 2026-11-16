@@ -80,8 +80,9 @@ def test_all_registered_cell_keyword_options_can_be_classified():
     for (method, family, backend), fn in CELLS.items():
         if method not in PROTOCOLS:
             continue
+        # `check` selects the kind of call (isb/sweep/execute.py), never a task param
         options = {name: param.default for name, param in inspect.signature(fn).parameters.items()
-                   if param.kind == inspect.Parameter.KEYWORD_ONLY}
+                   if param.kind == inspect.Parameter.KEYWORD_ONLY and name != "check"}
         semantics, realization = PROTOCOLS[method].classify(options)
         assert {**semantics, **realization} == options, (method, family, backend)
 

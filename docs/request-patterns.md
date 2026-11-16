@@ -70,7 +70,7 @@ An interpretability call is not just a forward:
 - **Hooks run inside the forward.** Reads and writes at module boundaries add Python and kernel work
   per hooked module.
 - **Saved values come back.** A logit lens over every layer returns `layers × vocabulary` values per
-  prompt: 17 MB per prompt on Qwen2.5-7B in fp32 on the host, against a few bytes for a sampled token.
+  prompt: 8.5 MB per prompt on Qwen2.5-7B in bf16 on the host, against a few bytes for a sampled token.
 - **Correctness depends on how prompts are grouped.** A padded HF batch shifts positions on padded
   rows; a vLLM batch does not pad. So each pattern is also scored for correctness, not just timed.
 
@@ -94,7 +94,7 @@ timed: each job loads once, warms up, then measures.
 ### Single stream (`interactive`)
 
 **Issues** one unit per call (a prompt, or a clean/corrupted pair), the next after the previous
-returns. **Timed:** the first unit, 3 warm-up and 7 timed calls, median. **Scored:** every unit of
+returns. **Timed:** the first unit, 3 warm-up and 3 timed calls, median. **Scored:** every unit of
 the regime, each as its own call (top-1 agreement and TV aggregated over them).
 
 **Tests** the fixed cost of one intervention call: trace construction, shipping, hooks, readout,
@@ -138,8 +138,9 @@ unused.
 **Issues** a sweep over M units (256), B units per call, calls back to back. `all` hands every unit
 to one call, which for vLLM means one trace with M invokes that the engine schedules together, like
 `LLM.generate(all prompts)`. **Timed:** one untimed warm-up pass, then 3 timed passes; reports
-units/s over the median pass, the pass time and per-call latency. **Scored:** the first 16 units of
-the last pass, against the reference's per-unit outputs (`offline_perprompt`).
+units/s over the median pass, the pass time and per-call latency. **Scored:** the first 16 units,
+from untimed check calls in the pass's chunks after the timed passes, against the reference's
+per-unit outputs (`offline_perprompt`).
 
 **Tests** throughput for a dataset job (harvesting activations, a patching sweep, an evaluation
 over a corpus) and how it depends on how the client chunks the data. Sweeping B separates three
@@ -164,8 +165,8 @@ through a first-come, first-served gate, which is what a server without a schedu
 concurrent clients: every request after the first waits for those ahead of it. **Timed:**
 one warm-up request per client, then three passes of M requests. Each request is timed from issue to
 return, so time spent queueing counts. Calls are prepared before the pass. Reports units/s and
-request latency p50, p90, p99 and mean. **Scored:** the first 16 units, against the reference's same
-regime.
+request latency p50, p90, p99 and mean. **Scored:** the first 16 units, from untimed check requests
+in one pass of the pattern after the timed passes, against the reference's same regime.
 
 **Tests** a shared server: many independent users (or one user's parallel jobs) sending traces to one
 engine, which is the shape of nnsight-serve and NDIF. It shows whether the system overlaps requests
@@ -191,8 +192,8 @@ schedule. A backend that can take concurrent requests gets them together; any ot
 behind the closed loop's first-come, first-served gate. **Timed:** one warm-up request, then three passes. Each request
 is timed from its scheduled arrival to its return, so waiting in a queue, or for the system to accept
 it, counts. Reports achieved units/s, request latency p50, p90, p99 and mean, the offered rate, and
-the most requests in flight at once. **Scored:** the first 16 units, against the reference's same
-regime.
+the most requests in flight at once. **Scored:** the first 16 units, from untimed check requests in
+one pass of the pattern after the timed passes, against the reference's same regime.
 
 **Tests** a production server under real traffic, including overload. Below capacity, latency stays
 near the single-request time and achieved throughput tracks the offered rate (a little under

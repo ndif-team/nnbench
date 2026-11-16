@@ -19,7 +19,7 @@
 #   load-fill SUITE MODEL WORKLOAD BACKEND...  one workload again, beside the HF 0.8.1 reference
 #   versions-small [MODEL]  the nnsight-versions workloads on a small model (gpt2), all versions
 #   large SUITE [ARGS]  an nnsight-large-* suite (qwen2.5-72b, shared cache, two GPUs)
-#   large-min         four prompts per cell over two GPUs, HF 0.8.1/0.4.6 vs vLLM tp2
+#   large-min         four prompts per cell over two GPUs, HF 0.8.1 vs vLLM tp2
 #   large-smoke       every 72B backend loads and runs one steering case
 #                     submit both with --partition=gpuH200x8 --gpus=2 --mem=480G
 #   diag-scaling      trace time against prompts x sites per prompt, vLLM and HF
@@ -233,7 +233,7 @@ micro)
                 nnsight-vllm-0-7:vllm_async nnsight-vllm-0-7:vllm_sync; do
         img=${pair%%:*}; be=${pair##*:}
         echo "### $(date -Is) constructs $img $be"
-        timeout 2400 $bin/py-$img scripts/micro.py --backend $be --repo openai-community/gpt2 \
+        timeout 2400 $bin/py-$img scripts/constructs.py --backend $be --repo openai-community/gpt2 \
             --out runs/micro-delta/constructs --name $img-$be \
             > runs/micro-delta/constructs/$img-$be.log 2>&1 || { echo "constructs $img $be rc=$?"; rc=1; }
     done
@@ -304,19 +304,10 @@ optimal)
     ;;
 versions-perf)
     # Suite nnsight-versions on one model (qwen2.5-7b | qwen3-32b): nnsight 0.7.0 and 0.8.1 each on
-    # HF (sdpa) and on vLLM (sync engine), plus 0.4.6 on HF on the current and on its own stack, all
-    # in one run on one card. Submit on an H200: sbatch --partition=gpuH200x8 --mem=240G ...
+    # HF (sdpa) and on vLLM (sync engine), all in one run on one card. Submit on an H200: sbatch --partition=gpuH200x8 --mem=240G ...
     # (gpue01 is NDIF-H200's node and stays excluded).
     shift
     bench run --suite nnsight-versions --model "$1" --gpu 0 --out runs/nnsight-versions-perf
-    exit $?
-    ;;
-versions-046)
-    # The nnsight 0.4.6 side of the suite alone, beside its HF 0.8.1 reference on the same card.
-    shift
-    bench run --suite nnsight-versions --model "$1" \
-        --backends nnsight-hf/0-8-1 nnsight-hf/0-4-6 nnsight-hf/0-4-6/era \
-        --reference nnsight-hf/0-8-1 --gpu 0 --out runs/nnsight-versions-perf
     exit $?
     ;;
 versions-fill)
@@ -378,7 +369,7 @@ versions-small)
     bench run --workload logit_lens steering ablation gen_steering activation_patching \
         --model "${1:-gpt2}" \
         --backends nnsight-hf/0-8-1 nnsight-vllm/0-8-1 \
-                   nnsight-hf/0-7 nnsight-vllm/0-7 nnsight-hf/0-4-6 \
+                   nnsight-hf/0-7 nnsight-vllm/0-7 \
         --reference nnsight-hf/0-8-1 --gpu 0 --timeout 3600 --out runs/nnsight-versions-small
     exit $?
     ;;
@@ -392,13 +383,13 @@ large)
     ;;
 large-min)
     # The smallest 72B comparison that still exercises every cell's default form over two GPUs:
-    # four prompts (four IOI pairs for patching), HF 0.8.1 and 0.4.6 split across the GPUs, vLLM
+    # four prompts (four IOI pairs for patching), HF 0.8.1 split across the GPUs, vLLM
     # 0.8.1 tensor parallel, scored against HF 0.8.1.
     rc=0
     for spec in "logit_lens steering ablation gen_steering|counterfact:4" "activation_patching|mib/ioi:4"; do
         ISB_MODEL_CACHE=isb-shared-cache bench run --workload ${spec%%|*} --model qwen2.5-72b \
             --data "${spec##*|}" --realizations default \
-            --backends nnsight-hf/0-8-1/gpu2 nnsight-vllm/0-8-1/tp2 nnsight-hf/0-4-6/gpu2 \
+            --backends nnsight-hf/0-8-1/gpu2 nnsight-vllm/0-8-1/tp2 \
             --reference nnsight-hf/0-8-1/gpu2 --gpu 0 --timeout 3600 --out runs/nnsight-large/min \
             || rc=1
     done
@@ -448,7 +439,7 @@ large-smoke)
     ISB_MODEL_CACHE=isb-shared-cache bench run --workload steering --model qwen2.5-72b \
         --data counterfact:4 --regimes interactive --realizations default \
         --backends nnsight-hf/0-8-1/gpu2 nnsight-vllm/0-8-1/tp2 \
-                   nnsight-vllm/0-8-1/async/tp2 nnsight-hf/0-4-6/gpu2 \
+                   nnsight-vllm/0-8-1/async/tp2 \
         --reference nnsight-hf/0-8-1/gpu2 --gpu 0 --timeout 3600 --out runs/nnsight-large/smoke
     exit $?
     ;;
@@ -459,7 +450,6 @@ versions-awq)
     bench run --workload steering --model qwen2.5-72b-awq --data counterfact:4 --regimes interactive \
         --realizations default \
         --backends nnsight-hf/0-8-1 nnsight-vllm/0-8-1 nnsight-hf/0-7 nnsight-vllm/0-7 \
-                   nnsight-hf/0-4-6 nnsight-hf/0-4-6/era \
         --gpu 0 --timeout 3600 --out runs/nnsight-versions-perf/awq-probe
     exit $?
     ;;

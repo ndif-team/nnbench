@@ -21,21 +21,20 @@ from __future__ import annotations
 import functools
 import json
 import os
+import weakref
 
 import torch
 import torch.nn.functional as F
 
 SITES = ("head", "engine")
+# backend -> (its loaded model, {(id(source), device, dtype): (source, its copy)}), kept by `moved`
+_ENGINE_COPIES = weakref.WeakKeyDictionary()
 
 
 def engine_logits(model):
-    """vLLM's logits for this step at the engine site. Runs INSIDE a trace. nnsight 0.7 and later
-    expose them as the `model.logits` property; 0.5 as the output of the `model.logits` wrapper
-    module (its README at v0.5.15: `model.logits.output`)."""
-    from nnsight.intervention.envoy import Envoy
-
-    logits = model.logits
-    return logits.output if isinstance(logits, Envoy) else logits
+    """vLLM's logits for this step at the engine site, the `model.logits` property. Runs INSIDE a
+    trace."""
+    return model.logits
 
 
 def final_logits(model, head, site):
@@ -47,6 +46,49 @@ def final_logits(model, head, site):
     if site == "head":
         return head.output[:, -1, :]
     raise ValueError(f"unknown read site {site!r} (expected one of {SITES})")
+
+
+def engine_samples(model):
+    """The token ids vLLM's sampler drew this step at the engine site, `[1, 1]`, the
+    `model.samples` property. Runs INSIDE a trace."""
+    return model.samples
+
+
+def next_token(model, head, site):
+    """The last token's greedy next token, the result a user reads; runs inside a trace. "head":
+    the argmax of the head's last-position logits (HF), `[B, 1]`; "engine": the token the engine
+    drew under the backends' greedy sampling (`engine_samples`), `[1, 1]`."""
+    if site == "engine":
+        return engine_samples(model)
+    if site == "head":
+        return head.output[:, -1, :].argmax(-1, keepdim=True)
+    raise ValueError(f"unknown read site {site!r} (expected one of {SITES})")
+
+
+def per_model(table, be, model):
+    """`table`'s dict for the model `be` has loaded (`table` maps a backend to it): a new one once
+    `be` loads another model, so a kept value never outlives the model it was built from."""
+    held = table.get(be)
+    if held is None or held[0]() is not model:
+        held = table[be] = (weakref.ref(model), {})
+    return held[1]
+
+
+def engine_copies(be, model):
+    """The copies `moved` keeps for every later call of the engine `be` has loaded, `model`. For HF
+    only, whose trace runs in this process: a block shipped with each vLLM request carries the host
+    tensor."""
+    return per_model(_ENGINE_COPIES, be, model)
+
+
+def moved(t, like, copies):
+    """`t` on `like`'s device and dtype, copied once per `copies`: a dict for one call, or
+    `engine_copies(be, model)` for a constant a user places on the GPU once. `t` must be the same object
+    on every call that shares `copies` (a cached spec's tensor, never a per-call copy)."""
+    key = (id(t), like.device, like.dtype)
+    if key not in copies:
+        copies[key] = (t, t.to(device=like.device, dtype=like.dtype))    # holding t keeps its id
+    return copies[key][1]
 
 
 def head_direction(model, head, token_id):

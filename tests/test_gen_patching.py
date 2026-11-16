@@ -4,7 +4,7 @@ generate_patch backend plumbing) — no GPU; torch + fakes only.
 Pins (1) the prefill-only injection semantics (the shape-gated write that lands at prefill and
 leaves decode steps untouched — the part the GPU run then measures across backends), (2) the
 clean-snapshot capture, (3) the cell plumbing through a fake generate_patch (capture once, inject
-per step, baseline path uses plain generate with no capture), and (4) a fake-backend sweep over a
+once, baseline path uses plain generate with no capture), and (4) a fake-backend sweep over a
 generation workload consuming a clean/corrupt PAIR (aggregate=False). The composition's actual
 cross-backend verdict is the GPU run's job, not fakeable here.
 """
@@ -24,7 +24,6 @@ from isb.methodologies.gen_patching import (  # noqa: E402
     _inject_transplant,
 )
 from isb.methodologies.registry import CELLS, get_cell  # noqa: E402
-from isb.states import AppState  # noqa: E402
 from isb.sweep.spec import BaselineSpec, CellConfig, EffectSpec, ExecutionRegime  # noqa: E402
 
 HID, VOCAB = 4, 8
@@ -35,12 +34,12 @@ class _Block:
         self.output = out
 
 
-def test_cells_registered_and_serve_falls_back():
+def test_cells_registered_and_sync_falls_back():
     # family-generic (§12.8): registered once under family="*", resolved per profiled family
     assert ("gen_patching", "*", "hf") in CELLS
     assert ("gen_patching", "*", "vllm_async") in CELLS
-    # serve reuses the in-process vLLM cell: same underlying generic fn behind the profile-bound wrapper
-    assert get_cell("gen_patching", "gpt2", "vllm_serve").__wrapped__ is CELLS[
+    # the sync engine reuses the async vLLM cell: same generic fn behind the profile-bound wrapper
+    assert get_cell("gen_patching", "gpt2", "vllm_sync").__wrapped__ is CELLS[
         ("gen_patching", "*", "vllm_async")]
 
 
@@ -107,28 +106,41 @@ class _PatchModel:
         self.lm_head = _Head()
         self.lm_head.output = torch.zeros(1, 4, VOCAB)
         self.logits = torch.zeros(4, VOCAB)
+        self.samples = torch.zeros(1, 1, dtype=torch.long)
 
 
 class _PatchBackend:
+    def between_calls(self, model):
+        pass
+
     """Fake generate_patch / generate: record args and drive the closures like the real loops."""
     name = "vllm_async"
 
     def __init__(self):
         self.calls = []
 
-    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True):
-        self.calls.append({"kind": "generate", "prompts": prompts,
-                           "new_tokens": new_tokens, "bounded": bounded})
-        rows = [build_step(step) for step in range(new_tokens)]
-        return torch.stack([r.detach().float().cpu() for r in rows], dim=0)
+    def _rows(self, model, build_step, new_tokens, keep_dtype, tokens):
+        rows = []
+        for step in range(new_tokens):
+            row = None if build_step is None else build_step(step)
+            rows.append(model.samples if tokens else row)
+        return torch.stack([r.detach() if keep_dtype or tokens else r.detach().float()
+                            for r in rows], dim=0)
 
-    def generate_patch(self, model, source_prompts, base_prompts, capture, build_step,
-                       *, new_tokens, bounded=True):
+    def generate(self, model, prompts, build_step, *, new_tokens, bounded=True, keep_dtype=False,
+                 tokens=False):
+        self.calls.append({"kind": "generate", "prompts": prompts, "new_tokens": new_tokens,
+                           "bounded": bounded, "per_step": build_step is not None,
+                           "tokens": tokens})
+        return self._rows(model, build_step, new_tokens, keep_dtype, tokens)
+
+    def generate_patch(self, model, source_prompts, base_prompts, capture, inject, build_step,
+                       *, new_tokens, bounded=True, keep_dtype=False, tokens=False):
         self.calls.append({"kind": "generate_patch", "sources": source_prompts,
-                           "bases": base_prompts, "new_tokens": new_tokens, "bounded": bounded})
-        clean = capture()                                # one capture, like trace 1
-        rows = [build_step(clean, step) for step in range(new_tokens)]
-        return torch.stack([r.detach().float().cpu() for r in rows], dim=0)
+                           "bases": base_prompts, "new_tokens": new_tokens, "bounded": bounded,
+                           "per_step": build_step is not None, "tokens": tokens})
+        inject(capture())                                # one capture, injected at the prefill
+        return self._rows(model, build_step, new_tokens, keep_dtype, tokens)
 
 
 def test_patched_cell_captures_then_injects():
@@ -140,26 +152,27 @@ def test_patched_cell_captures_then_injects():
     assert c["kind"] == "generate_patch"
     assert c["sources"] == ["clean prompt"] and c["bases"] == ["corrupt prompt"]
     assert c["new_tokens"] == 4 and c["bounded"] is False       # bound="unbounded" -> bounded=False
-    assert out.shape == (4, 1, VOCAB)
+    assert c["tokens"] and not c["per_step"]         # timed: the decode's tokens, no per-step read
+    assert out.shape == (4, 1, 1) and out.dtype == torch.long
     # the capture (layer-0 residual) was injected at the fake prefill (whole-tuple replace)
     assert torch.equal(model.transformer.h[0].output[0], torch.zeros(3, HID))
 
 
-def test_cell_injects_exactly_once_even_for_one_token_prompt():
-    # Regression: shape-only prefill detection re-injects on EVERY decode step of a one-token prompt
-    # (decode hidden shares the prefill's [1, hidden] shape). The first-forward flag must inject
-    # exactly once regardless of prompt length — else the method silently changes outside the
-    # length>1 benchmark prompts.
+def test_a_check_call_reads_every_step_and_injects_only_at_the_prefill():
+    # A one-token prompt's decode steps share the prefill's [1, hidden] shape, so a per-step
+    # closure that injected would re-inject on every step; the transplant is `inject`, run once.
     be, model = _PatchBackend(), _PatchModel(prompt_len=1)
     calls = []
     orig = gen_patching._inject_transplant
     gen_patching._inject_transplant = lambda *a, **k: calls.append(1)
     try:
         fn = get_cell("gen_patching", "gpt2", "hf")
-        fn(be, model, [("a", "b")], layer=0, bound="bounded", new_tokens=5, patch=True)
+        out = fn(be, model, [("a", "b")], layer=0, bound="bounded", new_tokens=5, patch=True,
+                 check=True)
     finally:
         gen_patching._inject_transplant = orig
     assert calls == [1], f"expected exactly one injection over 5 decode steps, got {len(calls)}"
+    assert out.shape == (5, 1, VOCAB)                            # each step's next-token logits
 
 
 def test_baseline_cell_uses_generate_with_no_capture():
@@ -168,14 +181,18 @@ def test_baseline_cell_uses_generate_with_no_capture():
     out = fn(be, model, [("clean", "corrupt")], layer=0, bound="bounded", new_tokens=3, patch=False)
     assert be.calls[0]["kind"] == "generate"                    # baseline path, no transplant
     assert be.calls[0]["prompts"] == ["corrupt"]                # the corrupted run alone
-    assert out.shape == (3, 1, VOCAB)
+    assert out.shape == (3, 1, 1)
 
 
-def test_vllm_cell_reads_engine_logits_site():
+def test_vllm_cell_returns_the_decode_tokens_timed_and_engine_logits_checked():
     be, model = _PatchBackend(), _PatchModel(prompt_len=3)
     fn = get_cell("gen_patching", "gpt2", "vllm_async")
+    model.samples = torch.tensor([[5]])
     out = fn(be, model, [("clean", "corrupt")], layer=0, bound="bounded", new_tokens=2, patch=True)
-    assert be.calls[0]["kind"] == "generate_patch"
+    assert be.calls[0]["kind"] == "generate_patch" and be.calls[0]["tokens"]
+    assert torch.equal(out, torch.tensor([[[5]], [[5]]]))         # the engine's token per step
+    out = fn(be, model, [("clean", "corrupt")], layer=0, bound="bounded", new_tokens=2, patch=True,
+             check=True)
     assert out.shape == (2, 1, VOCAB)                            # reads model.logits[-1:, :]
 
 
@@ -198,6 +215,9 @@ def _fake_get_cell(methodology, family, backend):
 
 
 class _FakeBackend:
+    def between_calls(self, model):
+        pass
+
     def load(self, repo):
         return "model"
 
@@ -205,13 +225,12 @@ class _FakeBackend:
         pass
 
 
-def test_generation_pair_sweep_oracle_and_effect():
+def test_generation_pair_sweep_records_throughput_and_effect():
     import tempfile
 
     from isb.runfile import load_run
     from isb.runs import EngineConfig, RunConfig
     from isb.sweep.execute import execute_run
-    from isb.sweep.score import score_runs
 
     spec = CellConfig(
         name="fake_gp", methodology="m", family="fam", repo="repo://x",
@@ -241,14 +260,11 @@ def test_generation_pair_sweep_oracle_and_effect():
             execute_mod.get_cell, execute_mod.make_backend, execute_mod.resolve_provenance = orig
 
     with tempfile.TemporaryDirectory() as d:
-        execute_fake(d, "hf", "transformers")
         execute_fake(d, "vllm", "vllm")
-        cells = score_runs(spec, d, "vllm", "hf", quiet=True)
-        meta = load_run(d, "vllm")[0][("__meta__",)]
+        out = load_run(d, "vllm")[0]
+        meta = out[("__meta__",)]
 
-    by = {c.label: c for c in cells}
-    assert by["bound=iter[0:N]"].state == AppState.SUPPORTED   # same fake output both engines
-    assert by["bound=iter[0:N]"].workload == "generation"
+    assert {("generation", "bound=iter[0:N]"), ("generation", "bound=iter[:]")} <= set(out)
     m = meta[("generation", "bound=iter[0:N]")]
     assert m["throughput"] is not None                         # tokens/s populated for generation
     assert meta[("__effect__", "generation")]["strong"]        # the patch moves the fake control

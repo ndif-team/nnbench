@@ -17,7 +17,7 @@ def main():
     if len(sys.argv) != 3:
         raise SystemExit(__doc__)
     run_path, out_path = sys.argv[1], sys.argv[2]
-    rf = torch.load(run_path, map_location="cpu", weights_only=False)
+    rf = torch.load(run_path, map_location="cpu", weights_only=True)
     stacks = [(k, v) for k, v in rf["outputs"].items()
               if k != ("__meta__",) and v is not None and v.dim() == 3 and v.shape[1] == v.shape[2]]
     if len(stacks) != 1:
