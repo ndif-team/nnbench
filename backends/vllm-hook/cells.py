@@ -108,13 +108,15 @@ def _weights(model, keep):
     return weights
 
 
-def _project(model, rows, keep):
+def _project(model, rows, keep, top=False):
     """Final RMSNorm, then the unembedding, on the GPU in fp32; the result on the host.
-    rows: [n, d_model] -> [n, vocab]. `keep` as `_weights`."""
+    rows: [n, d_model] -> [n, vocab], or with `top` the top-1 token ids [n, 1]. `keep` as
+    `_weights`."""
     w = _weights(model, keep)
     x = rows.to("cuda", torch.float32)
     x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + model.config.rms_norm_eps) * w["norm"]
-    return (x @ w["unembed"].T).cpu()
+    logits = x @ w["unembed"].T
+    return (logits.argmax(-1, keepdim=True) if top else logits).cpu()
 
 
 def _requests(tensors, n):
@@ -233,14 +235,15 @@ def _plain_tokens(model, prompts):
 
 
 @cell("logit_lens", family="llama", backend="vllm_hook")
-def logit_lens(be, model, units, *, layers="all"):
+def logit_lens(be, model, units, *, layers="all", check=False):
     """The final RMSNorm and unembedding applied in fp32 to the stream after each read layer at
-    each prompt's last token, `[n_layers, B, vocab]` on the host (`_project`)."""
+    each prompt's last token (`_project`): each layer's top-1 token id `[n_layers, B, 1]` for a
+    timed call, the logits `[n_layers, B, vocab]` for a check call."""
     n = model.n_layers
     idx = list(range(n)) if layers == "all" else [i % n for i in layers]
     rows = _last_rows(model, units, idx)                                       # [n_layers, B, d]
-    logits = _project(model, rows.reshape(-1, rows.shape[-1]), keep=True)
-    return logits.reshape(len(idx), len(units), -1)                            # [n_layers, B, vocab]
+    logits = _project(model, rows.reshape(-1, rows.shape[-1]), keep=True, top=not check)
+    return logits.reshape(len(idx), len(units), -1)
 
 
 @cell("steering", family="llama", backend="vllm_hook")

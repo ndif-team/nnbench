@@ -59,7 +59,7 @@ def logit_lens(be, model, units, *, layers="all", check=False):
     blocks = model.model.layers
     n = len(blocks)
     idx = list(range(n)) if layers == "all" else [i % n for i in layers]
-    key = ("logit_lens", tuple(idx))
+    key = ("logit_lens", tuple(idx), check)
     if not _ensure(be, key):
         norm, head = model.model.norm, model.lm_head
         with model.edit(name=EDIT) as (tracer, edit):
@@ -67,11 +67,12 @@ def logit_lens(be, model, units, *, layers="all", check=False):
             for i in idx:
                 out = blocks[i].output
                 rows.append(out[0][-1:] + out[1][-1:])          # last-token fused stream
-            lens = model.logits_processor(head, norm(torch.cat(rows))).save()   # one batched readout
+            lens = model.logits_processor(head, norm(torch.cat(rows)))         # one batched readout
+            lens = (lens if check else lens.argmax(-1, keepdim=True)).save()
         be.remember_edit(key, edit)
     saves = be.run_edit(model, units)
-    lens = torch.stack([s["lens"].cpu() for s in saves], dim=1)            # [n_layers, B, vocab]
-    return lens.float() if check else lens
+    lens = torch.stack([s["lens"].cpu() for s in saves], dim=1)
+    return lens.float() if check else lens     # [n_layers, B, vocab] checked, [n_layers, B, 1] timed
 
 
 @cell("residual_readout", family="llama", backend="nnsight_opt")

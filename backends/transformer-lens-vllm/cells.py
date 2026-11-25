@@ -251,13 +251,15 @@ def _patch_requests(be, model, units, layer, patch, positions):
 
 
 @cell("logit_lens", family="llama", backend="transformer_lens")
-def logit_lens(be, model, units, *, layers="all"):
+def logit_lens(be, model, units, *, layers="all", check=False):
     """Capture every block's output stream, then apply the final RMSNorm and the unembedding on
-    the host, as the driver does for its own logits."""
+    the host, as the driver does for its own logits: each layer's top-1 token id
+    `[n_layers, B, 1]` for a timed call, the logits `[n_layers, B, vocab]` for a check call."""
     n = model.n_layers
     idx = list(range(n)) if layers == "all" else [i % n for i in layers]
     rows = _last_rows(be, model, units, [f"blocks.{i}.hook_out" for i in idx]).float()
-    return _lens_logits(model, rows)                                         # [n_layers, B, vocab]
+    logits = _lens_logits(model, rows)
+    return logits if check else logits.argmax(-1, keepdim=True)
 
 
 @cell("jacobian_lens", family="llama", backend="transformer_lens")

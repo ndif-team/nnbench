@@ -97,8 +97,8 @@ def _read_last(last):
 
 @cell("logit_lens", family="llama", backend="vllm_lens_opt")
 def logit_lens(be, model, units, *, layers="all", check=False):
-    """The logit lens with one unembedding pass per request: `[n_layers, B, vocab]`, in the
-    engine's dtype for a timed call and in fp32 for a check call."""
+    """The logit lens with one unembedding pass per request: each layer's top-1 token id
+    `[n_layers, B, 1]` for a timed call, the logits `[n_layers, B, vocab]` in fp32 for a check call."""
     n = model.n_layers
     idx = list(range(n)) if layers == "all" else [i % n for i in layers]
     last = max(idx)
@@ -111,10 +111,10 @@ def logit_lens(be, model, units, *, layers="all", check=False):
             stacked = torch.cat(ctx.saved.pop("_rows"))
             normed = ctx.model.model.norm(stacked)
             logits = F.linear(normed, ctx.get_parameter("lm_head.weight"))
-            ctx.saved["lens"] = (logits.float() if check else logits).cpu()
+            ctx.saved["lens"] = (logits.float() if check else logits.argmax(-1, keepdim=True)).cpu()
 
     saved = _hooked(model, units, [lens] * len(units), idx)
-    return torch.stack([s["lens"] for s in saved], dim=1)                       # [n_layers, B, vocab]
+    return torch.stack([s["lens"] for s in saved], dim=1)
 
 
 def _transport(model, transport, layers):

@@ -104,13 +104,14 @@ def _final_logits(model, ids, specs=None):
 @cell("logit_lens", family="llama", backend="interp_engine")
 def logit_lens(be, model, units, *, layers="all", check=False):
     """Each layer's `resid_post` at every prompt's last token through `decode_residuals` (vLLM's
-    final norm and unembedding in the worker), `[n_layers, B, vocab]`: a timed call returns the
-    logits in the dtype the worker hands back, a check call casts them to fp32."""
+    final norm and unembedding in the worker), which hands the logits to the client: a timed
+    call returns each layer's top-1 token id `[n_layers, B, 1]`, a check call the logits in fp32,
+    `[n_layers, B, vocab]`."""
     n = model.n_layers
     idx = list(range(n)) if layers == "all" else [i % n for i in layers]
     rows = _rows(model, _ids(model, units), idx)                               # [n_layers, B, d]
     logits = model.engine.decode_residuals(rows.reshape(-1, rows.shape[-1]))
-    return (logits.float() if check else logits).reshape(len(idx), len(units), -1)
+    return (logits.float() if check else logits.argmax(-1, keepdim=True)).reshape(len(idx), len(units), -1)
 
 
 def _jlens_maps(model, transport, d):

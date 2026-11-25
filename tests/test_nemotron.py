@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import isb.methodologies  # noqa: F401,E402  (registers cells)
 from isb.methodologies.ablation import _ablate_and_read, _target_module_nemotron  # noqa: E402
 from isb.methodologies.registry import CELLS, get_cell  # noqa: E402
+from isb.oracle.checks import top_tokens_match  # noqa: E402
 
 HID = 4
 
@@ -128,7 +129,7 @@ def test_ablate_makes_layer_identity():
 def test_logit_lens_reads_model_tree():
     model = _NemoModel(n_layers=6)
     cell = get_cell("logit_lens", "nemotron", "hf")
-    out = cell(_FakeBE(), model, ["p"], unembed="weight", residual="plain")
+    out = cell(_FakeBE(), model, ["p"], unembed="weight", residual="plain", check=True)
     assert out.shape == (6, 1, HID)                # [n_layers, last-token=1, vocab]; identity norm+eye head
     # layer i's residual is constant i -> its last-token row is all-i (eye head, identity norm)
     assert torch.equal(out[3, 0], torch.full((HID,), 3.0))
@@ -137,8 +138,19 @@ def test_logit_lens_reads_model_tree():
 def test_logit_lens_module_unembed_uses_head_call():
     model = _NemoModel(n_layers=3)
     cell = get_cell("logit_lens", "nemotron", "hf")
-    out = cell(_FakeBE(), model, ["p"], unembed="module")   # exercises head(normed), not the weight matmul
+    out = cell(_FakeBE(), model, ["p"], unembed="module", check=True)   # head(normed), not the weight matmul
     assert out.shape == (3, 1, HID)
+
+
+def test_logit_lens_timed_call_returns_each_layers_top_token():
+    model = _NemoModel(n_layers=5)
+    cell = get_cell("logit_lens", "nemotron", "hf")
+    timed = cell(_FakeBE(), model, ["p"])
+    checked = cell(_FakeBE(), model, ["p"], check=True)
+    assert timed.shape == (5, 1, 1) and timed.dtype == torch.int64
+    assert torch.equal(timed, checked.argmax(-1, keepdim=True))
+    assert top_tokens_match(timed, checked)[0]
+    assert not top_tokens_match(timed, checked + torch.arange(HID))[0]
 
 
 def test_cell_uses_nemotron_names_not_gpt2_or_llama():

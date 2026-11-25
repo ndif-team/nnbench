@@ -101,6 +101,12 @@ def generated_tokens_match(timed, checked, stops=()):
                     "max_gap": float(gap[compared].max()), "units": units}
 
 
+def top_tokens_match(timed, checked):
+    """A timed read's top-1 token ids `[..., 1]` against the check call's logits `[..., vocab]` at
+    the same sites, as `tokens_match` with no stop tokens."""
+    return tokens_match(timed, checked)
+
+
 def read_matches(timed, checked):
     """A read's timed tensor, in the dtype the system returned it, against the check call's copy
     of the same units under the equivalence gate."""
