@@ -3,22 +3,26 @@ Family-generic; the profile `m` says where the blocks, norm and head live. `unem
 projection: the model's head module (HF), vLLM's `logits_processor` (whole under tensor
 parallelism) or a matmul with the head weight (this rank's slice under TP). `residual` selects the
 stream read on vLLM's fused-residual families (`fused` = hidden + residual). A timed call returns
-the lens logits in the dtype the model computes them, a check call in fp32."""
+each layer's top-1 token id, `[n_layers, B, 1]`, taken where the logits are computed (nnsight's
+docs/patterns/logit-lens.md saves the argmax inside the trace); a check call returns the lens
+logits `[n_layers, B, vocab]` in fp32."""
 from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
 
-from ..oracle.checks import read_matches, timed_check_of
+from ..oracle.checks import timed_check_of, top_tokens_match
 from ..profiles import _resid
 from .observations import record_resolved
 from .registry import cell
 
-timed_check_of("logit_lens")(read_matches)
+timed_check_of("logit_lens")(top_tokens_match)
 
 
-def _lens_proxy(blocks, norm, head, *, layers, unembed, last_fn, residual="plain", processor=None):
-    """The stacked logit-lens proxy `[n_layers, B, vocab]`. Runs inside a trace."""
+def _lens_proxy(blocks, norm, head, *, layers, unembed, last_fn, residual="plain", processor=None,
+                top=False):
+    """The stacked logit-lens proxy `[n_layers, B, vocab]`, or with `top` each layer's top-1 token
+    id `[n_layers, B, 1]`. Runs inside a trace."""
     idx = range(len(blocks)) if layers == "all" else layers
     rows = []
     with torch.no_grad():
@@ -32,7 +36,7 @@ def _lens_proxy(blocks, norm, head, *, layers, unembed, last_fn, residual="plain
                 rows.append(F.linear(normed, head.weight))
             else:
                 raise ValueError(f"unknown unembed {unembed!r}")
-    return torch.stack(rows, dim=0)
+    return torch.stack([r.argmax(-1, keepdim=True) for r in rows] if top else rows, dim=0)
 
 
 @cell("logit_lens", family="*", backend="hf", realizations=[{"unembed": "weight"}])
@@ -40,7 +44,7 @@ def logit_lens_hf(be, model, m, units, *, layers="all", unembed="module", residu
                   check=False):
     def build(rows):
         return _lens_proxy(m.blocks(model), m.norm(model), m.head(model), layers=layers,
-                           unembed=unembed, last_fn=be.last, residual=residual)
+                           unembed=unembed, last_fn=be.last, residual=residual, top=not check)
 
     return be.run(model, units, build, keep_dtype=not check)
 
@@ -57,6 +61,6 @@ def logit_lens_vllm(be, model, m, units, *, layers="all", unembed="logits_proces
     def build(rows):
         return _lens_proxy(m.blocks(model), m.norm(model), m.head(model), layers=layers,
                            unembed=unembed, last_fn=be.last, residual=residual,
-                           processor=m.logits_processor(model))
+                           processor=m.logits_processor(model), top=not check)
 
     return be.run(model, units, build, keep_dtype=not check)

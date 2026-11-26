@@ -201,18 +201,19 @@ def _transplant(clean, layer, positions, last):
 def logit_lens(be, model, units, *, layers="all", check=False):
     """A Hook on every read layer projects the request's last row through the final norm and the
     unembedding on the worker and copies it to the host, as in vLLM-Lens's logit-lens example:
-    `[n_layers, B, vocab]`, in the engine's dtype for a timed call and in fp32 for a check call,
-    which also checks each request collected one row per layer."""
+    a timed call keeps each layer's top-1 token id, `[n_layers, B, 1]`, a check call the logits in
+    fp32, `[n_layers, B, vocab]`, and also checks each request collected one row per layer."""
     n = model.n_layers
     idx = list(range(n)) if layers == "all" else [i % n for i in layers]
 
     def lens(ctx, h):
         if _rank0():
-            _append(ctx, "rows", _readout(ctx, h) if check else _unembed(ctx, h[-1:]).cpu())
+            _append(ctx, "rows", _readout(ctx, h) if check
+                    else _unembed(ctx, h[-1:]).argmax(-1, keepdim=True).cpu())
 
     saved = _hooked(model, units, [lens] * len(units), idx)
     expected = len(idx) if check else None
-    return torch.stack([torch.cat(_rows(s, expected)) for s in saved], dim=1)   # [n_layers, B, vocab]
+    return torch.stack([torch.cat(_rows(s, expected)) for s in saved], dim=1)
 
 
 def _generated_tokens(model, prompts, extra=None, *, new_tokens=1):

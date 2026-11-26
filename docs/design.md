@@ -1390,7 +1390,8 @@ cells is always found. The timed results, check outputs and timed checks, on eve
 |---|---|---|---|
 | steering, ablation, activation patching, DAS | greedy next token `[B, 1]` | next-token logits `[B, vocab]` | `tokens_match` |
 | generation-time steering and patching | the tokens the decode produced `[T, B, 1]` | per-step logits `[T, B, vocab]` | `generated_tokens_match` |
-| logit lens, Jacobian lens, activation harvest, per-step capture | the read as the system returns it | the read in fp32: cast, or projected in fp32 where the timed call projects in the engine's dtype | `read_matches` |
+| logit lens | each layer's top-1 token id `[n_layers, B, 1]`, taken where the logits are computed | lens logits `[n_layers, B, vocab]` in fp32 | `top_tokens_match` |
+| Jacobian lens, activation harvest, per-step capture | the read as the system returns it | the read in fp32: cast, or projected in fp32 where the timed call projects in the engine's dtype | `read_matches` |
 | attention pattern | probabilities | log-probabilities | `probabilities_match` |
 
 The next token is the engine's own sample (`model.samples` on nnsight's vLLM, the generated id of a
@@ -1402,7 +1403,7 @@ token sampled at each step. HF decodes greedily without the checkpoint's repetit
 (`repetition_penalty=1.0`; Qwen2.5-Instruct's generation config sets 1.05), the rule vLLM's
 explicit sampling parameters decode by.
 A cell declares `check` only where its check call differs from its timed call. The reads the
-TransformerLens bridge returns in fp32, vLLM-Hook's logit lens and Jacobian lens (projected in fp32
+TransformerLens bridge returns in fp32, vLLM-Hook's Jacobian lens (projected in fp32
 in both calls, as vLLM-Hook's analyzers replay the final norm on fp32 features), interp-engine's
 Jacobian lens, activation harvest and
 per-step capture, and the activation harvest and per-step capture of the opt realization, vLLM-Hook

@@ -49,13 +49,14 @@ def _final_logits(be, model, prompts, intervene=None):
     return _project(model, rows[0], keep=False)
 
 
-def _project(model, rows, keep=True):
-    """Final RMSNorm, then the unembedding, on the GPU in fp32. rows: [..., d_model]. `keep` as
-    `_gpu_weight`."""
+def _project(model, rows, keep=True, top=False):
+    """Final RMSNorm, then the unembedding, on the GPU in fp32, or with `top` the top-1 token ids
+    `[..., 1]`. rows: [..., d_model]. `keep` as `_gpu_weight`."""
     x = rows.to(model.device, torch.float32)
     x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + model.config.rms_norm_eps)
     x = x * _gpu_weight(model, "model.norm.weight", keep)
-    return (x @ _gpu_weight(model, "unembedding", keep).T).cpu()
+    logits = x @ _gpu_weight(model, "unembedding", keep).T
+    return (logits.argmax(-1, keepdim=True) if top else logits).cpu()
 
 
 def _gpu_weight(model, name, keep):
@@ -72,13 +73,14 @@ def _gpu_weight(model, name, keep):
 
 
 @cell("logit_lens", family="llama", backend="transformer_lens_opt")
-def logit_lens(be, model, units, *, layers="all"):
+def logit_lens(be, model, units, *, layers="all", check=False):
     """Capture every block's output stream, then apply the final RMSNorm and the unembedding on
-    the GPU."""
+    the GPU: each layer's top-1 token id `[n_layers, B, 1]` for a timed call, the logits
+    `[n_layers, B, vocab]` for a check call."""
     n = model.n_layers
     idx = list(range(n)) if layers == "all" else [i % n for i in layers]
     rows = _last_rows(be, model, units, [f"blocks.{i}.hook_out" for i in idx])   # [n_layers, B, d]
-    return _project(model, rows)                                             # [n_layers, B, vocab]
+    return _project(model, rows, top=not check)
 
 
 @cell("jacobian_lens", family="llama", backend="transformer_lens_opt")
